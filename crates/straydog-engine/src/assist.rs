@@ -25,6 +25,8 @@ pub const HELD_WINDOW: usize = 32;
 pub const OTHER_WINDOW: usize = 16;
 /// The part of the level in force's time that another level must save to replace it.
 pub const GAIN: f64 = 0.02;
+/// CUDA needs this saving in two consecutive completed rounds before replacing the held level.
+const CUDA_GAIN: f64 = 0.03;
 /// How many standard errors of the difference of two windows' means that saving must exceed.
 pub const CONFIDENCE: f64 = 2.0;
 
@@ -116,6 +118,11 @@ pub struct Tuner {
     round: Option<Round>,
     rounds: u32,
     outcome: Option<Outcome>,
+    cuda: bool,
+    /// The first winning round's stable level and candidate, awaiting a second round.
+    pending: Option<(u32, u32)>,
+    /// An invalidated round's held level, until the model actually restores it.
+    restore: Option<u32>,
 }
 
 /// The mean of `samples` without the slowest eighth, and its standard error: a stall of the machine in a pass (a page fault's wait,
@@ -137,7 +144,14 @@ impl Tuner {
         levels.push(level);
         levels.sort_unstable();
         levels.dedup();
-        Tuner { levels, level, since: INTERVAL + 1, round: None, rounds: 0, outcome: None }
+        Tuner { levels, level, since: INTERVAL + 1, round: None, rounds: 0, outcome: None,
+                cuda: false, pending: None, restore: None }
+    }
+
+    /// CUDA's tuner: a candidate must save at least 3%, beyond the same standard-error
+    /// threshold, in two consecutive complete rounds against the same held level.
+    pub fn new_cuda(levels: Vec<u32>, level: u32) -> Tuner {
+        Tuner { cuda: true, ..Self::new(levels, level) }
     }
 
     /// The level in force.
@@ -163,7 +177,7 @@ impl Tuner {
 
     /// `count` decode tokens were generated: a round begins every [`INTERVAL`] of them.
     pub fn tokens(&mut self, count: u64) {
-        if self.round.is_some() || !self.active() {
+        if self.round.is_some() || self.restore.is_some() || !self.active() {
             return;
         }
         self.since = self.since.saturating_add(count);
@@ -174,7 +188,7 @@ impl Tuner {
 
     /// A request begins decoding: a round begins if more than [`INTERVAL`] tokens have gone since the last.
     pub fn request(&mut self) {
-        if self.round.is_none() && self.active() && self.since > INTERVAL {
+        if self.round.is_none() && self.restore.is_none() && self.active() && self.since > INTERVAL {
             self.begin();
         }
     }
@@ -192,14 +206,40 @@ impl Tuner {
         }).min_by(|a, b| a.seconds.total_cmp(&b.seconds)).map_or(held, |best| best.level)
     }
 
+    fn choose_cuda(measured: &[Timing], held: u32) -> u32 {
+        let Some(&kept) = measured.iter().find(|timing| timing.level == held) else { return held };
+        measured.iter().filter(|timing| {
+            let saved = kept.seconds - timing.seconds;
+            timing.level != held && timing.seconds <= kept.seconds * (1.0 - CUDA_GAIN)
+                && saved > CONFIDENCE * kept.error.hypot(timing.error)
+        }).min_by(|a, b| a.seconds.total_cmp(&b.seconds)).map_or(held, |best| best.level)
+    }
+
     /// The next window, or the end of the round. The level to put in force, if it is not.
     fn advance(&mut self) -> Option<u32> {
         let round = self.round.as_mut()?;
+        if self.cuda {
+            if let Some(level) = round.target {
+                return (level != self.level).then_some(level);
+            }
+        }
         if let Some(&level) = round.order.get(round.at) {
             round.skip = 1;
             return (level != self.level).then_some(level);
         }
-        let chosen = Self::choose(&round.measured, round.held);
+        let chosen = if self.cuda {
+            let candidate = Self::choose_cuda(&round.measured, round.held);
+            if candidate == round.held {
+                self.pending = None;
+                round.held
+            } else if self.pending == Some((round.held, candidate)) {
+                self.pending = None;
+                candidate
+            } else {
+                self.pending = Some((round.held, candidate));
+                round.held
+            }
+        } else { Self::choose(&round.measured, round.held) };
         if chosen == self.level {
             self.conclude();
             return None;
@@ -236,22 +276,50 @@ impl Tuner {
     }
 
     /// The layers the GPU assists have changed (one more was page-locked): what a round measured was of the layers before, so one under way is
-    /// dropped and a round is due at the next request. The level in force stays.
-    pub fn restart(&mut self) {
+    /// dropped and a round is due at the next request. CUDA restores the held level if a
+    /// probe was in force; the caller must set it on the GPU before acknowledging with set().
+    pub fn restart(&mut self) -> Option<u32> {
+        if self.cuda {
+            self.pending = None;
+            self.restore = self.restore.or_else(|| self.round.as_ref().map(|round| round.held).filter(|held| *held != self.level));
+        }
         self.round = None;
         self.since = INTERVAL + 1;
+        self.restore
     }
 
     /// The level asked for is in force.
     pub fn set(&mut self, level: u32) {
         self.level = level;
+        if self.restore == Some(level) {
+            self.restore = None;
+        }
         if self.round.as_ref().is_some_and(|round| round.target == Some(level)) {
             self.conclude();
         }
     }
 
+    /// This level is the CUDA held level being restored, whose failure must be returned to
+    /// the caller instead of trying another unconfirmed candidate.
+    pub fn restoring(&self, level: u32) -> bool {
+        self.cuda && (self.restore == Some(level)
+            || self.round.as_ref().is_some_and(|round| round.target == Some(level) && round.held == level))
+    }
+
     /// The level asked for cannot be set: it is not tried again. The level to put in force instead, if any.
     pub fn cannot_set(&mut self, level: u32) -> Option<u32> {
+        if self.cuda {
+            self.pending = None;
+            let held = self.restore.or_else(|| self.round.as_ref().map(|round| round.held)).unwrap_or(self.level);
+            self.levels.retain(|other| *other != level || *other == held);
+            self.round = None;
+            self.since = 0;
+            self.outcome = None;
+            // A failed multi-device setter may have changed some devices even when level()
+            // still equals held. Always request an actual restore, then wait for its set().
+            self.restore = Some(held);
+            return Some(held);
+        }
         self.levels.retain(|other| *other != level);
         let round = self.round.as_mut()?;
         round.measured.retain(|timing| timing.level != level);
@@ -278,6 +346,207 @@ impl Tuner {
     /// What the last round found, once.
     pub fn outcome(&mut self) -> Option<Outcome> {
         self.outcome.take()
+    }
+}
+
+#[cfg(test)]
+mod cuda_tests {
+    use super::*;
+
+    fn finish(tuner: &mut Tuner, times: &dyn Fn(u32, usize) -> f64) -> (Outcome, Vec<u32>) {
+        tuner.tokens(INTERVAL);
+        tuner.request();
+        assert!(tuner.probing());
+        let (mut commands, mut nth, mut passes) = (Vec::new(), 0, 0);
+        while tuner.round.is_some() {
+            passes += 1;
+            assert!(passes <= round_passes(3));
+            if let Some(level) = tuner.pass(times(tuner.level(), nth)) {
+                commands.push(level);
+                tuner.set(level);
+                nth = 0;
+            } else { nth += 1; }
+        }
+        (tuner.outcome().unwrap(), commands)
+    }
+
+    fn times(level: u32, _: usize) -> f64 { if level == 2 { 0.080 } else { 0.100 } }
+
+    #[test]
+    fn cuda_needs_two_complete_wins_and_restores_the_first_winner_from_the_last_probe() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        let (first, commands) = finish(&mut tuner, &times);
+        assert_eq!(commands, [1, 2, 0], "even when the winning candidate was the last probe, return to the actual held level");
+        assert_eq!((first.from, first.chosen), (0, 0));
+        assert!(first.first && first.worth_saying());
+        assert_eq!(tuner.level(), 0);
+        assert_eq!(tuner.pending, Some((0, 2)));
+        let (second, commands) = finish(&mut tuner, &times);
+        assert_eq!(commands, [1, 2]);
+        assert_eq!((second.from, second.chosen), (0, 2));
+        assert!(!second.first && second.worth_saying());
+        assert_eq!(tuner.level(), 2);
+        assert_eq!(tuner.pending, None);
+    }
+
+    #[test]
+    fn cuda_requires_at_least_three_percent_and_strictly_more_than_two_standard_errors() {
+        let held = Timing { level: 0, seconds: 100.0, error: 0.0 };
+        let candidate = |seconds, error| Timing { level: 1, seconds, error };
+        assert_eq!(Tuner::choose_cuda(&[held, candidate(97.00000000000001, 0.0)], 0), 0);
+        assert_eq!(Tuner::choose_cuda(&[held, candidate(97.0, 0.0)], 0), 1);
+        assert_eq!(Tuner::choose_cuda(&[held, candidate(96.99999999999999, 0.0)], 0), 1);
+        assert_eq!(Tuner::choose_cuda(&[held, candidate(97.0, 1.5)], 0), 0, "equality with CONFIDENCE is insufficient");
+        assert_eq!(Tuner::choose_cuda(&[held, candidate(97.0, 1.49)], 0), 1);
+        assert_eq!(Tuner::choose_cuda(&[candidate(1.0, 0.0)], 0), 0, "a missing held window cannot confirm a gain");
+        // The old constructor still has its 2% single-round rule.
+        assert_eq!(Tuner::choose(&[held, candidate(97.9, 0.0)], 0), 1);
+        assert_eq!(Tuner::choose_cuda(&[held, candidate(97.9, 0.0)], 0), 0);
+    }
+
+    #[test]
+    fn cuda_stays_at_zero_through_two_percent_noise_and_small_gains() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        for _ in 0..12 {
+            let (outcome, _) = finish(&mut tuner, &|level, nth| {
+                let base = if level == 0 { 0.100 } else { 0.098 };
+                base * (1.0 + [0.02, -0.02, 0.01, -0.01][nth % 4])
+            });
+            assert_eq!((outcome.from, outcome.chosen), (0, 0));
+            assert_eq!(tuner.pending, None);
+        }
+    }
+
+    #[test]
+    fn cuda_a_changed_candidate_starts_a_new_streak() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        let one = |level, _| if level == 1 { 0.080 } else { 0.100 };
+        assert_eq!(finish(&mut tuner, &one).0.chosen, 0);
+        assert_eq!(tuner.pending, Some((0, 1)));
+        assert_eq!(finish(&mut tuner, &times).0.chosen, 0);
+        assert_eq!(tuner.pending, Some((0, 2)));
+        assert_eq!(finish(&mut tuner, &times).0.chosen, 2);
+    }
+
+    #[test]
+    fn cuda_a_round_without_a_winner_breaks_the_streak() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        finish(&mut tuner, &times);
+        assert_eq!(finish(&mut tuner, &|_, _| 0.100).0.chosen, 0);
+        assert_eq!(tuner.pending, None);
+        assert_eq!(finish(&mut tuner, &times).0.chosen, 0);
+        assert_eq!(finish(&mut tuner, &times).0.chosen, 2);
+    }
+
+    #[test]
+    fn cuda_restart_during_a_probe_waits_for_the_actual_gpu_restore_and_breaks_the_streak() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        finish(&mut tuner, &times);
+        tuner.tokens(INTERVAL);
+        let next = (0..=HELD_WINDOW).find_map(|_| tuner.pass(0.100));
+        assert_eq!(next, Some(1));
+        tuner.set(1);
+        assert_eq!(tuner.restart(), Some(0));
+        assert_eq!(tuner.level(), 1, "the model has not restored the GPU yet");
+        assert_eq!(tuner.pending, None);
+        assert!(tuner.restoring(0));
+        tuner.tokens(10 * INTERVAL);
+        tuner.request();
+        assert!(!tuner.probing(), "do not begin from the temporary probe while its restore is pending");
+        assert_eq!(tuner.restart(), Some(0), "a failed restore remains due");
+        assert_eq!(tuner.level(), 1);
+        tuner.set(0);
+        assert!(!tuner.restoring(0));
+        assert_eq!(finish(&mut tuner, &times).0.chosen, 0);
+        assert_eq!(finish(&mut tuner, &times).0.chosen, 2);
+    }
+
+    #[test]
+    fn cuda_cannot_set_a_probe_invalidates_the_round_instead_of_adopting_a_runner_up() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        finish(&mut tuner, &times);
+        tuner.tokens(INTERVAL);
+        let mut failed = false;
+        for _ in 0..round_passes(3) {
+            if let Some(level) = tuner.pass(if tuner.level() == 1 { 0.070 } else { 0.100 }) {
+                if level == 2 {
+                    assert_eq!(tuner.cannot_set(level), Some(0));
+                    failed = true;
+                    break;
+                }
+                tuner.set(level);
+            }
+        }
+        assert!(failed);
+        assert_eq!(tuner.level(), 1, "the actual restore has not succeeded");
+        assert!(tuner.round.is_none() && tuner.pending.is_none() && tuner.outcome().is_none());
+        assert!(tuner.restoring(0));
+        tuner.set(0);
+        assert_eq!(tuner.levels, [0, 1]);
+        let one = |level, _| if level == 1 { 0.070 } else { 0.100 };
+        assert_eq!(finish(&mut tuner, &one).0.chosen, 0);
+        assert_eq!(finish(&mut tuner, &one).0.chosen, 1);
+    }
+
+    #[test]
+    fn cuda_cannot_set_a_confirmed_target_still_restores_held_without_a_runner_up() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        let one = |level, _| match level { 1 => 0.060, 2 => 0.080, _ => 0.100 };
+        finish(&mut tuner, &one);
+        tuner.tokens(INTERVAL);
+        let mut target = None;
+        for _ in 0..round_passes(3) {
+            if let Some(level) = tuner.pass(one(tuner.level(), 0)) {
+                if tuner.round.as_ref().is_some_and(|round| round.target == Some(1)) { target = Some(level); break; }
+                tuner.set(level);
+            }
+        }
+        assert_eq!(target, Some(1));
+        assert_eq!(tuner.level(), 2);
+        assert_eq!(tuner.cannot_set(1), Some(0));
+        assert!(tuner.restoring(0) && tuner.pending.is_none() && tuner.round.is_none());
+        assert_eq!(tuner.level(), 2);
+        tuner.set(0);
+        assert_eq!(tuner.level(), 0);
+        assert_eq!(tuner.levels, [0, 2]);
+    }
+
+    #[test]
+    fn cuda_a_partial_set_failure_requests_held_even_if_the_recorded_level_is_already_held() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1], 0);
+        tuner.request();
+        assert_eq!((0..=HELD_WINDOW).find_map(|_| tuner.pass(0.100)), Some(1));
+        // The multi-GPU setter failed before tuner.set(1); some GPUs may still have changed.
+        assert_eq!(tuner.level(), 0);
+        assert_eq!(tuner.cannot_set(1), Some(0));
+        assert!(tuner.restoring(0));
+        tuner.request();
+        assert!(!tuner.probing());
+        tuner.set(0);
+        assert!(!tuner.restoring(0));
+    }
+
+    #[test]
+    fn cuda_the_same_round_cannot_vote_twice_while_its_restore_is_waiting() {
+        let mut tuner = Tuner::new_cuda(vec![0, 1, 2], 0);
+        tuner.request();
+        let mut restore = None;
+        for _ in 0..round_passes(3) {
+            if let Some(level) = tuner.pass(times(tuner.level(), 0)) {
+                if tuner.restoring(level) { restore = Some(level); break; }
+                tuner.set(level);
+            }
+        }
+        assert_eq!(restore, Some(0));
+        for _ in 0..5 {
+            assert_eq!(tuner.pass(0.080), None);
+            assert_eq!(tuner.advance(), Some(0));
+            assert_eq!(tuner.pending, Some((0, 2)));
+            assert_eq!(tuner.rounds, 0);
+        }
+        tuner.set(0);
+        assert_eq!(tuner.rounds, 1);
+        assert_eq!(tuner.level(), 0);
     }
 }
 
