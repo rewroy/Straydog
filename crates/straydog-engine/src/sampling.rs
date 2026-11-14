@@ -1065,6 +1065,38 @@ pub fn accept_top_drawn(drafts: &[u32], proposed: &[Vec<(f32, u32)>], top: &[Vec
     (drafts.len(), distribution(&top[drafts.len()]).draw(rng))
 }
 
+/// How many of a drafter's greatest raw logits [`guess_keyed`] reads: what a scan of the candidates keeps.
+pub const GUESS_TOP: usize = SCANNED_TOP_K;
+
+/// Whether a drafter's guess of the token [`accept_keyed`] commits is made by [`guess_keyed`] (from the drafter's greatest logits): where
+/// the target's token is not just the greatest raw logit -- a draw from a cut distribution (its candidates in order of their penalized
+/// logits, which a row of greatest logits gives too), or a greedy choice under a presence penalty.
+pub fn guesses_keyed(sampling: &Sampling) -> bool {
+    sampling.check().is_ok() && if sampling.temperature > 0.0 { sampling.cuts() } else { sampling.presence_penalty != 0.0 }
+}
+
+/// A drafter's guess of the token [`accept_keyed`] will commit at a row: [`choose`] over the drafter's row of greatest raw logits (`row`,
+/// most likely first) with the generator the target will use for that row -- the presence penalty over `generated`, the cuts, and the
+/// draw -- and the probability of the row's most likely token under the softmax of the pairs read (what a draft's cut reads). The
+/// target's draw picks the candidate its generator's one number falls in, the candidates in order of their logits: with the same number
+/// the two draws name the same token wherever the two distributions put that number in the same candidate, where the drafter's most
+/// likely token is the target's draw only as often as the target draws its own most likely one. Only a guess: the token committed is the
+/// target's. None for an empty row.
+pub fn guess_keyed(row: &[(f32, u32)], sampling: &Sampling, generated: &Generated, rng: &mut Rng) -> Option<(u32, f32)> {
+    let peak = row.first()?.0;
+    let total: f64 = row.iter().map(|&(logit, _)| f64::from(logit - peak).exp()).sum();
+    let confidence = (1.0 / total) as f32;
+    let mut candidates: Vec<(f64, u32)> = row.iter().map(|&(logit, token)| (penalized_logit(logit, token, sampling, generated), token)).collect();
+    candidates.sort_by(descending);
+    if sampling.temperature <= 0.0 {
+        return Some((candidates[0].1, confidence));
+    }
+    if sampling.top_k > 0 {
+        candidates.truncate(sampling.top_k.min(candidates.len()));
+    }
+    Some((cut(candidates, sampling).draw(rng), confidence))
+}
+
 /// [`accept`] of point drafts where each row's token is decided by the target alone: row `index`'s token is [`choose`]n from its logits with
 /// the generator `key(index)` gives (one keyed by the seed and the row's position: a fresh one for each row, so that no draw depends on the
 /// draws before it or on how many rows were verified), and a draft is kept iff it is that token. The probability that a draft is kept is its
@@ -1430,6 +1462,41 @@ mod tests {
 
     /// accept_keyed commits the token the target alone decides (the same whatever drafts were offered), and its tokens are drawn from the
     /// distribution the running generator draws from.
+    /// guess_keyed over a row's greatest logits is choose over the row with the same generator: a drafter whose logits were the target's
+    /// would guess every keyed draw, under a penalty and the cuts, and greedy under a penalty.
+    #[test]
+    fn a_keyed_guess_from_the_targets_own_top_is_the_targets_draw() {
+        let vocabulary = 300;
+        let mut state = 12345u64;
+        let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as f32 / (1u64 << 31) as f32 };
+        let row: Vec<f32> = (0..vocabulary).map(|_| next() * 8.0).collect();
+        let mut seen = Generated::new(vocabulary);
+        // (penalized tokens among the greatest: the order of the candidates changes)
+        let top = top_of(&row, GUESS_TOP);
+        for &(_, token) in top.iter().step_by(3).take(8) {
+            seen.insert(token);
+        }
+        for sampling in [Sampling { temperature: 0.7, top_k: 20, top_p: 0.8, presence_penalty: 1.5, ..Sampling::GREEDY },
+                         Sampling { temperature: 1.0, top_k: 20, top_p: 0.95, ..Sampling::GREEDY },
+                         Sampling { temperature: 0.9, top_k: 8, min_p: 0.05, presence_penalty: -1.0, ..Sampling::GREEDY },
+                         Sampling { presence_penalty: 1.5, ..Sampling::GREEDY }] {
+            assert!(guesses_keyed(&sampling));
+            let mut drawn = std::collections::BTreeSet::new();
+            for seed in 0..2000u64 {
+                let target = choose(&row, &sampling, &seen, &mut Rng::keyed(seed, 41));
+                let (guess, confidence) = guess_keyed(&top, &sampling, &seen, &mut Rng::keyed(seed, 41)).unwrap();
+                assert_eq!(guess, target, "seed {seed} {sampling:?}");
+                assert!(confidence > 0.0 && confidence <= 1.0);
+                drawn.insert(target);
+            }
+            // (the draws are not all the most likely token where the request draws)
+            assert_eq!(drawn.len() > 1, sampling.temperature > 0.0, "{sampling:?}");
+        }
+        assert!(!guesses_keyed(&Sampling::GREEDY));
+        assert!(!guesses_keyed(&Sampling { temperature: 0.8, ..Sampling::GREEDY }));
+        assert!(guess_keyed(&[], &Sampling::GREEDY, &seen, &mut Rng::keyed(0, 0)).is_none());
+    }
+
     #[test]
     fn keyed_acceptance_is_the_targets_draw_whatever_the_drafts() {
         let vocabulary = 6;
