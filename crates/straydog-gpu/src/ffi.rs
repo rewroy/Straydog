@@ -185,6 +185,9 @@ unsafe extern "C" {
     pub fn sd_test_refuse_host(count: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_test_fail_streamed(count: u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_test_hybrid_timeout(count: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -2028,6 +2031,68 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_verify_commit_forced(
+        handle: *mut ::std::os::raw::c_void,
+        begin: u64,
+        end: u64,
+        kept: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_pipeline_setup(
+        handle: *mut ::std::os::raw::c_void,
+        flags: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_freeze_slots(
+        handle: *mut ::std::os::raw::c_void,
+        frozen: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_set_window(handle: *mut ::std::os::raw::c_void, window: u64)
+        -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_verify_window_begin(
+        handle: *mut ::std::os::raw::c_void,
+        window: u64,
+        position: u64,
+        rows: u64,
+        epoch: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_verify_window_restore(
+        handle: *mut ::std::os::raw::c_void,
+        begin: u64,
+        end: u64,
+        epoch: u64,
+        position: u64,
+        rows: u64,
+        touched: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_abort_flag(handle: *mut ::std::os::raw::c_void) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn sd_abort_flag_retain(flag: *mut ::std::os::raw::c_void);
+}
+unsafe extern "C" {
+    pub fn sd_abort_flag_release(flag: *mut ::std::os::raw::c_void);
+}
+unsafe extern "C" {
+    pub fn sd_abort_flag_set(flag: *mut ::std::os::raw::c_void, raised: u64);
+}
+unsafe extern "C" {
+    pub fn sd_hybrid_usage(
+        handle: *mut ::std::os::raw::c_void,
+        restore: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_output_head(
         handle: *mut ::std::os::raw::c_void,
         pointers: *const *mut ::std::os::raw::c_void,
@@ -2157,6 +2222,15 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_draft_rows(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        first: u64,
+        count: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_draft_head(
         handle: *mut ::std::os::raw::c_void,
         head: *const *mut ::std::os::raw::c_void,
@@ -2191,6 +2265,9 @@ unsafe extern "C" {
         replays: *mut u64,
         resident: *mut u64,
     ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_experts_finalize(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn sd_resident_moe_create(
@@ -2411,7 +2488,10 @@ unsafe extern "C" {
     pub fn sd_cpu_error() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
-    pub fn sd_cpu_experts_create(threads: u32) -> *mut ::std::os::raw::c_void;
+    pub fn sd_cpu_experts_create(threads: u32, first_core: u32) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn sd_cpu_default_threads(threads: *mut u32) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn sd_cpu_experts_destroy(handle: *mut ::std::os::raw::c_void);

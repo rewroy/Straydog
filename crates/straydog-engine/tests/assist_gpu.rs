@@ -80,14 +80,21 @@ fn relative_difference(a: &[f32], b: &[f32]) -> f64 {
     (diff / norm.max(1e-30)).sqrt()
 }
 
-/// The level asked for is the level every pass runs at: the routes a pass assists are none at 0 and some at more, from the first pass after
-/// a change on (a graph captured at another level, replayed, would assist as that level did), and their count rises with the level.
+/// The level asked for is the level every pass runs at: the routes a pass assists are none at 0 and, at the top level, some, from the first
+/// pass after a change on (a graph captured at another level, replayed, would assist as that level did); the count never exceeds what the
+/// level allows, and the top level assists more than the lowest.
+///
+/// On CUDA a layer's pass stages its missed experts only when it misses at most `level` distinct ones, and this model at this budget misses
+/// about six in a layer: levels 1 and 2 assist nothing there, so only the top level (8) is required to assist. On HIP the level is the most
+/// routes a layer takes, and every level above 0 assists.
 #[test]
 fn every_pass_runs_at_its_level() {
     let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
     let _gpu = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    // blocks of four passes: 2, 0, 1, 2, 0, 2
-    let script: Vec<u32> = [2, 0, 1, 2, 0, 2].iter().flat_map(|level| [*level; 4]).collect();
+    // (the level that must assist: on CUDA one that can take a layer's misses, the cap)
+    let top: u32 = if cfg!(feature = "cuda") { 8 } else { 2 };
+    // blocks of four passes: 2, 0, 1, top, 0, top
+    let script: Vec<u32> = [2, 0, 1, top, 0, top].iter().flat_map(|level| [*level; 4]).collect();
     let run = run(&root, &script, script.len());
     assert_eq!(run.tokens.len(), script.len() + 1, "the model went on for the passes asked");
     assert_eq!(run.trace.len(), script.len(), "a pass is a trace entry");
@@ -112,7 +119,9 @@ fn every_pass_runs_at_its_level() {
             // (the pass the level changed at too: its graphs were dropped and captured at 0)
             assert_eq!(total, 0, "a block at level 0 assisted {block:?}");
         } else {
-            assert!(total > 0, "a block at level {level} assisted nothing: {block:?}");
+            if level == top || cfg!(not(feature = "cuda")) {
+                assert!(total > 0, "a block at level {level} assisted nothing: {block:?}");
+            }
             // (a layer takes at most `level` routes, over the layers whose banks are mapped: the four the test locks, or every layer
             // where the start has page-locked them all)
             assert!(block.iter().all(|(_, count)| *count <= level as u64 * run.mapped), "{block:?}");
@@ -120,10 +129,14 @@ fn every_pass_runs_at_its_level() {
     }
     let by_level = |wanted: u32| counts.iter().filter(|(level, _)| *level == wanted).map(|(_, count)| *count).sum::<u64>() as f64
         / counts.iter().filter(|(level, _)| *level == wanted).count() as f64;
-    eprintln!("assisted a pass: 0 {:.2}, 1 {:.2}, 2 {:.2}", by_level(0), by_level(1), by_level(2));
-    assert!(by_level(2) > by_level(1), "level 2 must assist more than level 1");
+    eprintln!("assisted a pass: 0 {:.2}, 1 {:.2}, 2 {:.2}, {top} {:.2}", by_level(0), by_level(1), by_level(2), by_level(top));
+    if cfg!(feature = "cuda") {
+        assert!(by_level(top) > by_level(0), "level {top} must assist more than level 0");
+    } else {
+        assert!(by_level(2) > by_level(1), "level 2 must assist more than level 1");
+    }
     // the level in force at the end is the request line's
-    assert_eq!(run.detail["assist"], 2, "{}", run.detail);
+    assert_eq!(run.detail["assist"], top, "{}", run.detail);
 }
 
 /// A model that changes level between passes gives each pass the results of the model at that level: close to the pass of a model that

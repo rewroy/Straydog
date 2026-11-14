@@ -66,10 +66,12 @@ void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps
         const float* norm = static_cast<const float*>(pointers[0]);
         float* denominators = normalized;
         if (!prenormalized) hc_normalize_half<<<unsigned(steps * 4), 256, 0, d.stream>>>(hidden, norm, half, denominators);
+        phase(d, "hc_norm");
         batch_project(d, down, steps, nullptr, half, low);
         batch_project(d, inject, steps, nullptr, half, injection);
         hc_activate_low<<<unsigned((steps * 320 + 255) / 256), 256, 0, d.stream>>>(low, steps * 320);
         batch_cast(d, low, half, steps * 320);
+        phase(d, "hc_down");
 #if defined(__HIPCC__)
         // A long read's rows: the up projection and the finish in one kernel (hc_fused.hpp), the F32 projection never written.
         if (d.hc_fused && d.rdna4) {
@@ -80,8 +82,10 @@ void hc_prefill(Device& d, void* const* pointers, const int* kinds, size_t steps
         }
 #endif
         batch_project(d, up, steps, low, half, projected);
+        phase(d, "hc_up");
         hc_finish_hidden<<<unsigned((steps * 2560 + 255) / 256), 256, 0, d.stream>>>(hidden, norm, denominators, projected, injection,
                                                                                     steps, mixed);
+        phase(d, "hc_finish");
         check(hipGetLastError());
         return;
     }
@@ -137,6 +141,7 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
     }
     batch_project(d, beta_weights, steps, mixed, half, beta);
     batch_project(d, alpha_weights, steps, mixed, half, alpha);
+    phase(d, "gdn_proj_in");
     for (size_t first = 0; first < steps; first += chunk) {
         const size_t count = std::min(chunk, steps - first);
         float* rows = qkv + first * H::channels;
@@ -153,6 +158,21 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
                 post + first * H::gate);
             continue;
         }
+#else
+        // (CUDA: the same chunks of 16 tokens, the scan in F32 FMAs on a warp a head's 32 columns: gdn_chunk_scan_f32)
+        if (d.gdn_chunked && count > 1 && GdnChunkLayout<P>(count).total <= d.input_capacity) {
+            gdn_chunk_prep<P><<<dim3(unsigned((count + gdn_chunk_tokens - 1) / gdn_chunk_tokens), unsigned(H::key)), 640, 0, d.stream>>>(rows,
+                static_cast<const float*>(conv), static_cast<const float*>(pointers[5]), beta + first * H::value, alpha + first * H::value,
+                static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
+            phase(d, "gdn_prep");
+            gdn_chunk_scan_f32<P><<<dim3(unsigned(H::value), unsigned(128 / (16 * gdn_scan_warps))), 32 * gdn_scan_warps, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows,
+                static_cast<float*>(conv));
+            phase(d, "gdn_scan");
+            gdn_post<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
+                post + first * H::gate);
+            phase(d, "gdn_post");
+            continue;
+        }
 #endif
         // (the runs' edges in the packed values' scratch, d.input, before the chunk's values are packed there)
         const unsigned columns = unsigned((H::channels + 255) / 256), runs = unsigned((count + gdn_conv_run - 1) / gdn_conv_run);
@@ -161,15 +181,23 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
         gdn_normalize_qk<P><<<unsigned(count * H::key), 128, 0, d.stream>>>(rows, count, d.input);
         gdn_pack_values<P><<<unsigned((count * H::gate + 255) / 256), 256, 0, d.stream>>>(rows, beta + first * H::value,
             alpha + first * H::value, static_cast<const float*>(pointers[6]), static_cast<const float*>(pointers[7]), count, d.input);
+        phase(d, "gdn_prep");
         // Every qkv row of this chunk is packed before the recurrence overwrites the chunk's rows.
         if (d.rdna4 && count > 1)
             delta_split_sequence<P><<<delta_split_blocks<P>(), delta_columns * 8, 0, d.stream>>>(static_cast<float*>(recurrent), count, d.input, rows);
+#if !defined(__HIPCC__)
+        else if (count > 1)
+            delta_register_sequence_ahead<<<unsigned(H::value), 128, 0, d.stream>>>(static_cast<float*>(recurrent), H::value, count, d.input, rows);
+#endif
         else delta_register_sequence<<<unsigned(H::value), 128, 0, d.stream>>>(static_cast<float*>(recurrent), H::value, count, d.input, rows);
+        phase(d, "gdn_scan");
         gdn_post<<<unsigned(count * H::value), 128, 0, d.stream>>>(rows, gate + first * H::gate, static_cast<const float*>(pointers[8]),
             post + first * H::gate);
+        phase(d, "gdn_post");
     }
     if (cast) batch_cast(d, post, half, steps * H::gate);
     batch_project(d, output_weights, steps, post, half, branch);
+    phase(d, "gdn_proj_out");
     check(hipGetLastError());
 }
 
@@ -196,11 +224,9 @@ void qsa_attention_gathered(Device& d, void* state, size_t context, size_t base,
             qsa_gather_union<<<unsigned(total), 256, 0, d.stream>>>(d.kv_row, static_cast<const kv_t*>(state), context, planes, blocks,
                                                                      kv_stage_rows(d), capacity);
             qsa_renumber_selection<P><<<unsigned(count), 256, 0, d.stream>>>(d.input, steps, selected, first, places);
-            qsa_flash<P><<<dim3(unsigned(count), unsigned(H::kv)), 256, 0, d.stream>>>(d.kv_row, kv_stage_rows(d), capacity, base, steps, selected,
-                                                                                     d.input, output, first);
+            qsa_flash_launch<P>(d, dim3(unsigned(count), unsigned(H::kv)), kv_stage_rows(d), capacity, base, steps, selected, d.input, output, first);
         } else   // (a stage too small for one token's selection)
-            qsa_flash<P><<<dim3(1, unsigned(H::kv)), 256, 0, d.stream>>>(d.kv_row, static_cast<const kv_t*>(state), context, base, steps, selected,
-                                                                       d.input, output, first);
+            qsa_flash_launch<P>(d, dim3(1, unsigned(H::kv)), static_cast<const kv_t*>(state), context, base, steps, selected, d.input, output, first);
         first += count;
     }
 }
@@ -250,6 +276,7 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
     const bool cast = batch_half(d, steps);
     if (cast) batch_cast(d, mixed, half, steps * 2560);
     for (size_t i = 0; i < 5; ++i) batch_project(d, matrices[i], steps, mixed, half, targets[i]);
+    phase(d, "qsa_proj_in");
     const size_t pool = context / 4 + 1;
     float* blocks = static_cast<float*>(index_state);
     float* history = blocks + pool * 128;
@@ -316,9 +343,12 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             else if (completed)
                 qsa_pool<<<unsigned(completed), 128, 0, d.stream>>>(chunk_ik, history, static_cast<const float*>(pointers[9]), pool, position, blocks);
             qsa_save_history<<<unsigned((std::min(count, size_t(4)) * 128 + 255) / 256), 256, 0, d.stream>>>(chunk_ik, position, count, history);
+            phase(d, "qsa_prep");
             if (own) qsa_index_chunk<P>(d, chunk_iq, blocks, pool, position, count, selected, static_cast<float*>(scores), d.input, per_token, &iv_valid);
+            phase(d, "qsa_index");
             write_attention_kv<P><<<unsigned((count * K + 255) / 256), 256, 0, d.stream>>>(d.kv_row, kv.kv, kv.capacity, position, count, d.input,
                 nullptr, nullptr, kv.mirror, kv.mirror_rows);
+            phase(d, "qsa_kv");
             if (per_token) {
                 if (own) {
                     if (shared)
@@ -336,6 +366,7 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
             } else if (gathered) qsa_attention_gathered<P>(d, kv_state, context, position, count, selected, attended + first * Q, places, placed);
             else qsa_attention<P>(d, kv.kv, kv.capacity, position, count, selected, d.input, attended + first * Q, nullptr, kv.mirror,
                                   kv.mirror_rows);
+            phase(d, "qsa_attn");
         }
         if (shared) {
             // The other's chunks' selections: its stores are done before its flag, which this device's stream waits for.
@@ -383,5 +414,6 @@ void qsa_prefill(Device& d, void* const* pointers, const int* kinds, void* kv_st
     qsa_gate<<<unsigned((steps * Q + 255) / 256), 256, 0, d.stream>>>(attended, qgate, steps * Q);
     if (cast) batch_cast(d, attended, half, steps * Q);
     batch_project(d, matrices[5], steps, attended, half, branch);
+    phase(d, "qsa_proj_out");
     check(hipGetLastError());
 }

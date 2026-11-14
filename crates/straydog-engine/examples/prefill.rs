@@ -135,6 +135,7 @@ fn main() -> Result<(), String> {
                       total as f64 / (1u64 << 30) as f64, budget as f64 / (1u64 << 30) as f64);
         }
     }
+    eprintln!("K/V {} positions of {}, {} expert slots", model.kv_positions(), settings.context, model.slot_counts().0);
     // "+N" appends N tokens to the previous prompt (the conversation cache resumes it).
     let mut previous: Vec<u32> = Vec::new();
     let mut row_counts = (0, 0, 0);
@@ -235,6 +236,9 @@ fn main() -> Result<(), String> {
                 println!("GPU {device}: {:.3} GiB free after the run", free as f64 / (1u64 << 30) as f64);
             }
         }
+        println!("  K/V {} positions, {} expert slots, growth {} s, slots by growth {}", model.kv_positions(), model.slot_counts().0,
+                 model.last_metrics.get("kv_growth_seconds").map_or("none".to_string(), |seconds| seconds.to_string()),
+                 model.last_metrics.get("kv_growth_slots").map_or("none".to_string(), |slots| slots.to_string()));
         println!("  batches: {} of up to {} rows", model.last_metrics["prefill_batches"].as_u64().unwrap_or(0),
                  model.last_metrics["prefill_batch_rows"].as_u64().unwrap_or(0));
         println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,

@@ -608,7 +608,7 @@ fn cpu_experts_on_the_model_equal_the_reference() {
     let Some(shards) = Shards::open() else { return };
     load_tables();
     // SAFETY: plain value; null on failure.
-    let engine = unsafe { ffi::sd_cpu_experts_create(0) };
+    let engine = unsafe { ffi::sd_cpu_experts_create(0, 0) };
     assert!(!engine.is_null());
     let mut random = Random(23);
     for (layer, which) in [(0, [3, 381]), (1, [7, 200]), (2, [64, 300]), (10, [1, 255]), (20, [9, 383]), (25, [100, 2])] {
@@ -675,7 +675,7 @@ fn cpu_expert_rows_in_one_call_equal_each_row_alone() {
     let mut random = Random(23);
     let (hidden, inter) = (2560usize, 640usize);
     // SAFETY: a plain value; null on failure.
-    let engine = unsafe { ffi::sd_cpu_experts_create(3) };
+    let engine = unsafe { ffi::sd_cpu_experts_create(3, 0) };
     assert!(!engine.is_null());
     for gate_kind in [16u32, 17] {
         let kinds = [gate_kind as i32, gate_kind as i32, 42];

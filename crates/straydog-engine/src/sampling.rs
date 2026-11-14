@@ -978,6 +978,24 @@ pub fn accept_top_drawn(drafts: &[u32], proposed: &[Vec<(f32, u32)>], top: &[Vec
     (drafts.len(), distribution(&top[drafts.len()]).draw(rng))
 }
 
+/// [`accept`] of point drafts where each row's token is decided by the target alone: row `index`'s token is [`choose`]n from its logits with
+/// the generator `key(index)` gives (one keyed by the seed and the row's position: a fresh one for each row, so that no draw depends on the
+/// draws before it or on how many rows were verified), and a draft is kept iff it is that token. The probability that a draft is kept is its
+/// probability under the target, as in [`accept`] (temperature 0 is the same rule), and the token committed at a position is the same whatever
+/// drafts were offered: a pass whose rows were guessed before the pass before it was decided commits what the ordinary order does.
+pub fn accept_keyed(drafts: &[u32], logits: &[f32], vocabulary: usize, sampling: &Sampling, generated: &mut Generated,
+                    key: &dyn Fn(usize) -> Rng) -> (usize, u32) {
+    let row = |index: usize| &logits[index * vocabulary..(index + 1) * vocabulary];
+    for (index, draft) in drafts.iter().enumerate() {
+        let target = choose(row(index), sampling, generated, &mut key(index));
+        if target != *draft {
+            return (index, target);
+        }
+        generated.insert(*draft);
+    }
+    (drafts.len(), choose(row(drafts.len()), sampling, generated, &mut key(drafts.len())))
+}
+
 /// Accepted draft count and the next token, given the target logits of every row of a
 /// verification (`vocabulary` wide): a greedy match, or exact speculative sampling. A
 /// deterministic draft is a point proposal, accepted with its target probability; after a
@@ -1150,6 +1168,41 @@ pub fn accept_drawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// accept_keyed commits the token the target alone decides (the same whatever drafts were offered), and its tokens are drawn from the
+    /// distribution the running generator draws from.
+    #[test]
+    fn keyed_acceptance_is_the_targets_draw_whatever_the_drafts() {
+        let vocabulary = 6;
+        let row = [2.0f32, 1.0, 0.5, 3.0, -1.0, 2.5];
+        let logits: Vec<f32> = row.iter().chain(row.iter()).copied().collect();
+        let sampling = Sampling { temperature: 0.8, presence_penalty: 1.5, top_k: 4, ..Sampling::GREEDY };
+        let mut seen = Generated::new(vocabulary);
+        seen.insert(3);
+        let expected = distribution(&row, &sampling, &seen);
+        let mut counts = [0usize; 6];
+        let seeds = 20000u64;
+        for seed in 0..seeds {
+            let key = |index: usize| Rng::keyed(seed, 100 + index as u64);
+            let token = choose(&row, &sampling, &seen, &mut key(0));
+            counts[token as usize] += 1;
+            // Whatever the draft, the first token committed is that token.
+            for draft in 0..vocabulary as u32 {
+                let mut generated = Generated::new(vocabulary);
+                generated.insert(3);
+                let (accepted, following) = accept_keyed(&[draft], &logits, vocabulary, &sampling, &mut generated, &key);
+                let committed = if accepted == 1 { draft } else { following };
+                assert_eq!(committed, token, "seed {seed} draft {draft}");
+            }
+        }
+        for token in 0..vocabulary as u32 {
+            let seen_share = counts[token as usize] as f64 / seeds as f64;
+            assert!((seen_share - expected.probability(token)).abs() < 0.02, "token {token}: {seen_share} against {}", expected.probability(token));
+        }
+        // The same seed and position give the same draw; another position another stream.
+        let a = choose(&row, &sampling, &seen, &mut Rng::keyed(7, 1));
+        assert_eq!(a, choose(&row, &sampling, &seen, &mut Rng::keyed(7, 1)));
+    }
 
     #[test]
     fn choose_where_draws_only_allowed_tokens_and_none_when_none_is() {

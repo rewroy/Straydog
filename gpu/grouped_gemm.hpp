@@ -6,7 +6,9 @@ struct MoeTile { uint32_t group,first; };
 // and the routed rows per token (shared rows follow all routed ones).
 struct MoeShape { uint32_t hidden, ffn, top_k; };
 
+template<bool allow_soa=false>
 __device__ float grouped_weight(const Matrix& matrix, size_t row, size_t column) {
+    if constexpr (allow_soa) if (matrix.layout) return expert_soa_weight(matrix,row,column);
     const uint8_t* data=matrix.data+row*matrix.row_bytes;
     #define SD_GROUP(format) case format: return weight<format>(data,column);
     switch (matrix.kind) {
@@ -16,6 +18,7 @@ __device__ float grouped_weight(const Matrix& matrix, size_t row, size_t column)
     return 0;
 }
 
+template<bool allow_soa=false>
 __global__ void grouped_moe(const MoeGroup* groups, const MoeTile* tiles, const int32_t* positions,
                             size_t steps, bool down, const float* input, float* output,
                             const unsigned* tile_count=nullptr, int filter=0) {
@@ -43,7 +46,7 @@ __global__ void grouped_moe(const MoeGroup* groups, const MoeTile* tiles, const 
             x[i]=value;
         }
         for (size_t i=lane;i<64*32;i+=256) {
-            float value=grouped_weight(matrix,column+i/32,begin+i%32);
+            float value=grouped_weight<allow_soa>(matrix,column+i/32,begin+i%32);
             if (half) value=__half2float(__float2half(value));
             w[i]=value;
         }
@@ -67,7 +70,7 @@ __global__ void grouped_moe(const MoeGroup* groups, const MoeTile* tiles, const 
 
 // RDNA4 fragments follow AMD's documented lane-group-split WMMA ABI.
 // Other targets retain the portable tiled implementation above.
-template<size_t tile_rows>
+template<size_t tile_rows,bool allow_soa=false>
 __global__ void grouped_moe_wmma(const MoeGroup* groups, const MoeTile* tiles, const int32_t* positions,
                                  size_t steps, bool down, const float* input, float* output,
                                  const unsigned* tile_count=nullptr, int filter=0) {
@@ -109,7 +112,7 @@ __global__ void grouped_moe_wmma(const MoeGroup* groups, const MoeTile* tiles, c
             }
         } else {
             for (size_t i=thread;i<64*32;i+=tile_rows*8)
-                w[(i/32)*34+i%32]=_Float16(grouped_weight(matrix,column+i/32,begin+i%32));
+                w[(i/32)*34+i%32]=_Float16(grouped_weight<allow_soa>(matrix,column+i/32,begin+i%32));
         }
         __syncthreads();
         #pragma unroll

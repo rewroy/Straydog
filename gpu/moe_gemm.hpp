@@ -126,6 +126,17 @@ template<> struct MoeUnit<21> {   // IQ3_S: a half is 32 qs, 4 qh and 16 sign by
         qh = moe_u32(b + 66 + 4 * half);
         header = moe_u16(b) | moe_u16(b + 106 + 2 * half) << 16;
     }
+    __device__ void load_soa(const Matrix& m, size_t row, size_t unit, unsigned half) {
+        qh = 0; header = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const ExpertSoaFields f = expert_soa_fields<21>(m, row, unit * 8 + half * 4 + i);
+            qs[2 * i] = f.q0; qs[2 * i + 1] = f.q1; signs[i] = f.signs;
+            qh |= f.high << (8 * i);
+            header |= f.scale << (16 + 4 * i);
+            if (i == 0) header |= f.d;
+        }
+    }
     __device__ void decode(int p, const uint32_t* table, uint32_t (&out)[4]) const {
         const int i = p / 4, g = p % 4;
         const unsigned pair = qs[2 * i + g / 2] >> (16 * (g % 2)), top = qh >> (8 * i);
@@ -146,6 +157,14 @@ template<> struct MoeUnit<18> {   // IQ3_XXS: a half is 32 qs bytes and four sig
         for (int i = 0; i < 4; ++i) { qs[i] = q0[i]; qs[4 + i] = q1[i]; aux[i] = a[i]; }
         d = moe_u16(b);
     }
+    __device__ void load_soa(const Matrix& m, size_t row, size_t unit, unsigned half) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const ExpertSoaFields f = expert_soa_fields<18>(m, row, unit * 8 + half * 4 + i);
+            qs[2 * i] = f.q0; qs[2 * i + 1] = f.q1; aux[i] = f.signs;
+            if (i == 0) d = f.d;
+        }
+    }
     __device__ void decode(int p, const uint32_t* table, uint32_t (&out)[4]) const {
         const int i = p / 4, g = p % 4;
         const unsigned pair = qs[2 * i + g / 2] >> (16 * (g % 2));
@@ -165,6 +184,16 @@ template<> struct MoeUnit<22> {   // IQ2_S: a half is 16 qs, 16 sign, 4 qh and 4
         #pragma unroll
         for (int i = 0; i < 4; ++i) { qs[i] = q[i]; signs[i] = s[i]; }
         qh = moe_u32(b + 66 + 4 * half); scales = moe_u32(b + 74 + 4 * half); d = moe_u16(b);
+    }
+    __device__ void load_soa(const Matrix& m, size_t row, size_t unit, unsigned half) {
+        qh = 0; scales = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const ExpertSoaFields f = expert_soa_fields<22>(m, row, unit * 8 + half * 4 + i);
+            qs[i] = f.q0; signs[i] = f.signs;
+            qh |= f.high << (8 * i); scales |= f.scale << (8 * i);
+            if (i == 0) d = f.d;
+        }
     }
     __device__ void decode(int p, const uint32_t* table, uint32_t (&out)[4]) const {
         const int i = p / 4, g = p % 4;
@@ -509,7 +538,19 @@ constexpr int moe_wave_n = 2;
 // first, and `route_weights` (one per grouped row) scale the product, as its SwiGLU does
 // (op_swiglu_kernel). Qwen3.8's instantiations are without: compiled in, the clamp and the weight
 // moved the FP16 products of its prefill (and its pinned generations with them).
-template<int kind, bool fused = true, int H = 0, int F = 0, int K = 0, bool weighted = false>
+// SoA only changes a specialized unit's fields: its span and the activation K order stay native.
+template<int kind, bool allow_soa>
+__device__ __forceinline__ void moe_load_unit(MoeUnit<kind>& unit, const Matrix& weights, size_t row, size_t index, unsigned half) {
+    if constexpr (allow_soa && (kind == 18 || kind == 21 || kind == 22)) {
+        if (weights.layout == 1) {
+            unit.load_soa(weights, row, index, half);
+            return;
+        }
+    }
+    unit.load(weights.data + row * weights.row_bytes, weights.kind, index, half);
+}
+
+template<int kind, bool fused = true, int H = 0, int F = 0, int K = 0, bool weighted = false, bool allow_soa = false>
 __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, const MoeTile* tiles,
                                                         const int32_t* positions, size_t steps, MoeShape shape,
                                                         const _Float16* input, _Float16* product,
@@ -554,7 +595,7 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
     };
     Unit next[N], unit[N];
     #pragma unroll
-    for (int n = 0; n < N; ++n) next[n].load(weights.data + (j0 + 16 * n) * weights.row_bytes, weights.kind, 0, half);
+    for (int n = 0; n < N; ++n) moe_load_unit<kind, allow_soa>(next[n], weights, j0 + 16 * n, 0, half);
     load_a(0); store_a(0);
     __syncthreads();
     moe_float8 sum[4][N] = {};
@@ -562,7 +603,7 @@ __global__ void __launch_bounds__(256) moe_gate_up_wmma(const MoeGroup* groups, 
         #pragma unroll
         for (int n = 0; n < N; ++n) {
             unit[n] = next[n];
-            if (u + 1 < total / per_unit) next[n].load(weights.data + (j0 + 16 * n) * weights.row_bytes, weights.kind, u + 1, half);
+            if (u + 1 < total / per_unit) moe_load_unit<kind, allow_soa>(next[n], weights, j0 + 16 * n, u + 1, half);
         }
         #pragma unroll
         for (int s = 0; s < per_unit; ++s) {
@@ -762,14 +803,14 @@ inline int moe_down_unit(int down, MoeShape shape) {
 }
 #define SD_MOE_UNITS(X) X(21) X(18) X(22) X(16) X(17) X(29) X(19) X(10) X(23) X(20) X(8) X(39) X(42) X(-1) X(0)
 // H, F, K: as moe_gate_up_wmma's (a caller with one fixed shape passes it).
-template<int H = 0, int F = 0, int K = 0>
+template<int H = 0, int F = 0, int K = 0, bool allow_soa = false>
 inline void moe_expert_launch(hipStream_t stream, MoeKinds routed, MoeKinds common, const MoeGroup* groups, const MoeTile* tiles,
                               const int32_t* positions, size_t steps, MoeShape shape, const _Float16* input, _Float16* product,
                               float* outputs, const unsigned* count, unsigned listed, unsigned shared) {
     const MoeTile* last = count ? tiles : tiles + (listed - shared);
     const unsigned gate_columns = shape.ffn / (64 * moe_wave_n), down_columns = shape.hidden / (128 * moe_wave_n);
     auto gate_up = [&](int kind, const MoeTile* list, unsigned blocks, unsigned skip, bool tail) {
-        #define SD_GATE_UP(format) case format: moe_gate_up_wmma<format, true, H, F, K><<<dim3(gate_columns, blocks), 256, 0, stream>>>( \
+        #define SD_GATE_UP(format) case format: moe_gate_up_wmma<format, true, H, F, K, false, allow_soa><<<dim3(gate_columns, blocks), 256, 0, stream>>>( \
             groups, list, positions, steps, shape, input, product, count, skip, tail); break;
         if (blocks) switch (kind) { SD_MOE_UNITS(SD_GATE_UP) }
         #undef SD_GATE_UP
