@@ -469,12 +469,26 @@ __global__ void __launch_bounds__(128) gdn_post_rows(const float* recurrent, con
 
 #if !defined(__HIPCC__)
 // 16 bytes from global memory to shared memory without a register in between (Ampere and later): copies in flight while the matrix is multiplied.
+// Before sm_80 (a build for every default architecture compiles this for sm_75 too, where ptxas refuses cp.async) the copy is a plain 16-byte
+// load and store, done when it returns, and commit and wait do nothing: the scan's buffers are reused only after a barrier either way.
 __device__ __forceinline__ void gdn_copy16(void* shared, const void* global) {
+#if __CUDA_ARCH__ >= 800
     const unsigned address = unsigned(__cvta_generic_to_shared(shared));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(address), "l"(global) : "memory");
+#else
+    *reinterpret_cast<uint4*>(shared) = *reinterpret_cast<const uint4*>(global);
+#endif
 }
-__device__ __forceinline__ void gdn_copy_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
-__device__ __forceinline__ void gdn_copy_wait() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
+__device__ __forceinline__ void gdn_copy_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void gdn_copy_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
+}
 
 // The scan over a launch's chunks of 16 tokens on CUDA, in F32 FMAs (gdn_chunk_prep's U, W, B, g and e and the normalized keys and queries as floats
 // are its inputs): a block of four warps takes 64 columns of one value head, a warp 16 of them, two lanes a column, each its column's state for 64 of
