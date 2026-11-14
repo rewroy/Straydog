@@ -12,7 +12,8 @@
 //! The worker owns the first device while the loop runs (the loop touches only the second device then, and the first once the worker
 //! is idle); each device has a CPU engine of its own.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::collections::VecDeque;
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
 use super::*;
 use crate::gpu::{Backend, SpanAbort, SPAN_ABORTED};
@@ -54,6 +55,16 @@ pub(super) struct PipelineConfig {
     no_copy: bool,
     /// STRAYDOG_PIPELINE_PASS_LOG=1 (a test's): each verified pass's position, tokens, accepted drafts and next token on a line, in both loops.
     pass_log: bool,
+    /// STRAYDOG_PIPELINE_HEAD_SHARE=1 lets the drafter's head borrow an idle first device.
+    head_share: bool,
+}
+
+fn head_share_named(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn head_share_eligible(enabled: bool, idle: bool, lower_head: bool, extras: u64, read_rows: u64) -> bool {
+    enabled && idle && lower_head && extras == 0 && read_rows >= 2
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +94,8 @@ impl PipelineConfig {
                          hand_held: std::env::var("STRAYDOG_PIPELINE_HANDOVER").is_ok_and(|value| ["hold", "start", "zero"].contains(&value.as_str())),
                          hand_test: match std::env::var("STRAYDOG_PIPELINE_HANDOVER").as_deref() { Ok("start") => 1, Ok("zero") => 2, _ => 0 },
                          no_copy: std::env::var("STRAYDOG_PIPELINE_NO_COPY").is_ok_and(|value| value == "1"),
-                         pass_log: std::env::var("STRAYDOG_PIPELINE_PASS_LOG").is_ok_and(|value| value == "1") }
+                         pass_log: std::env::var("STRAYDOG_PIPELINE_PASS_LOG").is_ok_and(|value| value == "1"),
+                         head_share: head_share_named(std::env::var("STRAYDOG_PIPELINE_HEAD_SHARE").ok().as_deref()) }
     }
 
     /// The expert slots and the assist level held as they are.
@@ -580,7 +592,15 @@ fn prepare(weights: &Weights, request: &FrontRequest) -> Result<FrontJob> {
 
 /// Makes the rows of the passes the loop asks for, in order, and hands everything else on to the first device's thread as it comes: the
 /// rows of a pass sent behind another are made while the first device is on that one.
-fn relay(weights: std::sync::Arc<Weights>, commands: Receiver<Command>, worker: Sender<Command>) {
+/// A failed forwarding hop still owns an unsent Resume's actual Backend.
+fn forward_front_command(worker: &Sender<Command>, command: Command) -> std::result::Result<(), (String, Option<Backend>)> {
+    worker.send(command).map_err(|error| {
+        let returned = match error.0 { Command::Resume(device) => Some(*device), _ => None };
+        ("the first device's thread ended before receiving a command".to_string(), returned)
+    })
+}
+
+fn relay(weights: std::sync::Arc<Weights>, commands: Receiver<Command>, worker: Sender<Command>) -> (Result<()>, Option<Backend>) {
     // (a counted reference: the reads are through `&Weights`, which locks what it caches, and the model's own reads are shared ones too)
     for command in commands {
         let command = match command {
@@ -591,10 +611,10 @@ fn relay(weights: std::sync::Arc<Weights>, commands: Receiver<Command>, worker: 
             other => other,
         };
         let stop = matches!(command, Command::Stop);
-        if worker.send(command).is_err() || stop {
-            return;
-        }
+        if let Err((error, returned)) = forward_front_command(&worker, command) { return (Err(error), returned); }
+        if stop { return (Ok(()), None); }
     }
+    (Ok(()), None)
 }
 
 fn run_front(device: &mut Backend, ple: &[Operand], split: usize, job: FrontJob, trace: &mut FrontTrace) -> Result<FrontOut> {
@@ -689,88 +709,210 @@ fn front_worker(device: Backend, ple: Vec<Operand<'static>>, split: usize, comma
     device
 }
 
-/// The loop's side of the worker.
-struct Link {
-    commands: Sender<Command>,
+/// Completed fronts retain their FIFO order when an idle check receives them before their verdict.
+struct FrontReplies {
     replies: Receiver<Reply>,
-    /// Passes sent whose fronts have not been taken back.
-    outstanding: usize,
-    abort: SpanAbort,
+    cached: VecDeque<Result<FrontOut>>,
+    /// Physical fronts not yet received from the channel; cached fronts are no longer in flight.
+    in_flight: usize,
+    protocol_error: Option<String>,
+    /// Unexpected control replies stay owned here, including any yielded Backend.
+    controls: Vec<Reply>,
 }
 
-/// Receive every submitted front before shutdown. A normal span abort is expected; a later
-/// device fault must replace an earlier recovered wait rather than leave the request retryable.
-fn drain_fronts(replies: &Receiver<Reply>, outstanding: &mut usize) -> Result<()> {
-    let mut result = Ok(());
-    while *outstanding > 0 {
-        let front = match replies.recv() {
-            Ok(Reply::Front(Ok(_))) => Ok(()),
-            Ok(Reply::Front(Err(error))) if error.contains(SPAN_ABORTED) => Ok(()),
-            Ok(Reply::Front(Err(error))) => Err(error),
-            Ok(Reply::Restored(_)) | Ok(Reply::Yielded(_)) => Err("the first device's thread answered out of order".into()),
-            Err(_) => return Err("the first device's thread ended".into()),
+impl FrontReplies {
+    fn new(replies: Receiver<Reply>) -> Self {
+        Self { replies, cached: Default::default(), in_flight: 0, protocol_error: None, controls: Vec::new() }
+    }
+
+    fn failed(&mut self, error: &str) -> String {
+        self.protocol_error.get_or_insert_with(|| error.to_string()).clone()
+    }
+
+    fn receive(&mut self, reply: Reply) -> Result<()> {
+        match reply {
+            Reply::Front(out) => {
+                self.cached.push_back(out);
+                let Some(left) = self.in_flight.checked_sub(1) else {
+                    return Err(self.failed("the first device sent an unsolicited front"));
+                };
+                self.in_flight = left;
+                Ok(())
+            }
+            control => {
+                self.controls.push(control);
+                Err(self.failed("the first device's thread answered out of order"))
+            }
+        }
+    }
+
+    fn completed(&self) -> Result<()> {
+        let mut result = Ok(());
+        for error in self.cached.iter().filter_map(|out| out.as_ref().err()) {
+            result = finish_device_work(result, Err(error.clone()));
+        }
+        finish_device_work(result, self.protocol_error.clone().map_or(Ok(()), Err))
+    }
+
+    /// Poll only: all submitted fronts must physically finish, and every cached result must be sound.
+    fn idle(&mut self) -> Result<bool> {
+        loop {
+            match self.replies.try_recv() {
+                Ok(reply) => self.receive(reply)?,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Err(self.failed("the first device's thread ended")),
+            }
+        }
+        self.completed()?;
+        Ok(self.in_flight == 0)
+    }
+
+    /// Outer errors describe a broken protocol; the inner result belongs to the oldest front.
+    fn next(&mut self) -> Result<Result<FrontOut>> {
+        if self.cached.is_empty() {
+            if self.in_flight == 0 {
+                return Err(self.failed("the first device has no pending front"));
+            }
+            let reply = match self.replies.recv() {
+                Ok(reply) => reply,
+                Err(_) => {
+                    self.in_flight = 0;
+                    return Err(self.failed("the first device's thread ended"));
+                }
+            };
+            self.receive(reply)?;
+        }
+        self.cached.pop_front().ok_or_else(|| self.failed("the first device's front is missing"))
+    }
+
+    fn empty(&self) -> bool {
+        self.in_flight == 0 && self.cached.is_empty()
+    }
+
+    /// Called after joining the worker: preserve a Backend delivered with an unexpected Yield,
+    /// and report every late front/control error before the model can be reused.
+    fn after_shutdown(&mut self) -> (Result<()>, Option<Backend>) {
+        while let Ok(reply) = self.replies.try_recv() { let _ = self.receive(reply); }
+        let drained = drain_fronts(self);
+        let mut returned = None;
+        for reply in self.controls.drain(..) {
+            if let Reply::Yielded(Ok(device)) = reply {
+                if returned.is_none() { returned = Some(*device); }
+            }
+        }
+        (drained, returned)
+    }
+}
+
+/// Receive cached and running fronts before shutdown. Normal span aborts are expected; a
+/// later device fault replaces an earlier recovered wait, including wholly cached failures.
+fn drain_fronts(fronts: &mut FrontReplies) -> Result<()> {
+    let mut result = fronts.protocol_error.clone().map_or(Ok(()), Err);
+    while !fronts.empty() {
+        let front = match fronts.next() {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) if error.contains(SPAN_ABORTED) => Ok(()),
+            Ok(Err(error)) | Err(error) => Err(error),
         };
-        *outstanding -= 1;
         result = finish_device_work(result, front);
     }
     result
 }
 
+/// The loop's side of the worker. A synchronous loan admits no new front, restore or abort.
+struct Link {
+    commands: Sender<Command>,
+    fronts: FrontReplies,
+    abort: SpanAbort,
+    aborting: bool,
+    restoring: bool,
+    loaned: bool,
+}
+
 impl Link {
     fn submit(&mut self, request: FrontRequest) -> Result<()> {
+        if self.loaned || self.aborting || self.restoring {
+            return Err("the first device is unavailable for a new front".into());
+        }
+        self.fronts.completed()?;
+        let count = self.fronts.in_flight.checked_add(1).ok_or("the first device has too many pending fronts")?;
         self.commands.send(Command::Prepare(request)).map_err(|_| "the first device's thread ended".to_string())?;
-        self.outstanding += 1;
+        self.fronts.in_flight = count;
         Ok(())
     }
 
-    /// The oldest pass's front, once the first device has run it.
+    /// The oldest semantic front: cached results precede channel results and are consumed only once.
     fn front(&mut self) -> Result<FrontOut> {
-        match self.replies.recv() {
-            Ok(Reply::Front(out)) => {
-                self.outstanding -= 1;
-                out
-            }
-            Ok(Reply::Restored(_)) | Ok(Reply::Yielded(_)) => Err("the first device's thread answered out of order".into()),
-            Err(_) => Err("the first device's thread ended".into()),
-        }
+        self.fronts.next()?
     }
 
-    /// The passes sent and not taken back are given up: the first device stops the one it is on at its next layer and runs the rest as
-    /// nothing, and its stream is drained when this returns.
-    fn give_up(&mut self) -> Result<()> {
-        if self.outstanding == 0 {
-            return Ok(());
-        }
+    fn idle(&mut self) -> Result<bool> {
+        if self.loaned || self.aborting || self.restoring { return Ok(false); }
+        self.fronts.idle()
+    }
+
+    fn cancel(&mut self) -> Result<()> {
+        if self.loaned || self.restoring { return Err("the first device cannot abort during a loan or restore".into()); }
+        self.aborting = true;
         self.abort.raise(true);
-        let drained = drain_fronts(&self.replies, &mut self.outstanding);
+        Ok(())
+    }
+
+    /// Give up semantic fronts too: an idle poll may have cached a failed front already.
+    fn give_up(&mut self) -> Result<()> {
+        if self.fronts.in_flight > 0 { self.cancel()?; }
+        let drained = drain_fronts(&mut self.fronts);
         self.abort.raise(false);
+        self.aborting = false;
         drained
     }
 
-    /// The first device itself, back from the worker for the loop's own use: only with nothing in flight (a drain). It goes back with `lend`.
+    /// The actual device comes back even when its completed fronts still await their verdict.
     fn recall(&mut self) -> Result<Backend> {
-        if self.outstanding != 0 {
-            return Err("the first device was asked for with passes in flight".into());
+        if self.loaned || self.aborting || self.restoring || self.fronts.in_flight != 0 {
+            return Err("the first device was asked for while unavailable".into());
         }
+        self.fronts.completed()?;
         self.commands.send(Command::Yield).map_err(|_| "the first device's thread ended".to_string())?;
-        match self.replies.recv() {
+        self.loaned = true;
+        match self.fronts.replies.recv() {
             Ok(Reply::Yielded(device)) => device.map(|device| *device),
-            Ok(_) => Err("the first device's thread answered out of order".into()),
-            Err(_) => Err("the first device's thread ended".into()),
+            Ok(other) => {
+                let _ = self.fronts.receive(other);
+                Err(self.fronts.failed("the first device's thread answered out of order"))
+            }
+            Err(_) => Err(self.fronts.failed("the first device's thread ended")),
         }
     }
 
     fn lend(&mut self, device: Backend) -> Result<()> {
-        self.commands.send(Command::Resume(Box::new(device))).map_err(|_| "the first device's thread ended".to_string())
+        match self.commands.send(Command::Resume(Box::new(device))) {
+            Ok(()) => { self.loaned = false; Ok(()) }
+            Err(error) => {
+                // Keep the actual Backend for the model's final return if the receiver ended.
+                if let Command::Resume(device) = error.0 { self.fronts.controls.push(Reply::Yielded(Ok(device))); }
+                Err(self.fronts.failed("the first device's thread ended"))
+            }
+        }
     }
 
     fn restore(&mut self, job: RestoreJob) -> Result<Option<u64>> {
-        self.commands.send(Command::Restore(job)).map_err(|_| "the first device's thread ended".to_string())?;
-        match self.replies.recv() {
-            Ok(Reply::Restored(result)) => result,
-            Ok(Reply::Front(_)) | Ok(Reply::Yielded(_)) => Err("the first device's thread answered out of order".into()),
-            Err(_) => Err("the first device's thread ended".into()),
+        if self.loaned || self.aborting || self.restoring || !self.fronts.empty() {
+            return Err("the first device is unavailable for a restore".into());
         }
+        self.fronts.completed()?;
+        self.commands.send(Command::Restore(job)).map_err(|_| "the first device's thread ended".to_string())?;
+        self.restoring = true;
+        let result = match self.fronts.replies.recv() {
+            Ok(Reply::Restored(result)) => result,
+            Ok(other) => {
+                let _ = self.fronts.receive(other);
+                Err(self.fronts.failed("the first device's thread answered out of order"))
+            }
+            Err(_) => Err(self.fronts.failed("the first device's thread ended")),
+        };
+        self.restoring = false;
+        result
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -786,6 +928,8 @@ struct Tools {
     head: Vec<Operand<'static>>,
     draft_with_head: Vec<Operand<'static>>,
     draft_without_head: Vec<Operand<'static>>,
+    /// Pinned while the first Backend still belongs to the model; read only during an exclusive loan.
+    lower_head: Option<(u64, *mut std::ffi::c_void)>,
     /// DS41_PROFILE: the drafter's calls by kind (the catch-up's batch, a forced token's step, a draft's step, the drafter's own hidden state read
     /// back for the pass behind) as [calls, seconds], and the time of the sends (the request made and handed to the relay).
     stats: std::cell::RefCell<[[[f64; 2]; 4]; 2]>,
@@ -811,8 +955,7 @@ impl Model {
         drop(std::mem::replace(&mut self.group.backends[0], device));
         let result = work(self);
         let device = std::mem::replace(&mut self.group.backends[0], Backend::vacant(ordinal));
-        link.lend(device)?;
-        result
+        finish_device_work(result, link.lend(device))
     }
 
     /// Whether what the pipeline holds is held now (see `pipeline_live`).
@@ -864,13 +1007,52 @@ impl Model {
         FrontRequest { rows: rows.to_vec(), before: before.to_vec(), position, parity, speculative, profile, sent: Instant::now(), idle }
     }
 
-    /// One step of the drafter on the second device alone (its head's lower half stays off the first device, which is busy).
-    fn chain_step(&mut self, tools: &Tools, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64, position: u64, head: bool, kind: usize)
-                  -> Result<Option<crate::gpu::Draft>> {
+    /// The opt-in head may borrow the first device only after all its physical fronts finish.
+    /// Every error after queueing drains the drafter before the pipeline begins its shutdown.
+    fn chain_step(&mut self, link: &mut Link, tools: &Tools, embeddings: &[f32], hidden: Option<&[f32]>, previous: u64, position: u64,
+                  head: bool, kind: usize) -> Result<Option<crate::gpu::Draft>> {
         let operands = if head { &tools.draft_with_head } else { &tools.draft_without_head };
         let last = self.group.backends.len() - 1;
         let started = Instant::now();
-        let step = self.group.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, None, 0);
+        let step = if self.pipeline.head_share && head {
+            let queued = self.group.backends[last].draft_queue(&tools.draft_without_head, 48, position, embeddings, hidden, previous);
+            let result = queued.and_then(|()| {
+                let polling = Instant::now();
+                let idle = link.idle()?;
+                self.metric_add("pipeline_head_share_poll_seconds", polling.elapsed().as_secs_f64());
+                let (vocabulary_rows, extras, read_rows) = self.group.backends[last].draft_vocabulary_info(operands[7].rows, 0)?;
+                self.last_metrics.entry("pipeline_head_vocabulary_rows").or_insert_with(|| json!(vocabulary_rows));
+                self.last_metrics.entry("pipeline_head_extra_count").or_insert_with(|| json!(extras));
+                self.last_metrics.insert("pipeline_head_read_rows".into(), json!(read_rows));
+                let eligible = head_share_eligible(true, idle, tools.lower_head.is_some(), extras, read_rows);
+                self.metric_count("pipeline_head_share_ready", u64::from(eligible));
+                self.metric_count("pipeline_head_share_busy", u64::from(!idle));
+                self.metric_count("pipeline_head_share_vocab_fallback", u64::from(extras != 0 || read_rows < 2 || tools.lower_head.is_none()));
+                let split = if eligible { tools.lower_head } else { None };
+                let rows = hidden.map_or(1, |hidden| hidden.len() / WIDTH) as u64;
+                let head_started = Instant::now();
+                let result = if split.is_some() {
+                    // The native split head mutates the peer's scratch and transfer counters:
+                    // its actual Backend is back in the model until this synchronous call ends.
+                    self.on_first_device(link, |model| model.group.backends[last].draft_head(&operands[4..], 48, rows - 1, split, 0))
+                } else {
+                    self.group.backends[last].draft_head(&operands[4..], 48, rows - 1, None, 0)
+                };
+                self.metric_count("pipeline_head_share_used", u64::from(split.is_some() && result.is_ok()));
+                self.metric_add(if split.is_some() { "pipeline_head_split_seconds" } else { "pipeline_head_single_seconds" },
+                                head_started.elapsed().as_secs_f64());
+                self.metric_count(if split.is_some() { "pipeline_head_split_count" } else { "pipeline_head_single_count" }, 1);
+                result.map(Some)
+            });
+            if result.is_err() {
+                self.group.backends[last].draft_drain()
+                    .map_err(|error| format!("could not drain queued drafter: {error}; pipeline state is unusable"))
+                    .and(result)
+            } else { result }
+        } else {
+            // Default-off requests retain the original step, without a queue, idle poll or split-head pin.
+            self.group.backends[last].draft_step(operands, 48, position, embeddings, hidden, previous, None, 0)
+        };
         let mut stats = tools.stats.borrow_mut();
         let slot = &mut stats[usize::from(tools.started.get())][kind];
         slot[0] += 1.0;
@@ -895,13 +1077,13 @@ impl Model {
 
     /// The catch-up of `tokens` (their hidden rows `hidden`, the first pair at `position`), then `forced` fed in turn: the chain's first
     /// prediction is the token after them all.
-    fn chain_open(&mut self, tools: &Tools, hidden: &[f32], tokens: &[u32], position: u64, forced: &[u32]) -> Result<Chain> {
+    fn chain_open(&mut self, link: &mut Link, tools: &Tools, hidden: &[f32], tokens: &[u32], position: u64, forced: &[u32]) -> Result<Chain> {
         // (the rows of the tokens noted since the last chain go into the draft's vocabulary first, as the ordinary draft does: it lives on the
         // second device, which this loop drives)
         self.chain_vocabulary()?;
         let mut clock = Instant::now();
         let embedded = self.token_embeddings(tokens)?;
-        let step = self.chain_step(tools, &embedded, Some(hidden), 0, position, forced.is_empty(), 0)?;
+        let step = self.chain_step(link, tools, &embedded, Some(hidden), 0, position, forced.is_empty(), 0)?;
         self.phase("draft: catch-up and first draft", &mut clock);
         let mut chain = Chain { first: None, last: *tokens.last().unwrap_or(&0), previous: tokens.len() as u64, position: position + tokens.len() as u64 };
         if forced.is_empty() {
@@ -910,7 +1092,7 @@ impl Model {
         }
         for (index, token) in forced.iter().enumerate() {
             let embedded = self.token_embeddings(&[*token])?;
-            let step = self.chain_step(tools, &embedded, None, chain.previous, chain.position, index + 1 == forced.len(), 1)?;
+            let step = self.chain_step(link, tools, &embedded, None, chain.previous, chain.position, index + 1 == forced.len(), 1)?;
             chain.last = *token;
             (chain.previous, chain.position) = (1, chain.position + 1);
             if index + 1 == forced.len() {
@@ -926,7 +1108,7 @@ impl Model {
     /// `PARTIAL_ROWS` rows) in place of the catch-up and one step for each forced token. The rows of the real pairs are as before; the forced
     /// tokens' hidden states are the drafter's own from before this pass's verdict, as they were in the steps (those it chained from the
     /// catch-up's output are the ones that change). The drafts are only proposals: what is kept is what the target says.
-    fn chain_open_stashed(&mut self, tools: &Tools, hidden: &[f32], tokens: &[u32], position: u64, forced: &[u32], stash: &[f32]) -> Result<Chain> {
+    fn chain_open_stashed(&mut self, link: &mut Link, tools: &Tools, hidden: &[f32], tokens: &[u32], position: u64, forced: &[u32], stash: &[f32]) -> Result<Chain> {
         self.chain_vocabulary()?;
         let mut clock = Instant::now();
         let rows: Vec<f32> = hidden.iter().chain(stash).copied().collect();
@@ -937,7 +1119,7 @@ impl Model {
             let end = (at + PARTIAL_ROWS).min(all.len());
             let last = end == all.len();
             let embedded = self.token_embeddings(&all[at..end])?;
-            let step = self.chain_step(tools, &embedded, Some(&rows[at * WIDTH..end * WIDTH]), 0, position + at as u64, last, 0)?;
+            let step = self.chain_step(link, tools, &embedded, Some(&rows[at * WIDTH..end * WIDTH]), 0, position + at as u64, last, 0)?;
             chain.last = all[end - 1];
             (chain.previous, chain.position) = ((end - at) as u64, position + end as u64);
             if last {
@@ -950,14 +1132,14 @@ impl Model {
     }
 
     /// The chain's next prediction.
-    fn chain_next(&mut self, tools: &Tools, chain: &mut Chain) -> Result<(u32, f32)> {
+    fn chain_next(&mut self, link: &mut Link, tools: &Tools, chain: &mut Chain) -> Result<(u32, f32)> {
         if let Some(prediction) = chain.first.take() {
             chain.last = prediction.0;
             return Ok(prediction);
         }
         let mut clock = Instant::now();
         let embedded = self.token_embeddings(&[chain.last])?;
-        let step = self.chain_step(tools, &embedded, None, chain.previous, chain.position, true, 2)?;
+        let step = self.chain_step(link, tools, &embedded, None, chain.previous, chain.position, true, 2)?;
         self.phase("draft: next draft", &mut clock);
         let prediction = Self::predicted(step)?;
         chain.last = prediction.0;
@@ -969,13 +1151,13 @@ impl Model {
     /// most `limit`.
     /// With `stashing`, the drafter's own hidden state at each draft comes with them (a WIDTH row a draft), for the pass they go in to
     /// be fed with (see `chain_open_stashed`): taken from the second device's workspace as each step ends.
-    fn chain_drafts(&mut self, tools: &Tools, chain: &mut Chain, limit: usize, stashing: bool) -> Result<(Vec<u32>, Vec<f32>)> {
+    fn chain_drafts(&mut self, link: &mut Link, tools: &Tools, chain: &mut Chain, limit: usize, stashing: bool) -> Result<(Vec<u32>, Vec<f32>)> {
         let mut drafts = Vec::new();
         let mut stash = Vec::new();
         let mut product = 1.0f32;
         while drafts.len() < limit {
             let stepped = chain.first.is_none();
-            let (token, probability) = self.chain_next(tools, chain)?;
+            let (token, probability) = self.chain_next(link, tools, chain)?;
             product *= probability;
             if product < self.draft_cut(false, drafts.len() + 1) {
                 break;
@@ -1072,10 +1254,22 @@ impl Model {
         let split = self.group.split().ok_or("Straydog pipelined passes need two devices")?;
         // SAFETY of the borrows: operands point into the weights, which outlive the group (as in `with_operands`).
         let ple: Vec<Operand<'static>> = unsafe { std::mem::transmute(self.ple_operands()?) };
-        let tools = unsafe {
+        let mut tools = unsafe {
             Tools { head: std::mem::transmute(self.head_operands()?), draft_with_head: std::mem::transmute(self.draft_operands(true)?),
-                    draft_without_head: std::mem::transmute(self.draft_operands(false)?), stats: Default::default(), started: Default::default() }
+                    draft_without_head: std::mem::transmute(self.draft_operands(false)?), lower_head: None,
+                    stats: Default::default(), started: Default::default() }
         };
+        if self.pipeline.head_share {
+            tools.lower_head = self.group.pin_head(&tools.draft_with_head[7])?;
+        }
+        // Partial models also carry a default profile with every=false. Only an
+        // explicit profile enables the native head's timing events.
+        let last = self.group.backends.len() - 1;
+        let head_timing = if self.pipeline.head_share && self.profile.as_ref().is_some_and(|profile| profile.every) {
+            let before = self.group.backends[last].head_timing()?;
+            self.group.backends[last].head_timing_enable(true)?;
+            Some(before)
+        } else { None };
         let abort = self.group.backends[0].span_abort();
         abort.raise(false);
         // (the first device goes to the worker by value, a vacant backend in its place: nothing of the group reaches it from here until it is back)
@@ -1088,23 +1282,52 @@ impl Model {
             let (reply_tx, reply_rx) = channel();
             let worker = scope.spawn(move || front_worker(device, ple, split, job_rx, reply_tx));
             let relaying = scope.spawn(move || relay(weights, command_rx, job_tx));
-            let mut link = Link { commands: command_tx, replies: reply_rx, outstanding: 0, abort: abort.clone() };
+            let mut link = Link { commands: command_tx, fronts: FrontReplies::new(reply_rx), abort: abort.clone(),
+                                  aborting: false, restoring: false, loaned: false };
             let outcome = self.pipelined_passes(&mut link, &tools, split, &mut generated, &mut token, mtp_hidden, max_new, sampling, rng,
                                                 cancelled, emit);
             let stopped = link.shutdown();
-            let relayed = relaying.join().map_err(|_| "the first device's relay thread panicked".to_string());
-            let returned = worker.join();
+            let (relayed, relay_backend) = relaying.join()
+                .unwrap_or_else(|_| (Err("the first device's relay thread panicked".into()), None));
+            let joined = worker.join();
+            let (late, retained) = link.fronts.after_shutdown();
+            let outcome = finish_device_work(finish_device_work(finish_device_work(outcome, stopped), relayed), late);
+            let (outcome, returned) = match joined {
+                Ok(device) => (outcome, device.or(relay_backend).or(retained)),
+                Err(_) => (finish_device_work(outcome, Err("the first device's thread panicked".into())), relay_backend.or(retained)),
+            };
             abort.raise(false);
-            (finish_device_work(finish_device_work(outcome, stopped), relayed), returned)
+            (outcome, returned)
         });
-        // The first device is back, from the worker's thread.
+        // The first device is back, from the worker's thread or a retained Yield reply.
         match returned {
-            Ok(Some(device)) => drop(std::mem::replace(&mut self.group.backends[0], device)),
-            _ => return finish_device_work(outcome, Err("the first device's thread ended without the device".into())),
+            Some(device) => drop(std::mem::replace(&mut self.group.backends[0], device)),
+            None => {
+                let failed = finish_device_work(outcome, Err("the first device's thread ended without the device".into()));
+                let timing = self.pipeline_head_timing(head_timing);
+                return finish_device_work(failed, timing);
+            }
         }
         let closed = self.group.backends[0].end_verify_window()
             .map_err(|error| format!("could not close the first device's verification window: {error}; pipeline state is unusable"));
-        finish_device_work(outcome, closed)
+        let timing = self.pipeline_head_timing(head_timing);
+        finish_device_work(finish_device_work(outcome, closed), timing)
+    }
+
+    fn pipeline_head_timing(&mut self, before: Option<([u64; 2], [f64; 6])>) -> Result<()> {
+        let Some((calls, milliseconds)) = before else { return Ok(()) };
+        let last = self.group.backends.len() - 1;
+        let after = self.group.backends[last].head_timing();
+        let disabled = self.group.backends[last].head_timing_enable(false);
+        let (after_calls, after_ms) = finish_device_work(after, disabled)?;
+        for (index, key) in ["pipeline_head_native_single_count", "pipeline_head_native_split_count"].iter().enumerate() {
+            self.metric_count(key, after_calls[index].saturating_sub(calls[index]));
+        }
+        for (index, key) in ["pipeline_head_single_projection_seconds", "pipeline_head_single_device_seconds", "pipeline_head_split_local_projection_seconds",
+                             "pipeline_head_split_peer_projection_seconds", "pipeline_head_split_device_seconds", "pipeline_head_split_residual_seconds"].iter().enumerate() {
+            self.metric_add(key, (after_ms[index] - milliseconds[index]) / 1e3);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1237,19 +1460,41 @@ impl Model {
                 [after[0] - before[0], after[1] - before[1], after[2] - before[2], after[3] - before[3]]
             });
             self.phase("verify: layers (second device)", &mut clock);
-            let ((targets, scores, _), hidden) = self.group.backends[last].output_head_rows(&tools.head, crate::gpu::Rows::Layer(47), rows, sampling.needs_logits(),
-                                                                                           0, false, None)?;
-            let head_wall = clock.elapsed().as_secs_f64();
+            let top = if sampling.presence_penalty != 0.0 { sampling.target_read_top().unwrap_or(0) } else { 0 };
+            let ((targets, mut scores, _), hidden) = self.group.backends[last].output_head_rows(&tools.head, crate::gpu::Rows::Layer(47), rows, sampling.needs_logits(),
+                                                                                               top, false, None)?;
+            let mut head_wall = clock.elapsed().as_secs_f64();
             self.phase("verify: head", &mut clock);
             let accepting = Instant::now();
-            let (accepted, following) = match scores {
-                Some(Scores::Logits(logits)) => {
-                    let (seed, position) = (self.sample_seed, pass.position as u64);
-                    sampling::accept_keyed(drafts, &logits, VOCABULARY, sampling, generated, &|index| Rng::keyed(seed, position + index as u64))
-                }
-                _ => Self::accept(drafts, &[], &targets, None, sampling, generated, rng),
+            let certified = if let Some(Scores::Top(top)) = scores.as_ref() {
+                self.try_penalty_top(drafts, &[], top, sampling, generated, rng, pass.position as u64, true)
+            } else { None };
+            let mut fallback_head_wall = 0.0;
+            if matches!(scores.as_ref(), Some(Scores::Top(_))) && certified.is_none() {
+                self.phase("accept", &mut clock);
+                // Layer 47's retained rows are still live: do not queue a draft or replay a model layer before this head-only read.
+                let rereading = Instant::now();
+                let ((_, full, _), _) = self.group.backends[last].output_head_rows(&tools.head, crate::gpu::Rows::Layer(47), rows,
+                                                                                true, 0, false, None)?;
+                scores = match full {
+                    Some(full @ Scores::Logits(_)) => Some(full),
+                    _ => return Err("Straydog pipeline head returned no full logits".into()),
+                };
+                fallback_head_wall = rereading.elapsed().as_secs_f64();
+                head_wall += fallback_head_wall;
+                self.phase("verify: head", &mut clock);
+            }
+            let (accepted, following) = match certified {
+                Some(accepted) => accepted,
+                None => match scores {
+                    Some(Scores::Logits(logits)) => {
+                        let (seed, position) = (self.sample_seed, pass.position as u64);
+                        sampling::accept_keyed(drafts, &logits, VOCABULARY, sampling, generated, &|index| Rng::keyed(seed, position + index as u64))
+                    }
+                    _ => Self::accept(drafts, &[], &targets, None, sampling, generated, rng),
+                },
             };
-            let accept_wall = accepting.elapsed().as_secs_f64();
+            let accept_wall = (accepting.elapsed().as_secs_f64() - fallback_head_wall).max(0.0);
             self.phase("accept", &mut clock);
             if self.pipeline.pass_log() {
                 eprintln!("Straydog pass: position {} rows {:?} accepted {accepted} following {following}", pass.position, pass.rows);
@@ -1279,7 +1524,7 @@ impl Model {
                 self.metric_count(if holds { "pipeline_passes_continued" } else { "pipeline_passes_given_up" }, 1);
                 if !holds {
                     // (the first device stops the pass it is on at its next layer while the rest of this one is settled)
-                    link.abort.raise(true);
+                    link.cancel()?;
                 }
             }
             // The tokens go out, and the history and the first device's states follow.
@@ -1465,7 +1710,7 @@ impl Model {
             let pass = self.pipelined_send(link, vec![*token], self.history.len(), None, parity, plan)?;
             return Ok(Current { pass, spec: None, guess: None, lone: false });
         }
-        let mut chain = self.chain_open(tools, hidden, tokens, position, &[])?;
+        let mut chain = self.chain_open(link, tools, hidden, tokens, position, &[])?;
         let mut drafts = Vec::new();
         let mut product = 1.0f32;
         // The drafts while their product stays at the cut; the prediction that ends them is the guess of the bonus token (none is asked for
@@ -1474,7 +1719,7 @@ impl Model {
             if !gate.open() && drafts.len() == limit {
                 break None;
             }
-            let (next, probability) = self.chain_next(tools, &mut chain)?;
+            let (next, probability) = self.chain_next(link, tools, &mut chain)?;
             product *= probability;
             if drafts.len() == limit || product < self.draft_cut(false, drafts.len() + 1) {
                 break Some(next);
@@ -1498,7 +1743,7 @@ impl Model {
         let spec = if let (Some(guess), true) = (guess, gate.open() && room_behind) {
             let (next_width, next_plan) = self.pipelined_width(true);
             let next_limit = next_width.min(max_new.saturating_sub(after + 1)).min(next_room);
-            let (drafts_after, stash) = self.chain_drafts(tools, &mut chain, next_limit, self.pipeline.batch)?;
+            let (drafts_after, stash) = self.chain_drafts(link, tools, &mut chain, next_limit, self.pipeline.batch)?;
             let rows_after: Vec<u32> = std::iter::once(guess).chain(drafts_after).collect();
             let position = self.history.len() + pass.rows.len();
             let mut behind = self.pipelined_send(link, rows_after, position, Some(&pass.rows), parity, next_plan.map(|plan| (plan, next_limit)))?;
@@ -1525,19 +1770,19 @@ impl Model {
             // catch-up after `spec`'s verdict takes `spec`'s pairs alone, and the drafter's K/V at `pass`'s positions would keep the
             // rows it predicted them with)
             let embedded = self.token_embeddings(emitted)?;
-            self.chain_step(tools, &embedded, Some(&hidden[..emitted.len() * WIDTH]), 0, pass.position as u64, false, 0)?;
+            self.chain_step(link, tools, &embedded, Some(&hidden[..emitted.len() * WIDTH]), 0, pass.position as u64, false, 0)?;
             return Ok(None);
         }
         let (width, plan) = self.pipelined_width(true);
         let limit = width.min(max_new.saturating_sub(after + 1)).min(room);
         let (real, forced) = (&hidden[..emitted.len() * WIDTH], &spec.rows[1..]);
         let mut chain = if self.pipeline.batch && !forced.is_empty() && spec.stash.len() == forced.len() * WIDTH {
-            self.chain_open_stashed(tools, real, emitted, pass.position as u64, forced, &spec.stash)?
+            self.chain_open_stashed(link, tools, real, emitted, pass.position as u64, forced, &spec.stash)?
         } else {
-            self.chain_open(tools, real, emitted, pass.position as u64, forced)?
+            self.chain_open(link, tools, real, emitted, pass.position as u64, forced)?
         };
-        let (guess, _) = self.chain_next(tools, &mut chain)?;
-        let (drafts, stash) = self.chain_drafts(tools, &mut chain, limit, self.pipeline.batch)?;
+        let (guess, _) = self.chain_next(link, tools, &mut chain)?;
+        let (drafts, stash) = self.chain_drafts(link, tools, &mut chain, limit, self.pipeline.batch)?;
         let rows: Vec<u32> = std::iter::once(self.guess(guess, guesses)).chain(drafts).collect();
         let position = history + spec.rows.len();
         // (the pass before `spec` is not in the history yet: the tokens before the new rows are `pass`'s and `spec`'s)
@@ -1552,7 +1797,7 @@ impl Model {
     fn pipelined_send(&mut self, link: &mut Link, rows: Vec<u32>, position: usize, before: Option<&[u32]>, parity: &mut usize,
                       plan: Option<(width::Plan, usize)>) -> Result<Pass> {
         let tail = self.tail_with(before.unwrap_or(&[]));
-        let job = self.front_request(&rows, position, &tail, *parity, before.is_some(), link.outstanding == 0);
+        let job = self.front_request(&rows, position, &tail, *parity, before.is_some(), link.fronts.in_flight == 0);
         let pass = Pass { rows, position, parity: *parity, plan, stash: Vec::new() };
         *parity ^= 1;
         link.submit(job)?;
@@ -1569,9 +1814,10 @@ mod shutdown_tests {
         let (send, receive) = channel();
         for error in errors { assert!(send.send(Reply::Front(Err((*error).into()))).is_ok()); }
         drop(send);
-        let mut outstanding = errors.len();
-        let result = drain_fronts(&receive, &mut outstanding);
-        (result, outstanding)
+        let mut fronts = FrontReplies::new(receive);
+        fronts.in_flight = errors.len();
+        let result = drain_fronts(&mut fronts);
+        (result, fronts.in_flight)
     }
 
     #[test]
@@ -1590,12 +1836,125 @@ mod shutdown_tests {
 }
 
 #[cfg(test)]
+mod front_reply_tests {
+    use super::*;
+    use crate::gpu::HYBRID_WAIT_RECOVERED;
+
+    fn completed(marker: f32) -> Reply {
+        Reply::Front(Ok(FrontOut { first: Vec::new(), hidden: vec![marker], embeddings: Vec::new(), prepared: 0.0, handoff: None, time: None }))
+    }
+
+    #[test]
+    fn idle_poll_preserves_fifo_fronts_without_double_decrementing() {
+        let (send, receive) = channel();
+        let mut fronts = FrontReplies::new(receive);
+        fronts.in_flight = 2;
+        assert!(send.send(completed(1.0)).is_ok());
+        assert!(!fronts.idle().unwrap());
+        assert_eq!((fronts.in_flight, fronts.cached.len()), (1, 1));
+        assert!(send.send(completed(2.0)).is_ok());
+        assert!(fronts.idle().unwrap());
+        assert_eq!((fronts.in_flight, fronts.cached.len()), (0, 2));
+        assert_eq!(fronts.next().unwrap().unwrap().hidden, [1.0]);
+        assert_eq!(fronts.next().unwrap().unwrap().hidden, [2.0]);
+        assert!(fronts.empty());
+        assert!(fronts.next().is_err());
+        assert_eq!(fronts.in_flight, 0);
+    }
+
+    #[test]
+    fn cached_errors_are_drained_and_a_later_fault_stays_fatal() {
+        let fault = "an illegal memory access was encountered";
+        for cache_all in [false, true] {
+            let (send, receive) = channel();
+            let mut fronts = FrontReplies::new(receive);
+            fronts.in_flight = 2;
+            assert!(send.send(Reply::Front(Err(HYBRID_WAIT_RECOVERED.into()))).is_ok());
+            if cache_all { assert!(send.send(Reply::Front(Err(fault.into()))).is_ok()); }
+            assert!(fronts.idle().is_err());
+            if !cache_all { assert!(send.send(Reply::Front(Err(fault.into()))).is_ok()); }
+            assert_eq!(drain_fronts(&mut fronts), Err(fault.into()));
+            assert!(fronts.empty());
+        }
+    }
+
+    #[test]
+    fn unexpected_controls_stay_fatal_and_do_not_consume_a_front() {
+        for control in [Reply::Restored(Ok(None)), Reply::Yielded(Err("unexpected yield".into()))] {
+            let (send, receive) = channel();
+            let mut fronts = FrontReplies::new(receive);
+            fronts.in_flight = 1;
+            assert!(send.send(control).is_ok());
+            assert!(send.send(Reply::Front(Err(HYBRID_WAIT_RECOVERED.into()))).is_ok());
+            let error = fronts.idle().unwrap_err();
+            assert!(error.contains("out of order"));
+            assert_eq!((fronts.in_flight, fronts.controls.len()), (1, 1));
+            assert_eq!(drain_fronts(&mut fronts), Err(error));
+            assert!(fronts.empty());
+        }
+    }
+
+    #[test]
+    fn an_unexpected_yield_keeps_the_backend_until_shutdown_has_joined() {
+        let (send, receive) = channel();
+        let mut fronts = FrontReplies::new(receive);
+        // Vacant backends perform no GPU calls, including in Drop.
+        assert!(send.send(Reply::Yielded(Ok(Box::new(Backend::vacant(7))))).is_ok());
+        assert!(fronts.idle().is_err());
+        drop(send);
+        let (result, returned) = fronts.after_shutdown();
+        assert!(result.unwrap_err().contains("out of order"));
+        assert_eq!(returned.unwrap().ordinal, 7);
+    }
+
+    #[test]
+    fn a_failed_relay_hop_returns_the_unsent_backend_and_a_fatal_error() {
+        let (send, receive) = channel();
+        drop(receive);
+        let forwarded = forward_front_command(&send, Command::Resume(Box::new(Backend::vacant(11))));
+        match forwarded {
+            Err((error, Some(device))) => {
+                assert!(error.contains("thread ended") && !error.ends_with(HYBRID_WAIT_RECOVERED));
+                assert_eq!(device.ordinal, 11);
+            }
+            _ => panic!("a failed Resume must return the actual Backend and an error"),
+        }
+    }
+
+    #[test]
+    fn an_unsolicited_front_does_not_underflow_and_its_error_survives() {
+        let (_send, receive) = channel();
+        let mut fronts = FrontReplies::new(receive);
+        assert!(fronts.receive(Reply::Front(Err(HYBRID_WAIT_RECOVERED.into()))).is_err());
+        assert_eq!(fronts.in_flight, 0);
+        assert_eq!(fronts.cached.len(), 1);
+        let error = drain_fronts(&mut fronts).unwrap_err();
+        assert!(error.contains("unsolicited front") && !error.ends_with(HYBRID_WAIT_RECOVERED));
+        assert!(fronts.empty());
+    }
+}
+
+#[cfg(test)]
 mod config_tests {
     use super::*;
 
     fn on() -> PipelineConfig {
         PipelineConfig { mode: Mode::On, drafts: None, force_miss: 0, cpu_threads: None, gate: 0.3, assist: None, lone: true, free_slots: false,
-                         recover: true, batch: false, handover: true, hand_held: false, hand_test: 0, no_copy: false, pass_log: false }
+                         recover: true, batch: false, handover: true, hand_held: false, hand_test: 0, no_copy: false, pass_log: false, head_share: false }
+    }
+
+    #[test]
+    fn sharing_is_opt_in_and_requires_an_idle_complete_vocabulary() {
+        for value in [None, Some("0"), Some("true"), Some(" 1 ")] { assert!(!head_share_named(value)); }
+        assert!(head_share_named(Some("1")));
+        assert!(!on().head_share);
+        assert!(head_share_eligible(true, true, true, 0, 2));
+        for (enabled, idle, lower, extras, rows) in [
+            (false, true, true, 0, 2), (true, false, true, 0, 2), (true, true, false, 0, 2),
+            (true, true, true, 1, 2), (true, true, true, 0, 1),
+        ] {
+            assert!(!head_share_eligible(enabled, idle, lower, extras, rows));
+        }
     }
 
     #[test]

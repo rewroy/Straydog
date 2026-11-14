@@ -2237,6 +2237,9 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_draft_drain(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_draft_rows(
         handle: *mut ::std::os::raw::c_void,
         layer: u64,
@@ -2271,6 +2274,29 @@ unsafe extern "C" {
         tokens: *const i32,
         count: u64,
         reset: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_draft_vocabulary_info(
+        handle: *mut ::std::os::raw::c_void,
+        vocabulary: u64,
+        top: u64,
+        rows: *mut u64,
+        extra_count: *mut u64,
+        read_rows: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_head_timing_enable(
+        handle: *mut ::std::os::raw::c_void,
+        enabled: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_head_timing_read(
+        handle: *mut ::std::os::raw::c_void,
+        calls: *mut u64,
+        milliseconds: *mut f64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

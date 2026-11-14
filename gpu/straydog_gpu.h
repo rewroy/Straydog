@@ -606,13 +606,25 @@ int sd_draft_step(void* handle, void* const* mtp, const int* mtp_kinds, uint64_t
 // A drafting step's MTP layer queued with nothing waited for (sd_draft_step without its head): on each device of a layer in
 // parts, the host queueing both before sd_draft_head.
 int sd_draft_queue(void* handle, void* const* mtp, const int* mtp_kinds, uint64_t layer, uint64_t position, uint64_t steps, const float* embeddings, const float* hidden, uint64_t previous);
+// Checked drain after a queued drafting step is abandoned before its head. The caller exclusively owns this device.
+int sd_draft_drain(void* handle);
 // Rows [first, first + count) of the rows a drafting step left in `layer`'s workspace, to the host (10240 floats a row).
 int sd_draft_rows(void* handle, uint64_t layer, uint64_t first, uint64_t count, float* out);
 // sd_draft_step's head on row `row` of the rows sd_draft_queue left in `layer`'s workspace.
+// A split head also mutates the peer's scratch, staging and link state: the caller exclusively owns both devices.
+// Split confidence uses separately reduced sums and can round differently from a single-device head; argmax ties keep the same token.
 int sd_draft_head(void* handle, void* const* head, const int* head_kinds, uint64_t layer, uint64_t row, uint64_t vocabulary, uint64_t split, void* peer_head, int32_t* token, float* confidence, uint64_t top, float* best);
 // A draft's vocabulary when the head is split (sd_draft_step): rows [0, rows) of `head` (vocabulary rows of `kind`) and the rows of
 // `count` more tokens (each at least `rows`), appended to the ones before unless `reset`. rows 0: drafts read the whole head.
 int sd_draft_vocabulary(void* handle, void* head, int kind, uint64_t vocabulary, uint64_t rows, const int32_t* tokens, uint64_t count, int reset);
+// Configured prefix/extra rows and the rows a single-device draft head reads for this top count.
+int sd_draft_vocabulary_info(void* handle, uint64_t vocabulary, uint64_t top, uint64_t* rows, uint64_t* extra_count, uint64_t* read_rows);
+// Explicit DS41_PROFILE diagnostics, outside capture. Toggling preserves cumulative counters. Target heads are excluded.
+int sd_head_timing_enable(void* handle, int enabled);
+// calls[2]: single/split draft heads. milliseconds[6]: single projection/device total, split local/peer projection,
+// split device total, and sum(total - max(local projection, peer projection)). Totals run from mixed rows ready through
+// choice/confidence/merge before download, including dispatch, reduction and link waits. Each interval stays on one GPU.
+int sd_head_timing_read(void* handle, uint64_t* calls, double* milliseconds);
 int sd_execution_counts(void* handle, uint64_t* graphs, uint64_t* replays, uint64_t* resident);
 
 /* Resident experts and two-GPU links */

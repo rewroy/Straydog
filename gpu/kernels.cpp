@@ -84,6 +84,9 @@
 #define hipGraphLaunch cudaGraphLaunch
 #define hipStreamBeginCapture cudaStreamBeginCapture
 #define hipStreamEndCapture cudaStreamEndCapture
+#define hipStreamIsCapturing cudaStreamIsCapturing
+#define hipStreamCaptureStatus cudaStreamCaptureStatus
+#define hipStreamCaptureStatusNone cudaStreamCaptureStatusNone
 #define hipStreamCaptureModeThreadLocal cudaStreamCaptureModeThreadLocal
 #define hipHostMalloc(pointer,bytes,flags) cudaHostAlloc(pointer,bytes,flags)
 #define hipHostMallocDefault cudaHostAllocDefault
@@ -698,6 +701,10 @@ struct Device {
     size_t draft_rows = 0, draft_extra_count = 0, draft_extra_capacity = 0, draft_extra_row_bytes = 0;
     uint8_t* draft_extras = nullptr;
     int32_t* draft_extra_tokens = nullptr;
+    bool head_timing_enabled = false;
+    uint64_t head_timing_calls[2]{};
+    double head_timing_ms[6]{};
+    hipError_t head_timing_error = hipSuccess;
     void* kv_stage_owner = nullptr;
     // A prefetch (kv_prefetch) fills the stage on kv_stream; device-stream work waits for
     // kv_prefetched before it touches the stage while kv_prefetching.
@@ -1654,6 +1661,66 @@ int recover_hybrid_wait(void* handle) {
     return -1;
 }
 
+// Error paths own every side they drain. Attempt the other streams/devices even if
+// one fails; the first cleanup failure takes precedence over the initiating error.
+std::string drain_drafting(Device& d, bool shared_head) {
+    std::string failure;
+    auto attempt = [&](auto&& work) {
+        try { work(); }
+        catch (const std::exception& error) { if (failure.empty()) failure = error.what(); }
+        catch (...) { if (failure.empty()) failure = "unknown drafting drain failure"; }
+    };
+    Device* peer = shared_head ? d.link.peer : nullptr;
+    const bool pair = peer && peer != &d && peer->link.peer == &d && d.link.counters && peer->link.counters
+                   && d.link.flag && peer->link.flag;
+    if (shared_head && !pair) failure = "drafting cleanup requires a mutual peer pair";
+    Device* sides[2] = {&d, pair ? peer : nullptr};
+    for (Device* side : sides) if (side) {
+        attempt([&]() { check(side->head_timing_error); });
+        attempt([&]() { head_on_device(side->ordinal, [&]() { flush_launches(*side); }); });
+    }
+    for (Device* side : sides) if (side) {
+        attempt([&]() {
+            head_on_device(side->ordinal, [&]() {
+                attempt([&]() { check(hipStreamSynchronize(side->stream)); });
+                attempt([&]() { hybrid_settle(*side, true); });
+                attempt([&]() { check(hipStreamSynchronize(side->stream)); });
+                for (hipStream_t stream : {side->copy_stream, side->kv_stream, side->helper_stream, side->side_stream,
+                                          side->send_stream, side->stage_stream, side->rows_stream})
+                    if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
+                if (side->transfers)
+                    for (hipStream_t stream : side->transfers->streams)
+                        if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
+            });
+        });
+    }
+    // A partial send/receive must not leave the next head consuming an old message.
+    // Both devices are quiescent and exclusively held before either link is reset.
+    if (shared_head && pair && failure.empty()) {
+        for (Device* side : sides) {
+            attempt([&]() {
+                head_on_device(side->ordinal, [&]() {
+                    attempt([&]() { check(hipMemsetAsync(side->link.counters, 0, 8 * sizeof(uint32_t), side->stream)); });
+                    if (side->link.direct)
+                        attempt([&]() { check(hipMemsetAsync(side->link.flag, 0, (peer_partial_flag + 1) * sizeof(uint32_t), side->stream)); });
+                    else
+                        for (size_t slot : {size_t(0), peer_partial_flag}) host_store_release(side->link.flag + slot, 0);
+                    attempt([&]() { check(hipStreamSynchronize(side->stream)); });
+                });
+            });
+        }
+    }
+    if (failure.empty()) for (Device* side : sides) if (side) side->io_used = 0;
+    return failure;
+}
+
+int drafting_failure(Device* active, bool shared_head, const std::exception& error) {
+    const std::string original = error.what();
+    const std::string cleanup_error = active ? drain_drafting(*active, shared_head) : std::string{};
+    last_error = cleanup_error.empty() ? original : "Straydog drafting cleanup failed: " + cleanup_error;
+    return -1;
+}
+
 // The attention rope table: forward[row, pair], then the inverse at the same stride, one allocation
 // for the pass. Publishing consumes an arm from sd_attention_turns_arm.
 struct AttentionTurnsView {
@@ -1984,13 +2051,15 @@ int sd_draft_vocabulary(void* handle, void* head, int kind, uint64_t vocabulary,
 int sd_draft_step(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,
                   const float* embeddings,const float* hidden,uint64_t previous,void* const* head,const int* head_kinds,
                   uint64_t vocabulary,uint64_t split,void* peer_head,int32_t* token,float* confidence,uint64_t top,float* best) {
+    Device* active = nullptr;
     try {
+        Device& d = device(handle); active = &d;
         if (!mtp || !mtp_kinds) throw std::runtime_error("invalid drafting step");
-        draft_step(device(handle),mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,
+        draft_step(d,mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,
                    size_t(previous),head,head_kinds,size_t(vocabulary),size_t(split),peer_head,token,confidence,unsigned(top),best);
         return 0;
     } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
-    catch (const std::exception& e) { last_error=e.what(); return -1; }
+    catch (const std::exception& e) { return drafting_failure(active, split != 0, e); }
 }
 // Rows [first, first + count) of the rows `layer`'s last drafting step left in its workspace, to the host (the drafter's own hidden states, 10240 floats a row);
 // the range must lie within the rows that step wrote (the layer's `verified` count).
@@ -2007,26 +2076,36 @@ int sd_draft_rows(void* handle,uint64_t layer,uint64_t first,uint64_t count,floa
 }
 int sd_draft_queue(void* handle,void* const* mtp,const int* mtp_kinds,uint64_t layer,uint64_t position,uint64_t steps,
                    const float* embeddings,const float* hidden,uint64_t previous) {
+    Device* active = nullptr;
     try {
+        Device& d = device(handle); active = &d;
         if (!mtp || !mtp_kinds) throw std::runtime_error("invalid drafting step");
         bool parts=false;
-        draft_queue(device(handle),mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,size_t(previous),parts);
+        draft_queue(d,mtp,mtp_kinds,size_t(layer),size_t(position),size_t(steps),embeddings,hidden,size_t(previous),parts);
         if (parts) throw std::runtime_error("a queued drafting step needs a layer in parts");
         return 0;
     } catch (const HybridWaitTimeout&) { return recover_hybrid_wait(handle); }
-    catch (const std::exception& e) { last_error=e.what(); return -1; }
+    catch (const std::exception& e) { return drafting_failure(active, false, e); }
+}
+int sd_draft_drain(void* handle) {
+    try {
+        const std::string failure = drain_drafting(device(handle), false);
+        if (!failure.empty()) throw std::runtime_error("Straydog drafting cleanup failed: " + failure);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_draft_head(void* handle,void* const* head,const int* head_kinds,uint64_t layer,uint64_t row,uint64_t vocabulary,
                   uint64_t split,void* peer_head,int32_t* token,float* confidence,uint64_t top,float* best) {
+    Device* active = nullptr;
     try {
-        Device& d=device(handle);
+        Device& d=device(handle); active = &d;
         auto found=d.decoder.find(size_t(layer));
         if (found==d.decoder.end() || row>=verify_max || found->second.verified<=row)
             throw std::runtime_error("invalid drafting head row");
         draft_head(d,head,head_kinds,size_t(vocabulary),size_t(split),peer_head,
                    verify_layout(found->second.workspace).hidden+size_t(row)*10240,false,token,confidence,unsigned(top),best);
         return 0;
-    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+    } catch (const std::exception& e) { return drafting_failure(active, split != 0, e); }
 }
 // A deferred prompt's MTP pairs stay on the MTP layer's device (sd_mtp_keep, sd_mtp_embed,
 // sd_mtp_prompt_kept): nothing waits on the host between the prompt's batches.
@@ -3635,6 +3714,41 @@ int sd_transfer_counts(void* handle,uint64_t* counts) {
         auto& d=device(handle);
         auto& t=transfers(d);
         counts[0]=t.copies[0]; counts[1]=t.bytes[0]; counts[2]=t.copies[1]; counts[3]=t.bytes[1];
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_draft_vocabulary_info(void* handle,uint64_t vocabulary,uint64_t top,uint64_t* rows,uint64_t* extra_count,uint64_t* read_rows) {
+    try {
+        if (!vocabulary || top > head_top_max || !rows || !extra_count || !read_rows)
+            throw std::runtime_error("invalid draft vocabulary query");
+        Device& d = device(handle);
+        *rows = d.draft_rows; *extra_count = d.draft_extra_count;
+        *read_rows = draft_read_rows(d, size_t(vocabulary), unsigned(top));
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_head_timing_enable(void* handle,int enabled) {
+    try {
+        Device& d = device(handle);
+        if (enabled && !std::getenv("DS41_PROFILE"))
+            throw std::runtime_error("head timing requires explicit DS41_PROFILE");
+        if (d.op_recording) throw std::runtime_error("head timing must be configured outside graph capture");
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check(hipStreamIsCapturing(d.stream, &capture));
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::runtime_error("head timing must be configured outside graph capture");
+        check(d.head_timing_error);
+        d.head_timing_enabled = enabled != 0;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_head_timing_read(void* handle,uint64_t* calls,double* milliseconds) {
+    try {
+        if (!calls || !milliseconds) throw std::runtime_error("invalid head timing output");
+        Device& d = device(handle);
+        check(d.head_timing_error);
+        std::copy_n(d.head_timing_calls, 2, calls);
+        std::copy_n(d.head_timing_ms, 6, milliseconds);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
