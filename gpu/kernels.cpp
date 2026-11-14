@@ -569,6 +569,8 @@ struct Device {
     void* direct_queue = nullptr;
     uint64_t direct_tail_object = 0;
     int direct_mode = -1;
+    int qsa_mma = -1;   // STRAYDOG_QSA_MMA=1: the prompt's sparse attention on tensor cores over Q8_0 K/V (read at the first prompt batch)
+    bool mma_f16 = false;   // sm_80+: mma.sync m16n8k16 with FP16 operands (qsa_flash_mma)
     std::unordered_map<uint64_t,bool> direct_fenced;
     // Partially resident decode launches each layer's graph before the previous layer's
     // CPU result exists; the graph waits for it on the GPU (hybrid_await).
@@ -4098,6 +4100,7 @@ void* sd_create(int ordinal, uint64_t budget) {
         #else
         hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop,ordinal));
         value->expert_prefill=prop.major>=7;
+        value->mma_f16=prop.major>=8;
         value->graph_capture=true;
         value->hybrid_prelaunch=prop.major>=7;   // __nanosleep
         // (CUDA 13 no longer says whether kernels have a run-time limit: the shorter wait is the safe one)

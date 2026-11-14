@@ -413,13 +413,189 @@ __global__ void __launch_bounds__(256) qsa_flash_wide(unsigned kv_row,const kv_t
     #pragma unroll
     for (size_t h=0;h<12;++h) output[(token*H::query+kv*12+h)*256+t]=accumulator[h]/running[12+h];
 }
+// The prompt's QSA attention on tensor cores (qsa_flash_mma, STRAYDOG_QSA_MMA=1, Q8_0 K/V): qsa_flash_wide's attention with FP16 operands in
+// mma.sync m16n8k16 and F32 accumulation, softmax and merge, the numeric form of the RDNA4 kernel (qsa_prompt_attention), not qsa_flash_wide's
+// bits. A block is a token and a K/V head; each of its 4 warps takes every 4th tile of 16 selected keys, all 256 dimensions, with its own
+// online softmax, and the warps merge at the end in warp order (the result does not depend on timing). The twelve query heads are the M = 16
+// rows (four of zeros). S = Q K^T: a lane reads 64 consecutive bytes of a key row, its B operand for all 16 k-steps (the dimensions of a
+// k-step are 64 q + 4 s + 0..3 for the lane quad's q, the queries permuted the same way). O += P V: S's C fragments are P's A fragment; a
+// lane reads 32 consecutive bytes of each of its four key rows, so n-tile j of the output holds the dimensions 32 n + j. Q8_0 to FP16 as the
+// RDNA4 kernel does it: the int8 + 128 behind 0x64 is the half 1024 + b + 128, minus 1152 exactly, times the scale.
+// qsa_flash_wide is F32 SIMT work (10-11 TFLOP/s on an RTX 5070 Ti, 128 registers, 3 block barriers per 64 keys). One layer, 4096 rows at
+// position 98304, P = 2, Q8_0 K/V, RTX 5070 Ti: qsa_flash_wide 9.3-10.2 ms, this 2.5-2.7 ms; RMS relative error against
+// qsa_flash_wide 2.7-3.2e-4, worst 256-value head-row 4.0-4.8e-4, no non-finite value, also at positions 0-4095 and for selections of
+// 1-37 keys (partial tiles).
+__device__ __forceinline__ uint32_t qp_half2(float a, float b) {
+    __half2 h = __floats2half2_rn(a, b); uint32_t u; memcpy(&u, &h, 4); return u;
+}
+__device__ __forceinline__ uint32_t qp_dq(uint32_t biased, __half2 scale) {
+    __half2 h; memcpy(&h, &biased, 4);
+    h = __hmul2(__hsub2(h, __float2half2_rn(1152.0f)), scale);
+    uint32_t u; memcpy(&u, &h, 4); return u;
+}
+__device__ __forceinline__ void qp_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if __CUDA_ARCH__ >= 800   // (sm_75 has no m16n8k16: qsa_flash_launch does not reach this kernel there)
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 #endif
-// qsa_flash over `grid` (a block a token and K/V head): qsa_flash_wide on CUDA for the two K/V formats, qsa_flash where it is not compiled.
+}
+__device__ __forceinline__ uint32_t qp_word(const uint4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+constexpr unsigned qp_head = 4 * 72 + 1;   // merged: a head's 256 values as [quad q][64 + 8 pad]; + 1 so the 8 rows of a k-step miss each other's banks
+template<int P>
+__global__ void __launch_bounds__(128) qsa_flash_mma(unsigned kv_row, const kv_t* state, size_t context, size_t base, size_t steps,
+                                                    size_t selected, const float* input, float* output, size_t first_token = 0) {
+    using H = QwenHeads<P>;
+    const unsigned t = threadIdx.x, lane = t & 31, wave = t >> 5, gid = lane >> 2, tig = lane & 3;
+    const size_t token = first_token + blockIdx.x, kv = blockIdx.y;
+    const size_t index_start = steps * H::packed;
+    const size_t count = std::min(selected, size_t(input[index_start + steps * selected + token]));
+    const float limit = float(base + token), bound = float(context);
+    const float* list = input + index_start + token * selected;
+    __shared__ uint4 qfrag[16 * 32];
+    __shared__ float merged[12 * qp_head];
+    __shared__ float stats[4][16][2];
+    {
+        const float* queries = input + (token * H::query + kv * 12) * 256;
+        for (unsigned i = t; i < 16 * 32; i += 128) {
+            const unsigned s = i / 32, L = i % 32, g = L >> 2, q = L & 3, d = 64 * q + 4 * s;
+            const float4 a = *reinterpret_cast<const float4*>(queries + g * 256 + d);
+            const float4 b = g + 8 < 12 ? *reinterpret_cast<const float4*>(queries + (g + 8) * 256 + d) : make_float4(0, 0, 0, 0);
+            qfrag[i] = make_uint4(qp_half2(a.x, a.y), qp_half2(b.x, b.y), qp_half2(a.z, a.w), qp_half2(b.z, b.w));
+        }
+        for (unsigned i = t; i < 12 * qp_head; i += 128) merged[i] = 0.0f;
+    }
+    __syncthreads();
+    const kv_t* keys = state + kv * context * kv_row;
+    const kv_t* values = state + (H::kv + kv) * context * kv_row;
+    float o[32][4];
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;   // rows gid and gid + 8: running maximum, this lane's part of the sum
+    auto key_at = [&](size_t slot, bool& ok) -> size_t {
+        ok = false;
+        if (slot < count) {
+            const float raw = list[slot];
+            if (raw >= 0 && raw <= limit && raw < bound) { ok = true; return size_t(raw); }
+        }
+        return 0;
+    };
+    for (size_t tile = wave; tile * 16 < count; tile += 4) {
+        const size_t first = tile * 16;
+        bool okk0, okk1, ok[4];
+        const size_t k0 = key_at(first + gid, okk0), k1 = key_at(first + 8 + gid, okk1);
+        const size_t r0 = key_at(first + 2 * tig, ok[0]), r1 = key_at(first + 2 * tig + 1, ok[1]);
+        const size_t r2 = key_at(first + 2 * tig + 8, ok[2]), r3 = key_at(first + 2 * tig + 9, ok[3]);
+        const kv_t* kr0 = keys + k0 * kv_row;
+        const kv_t* kr1 = keys + k1 * kv_row;
+        uint4 ka[4], kb[4], va[4][2];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            ka[i] = *reinterpret_cast<const uint4*>(kr0 + 64 * tig + 16 * i);
+            kb[i] = *reinterpret_cast<const uint4*>(kr1 + 64 * tig + 16 * i);
+        }
+        const uint32_t ksa = *reinterpret_cast<const uint32_t*>(kr0 + 256 + 4 * tig), ksb = *reinterpret_cast<const uint32_t*>(kr1 + 256 + 4 * tig);
+        const kv_t* vr[4] = {values + r0 * kv_row, values + r1 * kv_row, values + r2 * kv_row, values + r3 * kv_row};
+        __half vs[4];
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            va[r][0] = *reinterpret_cast<const uint4*>(vr[r] + 32 * gid);
+            va[r][1] = *reinterpret_cast<const uint4*>(vr[r] + 32 * gid + 16);
+            vs[r] = *reinterpret_cast<const __half*>(vr[r] + 256 + 2 * gid);
+        }
+        __half2 sa_lo, sa_hi, sb_lo, sb_hi;
+        {
+            __half2 a, b; memcpy(&a, &ksa, 4); memcpy(&b, &ksb, 4);
+            sa_lo = __low2half2(a); sa_hi = __high2half2(a); sb_lo = __low2half2(b); sb_hi = __high2half2(b);
+        }
+        float s0[4] = {0, 0, 0, 0}, s1[4] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int s = 0; s < 16; ++s) {
+            const uint4 q = qfrag[s * 32 + lane];
+            const uint32_t A[4] = {q.x, q.y, q.z, q.w};
+            const uint32_t wa = qp_word(ka[s / 4], s % 4) ^ 0x80808080u, wb = qp_word(kb[s / 4], s % 4) ^ 0x80808080u;
+            const __half2 sa = s < 8 ? sa_lo : sa_hi, sb = s < 8 ? sb_lo : sb_hi;
+            qp_mma(s0, A, qp_dq(__byte_perm(wa, 0x64646464u, 0x4140), sa), qp_dq(__byte_perm(wa, 0x64646464u, 0x4342), sa));
+            qp_mma(s1, A, qp_dq(__byte_perm(wb, 0x64646464u, 0x4140), sb), qp_dq(__byte_perm(wb, 0x64646464u, 0x4342), sb));
+        }
+        // s0: slots 2 tig, 2 tig + 1 (rows gid, gid, gid + 8, gid + 8); s1: slots 2 tig + 8, 2 tig + 9.
+        float x[8] = {ok[0] ? s0[0] * 0.0625f : -INFINITY, ok[1] ? s0[1] * 0.0625f : -INFINITY,
+                      ok[2] ? s1[0] * 0.0625f : -INFINITY, ok[3] ? s1[1] * 0.0625f : -INFINITY,
+                      ok[0] ? s0[2] * 0.0625f : -INFINITY, ok[1] ? s0[3] * 0.0625f : -INFINITY,
+                      ok[2] ? s1[2] * 0.0625f : -INFINITY, ok[3] ? s1[3] * 0.0625f : -INFINITY};
+        float mx0 = fmaxf(fmaxf(x[0], x[1]), fmaxf(x[2], x[3])), mx1 = fmaxf(fmaxf(x[4], x[5]), fmaxf(x[6], x[7]));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);
+        const float alpha0 = m0 == -INFINITY ? 0.0f : expf(m0 - n0), alpha1 = m1 == -INFINITY ? 0.0f : expf(m1 - n1);
+        float p[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) p[i] = x[i] == -INFINITY ? 0.0f : expf(x[i] - (i < 4 ? n0 : n1));
+        l0 = l0 * alpha0 + (p[0] + p[1] + p[2] + p[3]);
+        l1 = l1 * alpha1 + (p[4] + p[5] + p[6] + p[7]);
+        m0 = n0; m1 = n1;
+        if (!__all_sync(0xffffffffu, alpha0 == 1.0f && alpha1 == 1.0f)) {
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) { o[j][0] *= alpha0; o[j][1] *= alpha0; o[j][2] *= alpha1; o[j][3] *= alpha1; }
+        }
+        const uint32_t PA[4] = {qp_half2(p[0], p[1]), qp_half2(p[4], p[5]), qp_half2(p[2], p[3]), qp_half2(p[6], p[7])};
+        const __half2 sab = __halves2half2(vs[0], vs[1]), scd = __halves2half2(vs[2], vs[3]);
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            const uint32_t a = qp_word(va[0][w / 4], w % 4) ^ 0x80808080u, b = qp_word(va[1][w / 4], w % 4) ^ 0x80808080u;
+            const uint32_t c = qp_word(va[2][w / 4], w % 4) ^ 0x80808080u, d = qp_word(va[3][w / 4], w % 4) ^ 0x80808080u;
+            const uint32_t ab0 = __byte_perm(a, b, 0x5140), ab1 = __byte_perm(a, b, 0x7362);
+            const uint32_t cd0 = __byte_perm(c, d, 0x5140), cd1 = __byte_perm(c, d, 0x7362);
+            qp_mma(o[4 * w + 0], PA, qp_dq(__byte_perm(ab0, 0x64646464u, 0x4140), sab), qp_dq(__byte_perm(cd0, 0x64646464u, 0x4140), scd));
+            qp_mma(o[4 * w + 1], PA, qp_dq(__byte_perm(ab0, 0x64646464u, 0x4342), sab), qp_dq(__byte_perm(cd0, 0x64646464u, 0x4342), scd));
+            qp_mma(o[4 * w + 2], PA, qp_dq(__byte_perm(ab1, 0x64646464u, 0x4140), sab), qp_dq(__byte_perm(cd1, 0x64646464u, 0x4140), scd));
+            qp_mma(o[4 * w + 3], PA, qp_dq(__byte_perm(ab1, 0x64646464u, 0x4342), sab), qp_dq(__byte_perm(cd1, 0x64646464u, 0x4342), scd));
+        }
+    }
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    if (tig == 0) { stats[wave][gid][0] = m0; stats[wave][gid][1] = l0; stats[wave][gid + 8][0] = m1; stats[wave][gid + 8][1] = l1; }
+    __syncthreads();
+    float M0 = -INFINITY, M1 = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) { M0 = fmaxf(M0, stats[w][gid][0]); M1 = fmaxf(M1, stats[w][gid + 8][0]); }
+    const float f0 = m0 == -INFINITY ? 0.0f : expf(m0 - M0), f1 = m1 == -INFINITY ? 0.0f : expf(m1 - M1);
+    for (unsigned w = 0; w < 4; ++w) {
+        if (wave == w) {
+            float* row0 = merged + gid * qp_head + tig * 72;
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) { row0[j] += o[j][0] * f0; row0[32 + j] += o[j][1] * f0; }
+            if (gid + 8 < 12) {
+                float* row1 = merged + (gid + 8) * qp_head + tig * 72;
+                #pragma unroll
+                for (int j = 0; j < 32; ++j) { row1[j] += o[j][2] * f1; row1[32 + j] += o[j][3] * f1; }
+            }
+        }
+        __syncthreads();
+    }
+    for (unsigned i = t; i < 12 * 256; i += 128) {
+        const unsigned h = i / 256, d = i % 256;
+        float M = -INFINITY, L = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) M = fmaxf(M, stats[w][h][0]);
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) if (stats[w][h][0] != -INFINITY) L += stats[w][h][1] * expf(stats[w][h][0] - M);
+        output[(token * H::query + kv * 12 + h) * 256 + d] = merged[h * qp_head + (d / 64) * 72 + d % 64] / L;
+    }
+}
+#endif
+// qsa_flash over `grid` (a block a token and K/V head): qsa_flash_wide on CUDA for the two K/V formats, qsa_flash where it is not compiled;
+// over Q8_0 rows qsa_flash_mma when STRAYDOG_QSA_MMA=1 (development; read once per Device). Only a prompt's batches come here: decode and
+// verification passes attend through qsa_decode_parts (qsa_attention_rows).
 template<int P=1>
 void qsa_flash_launch(Device& d,dim3 grid,const kv_t* state,size_t context,size_t base,size_t steps,size_t selected,const float* input,
                       float* output,size_t first_token=0) {
 #if !defined(__HIPCC__)
     if (d.kv_row==kv_row_q8) {
+        if (d.qsa_mma<0) { const char* mode=std::getenv("STRAYDOG_QSA_MMA"); d.qsa_mma=mode && std::string(mode)=="1" ? 1 : 0; }
+        if (d.qsa_mma && d.mma_f16) {
+            qsa_flash_mma<P><<<grid,128,0,d.stream>>>(d.kv_row,state,context,base,steps,selected,input,output,first_token);
+            return;
+        }
         qsa_flash_wide<P,true><<<grid,256,0,d.stream>>>(d.kv_row,state,context,base,steps,selected,input,output,first_token);
         return;
     }
