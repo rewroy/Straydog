@@ -56,7 +56,7 @@ __device__ __forceinline__ float resident_pair_sum(const Matrix& matrix,size_t r
 template<int kind, int V>
 __device__ __forceinline__ void resident_dots(const Matrix& m, size_t row, size_t unit,
                                              const float* input, uint32_t stride, float (&result)[V]) {
-    if constexpr (kind==18 || kind==21 || kind==22)
+    if constexpr (kind==16 || kind==18 || kind==21 || kind==22)
         expert_soa_dot<kind,V>(m,row,unit,input,stride,result);
     else GemvFormat<kind>::template dots<V>(m.data+row*m.row_bytes,unit,input,stride,result);
 }
@@ -104,6 +104,6 @@ __device__ void resident_wave(const Matrix& m,size_t local_wave,unsigned lanes,c
         return;
     }
     #define SD_SOA_ROWS(kind) case kind: resident_rows<kind,V>(m,local_wave*(32/lanes),lanes,input,input_stride,output,output_stride); break;
-    switch (m.kind) { SD_SOA_ROWS(18) SD_SOA_ROWS(21) SD_SOA_ROWS(22) }
+    switch (m.kind) { SD_SOA_ROWS(16) SD_SOA_ROWS(18) SD_SOA_ROWS(21) SD_SOA_ROWS(22) }
     #undef SD_SOA_ROWS
 }

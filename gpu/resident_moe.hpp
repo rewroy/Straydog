@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(256) resident_expert_pairs(const MoeGroup* gro
     const Matrix& matrix=groups[selected[route]].weights[group<half ? 0 : 1];
     if (!matrix.data) return;
     float sum;
-    if constexpr (routed==18 || routed==21 || routed==22) {
+    if constexpr (routed==16 || routed==18 || routed==21 || routed==22) {
         if (matrix.layout) sum=resident_pair_sum<routed,true>(matrix,row,sub,lanes,input);
         else sum=resident_pair_sum<routed,false>(matrix,row,sub,lanes,input);
     } else sum=resident_pair_sum<routed,false>(matrix,row,sub,lanes,input);
