@@ -31,6 +31,10 @@ else()
   target_link_libraries(straydog_gpu PRIVATE CUDA::cublas)
   # Device code calls constexpr std::min/std::max, as HIP allows.
   target_compile_options(straydog_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  # kernels.cpp is one translation unit, compiled once for each architecture in CMAKE_CUDA_ARCHITECTURES, and nvcc compiles those
+  # one after another unless told otherwise. --threads 0 compiles them side by side, a thread each. nvcc's own times for 0.1.12's
+  # kernels.cpp and the four default architectures: 15 minutes of cicc and ptxas in all, 4 minutes on the clock side by side.
+  target_compile_options(straydog_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--threads=0>)
 endif()
 # Drafter quantization must produce the pinned bytes on every compiler.
 set_source_files_properties(cpu_experts.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")
