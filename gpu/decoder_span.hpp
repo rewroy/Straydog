@@ -43,7 +43,11 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
         (scratch->second/4-extra)%15364)
         throw std::runtime_error("invalid decoder workspace allocation");
     const size_t capacity=(scratch->second/4-extra)/15364;
-    if (capacity>4096 || capacity>d.resident.find(moe)->second->capacity)
+    // (a batch wider than the plan's experts' chunk: their workspace holds its row scratch all the same, moe_workspace_floats)
+    const auto& expert_plan=*d.resident.find(moe)->second;
+    const auto moe_workspace=d.allocations.find(expert_plan.workspace);
+    if (capacity>prefill_rows_max || moe_workspace==d.allocations.end() ||
+        moe_workspace->second/4<moe_workspace_floats(capacity,d.qwen_parts==2 && expert_plan.part))
         throw std::runtime_error("invalid decoder workspace capacity");
     const size_t hc_rows[4]={1,320,10240,4},hc_cols[4]={10240,10240,320,10240};
     const size_t gd_rows[9]={10240/parts,6144/parts,48/parts,48/parts,2560,10240/parts,1,1,1};
@@ -90,7 +94,8 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
         d.kv_planes[states[0]]=2;
         if (d.kv_stage) { kv_clear_graphs(d); kv_layout(d); }
     }
-    const auto& expert=*d.resident.find(moe)->second;
+    auto& expert=*d.resident.find(moe)->second;
+    expert.drafter=layer==48;
     plan.dependencies.insert(plan.dependencies.end(),expert.dependencies.begin(),expert.dependencies.end());
     plan.dependencies.push_back(expert.table); plan.dependencies.push_back(expert.workspace);
     d.decoder.emplace(layer,std::move(plan));
@@ -121,6 +126,9 @@ bool hybrid_ahead(const Device& d,size_t begin,size_t end) {
 
 // Partially resident layers alternate a captured GPU part with the host CPU experts.
 void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const float* input,float* output) {
+#if !defined(__HIPCC__)
+    if (end>hybrid_layer_slots) throw std::runtime_error("decoder span has no compatible hybrid layer");   // (a layer a slot of the exchange)
+#endif
     float* workspace=nullptr;
     for (size_t layer=begin;layer<end;++layer) {
         auto found=d.decoder.find(layer);
@@ -148,10 +156,11 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
 #else
     const bool stage_cpu_result=ahead;
 #endif
-    const float* cpu_result=stage_cpu_result ? d.cpu_partial : d.exchange_device+hybrid_result_at(0);
-    auto finish_previous=[&]() {
-        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters,d.exchange_device+hybrid_result_at(0),stage_cpu_result ? d.cpu_partial : nullptr,d.await_timeout);
-        hybrid_finish<<<40,256,0,d.stream>>>(hidden,mixed,0,branch,cpu_result,0,hybrid_clock(d));
+    auto finish_previous=[&](size_t previous) {
+        const size_t slot=hybrid_slot_of(previous);
+        if (ahead) hybrid_await<<<1,256,0,d.stream>>>(counters,d.exchange_device+hybrid_result_at(0,slot),stage_cpu_result ? d.cpu_partial : nullptr,d.await_timeout,hybrid_need(d),
+                                                      HYBRID_AWAITED(d),d.flags+hybrid_await_device_failed);
+        hybrid_finish<<<40,256,0,d.stream>>>(hidden,mixed,0,branch,stage_cpu_result ? d.cpu_partial : d.exchange_device+hybrid_result_at(0,slot),0,hybrid_clock(d));
     };
     // One captured graph per layer: the previous layer's residual (adding the CPU
     // result), this layer up to routing, the export to pinned memory and its
@@ -163,7 +172,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
         const size_t attention=decoder_linear(layer) ? 9 : 10;
         const bool finish=layer>begin;
         auto submit=[&]() {
-            if (finish) finish_previous();
+            if (finish) finish_previous(layer-1);
             hyperconnection(d,pointers,kinds,1,true,hidden,mixed,true);
             if (decoder_linear(layer))
                 gated_delta(d,pointers+4,kinds+4,plan.states[0],plan.states[1],1,mixed,branch,true);
@@ -172,8 +181,8 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
                     plan.context,gpu_position,mixed,branch);
             decoder_residual<<<40,256,0,d.stream>>>(hidden,mixed,branch);
             hyperconnection(d,pointers+4+attention,kinds+4+attention,1,true,hidden,mixed,true);
-            hybrid_route_export(d,experts,mixed);
-            hybrid_tick<<<1,1,0,d.stream>>>(d.flags+1,reinterpret_cast<uint32_t*>(d.exchange_device+hybrid_sequence_slot),hybrid_clock(d),finish);
+            const bool deferred=hybrid_route_export(d,experts,mixed,1,2564,hybrid_slot_of(layer));
+            hybrid_publish(d,experts,1,finish,hybrid_slot_of(layer),deferred ? mixed : nullptr,2564);
             hybrid_resident_experts(d,experts,mixed,branch);
             check(hipGetLastError());
         };
@@ -185,7 +194,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     };
     auto launch_after=[&](size_t layer) {
         if (layer+1<end) launch(layer+1);
-        else { ++await.launched; finish_previous(); check(hipGetLastError()); flush_launches(d); }
+        else { ++await.launched; finish_previous(end-1); check(hipGetLastError()); flush_launches(d); }
     };
     if (ahead) launch(begin);
     for (size_t layer=begin;layer<end;++layer) {
@@ -197,21 +206,22 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
         hybrid_wait_export(d,++d.hybrid_sequence);
         if (ahead) await.check_failed();
         const auto computed=std::chrono::steady_clock::now();
-        hybrid_host_experts(d,experts,d.exchange,d.exchange+hybrid_result_at(0));
+        hybrid_host_experts(d,experts,d.exchange+hybrid_export_at(0,hybrid_slot_of(layer)),d.exchange+hybrid_result_at(0,hybrid_slot_of(layer)));
         if (ahead) await.publish();
         const auto finished=std::chrono::steady_clock::now();
         d.hybrid_wait_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed-waited).count());
         d.hybrid_cpu_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished-computed).count());
         if (ahead && !before) launch_after(layer);
     }
-    if (!ahead) finish_previous();
+    if (!ahead) finish_previous(end-1);
     d.hybrid_layers+=end-begin; d.hybrid_timed_layers+=end-begin-1;
     check(hipGetLastError());
     download(d,output,hidden,10240*4);
     if (ahead) await.check_failed();
-    // Follow decode routing: up to 32 swaps every four tokens, issued after this
+    hybrid_check_report(d);
+    // Follow decode routing: up to 32 swaps every four tokens where the slots miss routes (hybrid_refresh_due), issued after this
     // device's last layer so the copies overlap the head and the next token's start.
-    if ((end==48 || d.decoder.find(end)==d.decoder.end()) && d.hybrid_tokens%4==0) hybrid_rebalance(d,32,false);
+    if ((end==48 || d.decoder.find(end)==d.decoder.end()) && d.hybrid_tokens%4==0 && hybrid_refresh_due(d)) hybrid_rebalance(d,32,false);
 }
 
 void decode_span(Device& d,size_t begin,size_t end,size_t position,const float* input,float* output) {
@@ -313,6 +323,13 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
         work();
         if (timings) { check(hipEventRecord(events[index]->last,d.stream)); categories.push_back(category); }
     };
+    // (CUDA, FP16 projections: the residual updates that a hyperconnection's normalization follows are made with it, hc_residual_normalize_half)
+#if defined(__HIPCC__)
+    const bool fused=false;
+#else
+    const bool fused=batch_half(d,steps);
+#endif
+    bool normalized_ahead=false;
     if (input) upload(d,hidden,input,steps*10240*4);
     // The span's first host-K/V attention layer stages its prefix while the layers before it run.
     if (steps>1 && !d.layer_prefill_plan) kv_prefetch_from(d,begin,position);
@@ -326,7 +343,17 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
             throw std::runtime_error("prefill batch exceeds the resident expert workspace");
         const bool linear=decoder_linear(layer);
         SD_PREFILL_OBSERVE(d,layer,0,position,steps,10240,hidden);
-        record(0,[&]() { hc_prefill(d,pointers,kinds,steps,hidden,mixed,scratch); });
+        if (d.phase_on) {
+            d.phase_mtp=layer==48;
+            if (d.phase_first==size_t(-1)) { d.phase_first=48; for (const auto& entry : d.decoder) d.phase_first=std::min(d.phase_first,entry.first); }
+            const bool start=layer==d.phase_first;
+            if (start) ++d.phase_batches;
+            ++d.phase_layers;
+            phase(d,start ? "gap_batch_start" : layer==begin ? "gap_span_start" : "gap_in_span");
+        }
+        record(0,[&]() { hc_prefill(d,pointers,kinds,steps,hidden,mixed,scratch,normalized_ahead); });
+        normalized_ahead=false;
+        phase(d,"hc");
         SD_PREFILL_OBSERVE(d,layer,1,position,steps,2560,mixed);
         record(linear ? 1 : 2,[&]() {
             if (linear) {
@@ -338,18 +365,31 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
                 if (steps>1 && !d.layer_prefill_plan) kv_prefetch_from(d,layer+1,position);
             }
         });
+        phase(d,linear ? "gdn" : "attn");
         SD_PREFILL_OBSERVE(d,layer,2,position,steps,2560,branch);
-        decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
+        if (fused)
+            hc_residual_normalize_half<<<unsigned(steps*4),256,0,d.stream>>>(hidden,mixed,branch,steps,static_cast<const float*>(pointers[4+(linear ? 9 : 10)]),
+                hc_scratch_half(scratch,steps),scratch);
+        else decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
         SD_PREFILL_OBSERVE(d,layer,3,position,steps,10240,hidden);
-        record(0,[&]() { hc_prefill(d,pointers+4+(linear ? 9 : 10),kinds+4+(linear ? 9 : 10),steps,hidden,mixed,scratch); });
+        record(0,[&]() { hc_prefill(d,pointers+4+(linear ? 9 : 10),kinds+4+(linear ? 9 : 10),steps,hidden,mixed,scratch,fused); });
+        phase(d,"hc");
         SD_PREFILL_OBSERVE(d,layer,4,position,steps,2560,mixed);
         record(3,[&]() {
             if (d.resident.find(plan.moe)->second->part) resident_moe_parts(d,plan.moe,layer,steps,mixed,branch);
             else resident_moe(d,plan.moe,steps,mixed,branch,true);
         });
+        phase(d,"moe_combine");
         SD_PREFILL_OBSERVE(d,layer,5,position,steps,2560,branch);
-        decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
+        if (fused && layer+1<end) {
+            // (the next layer's first hyperconnection reads its normalized rows from that layer's expert workspace)
+            const auto& next=d.decoder.find(layer+1)->second;
+            hc_residual_normalize_half<<<unsigned(steps*4),256,0,d.stream>>>(hidden,mixed,branch,steps,static_cast<const float*>(next.pointers[0]),
+                hc_scratch_half(d.resident.find(next.moe)->second->workspace,steps),d.resident.find(next.moe)->second->workspace);
+            normalized_ahead=true;
+        } else decoder_batch_residual<<<unsigned((steps*10240+255)/256),256,0,d.stream>>>(hidden,mixed,branch,steps);
         SD_PREFILL_OBSERVE(d,layer,6,position,steps,10240,hidden);
+        phase(d,"residual");
     }
     const bool parts=span_has_parts(d,begin,end);
     if (d.prefill_deferred && !output_rows && !timings) {

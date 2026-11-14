@@ -2,8 +2,9 @@
 // (QwenHeads<2>): half of a DeltaNet's heads (8 key heads and the 24 value heads that read them) or of an attention layer's
 // (12 query heads and their K/V head), with their rows of the projections and their columns of the output projection; half of the
 // routed experts; and half of the shared expert's width (rows of gate and up, columns of down). Both keep the whole residual
-// streams and compute the
-// HyperConnections, the router and the attention's indexer alike, so they select the same experts and the same K/V blocks. A
+// streams and compute the HyperConnections and the router alike, so they select the same experts; the attention's indexer alike
+// for a pass's few rows, and for a prompt's chunks shared out in turn (qsa_prefill's), the selected blocks exchanged: both hold the
+// same K/V blocks (as marks, or as each token's own selection list from 8192 tokens). A
 // layer's two outputs, the attention's projection and the experts', are each this device's part of a sum the devices add (the
 // SumLink of device_link.hpp) before it goes into the streams; both add the same two values, so their streams stay equal. A
 // part's states are its own: its DeltaNet heads' recurrence and convolution, its K/V head's planes.
@@ -92,13 +93,7 @@ inline BatchRows batch_rows(size_t steps, size_t part) {
 // The exchanges move 8 values a thread into the other's inbox (16-byte stores) and 4 out of this device's (8-byte system-scope
 // loads, never a stale cached line): a 95K prompt's exchanges were 1.2% faster than with a value or two a thread.
 __device__ inline uint32_t qwen_half2_bits(__half2 value) { uint32_t bits; memcpy(&bits, &value, 4); return bits; }
-__device__ inline uint64_t qwen_inbox_bits(const void* at) {
-#if defined(__HIPCC__)
-    return __hip_atomic_load(static_cast<const uint64_t*>(at), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-#else
-    return *static_cast<const volatile uint64_t*>(at);
-#endif
-}
+__device__ inline uint64_t qwen_inbox_bits(const void* at) { return link_load64(at); }
 // Four halves of this device's inbox, as floats.
 __device__ inline float4 qwen_inbox_half4(const __half* at) {
     const uint64_t bits = qwen_inbox_bits(at);
@@ -222,10 +217,12 @@ __global__ void qwen_gather_send(const float* local, size_t steps, size_t first,
         }
     }
 }
-// The other's rows [first, first + count) of mixed from this device's inbox slot.
+// The other's rows [first, first + count) of mixed from this device's inbox slot (`fixed`: from `inbox` as given, one of the slots past
+// the two the sums alternate between).
+template<bool fixed = false>
 __global__ void qwen_gather_receive(size_t steps, size_t first, size_t count, const uint32_t* state, const __half* inbox, size_t capacity,
                                     float* mixed) {
-    const __half* slot = inbox + size_t(state[0] & 1) * capacity;
+    const __half* slot = fixed ? inbox : inbox + size_t(state[0] & 1) * capacity;
     for (size_t g = size_t(blockIdx.x) * blockDim.x + threadIdx.x; g < count * 641; g += size_t(gridDim.x) * blockDim.x) {
         if (g < count * 640) reinterpret_cast<float4*>(mixed + first * 2560)[g] = qwen_inbox_half4(slot + 4 * g);
         else {
@@ -282,8 +279,71 @@ void qwen_gather_mixed(Device& d, const float* local, size_t steps, BatchRows ow
     qwen_gather_send<<<unsigned(std::min<size_t>((own.count * 321 + 255) / 256, 1024)), 256, 0, d.stream>>>(
         local, steps, own.first, own.count, mixed, reinterpret_cast<__half*>(link.peer_inbox), link.state, link.capacity * 2);
     link_signal_kernel<<<1, 1, 0, d.stream>>>(link.state, link.peer_flag, d.await_timeout);
-    qwen_gather_receive<<<unsigned(std::min<size_t>((other.count * 641 + 255) / 256, 1024)), 256, 0, d.stream>>>(
+    qwen_gather_receive<false><<<unsigned(std::min<size_t>((other.count * 641 + 255) / 256, 1024)), 256, 0, d.stream>>>(
         steps, other.first, other.count, link.state, reinterpret_cast<const __half*>(link.inbox), link.capacity * 2, mixed);
+    check(hipGetLastError());
+}
+// qwen_gather_mixed in the experts' order (prefill_layer_part): the send of this device's rows to the other goes on the send stream while
+// the device stream goes on with them, and once it has done what it can with its own rows alone it signals and takes the other's.
+// The send is a copy (the copy engine, which takes no compute units: a send as a kernel did not overlap a GEMM, 1.4 ms for two
+// that take 0.7 ms each) of this device's rows as an inbox slot holds them, staged by qwen_gather_stage in the other's rows of
+// `mixed`, which nothing reads until qwen_gather_receive; into a slot of its own in the other's inbox (past the two the sums alternate
+// between: the copy's address is the host's, the alternating slot's the device's count). The slot is free to write once this device's
+// last signal has returned: the other raised its flag for it after it had read the slot's last use (the gather before), as with every slot.
+__global__ void qwen_gather_stage(const float* local, size_t steps, size_t first, size_t count, float* mixed, __half* stage) {
+    for (size_t g = size_t(blockIdx.x) * blockDim.x + threadIdx.x; g < count * 321; g += size_t(gridDim.x) * blockDim.x) {
+        if (g < count * 320) {
+            reinterpret_cast<uint4*>(stage)[g] = qwen_round8(local + 8 * g, mixed + first * 2560 + 8 * g);
+        } else {
+            const size_t j = g - count * 320;
+            const float4 mixes = reinterpret_cast<const float4*>(local + count * 2560)[j];
+            reinterpret_cast<float4*>(mixed + steps * 2560 + first * 4)[j] = mixes;
+            reinterpret_cast<float4*>(stage + count * 2560)[j] = mixes;
+        }
+    }
+}
+constexpr size_t qwen_gather_slot = 2;   // (in slots of `capacity` floats from the inbox's start)
+void qwen_send_streams(Device& d) {
+    if (d.send_stream) return;
+    // (of the highest priority: the runtime shares a few hardware queues among the streams of a priority, in the order they were made, so a
+    // stream of the device's default priority may share one with its compute stream, as the stream of the copy did after the GEMM priming of the
+    // worker's start had moved the order; the helper stream, made so too, is not used by a prompt batch of parts)
+    int least = 0, greatest = 0;
+    check(hipDeviceGetStreamPriorityRange(&least, &greatest));
+    check(hipStreamCreateWithPriority(&d.send_stream, hipStreamDefault, greatest));
+    check(hipEventCreateWithFlags(&d.send_fork, hipEventDisableTiming));
+    check(hipEventCreateWithFlags(&d.send_done, hipEventDisableTiming));
+}
+void qwen_gather_fork(Device& d, const float* local, size_t steps, BatchRows own, BatchRows other, float* mixed) {
+    SumLink& link = d.sums;
+    if (!link.peer || d.send_pending || own.count * 2568 > link.capacity * 2 || link.capacity % 8 || own.count * 2568 * 2 > other.count * 2560 * 4)
+        throw std::runtime_error("invalid Straydog row gather");
+    qwen_send_streams(d);
+    auto* stage = reinterpret_cast<__half*>(mixed + other.first * 2560);
+    qwen_gather_stage<<<unsigned(std::min<size_t>((own.count * 321 + 255) / 256, 1024)), 256, 0, d.stream>>>(local, steps, own.first, own.count,
+                                                                                                             mixed, stage);
+    check(hipGetLastError());
+    // (after the stream's last signal and the stage: the slot is free, and the copy reads what the stage wrote)
+    check(hipEventRecord(d.send_fork, d.stream));
+    check(hipStreamWaitEvent(d.send_stream, d.send_fork, 0));
+    check(hipMemcpyAsync(link.peer_inbox + qwen_gather_slot * link.capacity, stage, own.count * 2568 * 2, hipMemcpyDefault, d.send_stream));
+    check(hipEventRecord(d.send_done, d.send_stream));
+    d.send_pending = true;
+}
+// The signal waits for the copy (an event after it on the send stream); then the other's rows.
+void qwen_gather_complete(Device& d, size_t steps, BatchRows other, float* mixed) {
+    SumLink& link = d.sums;
+    if (!link.peer || !d.send_pending || other.count * 2568 > link.capacity * 2) throw std::runtime_error("invalid Straydog row gather");
+    check(hipStreamWaitEvent(d.stream, d.send_done, 0));
+    d.send_pending = false;
+    link_signal_kernel<<<1, 1, 0, d.stream>>>(link.state, link.peer_flag, d.await_timeout);
+    qwen_gather_receive<true><<<unsigned(std::min<size_t>((other.count * 641 + 255) / 256, 1024)), 256, 0, d.stream>>>(
+        steps, other.first, other.count, link.state, reinterpret_cast<const __half*>(link.inbox + qwen_gather_slot * link.capacity),
+        link.capacity * 2, mixed);
+    check(hipGetLastError());
+}
+void qsa_share_signal(Device& d) {
+    link_signal_kernel<<<1, 1, 0, d.stream>>>(d.sums.state, d.sums.peer_flag, d.await_timeout);
     check(hipGetLastError());
 }
 // This device's rows of the residual streams into the other's (`peer_hidden`, its workspace), then the other's flag raised and this
@@ -414,7 +474,11 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
     auto* pointers = plan.pointers.data(); const int* kinds = plan.kinds.data();
     const auto& experts = *d.resident.find(plan.moe)->second;
     float* scratch = experts.workspace;
-    if (steps * std::max({hc_batch_floats, gdn_batch_floats, qsa_batch_floats}) > experts.capacity * 49302 + 65536)
+    // (the workspace holds the rows' scratch of every stage but the experts', which run in chunks of the plan's capacity, below: a part's, with the
+    // HyperConnections' over this device's half of the rows)
+    const auto workspace = d.allocations.find(scratch);
+    if (workspace == d.allocations.end() || steps > prefill_rows_max ||
+        std::max({(steps + 1) / 2 * hc_batch_floats, steps * gdn_batch_floats_of<2>(), steps * qsa_batch_floats_of<2>()}) > workspace->second / 4)
         throw std::runtime_error("prefill batch exceeds the resident expert workspace");
     const bool linear = decoder_linear(layer);
     const BatchRows own = batch_rows(steps, plan.part), other = batch_rows(steps, 1 - plan.part);
@@ -422,27 +486,60 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
     const bool fold = batch_half(d, own.count);
     // (the HyperConnections' rows in `branch` before they are gathered: the last sum has read the branch there)
     hc_prefill(d, pointers, kinds, own.count, hidden + own.first * 10240, branch, scratch, fold && normalized);
-    qwen_gather_mixed(d, branch, steps, own, other, mixed);
+    // A DeltaNet layer's big projections (qkv, gate) of this device's rows run while its rows go to the other (qwen_gather_fork), the other's after
+    // they have come: for the halves of a batch of 8192 rows, whose GEMMs over 4096 rows give each row the bits they do over 8192 (the beta and
+    // alpha products of a few rows each, whose GEMMs do not, stay over the whole batch). A batch of 4096 rows was slower so (2048-row GEMMs).
+    const bool project_first = linear && d.parts_overlap && batch_half(d, steps) && fold && own.count == other.count && own.count == 4096;
+    if (project_first) qwen_gather_fork(d, branch, steps, own, other, mixed);
+    else qwen_gather_mixed(d, branch, steps, own, other, mixed);
     if (linear) {
         const size_t chunk = d.input_capacity >= 16 * 1024 * 1024 ? 512 : 128;
-        gdn_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], steps, chunk, mixed, branch, scratch);
+        GdnSplit split{{own.first, other.first}, {own.count, other.count}, [&]() { qwen_gather_complete(d, steps, other, mixed); }};
+        gdn_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], steps, chunk, mixed, branch, scratch,
+                       project_first ? &split : nullptr);
     } else {
         qsa_prefill<2>(d, pointers + 4, kinds + 4, plan.states[0], plan.states[1], plan.states[2], plan.context, position, steps, mixed,
-                       branch, scratch);
+                       branch, scratch, int(plan.part));
         if (steps > 1) kv_prefetch_from(d, layer + 1, position);
     }
     void* const* second = pointers + 4 + (linear ? 9 : 10);
     const HcNext second_next = hc_next(static_cast<const float*>(second[0]), scratch, own.count);
     qwen_scatter_prefill(d, branch, steps, own, other, hidden, mixed, fold ? &second_next : nullptr);
     hc_prefill(d, second, kinds + 4 + (linear ? 9 : 10), own.count, hidden + own.first * 10240, branch, scratch, fold);
-    qwen_gather_mixed(d, branch, steps, own, other, mixed);
-    const StepMoe moe = step_moe(d, plan.moe, steps);
-    moe_steps_route(d, moe, steps, mixed);
-    moe_steps_compute(d, moe, steps, mixed);
-    const bool half = moe.plan->half[0].data != nullptr;
-    if (half) moe_half_batch(d, moe, steps, mixed);
-    moe_part_partial<<<dim3(10, unsigned(steps)), 256, 0, d.stream>>>(moe.outputs, moe.probabilities, moe.selected, moe.groups, steps,
-                                                                     true, moe.plan->shared || half, branch);
+    // The experts of at most `experts.capacity` rows at a time (a batch of no more is one chunk, as ever): each row's routes and outputs are its own,
+    // so the chunks give a row the sum a batch of its own would; a wider batch's chunks read the experts again, as the batches of that width do. The
+    // chunks are as even as can be, none of a lone row (a row alone takes the decode layout of the experts' outputs).
+    const size_t chunks = (steps + experts.capacity - 1) / experts.capacity;
+    struct Chunk { size_t first, count; };
+    std::vector<Chunk> order(chunks);
+    for (size_t chunk_index = 0, first = 0; chunk_index < chunks; ++chunk_index) {
+        order[chunk_index] = {first, steps / chunks + (chunk_index < steps % chunks ? 1 : 0)};
+        first += order[chunk_index].count;
+    }
+    // Where the chunks fall within the devices' rows (BatchRows), this device's rows' chunks run first, beside its send of them to the other
+    // (qwen_gather_fork), and the other's rows' chunks once those have arrived: only the order of the chunks changes.
+    size_t own_chunks = 0;
+    if (d.parts_overlap && chunks >= 2)
+        for (size_t at = 1; at < chunks; ++at)
+            if (order[at].first == batch_rows(steps, 0).count) own_chunks = plan.part ? chunks - at : at;
+    if (own_chunks) {
+        if (plan.part) std::rotate(order.begin(), order.begin() + (chunks - own_chunks), order.end());
+        qwen_gather_fork(d, branch, steps, own, other, mixed);
+    } else {
+        qwen_gather_mixed(d, branch, steps, own, other, mixed);
+    }
+    for (size_t at = 0; at < chunks; ++at) {
+        if (own_chunks && at == own_chunks) qwen_gather_complete(d, steps, other, mixed);
+        const size_t first = order[at].first, count = order[at].count;
+        const float* rows = mixed + first * 2560;
+        const StepMoe moe = step_moe(d, plan.moe, count);
+        moe_steps_route(d, moe, count, rows);
+        moe_steps_compute(d, moe, count, rows);
+        const bool half = moe.plan->half[0].data != nullptr;
+        if (half) moe_half_batch(d, moe, count, rows);
+        moe_part_partial<<<dim3(10, unsigned(count)), 256, 0, d.stream>>>(moe.outputs, moe.probabilities, moe.selected, moe.groups, count,
+                                                                         true, moe.plan->shared || half, branch + first * 2560);
+    }
     if (fold && next) {
         const auto& following = d.decoder.find(layer + 1)->second;
         const HcNext first_next = hc_next(static_cast<const float*>(following.pointers[0]),
@@ -461,7 +558,7 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
 // them waits for both devices (a batch's spans then run with no host round trip between them).
 void prefill_span_parts(Device& a, Device& b, size_t begin, size_t end, size_t position, size_t steps, const float* input,
                         float* output, size_t output_rows) {
-    if (begin >= end || end > 49 || !steps || steps > 4096 || end - begin > 4 || output_rows > steps || (output_rows && !output) ||
+    if (begin >= end || end > 49 || !steps || steps > prefill_rows_max || end - begin > 4 || output_rows > steps || (output_rows && !output) ||
         a.sums.peer != &b || b.sums.peer != &a)
         throw std::runtime_error("invalid prefill span of parts");
     Device* sides[2] = {&a, &b};
@@ -480,6 +577,8 @@ void prefill_span_parts(Device& a, Device& b, size_t begin, size_t end, size_t p
     for (size_t side = 0; side < 2; ++side) {
         Device& d = *sides[side];
         on_device(d.ordinal, [&]() {
+            // (a send left queued by a span that failed half way: finished, and forgotten)
+            if (d.send_pending) { check(hipStreamSynchronize(d.send_stream)); d.send_pending = false; }
             if (input) upload(d, workspaces[side], input, steps * 10240 * 4);
             if (steps > 1) kv_prefetch_from(d, begin, position);
         });
@@ -526,6 +625,9 @@ int sd_qwen_parts(void* handle, uint64_t parts) {
         if (parts == 2) throw std::runtime_error("Straydog splits Qwen3.8's layers on RDNA4 only");
 #endif
         d.qwen_parts = size_t(parts);
+        // STRAYDOG_PARTS_OVERLAP=off: a prompt batch's sends stay in the device stream's order.
+        const char* overlap = std::getenv("STRAYDOG_PARTS_OVERLAP");
+        d.parts_overlap = !(overlap && std::string(overlap) == "off");
         check(hipMemset(d.flags + 3, 0, 4));   // (prefill_span_parts' accumulated check)
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }

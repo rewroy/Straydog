@@ -75,7 +75,7 @@ fn main() {
     sizes.push(0);   // the engine's own choice: its physical cores
     for threads in sizes {
         // SAFETY: a plain value; null on failure.
-        let engine = unsafe { ffi::sd_cpu_experts_create(threads) };
+        let engine = unsafe { ffi::sd_cpu_experts_create(threads, 0) };
         assert!(!engine.is_null());
         for hot in [false, true] {
             let x: Vec<f32> = (0..HIDDEN).map(|_| ((random.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0).collect();

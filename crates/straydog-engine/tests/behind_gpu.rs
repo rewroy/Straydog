@@ -114,6 +114,11 @@ fn the_assist_turns_on_as_layers_come() {
         let mapped = model.banks_locked(locked).unwrap();
         assert_eq!(mapped, index as u64 + 1, "the plans the GPU can read after {} layers", index + 1);
         assert_eq!(model.locked_layers(), index + 1);
+        if cfg!(feature = "cuda") && index == 0 {
+            // (CUDA's level starts at none: this model misses about six distinct experts in a layer, which only the top level (8) takes. The
+            // script holds it for this model alone, from the first layer on; the layers locked after take the level in force)
+            model.assist_script(&[8]).unwrap();
+        }
         // (a request between layers: its passes capture the layers' graphs with the banks mapped so far)
         let run = decode(&mut model, &prompt);
         assert_eq!(run.tokens.len(), PASSES + 1);

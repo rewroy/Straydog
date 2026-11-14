@@ -65,6 +65,23 @@ pub fn device_info(ordinal: usize) -> Result<(String, u64, u64)> {
     Ok((name, free, total))
 }
 
+/// Signed memory headroom, and whether it comes from the process's memory budget.
+pub fn device_headroom(ordinal: usize) -> Result<(i64, bool)> {
+    let ordinal = c_int::try_from(ordinal).map_err(|_| Error(format!("invalid GPU ordinal {ordinal}")))?;
+    let (mut bytes, mut process_budget) = (0i64, 0 as c_int);
+    // SAFETY: the ordinal fits the native argument and both output pointers are valid.
+    check(unsafe { ffi::sd_device_headroom(ordinal, &mut bytes, &mut process_budget) })?;
+    Ok((bytes, process_budget != 0))
+}
+
+/// Log the device's runtime and Windows memory-budget diagnostics.
+#[cfg(all(windows, feature = "cuda"))]
+pub fn memory_diagnostic(ordinal: usize, ready: bool) -> Result<()> {
+    let ordinal = c_int::try_from(ordinal).map_err(|_| Error(format!("invalid GPU ordinal {ordinal}")))?;
+    // SAFETY: the ordinal fits the native argument; ready is the startup/ready phase flag.
+    check(unsafe { ffi::sd_device_memory_diagnostic(ordinal, c_int::from(ready)) }).map(drop)
+}
+
 /// Whether this CUDA GPU advertises support for registering host memory as read-only.
 #[cfg(feature = "cuda")]
 pub fn host_register_read_only_supported(ordinal: usize) -> Result<bool> {
