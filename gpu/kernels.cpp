@@ -3227,6 +3227,8 @@ void* sd_create(int ordinal, uint64_t budget) {
             check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid3xxs), grids[3], grid_bytes[3]));
             check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid3s), grids[4], grid_bytes[4]));
             check(hipMemcpyToSymbol(HIP_SYMBOL(iq_grid1s), grids[5], grid_bytes[5]));
+            iq_grids_upload_gemv_a(grids, grid_bytes);
+            iq_grids_upload_gemv_b(grids, grid_bytes);
             iq_uploaded = true;
         }
         {
@@ -4148,7 +4150,7 @@ int sd_matvec_batch(void* handle, void* const* pointers, const int* kinds,
             }
         } else if (fallback_count) {
             upload(value, value.matrices, fallback, fallback_count * sizeof(GemvItem));
-            gemv_list<<<unsigned((fallback_waves+7)/8), 256, 0, value.stream>>>(value.matrices, fallback_count, value.input, value.output);
+            launch_gemv_list(unsigned((fallback_waves+7)/8), value.stream, value.matrices, fallback_count, value.input, value.output);
             check(hipGetLastError());
         }
         download(value, output, value.output, total_out * 4);
