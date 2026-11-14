@@ -570,7 +570,8 @@ struct Device {
     uint64_t direct_tail_object = 0;
     int direct_mode = -1;
     int qsa_mma = -1;   // STRAYDOG_QSA_MMA=1: the prompt's sparse attention on tensor cores over Q8_0 K/V (read at the first prompt batch)
-    bool mma_f16 = false;   // sm_80+: mma.sync m16n8k16 with FP16 operands (qsa_flash_mma)
+    int hc_fused_mode = -1;   // CUDA: STRAYDOG_HC_FUSED=0 keeps a prompt batch's HyperConnection up projection and finish as two kernels (read at the first batch)
+    bool mma_f16 = false;   // sm_80+: mma.sync m16n8k16 with FP16 operands (qsa_flash_mma, hc_up_finish_mma)
     std::unordered_map<uint64_t,bool> direct_fenced;
     // Partially resident decode launches each layer's graph before the previous layer's
     // CPU result exists; the graph waits for it on the GPU (hybrid_await).
