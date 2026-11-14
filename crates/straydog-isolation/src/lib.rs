@@ -35,7 +35,7 @@ pub use tree::{prepare, ProcessTree};
 /// DeepSeek-V4.1's DS41_ ones. One list for both: a switch named on one system's list alone never reached the other's worker (speed first
 /// and the engram table did nothing in a Linux worker), and one on neither never reached a worker at all (the layer order's rows and the K/V's
 /// format measured nothing on 2026-11-11): every name the engine reads is here or a test's (the test below).
-pub const ENGINE_VARIABLES: [&str; 72] = ["STRAYDOG_LOCK_BUDGET", "STRAYDOG_EXPERT_Q8", "STRAYDOG_EXPERT_Q8_LANES", "STRAYDOG_EXPERT_Q8_GRID", "STRAYDOG_EXPERT_Q8_DOWN", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+pub const ENGINE_VARIABLES: [&str; 71] = ["STRAYDOG_LOCK_BUDGET", "STRAYDOG_EXPERT_Q8", "STRAYDOG_EXPERT_Q8_LANES", "STRAYDOG_EXPERT_Q8_GRID", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
                                          "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
                                          "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT",
                                          "STRAYDOG_HOST_REGISTER_READ_ONLY", "STRAYDOG_LAYER_PREFILL_ROWS", "STRAYDOG_LOCK_DURING_PREFILL", "STRAYDOG_KV",

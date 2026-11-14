@@ -299,14 +299,6 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
         q8=true;
         geometry.only=3;
     }
-    // The routed down on INT8 products (resident_expert_q8.hpp): every route the GPU evaluates, a resident expert's or a staged one's, so that
-    // the kernels below are left the shared expert's down alone (no routed wave in their grid).
-    bool q8_down=false;
-    if (down && resident_down_q8_takes(d,plan,input,tokens,input_stride)) {
-        resident_down_q8_launch(d,plan,groups,selected,geometry,input,output,tokens,input_stride,output_stride);
-        if (!with_shared || only==2) return;
-        q8_down=true;
-    }
     // The kernel of the stage's routed format (resident_expert_gemv_kind) when it has one: its shared down rows of a light
     // format; the shared gate and up (on the Q8 GEMV: Device::q8_wide) on a stream of their own beside it, joined after.
     const int routed=weights[down ? 2 : 0].kind;
@@ -317,7 +309,7 @@ void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* gr
     for (size_t r=0;r<roles;++r) {
         const size_t role=down ? 2 : r;
         geometry.routed_lanes[r]=resident_lanes(weights,role,input,kind && !down ? 4 : 10*roles);
-        geometry.routed_waves[r]=q8_down ? 0 : uint32_t(gemv_waves(weights[role],geometry.routed_lanes[r]));
+        geometry.routed_waves[r]=uint32_t(gemv_waves(weights[role],geometry.routed_lanes[r]));
         Matrix matrix=weights[shared+role];
         if (down) matrix.input_offset=10*640;
         geometry.shared_lanes[r]=gemv_lanes(matrix,input,10*roles);
