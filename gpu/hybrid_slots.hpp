@@ -648,8 +648,11 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     // the experts are scanned, in that order (the orders are total, so they are the ones a sort of every expert would put first). Every
     // expert listed and then partially sorted took the host 0.15 ms a refresh, and 1.85 ms where its cores are shared and slow (27 plans,
     // 9,720 slots: a verification pass of a pair of RTX 3090 there spent that between a span's end and the next device's start).
-    const auto keep = [max_swaps](std::vector<Entry>& kept, const Entry& entry, const auto& before, bool strongest) {
-        if (!max_swaps) { kept.push_back(entry); return; }
+    // (a bound above the few hundred a decoding refresh asks for is a prompt's whole re-pick: every expert is listed and sorted, as with no
+    // bound. Kept in order as they were scanned, a device's 9,700 residents were 560 MB of moves, 35 ms of a slow host after every prompt.)
+    const bool listed = !max_swaps || max_swaps > 512;
+    const auto keep = [max_swaps, listed](std::vector<Entry>& kept, const Entry& entry, const auto& before, bool strongest) {
+        if (listed) { kept.push_back(entry); return; }
         if (kept.size() == max_swaps) {
             // (most experts fall here, at one comparison of scores: the order's other keys only part equal scores)
             const double last = kept.back().score;
@@ -659,7 +662,7 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
         }
         kept.insert(std::upper_bound(kept.begin(), kept.end(), entry, before), entry);
     };
-    if (max_swaps) for (size_t g = 0; g < group_count; ++g) { residents[g].reserve(max_swaps + 1); waiting[g].reserve(max_swaps + 1); }
+    if (!listed) for (size_t g = 0; g < group_count; ++g) { residents[g].reserve(max_swaps + 1); waiting[g].reserve(max_swaps + 1); }
     for (auto& item : d.resident) {
         if (!item.second->hybrid) continue;
         ResidentMoe& plan = *item.second;
@@ -672,8 +675,8 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     std::vector<Entry> candidates;
     for (size_t g = 0; g < group_count; ++g) {
         candidates.insert(candidates.end(), waiting[g].begin(), waiting[g].end());
-        // (an unbounded refresh ranks every resident)
-        if (!max_swaps) std::sort(residents[g].begin(), residents[g].end(), weakest);
+        // (a refresh that listed every resident ranks them)
+        if (listed) std::sort(residents[g].begin(), residents[g].end(), weakest);
     }
     std::sort(candidates.begin(), candidates.end(), order);
     std::unordered_map<ResidentMoe*, std::vector<std::pair<size_t, const uint8_t*>>> released;

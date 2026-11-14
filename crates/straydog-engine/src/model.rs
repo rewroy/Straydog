@@ -400,6 +400,20 @@ fn prompt_passes() -> usize {
     *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_PASSES").ok().and_then(|rows| rows.parse().ok()).unwrap_or(0))
 }
 
+/// STRAYDOG_PROMPT_REFRESH_AHEAD (development): a prompt of at most this many new tokens re-picks the expert slots from its routes without
+/// waiting for the swaps' copies (unset or 0: every prompt waits, as before). The wait is 0.09 s of a short prompt's 0.24 s to the first
+/// token on two RTX 3090; the experts on their way are the CPU's or staged until they land.
+fn prompt_refresh_ahead() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_REFRESH_AHEAD").ok().and_then(|rows| rows.parse().ok()).unwrap_or(0))
+}
+
+/// STRAYDOG_DRAFTER_RESIDENT=1 (development): a partially resident model's MTP layer holds its whole bank in VRAM.
+fn drafter_pinned() -> bool {
+    static PINNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PINNED.get_or_init(|| std::env::var("STRAYDOG_DRAFTER_RESIDENT").is_ok_and(|value| value == "1"))
+}
+
 fn front_chain_wanted() -> bool {
     front_chain_mode() != Some("0")
 }
@@ -1968,7 +1982,7 @@ impl Model {
             // (development: STRAYDOG_DRAFTER_RESIDENT=1 pins the MTP layer's whole bank, as a fully resident model does, where it is a
             // partially resident layer by default. A drafting step then has no CPU route and no host step in its layer: on two RTX 3090 a
             // step's GPU work is 0.6 ms of its 1.05 ms. The bank is 0.6 GB of the slots' VRAM at Q2_0.)
-            if std::env::var("STRAYDOG_DRAFTER_RESIDENT").is_ok_and(|value| value == "1") {
+            if drafter_pinned() {
                 self.register_resident_layer(48)?;
                 eprintln!("Straydog MTP layer: its whole bank is pinned (STRAYDOG_DRAFTER_RESIDENT=1)");
             } else {
@@ -2013,7 +2027,8 @@ impl Model {
         if prior.total() > 0 {
             for layer in 0..ROUTED_LAYERS {
                 let rates = prior.rates(layer);
-                if rates.iter().any(|&rate| rate > 0.0) {
+                // (the MTP layer with its whole bank pinned has no slots to rank)
+                if rates.iter().any(|&rate| rate > 0.0) && !(layer == 48 && drafter_pinned()) {
                     self.group.seed_scores(layer, &rates)?;
                 }
             }
@@ -5289,7 +5304,12 @@ impl Model {
         if self.partial {
             // Re-pick cached experts from this prompt's routing before decoding.
             let rebalance = Instant::now();
-            self.group.rebalance(0)?;
+            if tokens.len() - reused <= prompt_refresh_ahead() {
+                // (a short prompt's swaps are asked for and land while the reply begins: the first token does not wait for their copies)
+                self.group.refresh_ahead(2048)?;
+            } else {
+                self.group.rebalance(0)?;
+            }
             self.last_metrics.insert("rebalance_seconds".into(), json!(rebalance.elapsed().as_secs_f64()));
         }
         // (the last batch's delta was of where it began: the reply is past all of its images)
