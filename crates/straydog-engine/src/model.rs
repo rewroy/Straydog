@@ -203,10 +203,12 @@ fn layer_prefill_room(memory: u64, pinned: u64, now: Option<u64>) -> Option<u64>
 /// [`layer_prefill_room`]): under memory pressure, the ordinary path reads them from the drive again every batch (32.6K new on the
 /// RTX 5070 Ti with 4.1 GiB available: 161.8 s, layer order 73.0 s at 256 rows). Large shortages amortize it over two ordinary batches; a
 /// slight shortage needs three full maximum-sized batches, and either [`LAYER_PREFILL_SHORT_ROWS`] (`rows`, from
-/// [`Group::layer_prefill_rows`]). Where the banks fit, `fits` (see [`LAYER_PREFILL_FITS`]) takes layer order from three ordinary batches
-/// when it can take [`LAYER_PREFILL_FIT_ROWS`].
+/// [`Group::layer_prefill_rows`]). Where the banks fit, `fits` (see [`LAYER_PREFILL_FITS`]) takes layer order from one and a half ordinary
+/// batches when it can take [`LAYER_PREFILL_FIT_ROWS`]: every batch of the ordinary path streams most of the absent experts again (IQ2_XS on
+/// an RTX 5070 Ti at 10 GiB, ordinary batches of 4096 rows, layer order at 2048: 8981 new 10.4 to 12.4 s against 8.4 to 8.6, 55 to 61
+/// thousand experts streamed against 25.5; 6357 new 7.9 to 8.5 s against 7.3 to 7.7; 4519 new 6.2 to 6.5 s against 6.4 to 6.7).
 fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, room: Option<u64>, rows: u64, fits: bool) -> bool {
-    if fits && rows >= LAYER_PREFILL_FIT_ROWS && new_tokens / ordinary.max(batch).max(1) >= 3 {
+    if fits && rows >= LAYER_PREFILL_FIT_ROWS && new_tokens * 2 >= ordinary.max(batch).max(1) * 3 {
         return true;
     }
     let Some(room) = room else { return false };
@@ -6155,7 +6157,7 @@ mod layer_prefill_policy_tests {
         assert_eq!(layer_prefill_room(0,G,Some(100*G)),None);
     }
     #[test]
-    fn fitting_banks_take_layer_order_from_three_ordinary_batches_at_the_fit_rows_on_windows() {
+    fn fitting_banks_take_layer_order_from_one_and_a_half_ordinary_batches_at_the_fit_rows_on_windows() {
         // Windows, banks in RAM, ordinary batch 2048: 8.2K new at 512 rows layer order, 3.8K follow-up at 128 rows and 32.6K at 256 rows
         // ordinary.
         let room=Some(60*G);
@@ -6163,8 +6165,14 @@ mod layer_prefill_policy_tests {
         assert!(!layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
         assert!(!layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
         assert!(layer_prefill_needed(32646,2048,2048,50*G,room,1024,true));
-        assert!(!layer_prefill_needed(3*2048-1,2048,2048,50*G,room,512,true));
-        assert!(layer_prefill_needed(3*2048,2048,2048,50*G,room,512,true));
+        assert!(!layer_prefill_needed(3*1024-1,2048,2048,50*G,room,512,true));
+        assert!(layer_prefill_needed(3*1024,2048,2048,50*G,room,512,true));
+        // the RTX 5070 Ti at 10 GiB, ordinary batches of 4096 rows, layer order at 2048, banks 33.0 GiB in a room of 38 to 42 GiB: 8981 and
+        // 6357 new take layer order (8.4 against 10.4 to 12.4 s, 7.3 to 7.7 against 7.9 to 8.5); 4519 new is even and stays ordinary
+        let banks=33*G;
+        assert!(layer_prefill_needed(8981,4096,4096,banks,Some(38*G),2048,true));
+        assert!(layer_prefill_needed(6357,4096,4096,banks,Some(40*G),2048,true));
+        assert!(!layer_prefill_needed(4519,4096,4096,banks,Some(41*G),2048,true));
         // Linux keeps the ordinary path for banks that fit (14.9K new at 512 rows: 22.4 s against 23.6 s, 3.7K 10.5 against 6.4).
         assert!(!layer_prefill_needed(14937,2048,2048,50*G,Some(98*G),512,false));
         assert!(!layer_prefill_needed(30000,0,0,0,None,0,true));
