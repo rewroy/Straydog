@@ -34,18 +34,7 @@ constexpr unsigned expert_q8_rows_most = 8, expert_q8_share = 4;
 // SoA layout; its gate's and its up's weights), then each row's activations (INT8 words, then a scale to every 32).
 constexpr size_t expert_q8_masks8_at = 0, expert_q8_masks7_at = 2048, expert_q8_entries_at = 3072, expert_q8_entry_words = 12,
                  expert_q8_rows_at = expert_q8_entries_at + expert_q8_rows_most * 10 * expert_q8_entry_words * 4;
-__host__ __device__ constexpr size_t expert_q8_gate_bytes(size_t cols) { return expert_q8_rows_at + expert_q8_rows_most * expert_q8_row_words(cols) * 4; }
-// After the gate and up's part, the down's: a (row, route)'s entry of four words (1 where the GPU evaluates it, a word unused, its down's
-// weights), then each (row, route)'s product (expert_q8_down_words words: INT8 words, a scale to every 32 values, and the sum of every 32
-// INT8 values, which Q2_0's codes -- a value plus one -- take off once a group).
-constexpr size_t expert_q8_down_cols = 640, expert_q8_down_words = expert_q8_down_cols / 4 + 2 * (expert_q8_down_cols / 32), expert_q8_down_entry_words = 4;
-__host__ __device__ constexpr size_t expert_q8_down_entries_at(size_t cols) { return expert_q8_gate_bytes(cols); }
-__host__ __device__ constexpr size_t expert_q8_down_rows_at(size_t cols) {
-    return expert_q8_down_entries_at(cols) + expert_q8_rows_most * 10 * expert_q8_down_entry_words * 4;
-}
-__host__ __device__ constexpr size_t expert_q8_scratch_bytes(size_t cols) {
-    return expert_q8_down_rows_at(cols) + expert_q8_rows_most * 10 * expert_q8_down_words * 4;
-}
+__host__ __device__ constexpr size_t expert_q8_scratch_bytes(size_t cols) { return expert_q8_rows_at + expert_q8_rows_most * expert_q8_row_words(cols) * 4; }
 __device__ __forceinline__ const uint8_t* expert_q8_grid(int kind) {
     return kind == 16 ? iq_grid2xxs : kind == 17 ? iq_grid2xs : kind == 22 ? iq_grid2s : kind == 18 ? iq_grid3xxs : iq_grid3s;
 }
@@ -374,154 +363,19 @@ __global__ void __launch_bounds__(256) resident_gate_up_q8(const uint8_t* scratc
         if (sub == 0) output[size_t(users[v] / 10) * output_stride + (users[v] % 10) * 1280 + role * 640 + matrix_row] = total;
     }
 }
-// ---- the routed down (2560 x 640, IQ4_NL or Q2_0, native rows of 18-byte units) on INT8 products ----
-// The F32 kernel gives a matrix row two lanes, sixteen rows a wave: a wave's load is then 32 pieces of a few bytes each, 90 bytes apart and
-// rows apart, and the launch took 110 us of a four-row pass on an RTX 3090 where the gate and up's had come down to 70. Here a lane takes
-// one unit and a wave 32 units that follow one another in memory (576 bytes), whatever rows they are of: a block of 640 lanes holds whole
-// rows (32 of 20 units, 64 of 10), leaves each lane's part in shared memory, and the row's first lane adds its row's parts in their order.
-// Its two launches are as the gate and up's: a block a row writes each (row, route)'s product quantized and its down's weights to the
-// scratch, then the read. A staged expert's down is read as a resident one's: both are native rows.
-__host__ __device__ constexpr bool expert_q8_down_kind(int kind) { return kind == 20 || kind == 42; }
-// expert_source of the down of route `route` of the pass's row `row` (as expert_q8_source: no array of the plan indexed by a computed number).
-__device__ __forceinline__ const uint8_t* expert_q8_down_source(const MoeGroup* groups, const int32_t* selected, const ExpertGemv& plan, uint32_t row,
-                                                                uint32_t route) {
-    const int32_t* routes = selected + row * 10;
-    const uint32_t expert = uint32_t(routes[route]);
-    const uint8_t* data = groups[expert].weights[2].data;
-    if (data) return plan.only == 2 ? nullptr : data;
-    if (plan.only == 1 || !plan.assist || !plan.mapped[2]) return nullptr;
-    const uint64_t within = plan.bytes[0] + plan.bytes[1];
-    if (plan.assign) {
-        const int32_t slot = plan.assign[row * 10 + route];
-        if (slot < 0) return nullptr;
-        if (plan.stage) return plan.stage + uint64_t(slot) * plan.slot_bytes + within;
-        return plan.mapped[2] + uint64_t(expert) * plan.bytes[2];
-    }
-    uint32_t earlier = 0, absent = 0;
-    for (uint32_t r = 0; r < 10; ++r) {
-        const bool missing = groups[routes[r]].weights[0].data == nullptr;
-        absent += missing; earlier += missing && r < route;
-    }
-    if (earlier >= min(plan.assist, (5 * absent + 4) / 12)) return nullptr;
-    if (plan.stage) return plan.stage + (uint64_t(row) * plan.assist + earlier) * plan.slot_bytes + within;
-    return plan.mapped[2] + uint64_t(expert) * plan.bytes[2];
-}
-// A block a row (grid.y), 256 threads: lane 20 * route + group quantizes group `group` of the route's product, and a route's first lane
-// writes its entry.
-__global__ void __launch_bounds__(256) resident_down_q8_plan(const MoeGroup* groups, const int32_t* selected, ExpertGemv plan, const float* product,
-                                                             size_t product_stride, uint8_t* scratch, uint32_t cols) { SD_KERNEL_ACQUIRE;
-    const uint32_t row = blockIdx.y, route = threadIdx.x / 20, group = threadIdx.x % 20, pair = row * 10 + route;
-    if (route >= 10) return;
-    const uint8_t* down = expert_q8_down_source(groups, selected, plan, row, route);
-    if (group == 0) {
-        uint32_t* entry = reinterpret_cast<uint32_t*>(scratch + expert_q8_down_entries_at(cols)) + pair * expert_q8_down_entry_words;
-        *reinterpret_cast<const uint8_t**>(entry + 2) = down;
-        entry[0] = down ? 1u : 0u;
-    }
-    if (!down) return;
-    const float* from = product + size_t(row) * product_stride + route * expert_q8_down_cols + group * 32;
-    uint32_t* to = reinterpret_cast<uint32_t*>(scratch + expert_q8_down_rows_at(cols)) + pair * expert_q8_down_words;
-    float4 v[8];
-    float top = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        v[i] = gemv_load4(from + 4 * i);
-        top = fmaxf(top, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
-    }
-    const float inverse = top > 0.0f ? 127.0f / top : 0.0f;
-    int total = 0;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int a = int(rintf(v[i].x * inverse)), b = int(rintf(v[i].y * inverse)), c = int(rintf(v[i].z * inverse)), e = int(rintf(v[i].w * inverse));
-        total += a + b + c + e;
-        to[group * 8 + i] = uint32_t(a & 255) | uint32_t(b & 255) << 8 | uint32_t(c & 255) << 16 | uint32_t(e & 255) << 24;
-    }
-    reinterpret_cast<float*>(to + expert_q8_down_cols / 4)[group] = top / 127.0f;
-    reinterpret_cast<int32_t*>(to + expert_q8_down_cols / 4 + expert_q8_down_cols / 32)[group] = total;
-}
-// The read. grid.x: blocks of 640 lanes, each whole rows of the matrix (640 / units of them); grid.y: the pass's (row, route).
-template<int kind>
-__global__ void __launch_bounds__(640) resident_down_q8(const uint8_t* scratch, float* output, size_t output_stride, uint32_t matrix_rows, uint32_t cols) {
-    SD_KERNEL_ACQUIRE;
-    static_assert(kind == 20 || kind == 42);
-    extern __shared__ __align__(16) uint32_t expert_q8_down_lds[];
-    const uint32_t* entry = reinterpret_cast<const uint32_t*>(scratch + expert_q8_down_entries_at(cols)) + blockIdx.y * expert_q8_down_entry_words;
-    if (!entry[0]) return;
-    constexpr uint32_t units = kind == 20 ? expert_q8_down_cols / 32 : expert_q8_down_cols / 64, chunks = expert_q8_down_words / 4;
-    if (threadIdx.x < chunks)
-        reinterpret_cast<uint4*>(expert_q8_down_lds)[threadIdx.x] =
-            reinterpret_cast<const uint4*>(scratch + expert_q8_down_rows_at(cols))[blockIdx.y * chunks + threadIdx.x];
-    __syncthreads();
-    const uint32_t* x = expert_q8_down_lds;
-    const float* scales = reinterpret_cast<const float*>(x + expert_q8_down_cols / 4);
-    const int32_t* sums = reinterpret_cast<const int32_t*>(x + expert_q8_down_cols / 4 + expert_q8_down_cols / 32);
-    float* parts = reinterpret_cast<float*>(expert_q8_down_lds + expert_q8_down_words);
-    const uint32_t row = blockIdx.x * (blockDim.x / units) + threadIdx.x / units, unit = threadIdx.x % units;
-    float part = 0.0f;
-    if (row < matrix_rows) {
-        const uint8_t* data = *reinterpret_cast<const uint8_t* const*>(entry + 2);
-        // (a unit's 18 bytes start at an even address: five aligned words hold them, a half word on when the address is not a multiple of 4)
-        const uintptr_t address = reinterpret_cast<uintptr_t>(data) + (row * units + unit) * 18;
-        const uint32_t* base = reinterpret_cast<const uint32_t*>(address & ~uintptr_t(3));
-        const bool odd = (address & 2) != 0;
-        const uint32_t w0 = base[0], w1 = base[1], w2 = base[2], w3 = base[3], w4 = base[4];
-        const uint32_t words[5] = {w0, w1, w2, w3, w4};
-        const float d = gemv_half(odd ? w0 >> 16 : w0);
-        if constexpr (kind == 20) {
-            // IQ4_NL: byte j's low nibble is value j, its high nibble value 16 + j; gemv_iq4's bytes are the values + 128.
-            int sum = 0;
-            #pragma unroll
-            for (int m = 0; m < 4; ++m) {
-                const uint32_t codes = odd ? words[m + 1] : gemv_realign(words[m], words[m + 1], 2);
-                sum = gemv_dot_s8s8(gemv_iq4(codes & 0x0F0F0F0Fu) ^ 0x80808080u, x[unit * 8 + m], sum);
-                sum = gemv_dot_s8s8(gemv_iq4((codes >> 4) & 0x0F0F0F0Fu) ^ 0x80808080u, x[unit * 8 + 4 + m], sum);
-            }
-            part = float(sum) * (d * scales[unit]);
-        } else {
-            // Q2_0: byte j of word i holds values 16 i + 4 j to 16 i + 4 j + 3, two bits each, a value plus one; a unit is two groups of 32.
-            int first = 0, second = 0;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const uint32_t codes = odd ? words[i + 1] : gemv_realign(words[i], words[i + 1], 2);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    // (the four fields a byte each, by shifts and ORs: a multiplication would carry where the shifted copies overlap)
-                    const uint32_t byte = (codes >> (8 * j)) & 255u, spread = (byte | byte << 6 | byte << 12 | byte << 18) & 0x03030303u;
-                    if (i < 2) first = gemv_dot_s8s8(spread, x[unit * 16 + 4 * i + j], first);
-                    else second = gemv_dot_s8s8(spread, x[unit * 16 + 4 * i + j], second);
-                }
-            }
-            // (one fused multiply-add, written: the two groups' sum is then the same whatever the compiler contracts)
-            part = d * fmaf(float(first - sums[2 * unit]), scales[2 * unit], float(second - sums[2 * unit + 1]) * scales[2 * unit + 1]);
-        }
-    }
-    parts[threadIdx.x] = part;
-    __syncthreads();
-    if (unit || row >= matrix_rows) return;
-    float total = 0.0f;
-    #pragma unroll
-    for (uint32_t i = 0; i < units; ++i) total += parts[threadIdx.x + i];
-    const uint32_t pass_row = blockIdx.y / 10, route = blockIdx.y % 10;
-    output[size_t(pass_row) * output_stride + route * 2560 + row] = total;
-}
 // Whether a pass's routed gate and up take the kernels above: STRAYDOG_EXPERT_Q8=1; 2, with every (row, route) reading its expert itself
 // (the sums a row has are the same either way: the measurement of what the sharing saves, and the check that it changes nothing).
 inline int expert_q8_forced = -1;   // (the benchmark's: a level whatever the environment says)
-inline int expert_q8_asked = 0;     // (the environment's level and whether the down is taken, as expert_q8_read_environment found them)
-inline bool expert_q8_down_asked = true;
+inline int expert_q8_asked = 0;     // (the environment's level, as expert_q8_read_environment found it)
 inline int expert_q8_level() {
     if (expert_q8_forced >= 0) return expert_q8_forced;
     return expert_q8_asked;
 }
-// (development: STRAYDOG_EXPERT_Q8_DOWN=0 leaves the routed down to the F32 kernels, to measure the two stages apart)
-inline bool expert_q8_down_on() { return expert_q8_down_asked; }
-// The two switches as the environment has them: read when a device's scratch is made (a model's load), not at every layer's launches, and
-// again at the next load (a process that loads a model twice may have changed them between: examples/qwen_floor does).
+// The switch as the environment has it: read when a device's scratch is made (a model's load), not at every layer's launches, and again at
+// the next load (a process that loads a model twice may have changed it between: examples/qwen_floor does).
 inline void expert_q8_read_environment() {
     const char* p = std::getenv("STRAYDOG_EXPERT_Q8");
     expert_q8_asked = p && (p[0] == '1' || p[0] == '2') && !p[1] ? p[0] - '0' : 0;
-    const char* down = std::getenv("STRAYDOG_EXPERT_Q8_DOWN");
-    expert_q8_down_asked = !(down && down[0] == '0' && !down[1]);
 }
 // The device's scratch: made with the device (a launch may be recorded into a graph, where nothing can be allocated), for rows of
 // expert_q8_scratch_cols values at the most.
@@ -598,27 +452,5 @@ inline void resident_gate_up_q8_launch(Device& d, const ResidentMoe& plan, const
                                                                              uint32_t(gate.row_bytes), waves, uint32_t(lanes)); break;
     switch (kind) { SD_EXPERT_Q8(16) SD_EXPERT_Q8(17) SD_EXPERT_Q8(18) SD_EXPERT_Q8(21) SD_EXPERT_Q8(22) }
     #undef SD_EXPERT_Q8
-    check(hipGetLastError());
-}
-// Whether the pass's down stage is one resident_down_q8 takes: the kinds it reads, the shape, the scratch, and a product it can load aligned.
-inline bool resident_down_q8_takes(const Device& d, const ResidentMoe& plan, const float* product, size_t tokens, size_t product_stride) {
-    const Matrix& down = plan.weights[2];
-    return expert_q8_level() && expert_q8_down_on() && expert_q8_down_kind(down.kind) && down.rows == 2560 && down.cols == expert_q8_down_cols && d.expert_q8_scratch &&
-           tokens && tokens <= expert_q8_rows_most && reinterpret_cast<uintptr_t>(product) % 16 == 0 && (product_stride * 4) % 16 == 0;
-}
-// Launches it for the pass's rows: every routed down the GPU evaluates, a resident one or a staged one.
-inline void resident_down_q8_launch(Device& d, const ResidentMoe& plan, const MoeGroup* groups, const int32_t* selected, ExpertGemv geometry,
-                                    const float* product, float* output, size_t tokens, size_t product_stride, size_t output_stride) {
-    const Matrix& down = plan.weights[2];
-    uint8_t* scratch = d.expert_q8_scratch;
-    resident_down_q8_plan<<<dim3(1, unsigned(tokens)), 256, 0, d.stream>>>(groups, selected, geometry, product, product_stride, scratch,
-                                                                         uint32_t(expert_q8_scratch_cols));
-    const unsigned units = down.kind == 20 ? unsigned(down.cols / 32) : unsigned(down.cols / 64), rows_a_block = 640 / units;
-    const dim3 grid(unsigned((down.rows + rows_a_block - 1) / rows_a_block), unsigned(tokens * 10));
-    const size_t shared = (expert_q8_down_words + 640) * 4;
-    if (down.kind == 20)
-        resident_down_q8<20><<<grid, 640, shared, d.stream>>>(scratch, output, output_stride, uint32_t(down.rows), uint32_t(expert_q8_scratch_cols));
-    else
-        resident_down_q8<42><<<grid, 640, shared, d.stream>>>(scratch, output, output_stride, uint32_t(down.rows), uint32_t(expert_q8_scratch_cols));
     check(hipGetLastError());
 }
