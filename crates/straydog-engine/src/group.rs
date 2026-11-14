@@ -1113,6 +1113,15 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.rebalance(max_swaps))
     }
 
+    /// Every device's slots re-picked by their scores, at most `max_swaps` swaps each, without waiting for the copies: those in flight from an
+    /// earlier refresh are finished first, so that each device picks from its whole cache.
+    pub fn refresh_ahead(&mut self, max_swaps: u64) -> Result<()> {
+        for backend in &mut self.backends {
+            backend.drain_slot_copies()?;
+        }
+        self.refresh_slots(max_swaps).map(drop)
+    }
+
     pub fn enable_assist(&mut self, routes: u32) -> Result<u64> {
         self.backends.iter_mut().map(|backend| backend.enable_assist(routes)).sum()
     }
