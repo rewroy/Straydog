@@ -720,6 +720,24 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     if (wait) { hybrid_settle(d, true); check(hipStreamSynchronize(d.stream)); }
 }
 
+// Whether the slots are refreshed at one of the points where decoding looks (every four tokens: hybrid_rebalance, 32 swaps at the most):
+// once 64 routes have missed the slots since the last refresh, or 64 tokens have passed. A refresh moves a waiting expert in only where
+// routes missed it, so with few misses it finds little to do, and it is not free: it scans every plan's experts and its swaps copy and
+// pack on the device. Where the slots miss many routes (a GPU holding a part of the experts: 46 routes a token on one 26 GiB card, 143 on a
+// 16 GiB one) the 64 are there at every look and the refresh is every four tokens, as it always was. Where they hold nearly all (two RTX
+// 3090 with every layer's bank page-locked: 99.4% of the routes resident, 3.2 missed a token) a refresh every four tokens took 1.6 ms a
+// token of a slow host for 0.3 ms of staging: 100 tok/s with it, 115 with the slots held as they were.
+constexpr uint64_t hybrid_refresh_misses = 64, hybrid_refresh_tokens = 64;
+inline bool hybrid_refresh_due(Device& d) {
+    const uint64_t misses = d.cpu_experts + d.assisted_experts;
+    // (the counts may have gone back: a speculative pass's rows put back, a request's statistics cleared)
+    if (misses < d.refresh_misses) d.refresh_misses = misses;
+    if (d.hybrid_tokens < d.refresh_tokens) d.refresh_tokens = d.hybrid_tokens;
+    if (misses - d.refresh_misses < hybrid_refresh_misses && d.hybrid_tokens - d.refresh_tokens < hybrid_refresh_tokens) return false;
+    d.refresh_misses = misses; d.refresh_tokens = d.hybrid_tokens;
+    return true;
+}
+
 // compute(first, count) launches the expert GEMMs for missing[first, first+count); meanwhile() runs on this thread while they
 // stream, before they are waited for. The GPU's time from the first copy to the last expert's GEMMs, in ns (0 with none missing).
 template<class Compute, class Meanwhile>

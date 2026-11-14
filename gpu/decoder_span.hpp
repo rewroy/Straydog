@@ -219,9 +219,9 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     download(d,output,hidden,10240*4);
     if (ahead) await.check_failed();
     hybrid_check_report(d);
-    // Follow decode routing: up to 32 swaps every four tokens, issued after this
+    // Follow decode routing: up to 32 swaps every four tokens where the slots miss routes (hybrid_refresh_due), issued after this
     // device's last layer so the copies overlap the head and the next token's start.
-    if ((end==48 || d.decoder.find(end)==d.decoder.end()) && d.hybrid_tokens%4==0) hybrid_rebalance(d,32,false);
+    if ((end==48 || d.decoder.find(end)==d.decoder.end()) && d.hybrid_tokens%4==0 && hybrid_refresh_due(d)) hybrid_rebalance(d,32,false);
 }
 
 void decode_span(Device& d,size_t begin,size_t end,size_t position,const float* input,float* output) {
