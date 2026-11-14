@@ -53,6 +53,11 @@ const VERIFIED_PREFILL: usize = 16;
 /// 32 rows costs about what its eight passes do. One GPU whose passes wait for the CPU's experts (RTX 5070 Ti, 16 of 48 layers
 /// page-locked) read 60 tokens in 520 ms as batches and 630 ms as passes: it keeps the batches.
 const PARTIAL_PROMPT_PASSES: usize = 32;
+/// Longest prompt (its new tokens) whose re-pick of the slots is not waited for before the reply begins (CUDA). The wait was 0.09 s of
+/// 0.24 s to the first token of a 23-token prompt on two RTX 3090, and 0.28 s of 0.76 s for 60 tokens on an RTX 5070 Ti, where the 64
+/// tokens that followed took 1.60 s with the swaps landing meanwhile and 1.65 s after waiting for them. A longer prompt's wait is a small
+/// part of its read, and its routes say more about the reply's.
+const REFRESH_AHEAD_PROMPT: usize = 128;
 /// The CPU's routes a row in a prompt batch's first pass from which the slots are taken not to hold the prompt's experts, and the rest of
 /// the batch is read as a batch ([`Model::forward`]). A prompt the slots know leaves the CPU a route a row or none.
 const COLD_PROMPT_ROUTES: usize = 8;
@@ -423,12 +428,13 @@ fn prompt_passes_overlapped() -> bool {
     *ON.get_or_init(|| std::env::var("STRAYDOG_PROMPT_PASSES_OVERLAP").map_or(true, |value| value.trim() != "0"))
 }
 
-/// STRAYDOG_PROMPT_REFRESH_AHEAD (development): a prompt of at most this many new tokens re-picks the expert slots from its routes without
-/// waiting for the swaps' copies (unset or 0: every prompt waits, as before). The wait is 0.09 s of a short prompt's 0.24 s to the first
-/// token on two RTX 3090; the experts on their way are the CPU's or staged until they land.
+/// A prompt of at most this many new tokens re-picks the expert slots from its routes without waiting for the swaps' copies: the experts on
+/// their way are the CPU's or staged until they land. [`REFRESH_AHEAD_PROMPT`] on CUDA, 0 elsewhere (every prompt waits, not measured
+/// there); STRAYDOG_PROMPT_REFRESH_AHEAD (development) names it for both.
 fn prompt_refresh_ahead() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_REFRESH_AHEAD").ok().and_then(|rows| rows.parse().ok()).unwrap_or(0))
+    *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_REFRESH_AHEAD").ok().and_then(|rows| rows.parse().ok())
+        .unwrap_or(if cfg!(feature = "cuda") { REFRESH_AHEAD_PROMPT } else { 0 }))
 }
 
 /// STRAYDOG_DRAFTER_RESIDENT=1 (development): a partially resident model's MTP layer holds its whole bank in VRAM.
