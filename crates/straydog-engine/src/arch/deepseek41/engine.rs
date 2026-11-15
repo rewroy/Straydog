@@ -1661,6 +1661,19 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// served checkpoint copied them before the first token, ~0.2 s at 110K tokens and 2-4 s when
     /// the host had to find the pages).
     pub fn snapshot_into(&mut self, snapshot: &mut Snapshot) -> Result<()> {
+        self.copy_state(snapshot, true)
+    }
+
+    /// [`Engine::snapshot_into`] without the compressed rows and index keys, not even room for them: a mark that only the
+    /// sequence it was taken of goes back to, in place ([`Engine::rewind_to`], while it still [extends](Engine::extends)
+    /// it). What it copies is the window's rows and the tails, so that one can be taken every few hundred tokens of a reply;
+    /// [`Engine::restore`] is not for it.
+    pub fn mark_into(&mut self, snapshot: &mut Snapshot) -> Result<()> {
+        self.copy_state(snapshot, false)
+    }
+
+    /// The state a snapshot holds at once: with `whole`, room for the compressed rows and index keys too, left pending.
+    fn copy_state(&mut self, snapshot: &mut Snapshot, whole: bool) -> Result<()> {
         let (window, dim, index_dim, ring, position) = (self.hp.window, self.hp.head_dim, self.hp.index_dim, self.ring, self.position);
         let shard = &mut self.shards[0];
         let first = position.saturating_sub(window);
@@ -1678,8 +1691,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let groups = self.sources[&layer].groups;
             // (the compressed rows and index keys as they are, BF16 pairs in F32 words; the dims are even)
             let [rows, keys, tail_kv, tail_gate] = kept;
-            fit_room(rows, groups * dim / 2);
-            fit_room(keys, groups * index_dim / 2);
+            fit_room(rows, if whole { groups * dim / 2 } else { 0 });
+            fit_room(keys, if whole { groups * index_dim / 2 } else { 0 });
             for (buffer, values) in [(&buffers.tail_kv, tail_kv), (&buffers.tail_gate, tail_gate)] {
                 fit(values, dim);
                 shard.gpu.read_buffer(buffer, 0, values)?;
