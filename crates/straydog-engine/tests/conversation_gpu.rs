@@ -184,6 +184,65 @@ fn kept_conversation(drafter: Option<&std::ffi::OsStr>, root_dir: &std::ffi::OsS
             "with every expert beyond the slots streamed, the two agree to the bit: they differ by {worst:.2e}");
 }
 
+/// A long reply is marked as it grows (the recurrent state, every 512 tokens, at a multiple of four). A client that keeps it only in part
+/// (a file it cut at a line's end to have the model go on, a reply its person stopped) sends a prompt that leaves the held sequence before
+/// its end: the request goes on from the last mark the part reaches (the mark before the last, where the part ends between the two), where
+/// it read the whole reply again. Its first token is the one a model that reads the whole request chooses.
+fn kept_part(drafter: Option<&std::ffi::OsStr>, root_dir: &std::ffi::OsStr) {
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut model, text) = open(root_dir, drafter);
+    let prompt = text.encode("<|im_start|>user\nWrite a long and detailed essay about the sea in winter, of at least two thousand words.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+    let tail = text.encode("<|im_end|>\n<|im_start|>user\nGo on from there.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+    let top = |logits: &[f32]| logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(token, _)| token);
+    // (the part kept ends 40 tokens past the last mark, then 8 tokens before it: after the mark before the last)
+    for (past, kind) in [(40isize, "mark"), (-8, "mark_before")] {
+        model.reset().unwrap();
+        let mut written = Vec::new();
+        model.generate(&prompt, 1300, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| written.push(token)).unwrap();
+        let marks = model.last_metrics.get("marks").and_then(|marks| marks.as_u64()).unwrap_or(0);
+        let marked: Vec<usize> = model.last_metrics.get("marked_tokens").and_then(|marked| marked.as_array()).map(|marked| marked.iter().map(|at| at.as_u64().unwrap() as usize).collect())
+            .unwrap_or_default();
+        eprintln!("a reply of {} tokens: {marks} marks at {marked:?}, {:.1} ms each", written.len(),
+                  1e3 * model.last_metrics.get("mark_seconds").and_then(|seconds| seconds.as_f64()).unwrap_or(0.0) / marks.max(1) as f64);
+        assert!(marked.len() >= 2 && marked.iter().all(|at| at % 4 == 0), "the reply was long enough to be marked twice: {} tokens", written.len());
+        let (last, before) = (marked[marked.len() - 1], marked[marked.len() - 2]);
+        let kept = (last as isize + past) as usize - prompt.len();
+        assert!(kept + 8 < written.len() && last - before >= 512, "the part kept ends before the reply does");
+        let next: Vec<u32> = prompt.iter().chain(&written[..kept]).chain(&tail).copied().collect();
+        let stepped = first_logits(&mut model, &next);
+        let expected = if kind == "mark" { last } else { before };
+        assert_eq!((model.last_metrics["resumed_from"].as_str(), model.last_metrics["cached_tokens"].as_u64()), (Some(kind), Some(expected as u64)));
+        // The same request read whole, and (with no marks) from the place the reply began.
+        model.reset().unwrap();
+        let whole = first_logits(&mut model, &next);
+        assert_eq!(model.last_metrics["cached_tokens"].as_u64(), Some(0));
+        eprintln!("from the {kind} and read whole: relative difference {:.4}", relative_difference(&stepped, &whole));
+        assert_eq!(top(&stepped), top(&whole), "the first token from the {kind}");
+    }
+    // A model that takes no marks reads the reply again from where it began.
+    model.set_reply_marks(false);
+    model.reset().unwrap();
+    let mut written = Vec::new();
+    model.generate(&prompt, 700, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| written.push(token)).unwrap();
+    assert!(model.last_metrics.get("marks").is_none() && written.len() > 600);
+    let next: Vec<u32> = prompt.iter().chain(&written[..600]).chain(&tail).copied().collect();
+    first_logits(&mut model, &next);
+    assert!(model.last_metrics["cached_tokens"].as_u64().is_some_and(|cached| (cached as usize) <= prompt.len()), "{:?}", model.last_metrics["resumed_from"]);
+}
+
+#[test]
+fn a_reply_kept_in_part_goes_on_from_its_mark() {
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    kept_part(None, &root);
+}
+
+#[test]
+fn a_reply_kept_in_part_goes_on_from_its_mark_with_the_mtp_layers_too() {
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    let Some(drafter) = common::model_env("STRAYDOG_DRAFTER", "the MTP drafter's directory") else { return };
+    kept_part(Some(&drafter), &root);
+}
+
 #[test]
 fn a_fresh_model_takes_a_conversations_state() {
     let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
