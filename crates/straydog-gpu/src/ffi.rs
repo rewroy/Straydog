@@ -2103,6 +2103,53 @@ unsafe extern "C" {
     pub fn sd_abort_flag_retain(flag: *mut ::std::os::raw::c_void);
 }
 unsafe extern "C" {
+    pub fn sd_rows_overlap_begin(
+        handle: *mut ::std::os::raw::c_void,
+        storage: *mut ::std::os::raw::c_void,
+        slot_rows: u64,
+        host: *mut f32,
+        host_rows: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_up(
+        handle: *mut ::std::os::raw::c_void,
+        chunk: u64,
+        row: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_load(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        chunk: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_span(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        chunk: u64,
+        row: u64,
+        position: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_wait(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_end(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_times(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_abort_flag_release(flag: *mut ::std::os::raw::c_void);
 }
 unsafe extern "C" {

@@ -537,6 +537,22 @@ int sd_layer_rows_get(void* handle, void* storage, uint64_t first, float* rows, 
 int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t first, uint64_t steps);
 int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first);
 int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows, double* timings);
+/* Layer order's hidden rows kept on the host and moved beside the compute (gpu/kernels.cpp, RowsOverlap in gpu/core.hpp). `storage` is an
+   allocation of sd_prefill_bank_allocate of one or two slots of `slot_rows` rows (a ring standing for the rows a pass would hold in VRAM);
+   begin page-locks the pass's `host_rows` rows at `host` until end: 1 where they could not be (nothing has changed; sd_error says why).
+   Per layer and chunk c (rows of the pass from `row`, `steps` of them): up queues the chunk's rows into slot c % 2 on a copy stream of its own,
+   load waits for them on the device stream and copies them into the layer's workspace, span runs the layer on them (sd_prefill_span_held's
+   work) and queues the slot out to the host on a second copy stream. The calls come in that order, and each waits only on events. wait: every
+   copy has landed and the host's rows are the last layer's (the next pass starts clean); end: whatever the pass's end, waits for the copies and
+   unlocks the host rows (nothing where none moves). times: nanoseconds the device stream waited for rows to come up, nanoseconds the host
+   waited in wait (the copies' own times and bytes are in sd_prefill_row_transfers). */
+int sd_rows_overlap_begin(void* handle, void* storage, uint64_t slot_rows, float* host, uint64_t host_rows);
+int sd_rows_overlap_up(void* handle, uint64_t chunk, uint64_t row, uint64_t steps);
+int sd_rows_overlap_load(void* handle, uint64_t layer, uint64_t chunk, uint64_t steps);
+int sd_rows_overlap_span(void* handle, uint64_t layer, uint64_t chunk, uint64_t row, uint64_t position, uint64_t steps);
+int sd_rows_overlap_wait(void* handle);
+int sd_rows_overlap_end(void* handle);
+int sd_rows_overlap_times(void* handle, uint64_t* out);
 /* Qwen3.8's layers split across two linked GPUs (gpu/qwen_parts.hpp, sd_link_sums): this device's parts (1 or 2), before any
    layer or K/V state is registered on it; then each layer's part (0 or 1 of two), registered as sd_decoder_layer registers a
    whole layer, with the part's operands and states. */
