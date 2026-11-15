@@ -672,7 +672,7 @@ int sd_moe_shared_half(void* handle, void* plan, void* const* pointers, const in
         }
         // The table as it is (no shared expert) for prompts; the half as the shared expert for decode.
         const size_t bytes = (moe.experts + 1) * sizeof(MoeGroup);
-        if (bytes > d.budget - d.used) throw std::runtime_error("resident MoE metadata exceeds VRAM budget");
+        if (bytes > budget_available(d)) throw std::runtime_error("resident MoE metadata exceeds VRAM budget");
         void* table = nullptr;
         check(hipMalloc(&table, bytes));
         d.allocations.emplace(table, bytes); d.used += bytes;

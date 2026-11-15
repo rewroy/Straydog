@@ -447,7 +447,7 @@ void* create_resident_moe(Device& d,void* const* pointers,const int* kinds,size_
     for (size_t group=0;group<=experts;++group)
         groups[group]={{plan->weights[group*3],plan->weights[group*3+1],plan->weights[group*3+2]},0,0,0};
     const size_t bytes=groups.size()*sizeof(MoeGroup);
-    if (bytes>d.budget-d.used) throw std::runtime_error("resident MoE metadata exceeds VRAM budget");
+    if (bytes>budget_available(d)) throw std::runtime_error("resident MoE metadata exceeds VRAM budget");
     void* table=nullptr; check(hipMalloc(&table,bytes));
     try {
         upload(d,table,groups.data(),bytes);

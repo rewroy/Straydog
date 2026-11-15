@@ -30,6 +30,8 @@ int sd_device_pci(int ordinal, int* domain, int* bus, int* device);
 void* sd_create(int ordinal, uint64_t budget);
 void sd_destroy(void* handle);
 int sd_memory(void* handle, uint64_t* used, uint64_t* budget);
+// Budget admission includes the live allocator reserve; sd_memory remains requested bytes.
+int sd_memory_effective(void* handle, uint64_t* used, uint64_t* budget);
 /* Raise the budget while serving (GPU memory freed by other programs since the start, under `auto`); never below what is allocated. */
 int sd_set_budget(void* handle, uint64_t budget);
 
@@ -653,6 +655,29 @@ int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_
 /* A K/V growth takes the VRAM of the expert slots for its longer indexers (release) and gives back what is left (restore, `cache` slots). */
 int sd_expert_slots_release(void* handle);
 int sd_expert_slots_restore(void* handle, uint64_t cache);
+// Replacement pool prediction, excluding the existing pool. Includes a missing CPU
+// partial buffer automatically; extra is an additional, independently allocated workspace.
+// Returned cache is the nominal largest-slot count, not the carved group capacity.
+int sd_expert_slots_plan(void* handle, uint64_t cache_cap, uint64_t stage, uint64_t slot_bytes,
+                         uint64_t margin, uint64_t extra, uint64_t* cache, uint64_t* nominal, uint64_t* reserve);
+// 16 words: raw used, budget, reserve, charged live count, peak reserve, chunk bytes,
+// pool nominal/reserve/count, KV nominal/reserve/count, CPU partial nominal/reserve/count,
+// flags (requested, segmented, disabled). General allocations incur no new reserve.
+int sd_expert_slots_accounting(void* handle, uint64_t* out, uint64_t count);
+// Opt-in KV growth: 0 with *retained=0 requests the legacy allocation path;
+// negative returns preserve real GPU/copy/synchronization errors.
+int sd_expert_slots_retain_prepare(void* handle, const uint64_t* ordered_layers, uint64_t count,
+                                   uint64_t capacity, uint64_t margin, int* retained);
+int sd_expert_slots_retain_finish(void* handle, int* retained);
+int sd_expert_slots_retain_oom(void* handle);
+// Cumulative counters: attempts, successes, fallbacks, in-place experts,
+// D2D experts/bytes, new H2D experts/bytes, temporary evictions,
+// temporary H2D experts/bytes, freed bytes, pack launches, chunk allocations,
+// chunk frees, temporary eviction bytes. Exactly 16 uint64_t words.
+int sd_expert_slots_retain_stats(void* handle, uint64_t* out, uint64_t count);
+// Eight words per occupied slot: layer, expert, group, slot, device address,
+// payload bytes, layout bitmask, FNV-1a byte hash. Null out queries row count.
+int sd_expert_slots_residency(void* handle, uint64_t* out, uint64_t rows_capacity, uint64_t* rows);
 int sd_hybrid_attach_cpu(void* handle, void* engine);
 int sd_hybrid_drain(void* handle);
 int sd_hybrid_rebalance(void* handle, uint64_t max_swaps);

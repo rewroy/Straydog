@@ -127,7 +127,7 @@ void* create_hybrid_moe(Device& d, void* const* pointers, const int* kinds, cons
     for (size_t group = 0; group <= experts; ++group)
         groups[group] = {{plan->weights[group * 3], plan->weights[group * 3 + 1], plan->weights[group * 3 + 2]}, 0, 0, 0};
     const size_t bytes = groups.size() * sizeof(MoeGroup);
-    if (bytes > d.budget - d.used) throw std::runtime_error("hybrid MoE metadata exceeds VRAM budget");
+    if (bytes > budget_available(d)) throw std::runtime_error("hybrid MoE metadata exceeds VRAM budget");
     void* table = nullptr; check(hipMalloc(&table, bytes));
     try {
         upload(d, table, groups.data(), bytes);
@@ -144,8 +144,25 @@ bool slot_soa_plan(const ResidentMoe& plan) {
     return gate.kind==up.kind && expert_soa_eligible(gate.kind,gate.rows,gate.cols) &&
            expert_soa_eligible(up.kind,up.rows,up.cols);
 }
+inline uint8_t* expert_slot_pointer(const Device& d, size_t slot) {
+    return d.slots.segmented ? d.slots.pointers.at(slot) : d.slots.base+d.slots.at.at(slot);
+}
+inline uint8_t* expert_stage_pointer(const Device& d) {
+    return d.slots.segmented ? d.slots.base : d.slots.base+d.slots.arena;
+}
+inline uint8_t* expert_scratch_pointer(const Device& d) {
+    return d.slots.segmented ? d.slots.scratch : d.slots.base+d.slots.arena-d.slots.soa_scratch;
+}
 uint32_t slot_soa_layout(const Device& d,const ResidentMoe& plan,const uint8_t* base,size_t role) {
     if (!base || role>=2 || !d.slots.soa_scratch || !slot_soa_plan(plan)) return 0;
+    if (d.slots.segmented) {
+        const uintptr_t address=reinterpret_cast<uintptr_t>(base);
+        for (const auto& chunk : d.slots.chunks) {
+            const uintptr_t begin=reinterpret_cast<uintptr_t>(chunk.base);
+            if (chunk.base && address>=begin && address-begin<chunk.count*chunk.stride && (address-begin)%chunk.stride==0) return 1;
+        }
+        return 0;
+    }
     const uintptr_t address=reinterpret_cast<uintptr_t>(base),begin=reinterpret_cast<uintptr_t>(d.slots.base);
     return address>=begin && address-begin<d.slots.arena-d.slots.soa_scratch ? 1 : 0;
 }
@@ -153,7 +170,14 @@ uint32_t slot_soa_layout(const Device& d,const ResidentMoe& plan,const uint8_t* 
 // The pool in slots of the sizes its layers take. A mixed bundle's layers differ by as much as 1.8 times, and a slot of the largest size for
 // all of them holds a quarter fewer experts. Sizes within a tenth share a group, a group's slots are in proportion to its layers, and an
 // expert only replaces one of its own group, so the scores compare within a group: a layer's routes want about what another's do.
-void expert_slots_carve(Device& d, size_t arena) {
+struct ExpertCacheLayout {
+    size_t arena=0, scratch=0;
+    std::vector<size_t> at, stride, counts;
+    std::vector<uint8_t> group;
+};
+ExpertCacheLayout expert_cache_layout(Device& d, size_t arena, bool assign_groups=true) {
+    ExpertCacheLayout result;
+    result.arena=arena;
     std::vector<std::pair<size_t, ResidentMoe*>> layers;
     for (auto& item : d.resident) if (item.second->hybrid) layers.emplace_back(expert_slot_bytes(*item.second), item.second.get());
     std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first < b.first : a.second < b.second; });
@@ -164,17 +188,18 @@ void expert_slots_carve(Device& d, size_t arena) {
         if (groups.empty() || layer.first > floor_bytes + floor_bytes / 10) { groups.push_back({layer.first, 0}); floor_bytes = layer.first; }
         groups.back().bytes = (layer.first + 255) / 256 * 256;
         ++groups.back().layers;
-        layer.second->slot_group = uint8_t(groups.size() - 1);
+        if (assign_groups) layer.second->slot_group = uint8_t(groups.size() - 1);
     }
     size_t weight = 0;
     for (const Group& group : groups) weight += group.bytes * group.layers;
-    d.slots.at.clear(); d.slots.group.clear();
+    for (const auto& group : groups) { result.stride.push_back(group.bytes); result.counts.push_back(0); }
     size_t at = 0;
     for (size_t g = 0; g < groups.size() && weight; ++g) {
         const size_t count = size_t(double(arena) * double(groups[g].layers) / double(weight));
         for (size_t i = 0; i < count; ++i, at += groups[g].bytes) {
-            d.slots.at.push_back(at);
-            d.slots.group.push_back(uint8_t(g));
+            result.at.push_back(at);
+            result.group.push_back(uint8_t(g));
+            ++result.counts[g];
         }
     }
     size_t scratch=0;
@@ -183,18 +208,176 @@ void expert_slots_carve(Device& d, size_t arena) {
             const Matrix& matrix=layer.second->weights[role];
             scratch=std::max(scratch,(matrix.rows*matrix.row_bytes+255)/256*256);
         }
-    d.slots.soa_scratch=0;
     // Reuse the unused tail first; at most one cache slot gives way to the
     // private conversion buffer. Allocation bytes and the stage boundary stay.
-    if (scratch && !d.slots.at.empty()) {
-        if (arena-at<scratch && d.slots.at.size()>1) {
-            at=d.slots.at.back(); d.slots.at.pop_back(); d.slots.group.pop_back();
+    if (scratch && !result.at.empty()) {
+        if (arena-at<scratch && result.at.size()>1) {
+            at=result.at.back(); --result.counts[result.group.back()]; result.at.pop_back(); result.group.pop_back();
         }
-        if (arena-at>=scratch) d.slots.soa_scratch=scratch;
+        if (arena-at>=scratch) result.scratch=scratch;
     }
+    return result;
+}
+void expert_slots_carve(Device& d, size_t arena) {
+    auto layout=expert_cache_layout(d,arena);
+    d.slots.at=std::move(layout.at); d.slots.group=std::move(layout.group);
+    d.slots.soa_scratch=layout.scratch;
     d.slots.arena = arena;
     d.slots.cache = d.slots.at.size();
     d.slots.owner.assign(d.slots.cache, {nullptr, -1});
+}
+
+struct ExpertCacheOOM : std::runtime_error {
+    ExpertCacheOOM() : std::runtime_error("not enough VRAM for retained expert cache (code 2)") {}
+};
+constexpr size_t expert_cache_chunk_bytes=256*1024*1024;
+size_t expert_cache_chunk_slots(size_t stride) { return std::max<size_t>(1,expert_cache_chunk_bytes/stride); }
+size_t expert_cache_physical(const Device& d) {
+    if (!d.slots.segmented) return d.slots.base ? (d.slots.stage_bytes ? d.slots.stage_bytes : d.slots.arena+d.slots.stage*d.slots.bytes) : 0;
+    size_t bytes=d.slots.stage_bytes+d.slots.scratch_bytes+d.slots.padding_bytes;
+    for (const auto& chunk : d.slots.chunks) bytes+=chunk.bytes;
+    return bytes;
+}
+size_t expert_cache_pool_reserve(const Device& d) {
+    size_t bytes=d.slots.base_reserve+d.slots.scratch_reserve+d.slots.padding_reserve;
+    for (const auto& chunk:d.slots.chunks) bytes+=chunk.reserve;
+    return bytes;
+}
+void expert_cache_account(Device& d) {
+    d.slots.arena=expert_cache_physical(d)-d.slots.stage*d.slots.bytes;
+}
+uint8_t* expert_cache_allocate(Device& d, size_t bytes, size_t& reserve) {
+    const size_t charge=d.slots.retained_requested ? expert_cache_allocation_reserve : 0;
+    const size_t available=budget_available(d);
+    if (!bytes || bytes>available || charge>available-bytes) throw ExpertCacheOOM();
+    uint8_t* pointer=nullptr;
+    const auto status=hipMalloc(reinterpret_cast<void**>(&pointer),bytes);
+    if (status==hipErrorOutOfMemory) { (void)hipGetLastError(); throw ExpertCacheOOM(); }
+    check(status);
+    d.used+=bytes;
+    retained_reserve_add(d,charge); reserve=charge;
+    return pointer;
+}
+void expert_cache_free(Device& d, uint8_t*& pointer, size_t& bytes, size_t& reserve) {
+    if (!pointer) return;
+    if (bytes>d.used || reserve>d.retained_reserve) throw std::runtime_error("invalid expert pool accounting");
+    check(hipFree(pointer)); pointer=nullptr;
+    d.used-=bytes; bytes=0; d.retained_reserve-=reserve; reserve=0;
+}
+// Both construction rollback and full release keep ownership of any failed free.
+void expert_cache_free_segmented(Device& d) {
+    std::string failure;
+    auto release=[&](uint8_t*& pointer,size_t& bytes,size_t& reserve) {
+        try { expert_cache_free(d,pointer,bytes,reserve); }
+        catch (const std::exception& error) { if (failure.empty()) failure=error.what(); }
+    };
+    for (auto& chunk : d.slots.chunks) release(chunk.base,chunk.bytes,chunk.reserve);
+    release(d.slots.padding,d.slots.padding_bytes,d.slots.padding_reserve);
+    release(d.slots.scratch,d.slots.scratch_bytes,d.slots.scratch_reserve);
+    release(d.slots.base,d.slots.stage_bytes,d.slots.base_reserve);
+    if (!failure.empty()) throw std::runtime_error(failure);
+    d.slots.chunks.clear(); d.slots.pointers.clear(); d.slots.segmented=false;
+}
+size_t expert_cache_padding(const ExpertCacheLayout& layout) {
+    size_t consumed=layout.scratch+allocation_tail; // stage guard is charged to the old arena's slack
+    if (layout.scratch) consumed+=allocation_tail;
+    for (size_t g=0;g<layout.counts.size();++g) {
+        const size_t chunk=expert_cache_chunk_slots(layout.stride[g]);
+        consumed+=layout.counts[g]*layout.stride[g]+((layout.counts[g]+chunk-1)/chunk)*allocation_tail;
+    }
+    if (consumed>layout.arena) throw ExpertCacheOOM();
+    return layout.arena-consumed;
+}
+struct ExpertCacheFootprint {
+    size_t cache=0, nominal=0, reserve=0;
+};
+ExpertCacheFootprint expert_cache_footprint(Device& d,size_t cache,size_t stage,size_t slot_bytes) {
+    ExpertCacheFootprint result{cache,checked_product({uint64_t(cache+stage),uint64_t(slot_bytes)}),0};
+    size_t allocations=1;
+    if (cache && d.slots.retained_requested && !d.slots.retained_disabled) {
+        const auto layout=expert_cache_layout(d,checked_product({uint64_t(cache),uint64_t(slot_bytes)}),false);
+        const size_t padding=expert_cache_padding(layout);
+        allocations+=size_t(layout.scratch!=0)+size_t(padding!=0);
+        for (size_t g=0;g<layout.counts.size();++g) {
+            const size_t step=expert_cache_chunk_slots(layout.stride[g]);
+            allocations+=(layout.counts[g]+step-1)/step;
+        }
+    }
+    if (d.slots.retained_requested) result.reserve=checked_product({uint64_t(allocations),uint64_t(expert_cache_allocation_reserve)});
+    return result;
+}
+// Padding can disappear at a group boundary; the cost is not monotone. Search
+// downward from the caller's nominal ceiling, keeping the legacy group quotas.
+ExpertCacheFootprint expert_cache_fit(Device& d,size_t cap,size_t stage,size_t slot_bytes,size_t available) {
+    if (!slot_bytes || slot_bytes%256 || stage<2 || stage>65536 || cap>65536-stage)
+        throw std::runtime_error("invalid expert slot capacity plan");
+    cap=std::min(cap,available/slot_bytes>stage ? available/slot_bytes-stage : 0);
+    for (;;) {
+        try {
+            auto result=expert_cache_footprint(d,cap,stage,slot_bytes);
+            if (result.nominal<=available && result.reserve<=available-result.nominal) return result;
+        } catch (const ExpertCacheOOM&) {}
+        if (!cap) throw ExpertCacheOOM();
+        --cap;
+    }
+}
+ExpertCacheFootprint expert_cache_plan(Device& d,size_t cap,size_t stage,size_t slot_bytes,size_t margin,size_t extra) {
+    if (d.slots.restore_cap_live) cap=std::min(cap,d.slots.restore_cap);
+    const size_t pool=expert_cache_physical(d),pool_reserve=expert_cache_pool_reserve(d);
+    if (pool>d.used || pool_reserve>d.retained_reserve) throw std::runtime_error("invalid expert pool accounting");
+    const size_t partial=d.cpu_partial ? 0 : (hybrid_partial_floats+hybrid_check_scratch_floats())*4;
+    // Keep the legacy logical margin/allowance and independently cover the
+    // actual missing workspace. The existing partial buffer is already fixed.
+    const size_t allowance=std::max(checked_sum({uint64_t(margin),32768}),partial);
+    size_t fixed=checked_sum({uint64_t(d.used-pool),uint64_t(d.retained_reserve-pool_reserve),uint64_t(allowance),uint64_t(extra)});
+    if (extra && d.slots.retained_requested) fixed=checked_sum({uint64_t(fixed),uint64_t(expert_cache_allocation_reserve)});
+    if (!d.cpu_partial) {
+        fixed=checked_sum({uint64_t(fixed),uint64_t(d.slots.retained_requested ? expert_cache_allocation_reserve : 0)});
+    }
+    return expert_cache_fit(d,cap,stage,slot_bytes,fixed<d.budget ? d.budget-fixed : 0);
+}
+void expert_cache_make_segmented(Device& d, size_t arena, size_t extra) {
+    auto layout=expert_cache_layout(d,arena);
+    const size_t padding=expert_cache_padding(layout),stage=d.slots.stage*d.slots.bytes;
+    const auto footprint=expert_cache_footprint(d,arena/d.slots.bytes,d.slots.stage,d.slots.bytes);
+    const size_t wanted=checked_sum({uint64_t(footprint.nominal),uint64_t(footprint.reserve),uint64_t(extra),
+                                    uint64_t(extra && d.slots.retained_requested ? expert_cache_allocation_reserve : 0)});
+    if (wanted>budget_available(d)) throw ExpertCacheOOM();
+    size_t chunks=0;
+    for (size_t g=0;g<layout.counts.size();++g) {
+        const size_t n=expert_cache_chunk_slots(layout.stride[g]); chunks+=(layout.counts[g]+n-1)/n;
+    }
+    d.slots.chunks.reserve(chunks); d.slots.pointers.reserve(layout.at.size());
+    d.slots.owner.assign(layout.at.size(),{nullptr,-1});
+    d.slots.segmented=true;
+    try {
+        d.slots.base=expert_cache_allocate(d,stage+allocation_tail,d.slots.base_reserve); d.slots.stage_bytes=stage+allocation_tail;
+        check(hipMemsetAsync(d.slots.base+stage,0,allocation_tail,d.stream));
+        if (layout.scratch) {
+            d.slots.scratch=expert_cache_allocate(d,layout.scratch+allocation_tail,d.slots.scratch_reserve); d.slots.scratch_bytes=layout.scratch+allocation_tail;
+            check(hipMemsetAsync(d.slots.scratch+layout.scratch,0,allocation_tail,d.stream));
+        }
+        if (padding) { d.slots.padding=expert_cache_allocate(d,padding,d.slots.padding_reserve); d.slots.padding_bytes=padding; }
+        for (size_t g=0;g<layout.counts.size();++g) {
+            const size_t step=expert_cache_chunk_slots(layout.stride[g]);
+            for (size_t first=0;first<layout.counts[g];first+=step) {
+                const size_t count=std::min(step,layout.counts[g]-first),bytes=count*layout.stride[g]+allocation_tail;
+                size_t reserve=0;
+                uint8_t* pointer=expert_cache_allocate(d,bytes,reserve);
+                d.slots.chunks.push_back({pointer,bytes,layout.stride[g],count,uint8_t(g),reserve});
+                ++d.slots.retained_stats[13];
+                check(hipMemsetAsync(pointer+bytes-allocation_tail,0,allocation_tail,d.stream));
+                for (size_t i=0;i<count;++i) d.slots.pointers.push_back(pointer+i*layout.stride[g]);
+            }
+        }
+        check(hipStreamSynchronize(d.stream));
+    } catch (...) {
+        auto original=std::current_exception();
+        expert_cache_free_segmented(d);
+        std::rethrow_exception(original);
+    }
+    d.slots.at=std::move(layout.at); d.slots.group=std::move(layout.group);
+    d.slots.cache=d.slots.at.size(); d.slots.soa_scratch=layout.scratch; d.slots.arena=arena;
 }
 // A failed attempt leaves the pool as it was: empty. The caller retries a smaller one. This does not shrink the cache itself.
 void rollback_expert_slots(Device& d, size_t added) {
@@ -207,9 +390,34 @@ void rollback_expert_slots(Device& d, size_t added) {
     if (d.exchange) { cleanup(hipHostFree(d.exchange)); d.exchange = nullptr; }
     d.exchange_device = nullptr;
     if (d.slots.host) { cleanup(hipHostFree(d.slots.host)); d.slots.host = nullptr; }
-    if (d.cpu_partial) { cleanup(hipFree(d.cpu_partial)); d.cpu_partial = nullptr; }
-    if (d.slots.base) { cleanup(hipFree(d.slots.base)); d.slots.base = nullptr; }
-    d.used -= added;
+    if (d.slots.retained_requested) {
+        std::string failure;
+        if (d.cpu_partial) {
+            size_t bytes=(hybrid_partial_floats+hybrid_check_scratch_floats())*4;
+            uint8_t* pointer=reinterpret_cast<uint8_t*>(d.cpu_partial);
+            try { expert_cache_free(d,pointer,bytes,d.cpu_partial_reserve); d.cpu_partial=nullptr; }
+            catch (const std::exception& error) { failure=error.what(); }
+        }
+        try {
+            if (d.slots.segmented) expert_cache_free_segmented(d);
+            else expert_cache_free(d,d.slots.base,d.slots.stage_bytes,d.slots.base_reserve);
+        } catch (const std::exception& error) { if (failure.empty()) failure=error.what(); }
+        if (!failure.empty()) throw std::runtime_error(failure);
+    } else if (d.slots.segmented) {
+        std::string failure;
+        if (d.cpu_partial) {
+            const auto status=hipFree(d.cpu_partial);
+            if (status==hipSuccess) { d.cpu_partial=nullptr; d.used-=added; added=0; }
+            else failure=hipGetErrorString(status);
+        }
+        try { expert_cache_free_segmented(d); }
+        catch (const std::exception& error) { if (failure.empty()) failure=error.what(); }
+        if (!failure.empty()) throw std::runtime_error(failure);
+    } else {
+        if (d.cpu_partial) { cleanup(hipFree(d.cpu_partial)); d.cpu_partial = nullptr; }
+        if (d.slots.base) { cleanup(hipFree(d.slots.base)); d.slots.base = nullptr; }
+        d.used -= added;
+    }
     d.slots.stage = 0; d.slots.chunk = 0; d.slots.bytes = 0; d.slots.cache = 0; d.slots.arena = 0; d.slots.soa_scratch=0;
     d.slots.at.clear(); d.slots.group.clear(); d.slots.owner.clear(); d.slots.pending.clear();
     d.hybrid_sequence = 0;
@@ -220,27 +428,36 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
     for (const auto& entry : d.resident)
         if (entry.second->hybrid && expert_slot_bytes(*entry.second) > slot_bytes)
             throw std::runtime_error("an expert does not fit the Straydog expert slot size");
+    if (d.slots.retained_requested) cache=expert_cache_plan(d,cache,stage,slot_bytes,0,0).cache;
     const size_t bytes = (cache + stage) * slot_bytes;   // (`cache` slots of the largest size: expert_slots_carve makes more of it)
     const size_t extra = (hybrid_partial_floats + hybrid_check_scratch_floats()) * 4;
-    if (bytes > d.budget - d.used || extra > d.budget - d.used - bytes)
+    const size_t available=budget_available(d);
+    if (bytes > available || extra > available - bytes)
         throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
     size_t added = 0;
     try {
-        check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes));
-        d.used += bytes;
-        added += bytes;
         d.slots.stage = stage; d.slots.bytes = slot_bytes;
+        if (cache != 0 && d.slots.retained_requested && !d.slots.retained_disabled) {
+            try { expert_cache_make_segmented(d,cache*slot_bytes,extra); }
+            catch (const ExpertCacheOOM&) { d.slots.retained_disabled=true; }
+        }
+        if (!d.slots.segmented) {
+            if (d.slots.retained_requested) d.slots.base=expert_cache_allocate(d,bytes,d.slots.base_reserve);
+            else { check(hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes)); d.used+=bytes; added+=bytes; }
+            d.slots.stage_bytes=bytes;
+            expert_slots_carve(d, cache * slot_bytes);
+        }
         // (the first 32 staging slots are the chunks' two buffers; those past them, where there are any, hold prestaged experts)
         d.slots.chunk = std::min<size_t>(stage, 32);
-        expert_slots_carve(d, cache * slot_bytes);
-        check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra));
+        if (d.slots.retained_requested)
+            d.cpu_partial=reinterpret_cast<float*>(expert_cache_allocate(d,extra,d.cpu_partial_reserve));
+        else { check(hipMalloc(reinterpret_cast<void**>(&d.cpu_partial), extra)); if (d.slots.segmented) { d.used+=extra; added+=extra; } }
 #if !defined(__HIPCC__)
         check(hipMemset(d.cpu_partial, 0, extra));   // (the counts of a layer's missed experts live here and are added to on every pass: they start at 0)
 #else
         { const char* profile = std::getenv("DS41_PROFILE"); if (profile && std::strstr(profile, "hc")) check(hipMemset(d.cpu_partial, 0, extra)); }   // (the check's counters start at 0)
 #endif
-        d.used += extra;
-        added += extra;
+        if (!d.slots.retained_requested && !d.slots.segmented) { d.used+=extra; added+=extra; }
         // Host (not VRAM) memory: the staging slots' page-locked mirror for gathered prefill copies.
         // A refusal here is named, so the caller can start without the mirror instead of shrinking the cache.
         if (mirror) {
@@ -308,7 +525,7 @@ void copy_expert(Device& d, const ResidentMoe& plan, size_t expert, uint8_t* bas
     for (size_t role = 0; role < 3; ++role) {
         const uint8_t* source=plan.host[role]+expert*plan.host_bytes[role];
         if (slot_soa_layout(d,plan,base,role)) {
-            uint8_t* scratch=d.slots.base+d.slots.arena-d.slots.soa_scratch;
+            uint8_t* scratch=expert_scratch_pointer(d);
             check(hipMemcpyAsync(scratch,source,plan.host_bytes[role],hipMemcpyHostToDevice,stream));
             const Matrix& matrix=plan.weights[role];
             expert_soa_pack_launch(scratch,base+offset,matrix.kind,matrix.rows,matrix.cols,stream);
@@ -406,7 +623,7 @@ __global__ void hybrid_point_each(MoeGroup* groups, EachPointers list) {
 }
 inline size_t prestage_capacity(const Device& d) { return d.slots.stage > d.slots.chunk ? d.slots.stage - d.slots.chunk : 0; }
 inline void prestage_regions(const Device& d, const ResidentMoe& plan, uint8_t* (&regions)[3]) {
-    uint8_t* base = d.slots.base + d.slots.arena + d.slots.chunk * d.slots.bytes;
+    uint8_t* base = expert_stage_pointer(d) + d.slots.chunk * d.slots.bytes;
     const size_t capacity = prestage_capacity(d);
     regions[0] = base;
     regions[1] = regions[0] + capacity * plan.host_bytes[0];
@@ -568,7 +785,7 @@ bool hybrid_settle(Device& d, bool wait) {
     for (const size_t slot : d.slots.pending) {
         ResidentMoe* plan = d.slots.owner[slot].first;
         const size_t expert = size_t(d.slots.owner[slot].second);
-        uint8_t* base = d.slots.base + d.slots.at[slot];
+        uint8_t* base = expert_slot_pointer(d,slot);
         loaded[plan].emplace_back(expert, base);
         plan->slot_of[expert] = int32_t(slot);
         plan->weights[expert * 3].data = base;
@@ -581,21 +798,32 @@ bool hybrid_settle(Device& d, bool wait) {
 // Every expert leaves the slots and their VRAM goes; the table says so before the next kernel. Keeps the stage's size and
 // its host mirror; restore_expert_slots gives the pool its VRAM back at the size that then fits.
 void release_expert_slots(Device& d) {
-    if (!d.slots.base) return;
+    d.slots.growth.reset();
+    expert_cache_free(d,d.slots.untracked_kv,d.slots.untracked_kv_bytes,d.slots.untracked_kv_reserve);
+    if (!d.slots.base && !d.slots.segmented) return;
+    if (d.slots.segmented) { expert_cache_quiesce(d); kv_clear_graphs(d); }
     hybrid_settle(d, true);
     for (auto& item : d.resident) {
         if (!item.second->hybrid) continue;
         ResidentMoe& plan = *item.second;
         std::vector<std::pair<size_t, const uint8_t*>> absent;
         for (size_t expert = 0; expert < plan.experts; ++expert)
-            if (plan.slot_of[expert] >= 0) { absent.emplace_back(expert, nullptr); plan.slot_of[expert] = -1; }
+            if (plan.slot_of[expert] >= 0) {
+                absent.emplace_back(expert, nullptr); plan.slot_of[expert] = -1;
+                if (d.slots.segmented) for (size_t role=0;role<3;++role) {
+                    plan.weights[expert*3+role].data=nullptr; plan.weights[expert*3+role].layout=0;
+                }
+            }
         hybrid_point_list(d, plan, absent);
     }
     check(hipStreamSynchronize(d.stream));
     if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
-    check(hipFree(d.slots.base));
+    if (d.slots.segmented) expert_cache_free_segmented(d);
+    else {
+        if (d.slots.retained_requested) expert_cache_free(d,d.slots.base,d.slots.stage_bytes,d.slots.base_reserve);
+        else { check(hipFree(d.slots.base)); d.used-=d.slots.arena+d.slots.stage*d.slots.bytes; d.slots.stage_bytes=0; }
+    }
     d.prestage.plan = nullptr; d.prestage.experts.clear();   // (the region went with the pool)
-    d.used -= d.slots.arena + d.slots.stage * d.slots.bytes;
     d.slots.base = nullptr;
     d.slots.cache = 0;
     d.slots.arena = 0;
@@ -609,12 +837,26 @@ constexpr const char* kv_no_memory = "not enough host memory for the K/V of this
 constexpr const char* kv_no_vram = "not enough VRAM for the K/V of this sequence";
 void restore_expert_slots(Device& d, size_t cache) {
     if (d.slots.base || !d.slots.bytes) throw std::runtime_error("invalid Straydog expert slot pool");
+    if (!cache) d.slots.restore_cap_live=false;
+    if (d.slots.retained_requested) cache=expert_cache_plan(d,cache,d.slots.stage,d.slots.bytes,0,0).cache;
     size_t bytes = (cache + d.slots.stage) * d.slots.bytes;
-    if (bytes > d.budget - d.used) throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
+    if (bytes > budget_available(d)) throw std::runtime_error("expert slot pool exceeds the Straydog VRAM budget");
+    if (cache != 0 && d.slots.retained_requested && !d.slots.retained_disabled) {
+        try {
+            expert_cache_make_segmented(d,cache*d.slots.bytes,0);
+            kv_clear_graphs(d);
+            d.slots.restore_cap_live=false;
+            return;
+        } catch (const ExpertCacheOOM&) { d.slots.retained_disabled=true; }
+    }
     // The budget was measured at the start: other programs may hold what it counted by now, and a sequence must not die of that
     // when the experts that find no slot can run on the CPU. A smaller pool, then, down to the stage alone.
     while (true) {
-        const hipError_t error = hipMalloc(reinterpret_cast<void**>(&d.slots.base), bytes);
+        hipError_t error=hipSuccess;
+        if (d.slots.retained_requested) {
+            try { d.slots.base=expert_cache_allocate(d,bytes,d.slots.base_reserve); }
+            catch (const ExpertCacheOOM&) { error=hipErrorOutOfMemory; }
+        } else error=hipMalloc(reinterpret_cast<void**>(&d.slots.base),bytes);
         if (error == hipSuccess) break;
         if (error != hipErrorOutOfMemory) check(error);
         (void)hipGetLastError();
@@ -625,12 +867,14 @@ void restore_expert_slots(Device& d, size_t cache) {
         cache = cache < 16 ? 0 : cache / 8 * 7;
         bytes = (cache + d.slots.stage) * d.slots.bytes;
     }
-    d.used += bytes;
+    if (!d.slots.retained_requested) d.used += bytes;
+    d.slots.stage_bytes=bytes;
     expert_slots_carve(d, cache * d.slots.bytes);
     // The pool is at another address now, and its arena another size: the staging slots (base + arena, CUDA's assist) that the hybrid
     // layers' captured graphs hold by value are gone, and a replay would read and write freed memory. A K/V growth has dropped them
     // already (sd_kv_grow); a raised budget and a long prompt's end have not. Restores are rare: capturing again costs little.
     kv_clear_graphs(d);
+    d.slots.restore_cap_live=false;
 }
 
 // Bounded swaps (max_swaps > 0) never block the compute stream: victims are
@@ -717,7 +961,7 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     struct Copy { ResidentMoe* plan; size_t expert; uint8_t* base; };
     std::vector<Copy> copies;
     for (const size_t slot : d.slots.pending)
-        copies.push_back({d.slots.owner[slot].first, size_t(d.slots.owner[slot].second), d.slots.base + d.slots.at[slot]});
+        copies.push_back({d.slots.owner[slot].first, size_t(d.slots.owner[slot].second), expert_slot_pointer(d,slot)});
     auto issue = [&d, copies]() {
         for (const Copy& copy : copies) prefetch_experts(d, *copy.plan, &copy.expert, 1);
         for (const Copy& copy : copies) copy_expert(d, *copy.plan, copy.expert, copy.base, d.copy_stream);
@@ -727,6 +971,296 @@ void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
     else d.copier->run(std::move(issue));
     d.swapped_experts += d.slots.pending.size();
     if (wait) { hybrid_settle(d, true); check(hipStreamSynchronize(d.stream)); }
+}
+
+// The current chunk ownership is authoritative even when a growth is refused
+// halfway through changing groups. Rebuild dense slot ids only while quiescent.
+void expert_cache_reindex(Device& d) {
+    std::stable_sort(d.slots.chunks.begin(),d.slots.chunks.end(),[](const auto& a,const auto& b) { return a.group<b.group; });
+    std::vector<uint8_t*> pointers;
+    std::vector<size_t> offsets;
+    std::vector<uint8_t> groups;
+    size_t total=0;
+    for (const auto& chunk : d.slots.chunks) total+=chunk.count;
+    pointers.reserve(total); offsets.reserve(total); groups.reserve(total);
+    std::map<const uint8_t*,size_t> index;
+    size_t offset=0;
+    for (const auto& chunk : d.slots.chunks) {
+        if (!chunk.base) throw std::runtime_error("unowned expert cache chunk");
+        for (size_t i=0;i<chunk.count;++i) {
+            uint8_t* pointer=chunk.base+i*chunk.stride;
+            index.emplace(pointer,pointers.size()); pointers.push_back(pointer);
+            offsets.push_back(offset); groups.push_back(chunk.group); offset+=chunk.stride;
+        }
+    }
+    std::vector<std::pair<ResidentMoe*,int32_t>> owners(total,{nullptr,-1});
+    for (auto& item : d.resident) if (item.second->hybrid) {
+        auto& plan=*item.second;
+        for (size_t expert=0;expert<plan.experts;++expert) if (plan.slot_of[expert]>=0) {
+            auto found=index.find(plan.weights[expert*3].data);
+            if (found==index.end() || owners[found->second].first || groups[found->second]!=plan.slot_group)
+                throw std::runtime_error("inconsistent retained expert ownership");
+            owners[found->second]={&plan,int32_t(expert)};
+        }
+    }
+    for (size_t slot=0;slot<owners.size();++slot) if (owners[slot].first)
+        owners[slot].first->slot_of[size_t(owners[slot].second)]=int32_t(slot);
+    d.slots.pointers=std::move(pointers); d.slots.at=std::move(offsets); d.slots.group=std::move(groups);
+    d.slots.owner=std::move(owners); d.slots.cache=total;
+    expert_cache_account(d);
+}
+
+size_t expert_cache_counts_bytes(const std::vector<size_t>& stride,const std::vector<size_t>& counts) {
+    size_t bytes=0;
+    for (size_t g=0;g<counts.size();++g) {
+        const size_t step=expert_cache_chunk_slots(stride[g]);
+        bytes=checked_sum({uint64_t(bytes),uint64_t(checked_product({uint64_t(counts[g]),uint64_t(stride[g])})),
+                          uint64_t(checked_product({uint64_t((counts[g]+step-1)/step),uint64_t(allocation_tail)}))});
+    }
+    return bytes;
+}
+size_t expert_cache_counts_cost(const std::vector<size_t>& stride,const std::vector<size_t>& counts) {
+    size_t cost=expert_cache_counts_bytes(stride,counts);
+    for (size_t g=0;g<counts.size();++g) {
+        const size_t step=expert_cache_chunk_slots(stride[g]);
+        cost=checked_sum({uint64_t(cost),uint64_t(checked_product({uint64_t((counts[g]+step-1)/step),uint64_t(expert_cache_allocation_reserve)}))});
+    }
+    return cost;
+}
+
+// A host-only replay of resize's ownership and allocation order. Occupancy is
+// enough: moving old residents fills the same first vacant destinations no
+// matter which resident is visited first. No device pointer or owner is changed.
+struct ExpertCacheReplay {
+    struct Chunk {
+        size_t bytes=0, reserve=0, stride=0;
+        std::vector<uint8_t> occupied;
+    };
+    size_t used=0, reserve=0, budget=0;
+    std::vector<std::vector<Chunk>> groups;
+
+    ExpertCacheReplay(const Device& d,const ExpertCacheGrowth& growth,const std::vector<size_t>& during)
+        : used(d.used),reserve(d.retained_reserve),budget(d.budget),groups(during.size()) {
+        if (during.size()!=growth.stride.size() || during.size()!=growth.counts.size())
+            throw std::runtime_error("invalid retained resize replay groups");
+        for (size_t g=0;g<during.size();++g) if (!growth.stride[g] || during[g]>growth.counts[g])
+            throw std::runtime_error("invalid retained resize replay quota");
+        std::map<const uint8_t*,std::pair<size_t,std::pair<size_t,size_t>>> slots;
+        for (const auto& c:d.slots.chunks) {
+            if (!c.base || !c.count || c.group>=groups.size() || c.stride!=growth.stride[c.group])
+                throw std::runtime_error("invalid retained resize replay chunk");
+            const size_t payload=checked_product({uint64_t(c.count),uint64_t(c.stride)});
+            if (c.bytes!=checked_sum({uint64_t(payload),allocation_tail}))
+                throw std::runtime_error("invalid retained resize replay bytes");
+            auto& group=groups[c.group];
+            const size_t at=group.size();
+            group.push_back({c.bytes,c.reserve,c.stride,std::vector<uint8_t>(c.count,0)});
+            for (size_t i=0;i<c.count;++i)
+                if (!slots.emplace(c.base+i*c.stride,std::make_pair(size_t(c.group),std::make_pair(at,i))).second)
+                    throw std::runtime_error("duplicate retained resize replay slot");
+        }
+        std::vector<size_t> kept(groups.size(),0);
+        for (const auto& entry:growth.target) if (entry.original) {
+            const size_t g=entry.plan->slot_group;
+            if (g>=groups.size() || during[g]>growth.counts[g])
+                throw std::runtime_error("invalid retained resize replay quota");
+            if (kept[g]>=during[g]) continue;
+            ++kept[g];
+            auto found=slots.find(entry.original);
+            if (found==slots.end() || found->second.first!=g)
+                throw std::runtime_error("missing retained resize replay source");
+            auto& occupied=groups[g][found->second.second.first].occupied[found->second.second.second];
+            if (occupied) throw std::runtime_error("duplicate retained resize replay source");
+            occupied=1;
+        }
+        // prepare frees padding after dropping non-kept owners and before resize.
+        release(d.slots.padding_bytes,d.slots.padding_reserve);
+    }
+    void release(size_t bytes,size_t charge) {
+        if (bytes>used || charge>reserve) throw std::runtime_error("invalid retained resize replay accounting");
+        used-=bytes; reserve-=charge;
+    }
+    bool allocate(size_t bytes) {
+        const size_t charge=expert_cache_allocation_reserve;
+        if (!bytes || used>budget || reserve>budget-used || bytes>budget-used-reserve || charge>budget-used-reserve-bytes)
+            return false;
+        used+=bytes; reserve+=charge;
+        return true;
+    }
+    bool resize(const std::vector<size_t>& stride,const std::vector<size_t>& counts,size_t& rejected) {
+        for (size_t g=0;g<groups.size();++g) {
+            const size_t step=expert_cache_chunk_slots(stride[g]);
+            auto old=groups[g];
+            std::vector<bool> reusable(old.size(),false),freed(old.size(),false);
+            // Keep old[c] in its original position even after a pre-free. The
+            // real resize also keeps this snapshot while reindexing live owners.
+            for (size_t c=0;c<old.size();++c) {
+                const size_t first=checked_product({uint64_t(c),uint64_t(step)});
+                reusable[c]=first<counts[g] && old[c].occupied.size()==std::min(step,counts[g]-first) && old[c].stride==stride[g];
+                if (!reusable[c] && std::none_of(old[c].occupied.begin(),old[c].occupied.end(),[](uint8_t v) { return v!=0; })) {
+                    release(old[c].bytes,old[c].reserve); freed[c]=true;
+                }
+            }
+            std::vector<Chunk> desired;
+            for (size_t c=0,first=0;first<counts[g];++c,first+=step) {
+                const size_t count=std::min(step,counts[g]-first);
+                if (c<old.size() && reusable[c]) desired.push_back(old[c]);
+                else {
+                    const size_t bytes=checked_sum({uint64_t(checked_product({uint64_t(count),uint64_t(stride[g])})),allocation_tail});
+                    if (!allocate(bytes)) { rejected=g; return false; }
+                    desired.push_back({bytes,expert_cache_allocation_reserve,stride[g],std::vector<uint8_t>(count,0)});
+                }
+            }
+            size_t moved=0;
+            for (size_t c=0;c<old.size();++c) if (!reusable[c])
+                moved+=size_t(std::count(old[c].occupied.begin(),old[c].occupied.end(),uint8_t(1)));
+            for (auto& chunk:desired) for (auto& occupied:chunk.occupied) if (!occupied && moved) { occupied=1; --moved; }
+            if (moved) throw std::runtime_error("retained resize replay exceeds its slots");
+            // The copies and table publication must finish before these frees.
+            for (size_t c=0;c<old.size();++c) if (!reusable[c] && !freed[c]) release(old[c].bytes,old[c].reserve);
+            groups[g]=std::move(desired);
+        }
+        return true;
+    }
+};
+
+bool expert_cache_during_fits(const Device& d,const ExpertCacheGrowth& growth,const std::vector<size_t>& during,
+                              size_t fixed_peak,size_t& rejected) {
+    rejected=SIZE_MAX;
+    ExpertCacheReplay replay(d,growth,during);
+    // In a canonical group all reused chunks are a prefix; newly allocated
+    // chunks are appended after them by the real resize. Decline an unfamiliar
+    // shape rather than predicting a different next-resize order.
+    std::vector<bool> tail(during.size(),false);
+    for (const auto& chunk:d.slots.chunks) {
+        const size_t step=expert_cache_chunk_slots(growth.stride[chunk.group]);
+        if (tail[chunk.group] || chunk.count>step) return false;
+        tail[chunk.group]=chunk.count<step;
+    }
+    if (!replay.resize(growth.stride,during,rejected)) return false;
+    const size_t fixed=d.used-expert_cache_physical(d),fixed_reserve=d.retained_reserve-expert_cache_pool_reserve(d);
+    if (replay.used<fixed || replay.reserve<fixed_reserve) throw std::runtime_error("invalid retained resize replay fixed accounting");
+    const size_t pool=replay.used-fixed,pool_reserve=replay.reserve-fixed_reserve;
+    if (checked_sum({uint64_t(fixed_peak),uint64_t(pool),uint64_t(pool_reserve)})>d.budget) return false;
+    replay.used=checked_sum({uint64_t(growth.expected_fixed),uint64_t(pool)});
+    replay.reserve=checked_sum({uint64_t(growth.expected_reserve),uint64_t(pool_reserve)});
+    if (!replay.resize(growth.stride,growth.counts,rejected)) return false;
+    const size_t wanted=checked_sum({uint64_t(growth.arena),uint64_t(checked_product({uint64_t(d.slots.stage),uint64_t(d.slots.bytes)}))});
+    const size_t physical=replay.used-growth.expected_fixed;
+    if (physical>wanted) throw std::runtime_error("retained resize replay exceeds legacy arena");
+    return physical==wanted || replay.allocate(wanted-physical);
+}
+
+// Preserve the final target and its order. Only a group whose real allocation
+// order would exceed the budget gives up temporary residents, at a boundary
+// already backed by full chunks. Recheck both resizes and the K/V peak each time.
+bool expert_cache_trim_during(const Device& d,const ExpertCacheGrowth& growth,size_t fixed_peak,std::vector<size_t>& during) {
+    for (;;) {
+        size_t rejected=SIZE_MAX;
+        if (expert_cache_during_fits(d,growth,during,fixed_peak,rejected)) return true;
+        if (rejected==SIZE_MAX || rejected>=during.size() || !during[rejected]) return false;
+        const size_t step=expert_cache_chunk_slots(growth.stride[rejected]);
+        size_t full=0;
+        for (const auto& chunk:d.slots.chunks) if (chunk.group==rejected) {
+            if (chunk.stride!=growth.stride[rejected] || chunk.count!=step) break;
+            ++full;
+        }
+        during[rejected]=std::min((during[rejected]-1)/step,full)*step;
+    }
+}
+
+// All current resident identities must belong to keep. New tails are allocated
+// before their old sources go; data in retained full chunks stays in place.
+void expert_cache_resize(Device& d,const std::vector<size_t>& stride,const std::vector<size_t>& counts) {
+    if (!d.slots.segmented || !d.slots.pending.empty()) throw std::runtime_error("expert cache is not quiescent");
+    for (size_t g=0;g<counts.size();++g) {
+        const size_t step=expert_cache_chunk_slots(stride[g]);
+        std::vector<ExpertCacheChunk> old;
+        for (const auto& chunk : d.slots.chunks) if (chunk.group==g) old.push_back(chunk);
+        std::vector<ExpertCacheChunk> desired;
+        const size_t wanted=(counts[g]+step-1)/step;
+        desired.reserve(wanted);
+        d.slots.chunks.reserve(d.slots.chunks.size()+wanted);
+        // Obsolete chunks with no surviving owner need no relocation. Reclaim
+        // them before allocating a replacement tail, not after an avoidable OOM.
+        for (size_t c=0;c<old.size();++c) {
+            const size_t first=c*step;
+            const bool reusable=first<counts[g] && old[c].count==std::min(step,counts[g]-first) && old[c].stride==stride[g];
+            if (reusable) continue;
+            const uintptr_t begin=reinterpret_cast<uintptr_t>(old[c].base),end=begin+old[c].count*old[c].stride;
+            bool occupied=false;
+            for (const auto& item : d.resident) if (item.second->hybrid && item.second->slot_group==g) {
+                const auto& plan=*item.second;
+                for (size_t expert=0;expert<plan.experts;++expert) if (plan.slot_of[expert]>=0) {
+                    const uintptr_t pointer=reinterpret_cast<uintptr_t>(plan.weights[expert*3].data);
+                    if (pointer>=begin && pointer<end) { occupied=true; break; }
+                }
+                if (occupied) break;
+            }
+            if (occupied) continue;
+            auto actual=std::find_if(d.slots.chunks.begin(),d.slots.chunks.end(),[&](const auto& item) { return item.base==old[c].base; });
+            const size_t bytes=actual->bytes;
+            expert_cache_free(d,actual->base,actual->bytes,actual->reserve);
+            d.slots.retained_stats[11]+=bytes; ++d.slots.retained_stats[14];
+        }
+        d.slots.chunks.erase(std::remove_if(d.slots.chunks.begin(),d.slots.chunks.end(),[](const auto& c) { return !c.base; }),d.slots.chunks.end());
+        expert_cache_reindex(d);
+        try {
+            for (size_t c=0,first=0;first<counts[g];++c,first+=step) {
+                const size_t count=std::min(step,counts[g]-first);
+                if (c<old.size() && old[c].count==count && old[c].stride==stride[g]) desired.push_back(old[c]);
+                else {
+                    const size_t bytes=checked_sum({uint64_t(checked_product({uint64_t(count),uint64_t(stride[g])})),allocation_tail});
+                    size_t reserve=0;
+                    uint8_t* pointer=expert_cache_allocate(d,bytes,reserve);
+                    ExpertCacheChunk chunk{pointer,bytes,stride[g],count,uint8_t(g),reserve};
+                    d.slots.chunks.push_back(chunk); desired.push_back(chunk); ++d.slots.retained_stats[13];
+                    check(hipMemsetAsync(pointer+bytes-allocation_tail,0,allocation_tail,d.copy_stream));
+                }
+            }
+        } catch (const ExpertCacheOOM&) { expert_cache_reindex(d); throw; }
+        std::vector<uint8_t*> destinations;
+        for (const auto& chunk : desired) for (size_t i=0;i<chunk.count;++i) destinations.push_back(chunk.base+i*chunk.stride);
+        std::map<const uint8_t*,size_t> index;
+        for (size_t i=0;i<destinations.size();++i) index.emplace(destinations[i],i);
+        std::vector<bool> occupied(destinations.size(),false);
+        struct Move { ResidentMoe* plan; size_t expert; const uint8_t* from; uint8_t* to; };
+        std::vector<Move> moves;
+        for (auto& item : d.resident) if (item.second->hybrid && item.second->slot_group==g) {
+            auto& plan=*item.second;
+            for (size_t expert=0;expert<plan.experts;++expert) if (plan.slot_of[expert]>=0) {
+                const uint8_t* pointer=plan.weights[expert*3].data;
+                auto at=index.find(pointer);
+                if (at!=index.end()) occupied[at->second]=true;
+                else moves.push_back({&plan,expert,pointer,nullptr});
+            }
+        }
+        size_t next=0;
+        for (auto& move : moves) {
+            while (next<occupied.size() && occupied[next]) ++next;
+            if (next==occupied.size()) throw std::runtime_error("retained expert group exceeds its slots");
+            move.to=destinations[next]; occupied[next++]=true;
+            const size_t bytes=expert_slot_bytes(*move.plan);
+            check(hipMemcpyAsync(move.to,move.from,bytes,hipMemcpyDeviceToDevice,d.copy_stream));
+            ++d.slots.retained_stats[4]; d.slots.retained_stats[5]+=bytes;
+            if (d.slots.growth) for (auto& entry : d.slots.growth->target)
+                if (entry.plan==move.plan && entry.expert==move.expert) { entry.moved=true; break; }
+        }
+        check(hipStreamSynchronize(d.copy_stream));
+        for (const auto& move : moves) set_expert(d,*move.plan,move.expert,move.to,d.stream);
+        check(hipStreamSynchronize(d.stream));
+        for (const auto& chunk : old) {
+            const bool kept=std::any_of(desired.begin(),desired.end(),[&](const auto& item) { return item.base==chunk.base; });
+            if (kept) continue;
+            auto actual=std::find_if(d.slots.chunks.begin(),d.slots.chunks.end(),[&](const auto& item) { return item.base==chunk.base; });
+            if (actual==d.slots.chunks.end()) continue; // empty obsolete chunk was reclaimed before allocation
+            const size_t bytes=actual->bytes;
+            expert_cache_free(d,actual->base,actual->bytes,actual->reserve);
+            d.slots.retained_stats[11]+=bytes; ++d.slots.retained_stats[14];
+        }
+        d.slots.chunks.erase(std::remove_if(d.slots.chunks.begin(),d.slots.chunks.end(),[](const auto& c) { return !c.base; }),d.slots.chunks.end());
+        expert_cache_reindex(d);
+    }
 }
 
 // Whether the slots are refreshed at one of the points where decoding looks (every four tokens: hybrid_rebalance, 32 swaps at the most):
@@ -790,7 +1324,7 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     std::vector<uint8_t*> targets;
     for (size_t first = 0, chunk = 0; first < missing.size(); first += half, ++chunk) {
         const size_t count = std::min(half, missing.size() - first), buffer = chunk % 2;
-        uint8_t* base = d.slots.base + d.slots.arena + buffer * half * d.slots.bytes;
+        uint8_t* base = expert_stage_pointer(d) + buffer * half * d.slots.bytes;
         uint8_t* host = gather ? d.slots.host + buffer * half * d.slots.bytes : nullptr;
         if (gather) {
             // The DMA two chunks back read this mirror (its `loaded` event follows it on the copy stream).

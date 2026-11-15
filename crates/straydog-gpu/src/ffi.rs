@@ -64,6 +64,13 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_memory_effective(
+        handle: *mut ::std::os::raw::c_void,
+        used: *mut u64,
+        budget: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_set_budget(handle: *mut ::std::os::raw::c_void, budget: u64)
         -> ::std::os::raw::c_int;
 }
@@ -2402,6 +2409,61 @@ unsafe extern "C" {
     pub fn sd_expert_slots_restore(
         handle: *mut ::std::os::raw::c_void,
         cache: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_plan(
+        handle: *mut ::std::os::raw::c_void,
+        cache_cap: u64,
+        stage: u64,
+        slot_bytes: u64,
+        margin: u64,
+        extra: u64,
+        cache: *mut u64,
+        nominal: *mut u64,
+        reserve: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_accounting(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_prepare(
+        handle: *mut ::std::os::raw::c_void,
+        ordered_layers: *const u64,
+        count: u64,
+        capacity: u64,
+        margin: u64,
+        retained: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_finish(
+        handle: *mut ::std::os::raw::c_void,
+        retained: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_oom(handle: *mut ::std::os::raw::c_void)
+        -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_stats(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_residency(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
+        rows_capacity: u64,
+        rows: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
