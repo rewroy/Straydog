@@ -586,9 +586,11 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
             (false, Some(reason)) => {
                 // (on the host: moving beside the compute, with what the compute still waited for, or why not)
                 let beside = if timings["prefill_rows_overlap"] == true {
+                    // (what page-locking the rows took of the commit, where it is known: whether Windows charges rows charged when they were allocated)
+                    let charged = number("prefill_rows_lock_commit_bytes").map_or_else(String::new, |bytes| format!("; the lock took {:.2} GiB of commit", bytes / (1u64 << 30) as f64));
                     match (number("prefill_rows_overlap_stream_wait_seconds"), number("prefill_rows_overlap_host_wait_seconds")) {
-                        (Some(rows), Some(last)) => format!(", copied beside the compute (it waited {rows:.1} s for rows to come up and {last:.1} s for the last to go down)"),
-                        _ => ", copied beside the compute".to_string(),
+                        (Some(rows), Some(last)) => format!(", copied beside the compute (it waited {rows:.1} s for rows to come up and {last:.1} s for the last to go down{charged})"),
+                        _ => format!(", copied beside the compute{}", if charged.is_empty() { String::new() } else { format!(" ({})", &charged[2..]) }),
                     }
                 } else {
                     timings["prefill_rows_overlap_reason"].as_str().map_or_else(String::new, |why| format!(", not copied beside the compute ({why})"))

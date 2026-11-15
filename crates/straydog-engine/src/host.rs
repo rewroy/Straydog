@@ -472,6 +472,27 @@ fn lockable_of(available: u64, commit: u64, vram_room: u64, memory: u64) -> u64 
     within_free(u64::MAX, 0, available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS + vram_room)), memory)
 }
 
+/// Bytes of rows the process holds already (allocated, so charged to the commit, and written by each pass whether they are locked or not) that may
+/// be page-locked given the `available` physical memory and the `commit` left: what keeps [`COMMIT_AFTER_LOCKS`] of the commit, should the lock
+/// charge them to it once more. Not less what is kept free for the rest of the system ([`left_free`]), as the banks' locks are: the rows take that
+/// memory through the pass in any case. Asked as the banks are, they were asked for it twice: at --vram 5.5 on an RTX 5070 Ti with 62 GiB, a
+/// pass's 0.62 GiB of rows met "0.00 GiB lockable" with 6.4 GiB available, and moved the round trip they could have moved beside the compute.
+#[cfg(any(windows, test))]
+fn rows_lockable_of(available: u64, commit: u64) -> u64 {
+    available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS))
+}
+
+/// Bytes of rows already held that may be page-locked now ([`rows_lockable_of`]; no bound off Windows).
+pub fn rows_lockable() -> u64 {
+    #[cfg(windows)]
+    {
+        let (available, commit) = windows_available();
+        return rows_lockable_of(available, commit);
+    }
+    #[cfg(not(windows))]
+    u64::MAX
+}
+
 /// Bytes of the expert banks that may be page-locked now (no bound off Windows).
 pub fn lockable(memory: u64, vram_room: u64) -> u64 {
     #[cfg(windows)]
@@ -815,6 +836,12 @@ mod tests {
         // Commit bounds the locks where physical memory does not: 34 GiB of commit left, 46 of memory, 4 of VRAM to come.
         assert_eq!(super::lockable_of(46 * GIB, 34 * GIB, 4 * GIB, 62 * GIB), 29 * GIB - 62 * GIB / 8);
         assert_eq!(super::lockable_of(46 * GIB, 3 * GIB, 0, 62 * GIB), 0);
+        // Rows held already are not asked for the memory kept free again: with 6 GiB available and 7 of commit left the banks may lock nothing more,
+        // the rows what keeps a GiB of the commit; and with half a GiB of commit left, nothing.
+        assert_eq!(super::lockable_of(6 * GIB, 7 * GIB, 0, 62 * GIB), 0);
+        assert_eq!(super::rows_lockable_of(6 * GIB, 7 * GIB), 6 * GIB);
+        assert_eq!(super::rows_lockable_of(46 * GIB, GIB / 2), 0);
+        assert_eq!(super::rows_lockable_of(GIB / 2, 30 * GIB), GIB / 2);
     }
 
     /// Decides: the working set's share is what it was while the process's own memory fits it, and is never under the banks locked in place and that
