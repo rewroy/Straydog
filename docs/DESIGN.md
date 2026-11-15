@@ -1843,7 +1843,14 @@ with a model of its own reads no file it was not given.
   - `max_tokens` / `max_completion_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
     `presence_penalty`, `seed`, `stop`;
   - `suppress`: `not_cp932_han` (§6), listed in `/props` and `/v1/models`' `meta`;
-  - `straydog.tool_writing` (boolean; `checkpoint` is the other key of the `straydog` object): on a streamed request with
+  - `straydog.reasoning` (boolean): `false` asks this one reply with no reasoning in a conversation that thinks. The prompt
+    is the thinking one's as it stands, with the reasoning the template opens after `<｜Assistant｜>` closed at once, which is
+    how the template writes back a reply that had none: the request goes on from what the engine holds, and so does the next
+    one, sent with the reply's `reasoning_content` empty or left out. (Asked with another `reasoning_effort` or without
+    thinking, a DeepSeek-V4.1 conversation is read again from its first token: its template says the effort at the head of
+    the prompt.) Only DeepSeek-V4.1 takes it, listed as `reasoning_off: true` in `/props` and `/v1/models`' `meta`; a model
+    listed `false` reasons as the request's effort says, and a request that does not think has nothing to leave out;
+  - `straydog.tool_writing` (boolean; `checkpoint` is the third key of the `straydog` object): on a streamed request with
     tools, the chunks also carry the calls as the model writes them. The server holds a call's markup back and sends the call
     whole at the end, so a client would otherwise see nothing for the minutes a file takes to write. It is listed as
     `tool_writing: true` in `/props` and `/v1/models`' `meta` (a server without it refuses the key with a 400). The final
