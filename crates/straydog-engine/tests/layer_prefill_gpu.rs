@@ -85,6 +85,35 @@ fn layer_order_rows_held_in_vram_match_the_host_round_trip() {
     assert!(compare("rows held in VRAM against the host round trip", &runs[0], &runs[1]));
 }
 
+/// A pass's hidden rows that stay on the host and move to and from a ring of two chunk slots in VRAM beside the compute give the host round
+/// trip's logits, token and state, bit for bit (the same kernels, chunks and order of the device stream's work; only where the rows wait
+/// between layers differs). Where the layer-order batch is narrower than the prompt, the ring is fed from the host slot by slot, layer by layer.
+#[test]
+fn layer_order_rows_moved_beside_the_compute_match_the_host_round_trip() {
+    let (Some(root), Some(drafter)) = (common::model_env("STRAYDOG_LAYER_MODEL", "the Qwen model bundle directory"),
+                                     common::model_env("STRAYDOG_DRAFTER", "the MTP bundle directory")) else { return };
+    let mut runs = Vec::new();
+    for overlapped in [false, true] {
+        let (mut model, text) = open(Path::new(&root), Path::new(&drafter), true);
+        // (on the host either way: the comparison is the two ways of moving them)
+        model.layer_rows_in_vram(false);
+        model.layer_rows_overlapped(overlapped);
+        let line = "A printed source lets readers compare the same words, check the evidence, and correct errors in the next edition. ";
+        let mut plain = text.encode(&line.repeat(140)).unwrap();
+        plain.truncate(1025);
+        runs.push(observed(&mut model, &plain, false));
+        assert_eq!(model.last_metrics["prefill_order"], "layer", "the candidate fell back");
+        assert_eq!(model.last_metrics.get("prefill_rows_overlap").is_some(), overlapped,
+                   "{:?}", model.last_metrics.get("prefill_rows_overlap_reason"));
+        assert!(model.last_metrics.get("prefill_rows_vram").is_none());
+        if overlapped {
+            assert!(model.last_metrics["prefill_rows_up_bytes"].as_f64().unwrap() > 0.0);
+            assert!(model.last_metrics["prefill_rows_down_bytes"].as_f64().unwrap() > 0.0);
+        }
+    }
+    assert!(compare("rows moved beside the compute against the host round trip", &runs[0], &runs[1]));
+}
+
 #[test]
 fn layer_order_preserves_logits_checkpoints_and_cancelled_prefixes() {
     let (Some(root), Some(drafter)) = (common::model_env("STRAYDOG_LAYER_MODEL", "the Qwen model bundle directory"),

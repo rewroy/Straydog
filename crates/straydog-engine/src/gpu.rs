@@ -190,6 +190,21 @@ pub(crate) fn layer_rows_refusal(rows: u64, free: u64, margin: u64) -> Option<St
         .then(|| format!("{:.2} GiB of rows, {:.2} GiB of VRAM free", gib(rows * WIDTH as u64 * 4), gib(free)))
 }
 
+/// The ring that stands for a pass's `rows` hidden rows while they move between the host and VRAM beside the compute (chunks of at most `batch`
+/// rows): the rows of a slot, and the slots (two, so that a chunk's rows come up while the one before is computed and goes down; one where the
+/// pass is a single chunk).
+pub(crate) fn rows_ring_shape(rows: u64, batch: u64) -> (u64, u64) {
+    let slot_rows = batch.min(rows);
+    (slot_rows, if rows > slot_rows { 2 } else { 1 })
+}
+
+/// Why the pass's `bytes` of hidden rows are not page-locked for moving beside the compute when `lockable` bytes may be (see
+/// [`crate::host::lockable`]); None where they may be.
+pub(crate) fn rows_lock_refusal(bytes: u64, lockable: u64) -> Option<String> {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    (bytes > lockable).then(|| format!("{:.2} GiB of rows to page-lock, {:.2} GiB lockable", gib(bytes), gib(lockable)))
+}
+
 /// What `sd_create` counts of a device's budget from 2 GiB up: its input and output (64 MiB each), the expanded GEMMs (128), half input (32),
 /// BLAS (16) and attention scores (48).
 const DEVICE_WORKSPACES: u64 = (64 + 64 + 128 + 32 + 16 << 20) + 256 * 24 * 2052 * 4;
@@ -307,6 +322,39 @@ impl Drop for PageLock {
         // SAFETY: registered in `new`.
         unsafe { ffi::sd_host_unregister(self.0) };
     }
+}
+
+/// A layer-order pass's hidden rows page-locked on the host and moving to and from VRAM beside the compute ([`Backend::overlap_layer_rows`])
+/// while this lives. It ends however the pass does: [`RowsOverlap::finish`] on the way out, else its drop, which waits for the copies in
+/// flight and lets the host rows' pages go. The rows must outlive it.
+pub struct RowsOverlap {
+    handle: *mut c_void,
+    done: bool,
+}
+
+impl RowsOverlap {
+    /// Wait for every copy and unlock the host rows, and say whether that went well.
+    pub fn finish(mut self) -> Result<()> {
+        self.done = true;
+        // SAFETY: the live device this was made for, between its calls; ends what `overlap_layer_rows` began.
+        check(unsafe { ffi::sd_rows_overlap_end(self.handle) }).map(drop)
+    }
+}
+
+impl Drop for RowsOverlap {
+    fn drop(&mut self) {
+        if !self.done {
+            // SAFETY: as `finish`; a failure has nowhere to go from here, and the pass is ending in an error already.
+            unsafe { ffi::sd_rows_overlap_end(self.handle) };
+        }
+    }
+}
+
+/// What [`Backend::overlap_layer_rows`] made of its asking.
+pub enum RowsOverlapBegin {
+    Begun(RowsOverlap),
+    /// Not taken, and why (the pass then moves its rows to and from the host one chunk at a time, waiting for each copy).
+    Refused(String),
 }
 
 /// One thread's copies into one device's allocations (see `sd_fill`).
@@ -549,7 +597,8 @@ pub struct Backend {
     long_prefill: Option<u64>,
     /// Temporary routed-bank allocation for a layer-ordered prompt.
     layer_prefill_pool: Option<(*mut c_void, u64)>,
-    /// A layer-order pass's hidden rows held in VRAM ([`Backend::hold_layer_rows`]), and their count: until finish_layer_prefill.
+    /// A layer-order pass's hidden rows held in VRAM ([`Backend::hold_layer_rows`]), or the ring of chunk slots that stands for them while they move
+    /// between the host and VRAM beside the compute ([`Backend::overlap_layer_rows`]), and their count: until finish_layer_prefill.
     layer_rows: Option<(*mut c_void, u64)>,
     registered: Vec<*mut c_void>,
     pub batch_capacity: usize,
@@ -1527,6 +1576,84 @@ impl Backend {
         check(unsafe { ffi::sd_prefill_span_held(self.handle, layer as u64, layer as u64 + 1, position, steps, storage, first) }).map(drop)
     }
 
+    /// Move a layer-order pass's hidden rows (`host`, whole rows on the host) between the host and a ring of two chunk slots in VRAM beside the
+    /// compute, where they were not held in VRAM whole (after begin_layer_prefill; see [`Backend::hold_layer_rows`]): the ring takes the budget
+    /// the held rows would, `batch` rows a slot, and the host rows are page-locked until the guard ends. Refused (the reason) where the ring does
+    /// not fit beside what layer order holds, or the rows cannot be page-locked; the pass then runs as it did.
+    pub fn overlap_layer_rows(&mut self, host: &mut [f32], batch: u64) -> Result<RowsOverlapBegin> {
+        if self.layer_rows.is_some() {
+            return Ok(RowsOverlapBegin::Refused("rows already held".into()));
+        }
+        if host.is_empty() || host.len() % WIDTH != 0 {
+            return Err("invalid layer rows".into());
+        }
+        let (slot_rows, slots) = rows_ring_shape((host.len() / WIDTH) as u64, batch);
+        let ring_rows = slot_rows * slots;
+        let (used, budget) = self.budget_memory()?;
+        if let Some(reason) = layer_rows_refusal(ring_rows, budget.saturating_sub(used), self.slot_margin) {
+            return Ok(RowsOverlapBegin::Refused(format!("the ring of {ring_rows} rows: {reason}")));
+        }
+        let mut storage = std::ptr::null_mut();
+        // SAFETY: a live device and out-parameter; nothing reads the ring before the rows come up.
+        let status = unsafe { ffi::sd_prefill_bank_allocate(self.handle, ring_rows * WIDTH as u64 * 4, &mut storage) };
+        if !storage.is_null() { self.layer_rows = Some((storage, ring_rows)); }
+        if check(status)? == 1 { return Ok(RowsOverlapBegin::Refused("the device refused the ring's allocation".into())); }
+        pointer(storage)?;
+        // SAFETY: the ring (checked natively) and host rows that the caller keeps alive, and leaves alone while rows are in flight (between the
+        // calls that bring them up and the wait for them to go down): the copies are the device's own, ordered by events.
+        let status = unsafe { ffi::sd_rows_overlap_begin(self.handle, storage, slot_rows, host.as_mut_ptr(), (host.len() / WIDTH) as u64) };
+        match check(status) {
+            Ok(1) => {
+                let reason = last_error();
+                // SAFETY: the ring just allocated, which nothing has used.
+                let released = check(unsafe { ffi::sd_release(self.handle, storage) });
+                self.layer_rows = None;
+                released?;
+                Ok(RowsOverlapBegin::Refused(reason))
+            }
+            Ok(_) => Ok(RowsOverlapBegin::Begun(RowsOverlap { handle: self.handle, done: false })),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Chunk `chunk`'s `steps` rows from host row `row` of the overlapped rows, queued up into the ring.
+    pub fn rows_overlap_up(&mut self, chunk: u64, row: u64, steps: u64) -> Result<()> {
+        if !(1..=self.prefill_capacity).contains(&steps) { return Err("invalid layer prefill hidden rows".into()); }
+        // SAFETY: a live device; the ring and the host range were checked natively when the rows began to move.
+        check(unsafe { ffi::sd_rows_overlap_up(self.handle, chunk, row, steps) }).map(drop)
+    }
+
+    /// [`Backend::prefill_rows_held`] of a chunk brought up by [`Backend::rows_overlap_up`]: the device stream waits for its rows.
+    pub fn rows_overlap_load(&mut self, layer: usize, chunk: u64, steps: u64) -> Result<()> {
+        if !(1..=self.prefill_capacity).contains(&steps) { return Err("invalid layer prefill hidden rows".into()); }
+        // SAFETY: as rows_overlap_up, and a registered decoder layer.
+        check(unsafe { ffi::sd_rows_overlap_load(self.handle, layer as u64, chunk, steps) }).map(drop)
+    }
+
+    /// [`Backend::prefill_span_held`] of a loaded chunk, its rows then queued out to host row `row`.
+    pub fn rows_overlap_span(&mut self, layer: usize, chunk: u64, row: u64, position: u64, steps: u64) -> Result<()> {
+        if layer >= 49 || !(2..=self.prefill_capacity).contains(&steps) || position > 262144 - steps {
+            return Err("invalid Straydog resident prefill span".into());
+        }
+        // SAFETY: as rows_overlap_up; the span's own checks as sd_prefill_span's.
+        check(unsafe { ffi::sd_rows_overlap_span(self.handle, layer as u64, chunk, row, position, steps) }).map(drop)
+    }
+
+    /// Wait for every copy of the pass: the host rows are the last layer's, and may be read.
+    pub fn rows_overlap_wait(&mut self) -> Result<()> {
+        // SAFETY: a live device with rows moving.
+        check(unsafe { ffi::sd_rows_overlap_wait(self.handle) }).map(drop)
+    }
+
+    /// Rows moved beside the compute so far: (nanoseconds the device stream waited for rows to come up, nanoseconds the host waited for the last
+    /// rows to go down). The copies' own times and bytes are [`Backend::prefill_row_transfers`]'.
+    pub fn rows_overlap_times(&self) -> Result<[u64; 2]> {
+        let mut out = [0u64; 2];
+        // SAFETY: a live handle and a place for two values.
+        check(unsafe { ffi::sd_rows_overlap_times(self.handle, out.as_mut_ptr()) })?;
+        Ok(out)
+    }
+
     pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> {
         let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
         // SAFETY: owned storage retained until clear_layer_bank/finish_layer_prefill, and a registered decoder layer.
@@ -1549,7 +1676,11 @@ impl Backend {
 
     /// End the temporary bank's lifetime and restore workspace sizes; leave cache restoration until the head is back.
     pub fn finish_layer_prefill(&mut self) -> Result<()> {
+        // (rows still moving, their guard not ended: the copies into and out of the ring are waited for before it goes; none moving, nothing)
+        // SAFETY: a live device.
+        let ended = check(unsafe { ffi::sd_rows_overlap_end(self.handle) });
         self.clear_layer_bank()?;
+        ended?;
         if let Some((storage, _)) = self.layer_rows.take() {
             // SAFETY: the held rows' allocation; clear_layer_bank waited for the device's work, the last that read them.
             check(unsafe { ffi::sd_release(self.handle, storage) })?;
@@ -3393,6 +3524,40 @@ pub fn zeroed_floats(count: usize) -> Option<Vec<f32>> {
     }
 }
 
+/// Zeroed floats whose first is on a page boundary, with room for the whole pages of their bytes: what a range page-locked for a pass
+/// (`RowsOverlap`) is, so that the pages locked are the floats' own and no neighbour's.
+pub struct PageAlignedFloats {
+    backing: Vec<f32>,
+    offset: usize,
+    len: usize,
+}
+
+/// The bytes of a page, which the page-locked rows begin on.
+const PAGE_BYTES: usize = 4096;
+
+impl PageAlignedFloats {
+    /// `count` zeroed floats; None where the system refuses the memory.
+    pub fn zeroed(count: usize) -> Option<PageAlignedFloats> {
+        let slack = PAGE_BYTES / 4;
+        let backing = zeroed_floats(count.checked_add(slack)?)?;
+        let offset = (backing.as_ptr() as usize).wrapping_neg() % PAGE_BYTES / 4;
+        Some(PageAlignedFloats { backing, offset, len: count })
+    }
+}
+
+impl std::ops::Deref for PageAlignedFloats {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        &self.backing[self.offset..self.offset + self.len]
+    }
+}
+
+impl std::ops::DerefMut for PageAlignedFloats {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        &mut self.backing[self.offset..self.offset + self.len]
+    }
+}
+
 /// Tests only: the next `count` page-locked host allocations a request makes (a K/V growth's, the MTP rows' staging, a read's buffer) are refused as a
 /// machine short of memory refuses them; 0 ends it.
 #[doc(hidden)]
@@ -3784,6 +3949,69 @@ mod layer_rows_tests {
         assert_eq!(refused, "5.00 GiB of rows, 3.50 GiB of VRAM free");
         assert!(layer_rows_refusal(16_384, 640 << 20, margin).is_some());
         assert!(layer_rows_refusal(16_384, (640 << 20) + margin + 2 * ALLOCATION_TAIL, margin).is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod rows_overlap_tests {
+    use super::{layer_rows_refusal, rows_lock_refusal, rows_ring_shape, PageAlignedFloats, ALLOCATION_TAIL, WIDTH};
+
+    /// Decides: the ring is two slots of the batch's rows where the pass has more rows than a batch, one slot where the pass is a single chunk
+    /// (never more rows than the pass has), and it takes the VRAM budget by the rule the held rows follow: 2 x 2048 rows (160 MiB) fit in the
+    /// 0.49 GiB that 16,384 rows (0.62 GiB) do not.
+    #[test]
+    fn the_ring_is_two_chunks_and_fits_where_the_whole_rows_do_not() {
+        assert_eq!(rows_ring_shape(16_384, 2048), (2048, 2));
+        assert_eq!(rows_ring_shape(2049, 2048), (2048, 2));
+        assert_eq!(rows_ring_shape(2048, 2048), (2048, 1));
+        assert_eq!(rows_ring_shape(700, 2048), (700, 1));
+        let margin = 64 << 20;
+        let free = (0.49 * (1u64 << 30) as f64) as u64;
+        assert!(layer_rows_refusal(16_384, free, margin).is_some(), "the whole rows do not fit");
+        let (slot, slots) = rows_ring_shape(16_384, 2048);
+        assert!(layer_rows_refusal(slot * slots, free, margin).is_none(), "the ring does");
+        // (and is refused, with why, where even it does not)
+        let tight = (slot * slots * WIDTH as u64 * 4) + margin + 2 * ALLOCATION_TAIL - 1;
+        assert!(layer_rows_refusal(slot * slots, tight, margin).is_some());
+        assert!(layer_rows_refusal(slot * slots, tight + 1, margin).is_none());
+    }
+
+    /// Decides: the page-locked rows are refused, with how much was asked and how much may be locked, where they exceed what may be locked now;
+    /// taken at exactly that.
+    #[test]
+    fn the_host_rows_are_page_locked_only_within_what_may_be_locked() {
+        const GIB: u64 = 1 << 30;
+        let rows = 16_384 * WIDTH as u64 * 4;
+        assert!(rows_lock_refusal(rows, u64::MAX).is_none());
+        assert!(rows_lock_refusal(rows, rows).is_none());
+        assert!(rows_lock_refusal(rows, rows - 1).is_some());
+        let refused = rows_lock_refusal(rows, GIB / 4).unwrap();
+        assert!(refused.starts_with("0.6") && refused.ends_with(" GiB of rows to page-lock, 0.25 GiB lockable"), "{refused}");
+        assert!(rows_lock_refusal(rows, 0).is_some());
+    }
+
+    /// Decides: the pass's rows begin on a page boundary and are all zero, in the number asked for, whatever the allocator's alignment, and
+    /// whole rows end on one too (a row is ten pages), so the pages locked for them are theirs alone.
+    #[test]
+    fn the_rows_a_pass_locks_begin_on_a_page_and_are_zeroed() {
+        let mut firsts = std::collections::HashSet::new();
+        let mut held = Vec::new();
+        for rows in [1usize, 3, 512, 2049] {
+            let mut floats = PageAlignedFloats::zeroed(rows * WIDTH).unwrap();
+            assert_eq!(floats.len(), rows * WIDTH);
+            assert_eq!(floats.as_ptr() as usize % 4096, 0);
+            assert_eq!((floats.as_ptr() as usize + floats.len() * 4) % 4096, 0);
+            assert!(floats.iter().all(|value| *value == 0.0));
+            floats[0] = 1.0;
+            let last = floats.len() - 1;
+            floats[last] = 2.0;
+            assert_eq!((floats[0], floats[last]), (1.0, 2.0));
+            firsts.insert(floats.as_ptr() as usize);
+            held.push(floats);
+        }
+        assert_eq!(firsts.len(), 4, "four distinct allocations");
+        assert!(PageAlignedFloats::zeroed(usize::MAX).is_none());
     }
 }
 
