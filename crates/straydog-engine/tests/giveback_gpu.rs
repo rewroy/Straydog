@@ -8,17 +8,21 @@
 //! request as a machine short of memory does.
 //!
 //! The context is 131072, so that even Q8 K/V is in host memory at this budget and starts at 32768 positions. The growth the test asks for is
-//! to 65536. A decode after a growth is compared with one of a model that never locked a bank, within the tolerance `behind_gpu.rs` uses.
+//! to 65536. A decode after a growth is compared with one of a model that never locked a bank, within the tolerance `behind_gpu.rs` uses:
+//! every run is held to the same thirteen tokens by a constraint, which chooses the tokens and leaves the logits as they are, so that all
+//! twelve decode rows are compared whichever way a near tie of two tokens falls.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use straydog_engine::constraint::{Alternative, Constraint, TokenBytes};
 
 use straydog_engine::gpu::refuse_host_allocations;
 use straydog_engine::group::{Group, SplitMode};
-use straydog_engine::model::{Model, Settings, KV_NO_MEMORY, STARTING_KV};
+use straydog_engine::model::{Model, Settings, END_TOKENS, KV_NO_MEMORY, STARTING_KV};
 use straydog_engine::sampling::Sampling;
 use straydog_engine::text::Text;
 use straydog_engine::weights::Weights;
@@ -36,6 +40,9 @@ const PASSES: usize = 12;
 /// for bit and four for the first eight rows: a route in a slot a pass sooner or later). One pair is measured for the tolerance and can be
 /// a pair that agreed, and the floor is then all there is: 0.15 failed a run whose next request differed by 0.160 from a reference that
 /// had differed by 0 from its twin. A bank read wrongly moves the logits past 1 and parts the tokens at once (`behind_gpu.rs`).
+/// The runs take the same thirteen tokens ([`fixed_input`]): left to their own greedy tokens, two of them parted at the fourth row where
+/// one expert of layer 3 was in a slot (F32 inputs) in one and on the CPU (INT8 inputs) in the other, the rows 0.04 to 0.05 apart, and
+/// too few rows were left to compare.
 const NOISE_FLOOR: f64 = 0.30;
 /// The positions the growth is asked for: past the first capacity, within the context.
 const GROWN: usize = 40000;
@@ -59,17 +66,85 @@ fn open(root: &std::ffi::OsStr) -> (Model, Vec<u32>) {
 }
 
 struct Run {
+    prompt: Vec<u32>,
+    inputs: Vec<u32>,
     tokens: Vec<u32>,
     logits: Vec<Vec<f32>>,
 }
 
-/// A request from the start of the prompt: the model is reset, and the passes' logits kept.
+/// A request from the start of the prompt, greedy: the model is reset, and the passes' logits kept. It chooses the tokens the other runs take.
 fn decode(model: &mut Model, prompt: &[u32]) -> Run {
     model.reset().unwrap();
     model.logits_capture = Some(Vec::new());
     let mut tokens = Vec::new();
     model.generate(prompt, PASSES + 1, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |token| tokens.push(token)).unwrap();
-    Run { tokens, logits: model.logits_capture.take().unwrap() }
+    Run { prompt: prompt.to_vec(), inputs: model.history.clone(), tokens, logits: model.logits_capture.take().unwrap() }
+}
+
+/// A constraint that admits `forced` and nothing else: each token's bytes are its id's four, so the sequence is one of ids, whatever
+/// text the tokenizer gives them. The logits captured are those before the constraint.
+fn fixed_constraint(tokens: Arc<TokenBytes>, forced: &[u32]) -> Constraint {
+    let rest = forced.iter().flat_map(|token| token.to_be_bytes()).collect();
+    Constraint::new(tokens, &[], false, vec![Alternative::Exact { rest }])
+}
+
+fn fixed_vocabulary(vocabulary: usize) -> Arc<TokenBytes> {
+    assert!(vocabulary <= u32::MAX as usize);
+    Arc::new(TokenBytes::new((0..vocabulary as u32).map(|token| token.to_be_bytes().to_vec()).collect(), vec![false; vocabulary]))
+}
+
+fn check_fixed_constraint(tokens: Arc<TokenBytes>, forced: &[u32]) {
+    let mut constraint = fixed_constraint(tokens.clone(), forced);
+    for &expected in forced {
+        let allowed: Vec<_> = (0..tokens.len() as u32).filter(|&token| constraint.allows(token)).collect();
+        assert_eq!(allowed, vec![expected], "the fixed-input constraint must admit exactly the next token id");
+        constraint.advance(expected);
+    }
+    assert!((0..tokens.len() as u32).all(|token| !constraint.allows(token)), "no token is allowed after the exact sequence");
+}
+
+struct FixedInput {
+    tokens: Arc<TokenBytes>,
+    forced: Vec<u32>,
+    prompt: Vec<u32>,
+    vocabulary: usize,
+}
+
+fn fixed_input(root: &std::ffi::OsStr, grown: bool) -> FixedInput {
+    // (a model of its own chooses the tokens and is gone before the runs compared open theirs)
+    let seed = {
+        let (mut model, prompt) = open(root);
+        if grown { model.ensure_kv_for_test(GROWN).unwrap(); }
+        decode(&mut model, &prompt)
+    };
+    assert_eq!(seed.tokens.len(), PASSES + 1, "the seed must provide all thirteen non-END token ids");
+    assert_eq!(seed.logits.len(), PASSES + 1);
+    let vocabulary = seed.logits[0].len();
+    assert_eq!(vocabulary, 248320, "the complete model vocabulary is required");
+    assert!(seed.logits.iter().all(|row| row.len() == vocabulary && row.iter().all(|value| value.is_finite())));
+    assert!(seed.tokens.iter().all(|token| (*token as usize) < vocabulary && !END_TOKENS.contains(token)));
+    let tokens = fixed_vocabulary(vocabulary);
+    check_fixed_constraint(tokens.clone(), &seed.tokens);
+    FixedInput { tokens, forced: seed.tokens, prompt: seed.prompt, vocabulary }
+}
+
+fn decode_fixed(model: &mut Model, prompt: &[u32], fixed: &FixedInput) -> Run {
+    assert_eq!(prompt, fixed.prompt, "every run must receive the same prompt");
+    model.reset().unwrap();
+    model.logits_capture = Some(Vec::new());
+    let mut constraint = fixed_constraint(fixed.tokens.clone(), &fixed.forced);
+    let mut tokens = Vec::new();
+    model.generate_constrained(prompt, PASSES + 1, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false,
+                               &mut |token| tokens.push(token), Some(&mut constraint)).unwrap();
+    assert_eq!(tokens, fixed.forced, "all thirteen emitted ids must match the fixed input sequence");
+    let mut inputs = prompt.to_vec();
+    inputs.extend_from_slice(&fixed.forced[..PASSES]); // The final emitted token is not forwarded.
+    assert_eq!(model.history, inputs, "the model must actually process the same prompt plus twelve input ids");
+    let logits = model.logits_capture.take().unwrap();
+    assert_eq!(logits.len(), PASSES + 1, "one prefill row and all twelve ordinary decode rows are required");
+    assert!(logits.iter().all(|row| row.len() == fixed.vocabulary && row.iter().all(|value| value.is_finite())));
+    assert_eq!(model.last_metrics["decode_forward_tokens"].as_u64(), Some(PASSES as u64));
+    Run { prompt: prompt.to_vec(), inputs, tokens, logits }
 }
 
 fn relative_difference(a: &[f32], b: &[f32]) -> f64 {
@@ -94,6 +169,22 @@ fn compare(one: &Run, other: &Run) -> (usize, f64) {
     (compared, worst)
 }
 
+/// [`compare`] of two runs over the same tokens: all twelve rows, the prompt and the tokens fed the same.
+fn compare_fixed(one: &Run, other: &Run) -> (usize, f64) {
+    assert_eq!(one.prompt, other.prompt);
+    assert_eq!(one.inputs, other.inputs, "the processed input prefixes must be identical");
+    assert_eq!(one.tokens, other.tokens, "the constrained runs must emit the same fixed ids");
+    for run in [one, other] {
+        assert_eq!(run.tokens.len(), PASSES + 1);
+        assert_eq!(run.logits.len(), PASSES + 1);
+        assert!(run.logits.iter().all(|row| row.len() == 248320 && row.iter().all(|value| value.is_finite())),
+                "every compared row must contain the full finite vocabulary");
+    }
+    let (compared, worst) = compare(one, other);
+    assert_eq!(compared, PASSES, "all twelve fixed-input comparisons are mandatory");
+    (compared, worst)
+}
+
 /// The assist level in the request line of the last request: None while no layer is page-locked.
 fn assist_level(model: &Model) -> Option<u64> {
     model.last_metrics["partial_detail"]["assist"].as_u64()
@@ -105,16 +196,17 @@ fn assist_level(model: &Model) -> Option<u64> {
 fn a_refused_growth_takes_back_the_newest_layers_and_then_succeeds() {
     let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
     let _gpu = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixed = fixed_input(&root, true);
     // the reference: a model that never locked a bank, its K/V grown without a refusal (twice, for the noise between two runs)
     let reference = |root: &std::ffi::OsStr| {
         let (mut model, prompt) = open(root);
         model.ensure_kv_for_test(GROWN).unwrap();
         assert!(model.kv_positions() >= GROWN, "the K/V grew to {}", model.kv_positions());
         assert!(model.gave_back.is_empty());
-        decode(&mut model, &prompt)
+        decode_fixed(&mut model, &prompt, &fixed)
     };
     let (none_one, none_two) = (reference(&root), reference(&root));
-    let (compared, noise) = compare(&none_one, &none_two);
+    let (compared, noise) = compare_fixed(&none_one, &none_two);
     let tolerance = (4.0 * noise).max(NOISE_FLOOR);
     eprintln!("never locked, twice: {compared} passes compared, the worst relative difference {noise:.2e}; the tolerance {tolerance:.2e}");
     assert!(compared >= 6, "too few passes before the tokens parted ({compared})");
@@ -123,7 +215,7 @@ fn a_refused_growth_takes_back_the_newest_layers_and_then_succeeds() {
     let mapped = model.lock_layers_for_test(&LOCKED).unwrap();
     assert!(mapped >= LOCKED.len() as u64, "{mapped} plans mapped of {}", LOCKED.len());
     assert_eq!(model.locked_layers(), LOCKED.len());
-    decode(&mut model, &prompt);
+    decode_fixed(&mut model, &prompt, &fixed);
     assert!(assist_level(&model).is_some(), "the layers locked are assisted");
 
     // two refusals: the first layer's allocation of the growth, and the one asked again after the newest layer was given back
@@ -141,9 +233,9 @@ fn a_refused_growth_takes_back_the_newest_layers_and_then_succeeds() {
     }
 
     // the layers left are assisted; the ones given back are read as any layer that is not locked: the decode is that of a model that never locked
-    let run = decode(&mut model, &prompt);
+    let run = decode_fixed(&mut model, &prompt, &fixed);
     assert!(assist_level(&model).is_some(), "the two layers left locked are still assisted");
-    let (compared, worst) = compare(&run, &none_one);
+    let (compared, worst) = compare_fixed(&run, &none_one);
     eprintln!("a decode after the give-back, against a model that never locked: {compared} passes compared, the worst relative difference {worst:.2e}");
     assert!(compared >= 6, "too few passes before the tokens parted ({compared})");
     assert!(worst < tolerance, "{worst} against {tolerance}");
@@ -155,16 +247,13 @@ fn a_refused_growth_takes_back_the_newest_layers_and_then_succeeds() {
 fn with_nothing_left_to_give_back_the_request_fails_and_the_engine_serves_the_next() {
     let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
     let _gpu = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixed = fixed_input(&root, false);
     let (mut never, prompt) = open(&root);
-    let reference = decode(&mut never, &prompt);
+    let reference = decode_fixed(&mut never, &prompt, &fixed);
     drop(never);
-    // (the same start once more, for what two runs of one configuration differ by: the comparisons below are held to the tolerance the test
-    // above uses. The flat floor of 0.15 was at what two such runs differ by here: 0.12, 0.16, 0.12, 0.06 and 0.15 on an R9700, where the
-    // slots' swaps are packed after their copies and land a pass later than they did (0, 0, 0.06, 0.05 and 0 before that). Six of those
-    // ten runs had the logits of a run of the build before bit for bit, the other four its first eight rows: the same sums, with a route
-    // in a slot a pass sooner or later.)
+    // (the same start once more, for what two runs of one configuration differ by)
     let (mut again, _) = open(&root);
-    let (compared, noise) = compare(&decode(&mut again, &prompt), &reference);
+    let (compared, noise) = compare_fixed(&decode_fixed(&mut again, &prompt, &fixed), &reference);
     drop(again);
     let tolerance = (4.0 * noise).max(NOISE_FLOOR);
     eprintln!("never locked, twice: {compared} passes compared, the worst relative difference {noise:.2e}; the tolerance {tolerance:.2e}");
@@ -184,16 +273,16 @@ fn with_nothing_left_to_give_back_the_request_fails_and_the_engine_serves_the_ne
     assert_eq!(layers, vec![47, 46, 45, 44], "newest first, one for each refusal");
     assert_eq!(model.kv_positions(), STARTING_KV, "the K/V is as it was");
     // the next request
-    let run = decode(&mut model, &prompt);
+    let run = decode_fixed(&mut model, &prompt, &fixed);
     assert_eq!(assist_level(&model), None, "no layer is locked: nothing is assisted or tuned");
-    let (compared, worst) = compare(&run, &reference);
+    let (compared, worst) = compare_fixed(&run, &reference);
     eprintln!("the next request, against a model that never locked: {compared} passes compared, the worst relative difference {worst:.2e}");
     assert!(compared >= 6 && worst < tolerance, "{compared} passes, {worst} against {tolerance}");
     // and a growth that is not refused
     model.ensure_kv_for_test(GROWN).unwrap();
     assert!(model.kv_positions() >= GROWN, "the K/V grew to {}", model.kv_positions());
-    let run = decode(&mut model, &prompt);
-    let (compared, worst) = compare(&run, &reference);
+    let run = decode_fixed(&mut model, &prompt, &fixed);
+    let (compared, worst) = compare_fixed(&run, &reference);
     assert!(compared >= 6 && worst < tolerance, "{compared} passes, {worst} against {tolerance}");
 }
 
