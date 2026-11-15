@@ -87,9 +87,40 @@ const DRAFT_ROWS: u64 = 100_000;
 /// Tokens past DRAFT_ROWS a draft's vocabulary holds at most (sd_draft_vocabulary's space).
 const DRAFT_EXTRAS: usize = 16384;
 /// Conversation checkpoints, each a page-locked host copy of the recurrent state (~118 MB):
-/// root (the end of the system prompt), turn (where the reply to the last user message
-/// began), prior (the same for the message before) and step (the reply to the last tool result).
-const CHECKPOINTS: [&str; 4] = ["root", "turn", "prior", "step"];
+/// root (the end of the system prompt), root_before (the root of the system prompt before, see [`ROOT_BEFORE`]), turn (where the reply
+/// to the last user message began), prior (the same for the message before) and step (the reply to the last tool result).
+const CHECKPOINTS: [&str; 5] = ["root", "root_before", "turn", "prior", "step"];
+/// The root of the system prompt before the last, kept beside it: with one root, a second client's request (a team's test, another
+/// program) took the first client's root, and the first client's next conversation, whose state the departure had parked, could not be
+/// resumed from it and read its whole system prompt again. The root a prompt resumes from is the root afterwards, so a third system
+/// prompt gives up the one used least lately.
+const ROOT_BEFORE: &str = "root_before";
+
+/// Before a root of `history` is saved among `held` (each checkpoint's tokens by `tokens`): the root held, when it is another system
+/// prompt's, becomes the root before, and the root before it is given up (returned, for its memory to be freed). The same system prompt
+/// saved again moves nothing: one client's use is as it was with one root.
+fn keep_root_before<T>(held: &mut IndexMap<&'static str, T>, tokens: impl Fn(&T) -> &Vec<u32>, history: &[u32]) -> Option<T> {
+    if !held.get("root").is_some_and(|root| tokens(root)[..] != history[..]) {
+        return None;
+    }
+    let root = held.shift_remove("root").unwrap();
+    let given_up = held.shift_remove(ROOT_BEFORE);
+    held.insert(ROOT_BEFORE, root);
+    given_up
+}
+
+/// After a prompt resumed from the checkpoint `kind` among `held`: the root before, resumed from, is the root, and the root the root
+/// before, so that the root a third system prompt's makes the root before gives up the one used least lately.
+fn root_resumed<T>(held: &mut IndexMap<&'static str, T>, kind: &str) {
+    if kind != ROOT_BEFORE {
+        return;
+    }
+    let Some(before) = held.shift_remove(ROOT_BEFORE) else { return };
+    if let Some(root) = held.shift_remove("root") {
+        held.insert(ROOT_BEFORE, root);
+    }
+    held.insert("root", before);
+}
 /// Recurrent-state slots after the checkpoints' for parked sequences: one parked, one for the
 /// live sequence it trades places with.
 const PARK_SLOTS: [usize; 2] = [CHECKPOINTS.len(), CHECKPOINTS.len() + 1];
@@ -2608,6 +2639,11 @@ impl Model {
     }
 
     fn save_checkpoint(&mut self, kind: &'static str) -> Result<()> {
+        if kind == "root" {
+            if let Some(given_up) = keep_root_before(&mut self.checkpoints, |checkpoint| &checkpoint.tokens, &self.history) {
+                self.release_checkpoint(given_up)?;
+            }
+        }
         if kind == "turn" {
             if let Some(turn) = self.checkpoints.shift_remove("turn") {
                 if let Some(prior) = self.checkpoints.shift_remove("prior") {
@@ -2913,6 +2949,7 @@ impl Model {
         self.final_hidden = hidden;
         self.draft_note(&saved);
         self.history = saved;
+        root_resumed(&mut self.checkpoints, kind);
         Ok((self.history.len(), kind))
     }
 
@@ -2924,7 +2961,7 @@ impl Model {
             Some((_, kinds)) => kinds.push(kind),
             None => plan.push((position, vec![kind])),
         };
-        let root_held = self.checkpoints.get("root").is_some_and(|root| {
+        let root_held = ["root", ROOT_BEFORE].iter().filter_map(|kind| self.checkpoints.get(*kind)).any(|root| {
             root.tokens.len() <= tokens.len() && root.tokens[..] == tokens[..root.tokens.len()]
         });
         if !root_held {
@@ -5630,6 +5667,51 @@ impl Model {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::{keep_root_before, root_resumed, ROOT_BEFORE};
+    use indexmap::IndexMap;
+
+    /// The roots held, by kind, as their tokens.
+    fn roots(held: &IndexMap<&'static str, Vec<u32>>) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
+        (held.get("root").cloned(), held.get(ROOT_BEFORE).cloned())
+    }
+
+    /// A root saved, as `save_checkpoint` saves one: the root before kept, and what it gives up.
+    fn save(held: &mut IndexMap<&'static str, Vec<u32>>, tokens: &[u32]) -> Option<Vec<u32>> {
+        let given_up = keep_root_before(held, |tokens| tokens, tokens);
+        held.insert("root", tokens.to_vec());
+        given_up
+    }
+
+    /// Decides: one client's system prompt saved again keeps one root, as before; two clients taking turns each keep theirs; the root a
+    /// prompt resumes from becomes the root, so that a third system prompt gives up the root used least lately.
+    #[test]
+    fn the_last_two_system_prompts_keep_their_roots_and_the_one_used_least_lately_goes() {
+        let (first, second, third) = (vec![1u32, 1], vec![2u32, 2], vec![3u32, 3]);
+        let mut held: IndexMap<&'static str, Vec<u32>> = IndexMap::new();
+        held.insert("turn", vec![1, 1, 5]);
+        // one client
+        assert_eq!(save(&mut held, &first), None);
+        assert_eq!(save(&mut held, &first), None, "the same system prompt again moves nothing");
+        assert_eq!(roots(&held), (Some(first.clone()), None));
+        assert_eq!(held.get("turn"), Some(&vec![1, 1, 5]), "and the conversation's checkpoints are as they were");
+        // a second client
+        assert_eq!(save(&mut held, &second), None);
+        assert_eq!(roots(&held), (Some(second.clone()), Some(first.clone())));
+        // the first client's next conversation resumes from its root, which is the root again
+        root_resumed(&mut held, ROOT_BEFORE);
+        assert_eq!(roots(&held), (Some(first.clone()), Some(second.clone())));
+        root_resumed(&mut held, "root");
+        root_resumed(&mut held, "turn");
+        assert_eq!(roots(&held), (Some(first.clone()), Some(second.clone())), "resuming from another checkpoint moves no root");
+        // a third system prompt gives up the second, used least lately
+        assert_eq!(save(&mut held, &third), Some(second.clone()));
+        assert_eq!(roots(&held), (Some(third), Some(first)));
+        assert_eq!(held.len(), 3);
     }
 }
 
