@@ -860,7 +860,8 @@ struct Device {
     std::set<std::string> phase_names;
     hipEvent_t counts_event = nullptr;   // after a prompt batch's expert counts: the host's reads of them wait for it, not for the work queued after (eager_moe)
     bool phase_trace = phase_on && std::getenv("STRAYDOG_PREFILL_PHASES")[0] == '2';
-    struct PhaseMark { const char* name; hipEvent_t event; };
+    struct PhaseMark { const char* name; hipEvent_t event; bool start; };   // (start: the first after a break, its time from the mark before it not counted)
+    bool phase_broken = false;
     std::vector<PhaseMark> phase_marks;
     std::vector<hipEvent_t> phase_pool;
     struct PhaseSum { double sum = 0, largest = 0; uint64_t count = 0; };

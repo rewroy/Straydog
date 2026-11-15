@@ -6,7 +6,7 @@
 void phase_report(Device& d) {
     try {
         cleanup(hipSetDevice(d.ordinal));
-        phase_resolve(d);
+        phase_resolve(d, true);
         std::vector<std::pair<std::string, Device::PhaseSum>> rows(d.phase_totals.begin(), d.phase_totals.end());
         std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.sum > b.second.sum; });
         double total = 0;
