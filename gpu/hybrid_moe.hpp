@@ -365,7 +365,7 @@ ExpertGemv hybrid_assist(const Device& d, const ResidentMoe& plan, bool exportin
         if (exporting) assist.assist = 0;
         else {
             assist.assign = hybrid_plan_room(d);
-            assist.stage = d.slots.base + d.slots.arena; assist.slot_bytes = d.slots.bytes;
+            assist.stage = expert_stage_pointer(d); assist.slot_bytes = d.slots.bytes;
         }
     }
     return assist;

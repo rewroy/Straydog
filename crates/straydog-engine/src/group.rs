@@ -953,6 +953,17 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.grow_kv(capacity, valid))
     }
 
+    /// Sum each device's cumulative counters for retained expert-cache growth.
+    pub fn kv_cache_retain_stats(&self) -> Result<[u64; 16]> {
+        let mut total = [0u64; 16];
+        for backend in &self.backends {
+            for (sum, value) in total.iter_mut().zip(backend.kv_cache_retain_stats()?) {
+                *sum = sum.saturating_add(value);
+            }
+        }
+        Ok(total)
+    }
+
     /// Each device's K/V stage grown into the VRAM its placement left (see [`Backend::grow_kv_stage`]).
     pub fn grow_kv_stages(&mut self, context: u64) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.grow_kv_stage(context))

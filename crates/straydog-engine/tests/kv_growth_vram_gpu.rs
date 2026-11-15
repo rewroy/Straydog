@@ -18,6 +18,48 @@ use straydog_engine::group::{Group, SplitMode};
 use straydog_engine::model::{Model, Settings, STARTING_KV};
 use straydog_engine::weights::Weights;
 
+fn observe_memory() -> bool {
+    std::env::var("STRAYDOG_KV_CACHE_RETAIN").is_ok_and(|value| value == "1") || std::env::var_os("KV_GROWTH_OUT").is_some()
+}
+
+fn memory_snapshot(model: &Model) -> Json {
+    let raw: BTreeMap<_, _> = model.vram_budgets().unwrap().into_iter()
+        .map(|(ordinal, used, budget)| (ordinal, (used, budget))).collect();
+    let devices: Vec<_> = model.memory_accounting_for_test().unwrap().into_iter().map(|(ordinal, accounting)| {
+        assert_eq!((accounting.requested_used, accounting.budget), raw[&ordinal]);
+        let effective = accounting.effective_used().unwrap();
+        assert_eq!(accounting.reserve, accounting.pool_reserve + accounting.kv_reserve + accounting.partial_reserve);
+        if accounting.flags & 1 != 0 {
+            assert_eq!(accounting.reserve, accounting.live_allocations.checked_mul(2 << 20).unwrap());
+            assert_eq!(accounting.live_allocations, accounting.pool_allocations + accounting.kv_allocations + accounting.partial_allocations);
+            assert!(effective <= accounting.budget, "GPU {ordinal} exceeds its effective budget: {accounting:?}");
+            assert!(accounting.peak_reserve >= accounting.reserve);
+        } else { assert_eq!(accounting.reserve, 0); }
+        let (name, free, total) = straydog_gpu::device_info(ordinal).unwrap();
+        serde_json::json!({ "ordinal": ordinal, "name": name, "device_info_free_bytes": free, "device_info_total_bytes": total,
+                           "effective_used_bytes": effective, "accounting": accounting.record() })
+    }).collect();
+    serde_json::json!(devices)
+}
+
+fn memory_record(model: &Model, label: &str) -> Json {
+    // Host metadata only: this does not settle or submit any GPU work.
+    let slots = model.slot_counts();
+    let value = serde_json::json!({ "label": label, "kv_capacity": model.kv_positions(),
+                                  "slot_capacity": slots.0, "slots_held": slots.1, "memory": memory_snapshot(model),
+                                  "retention_counters": model.kv_cache_retain_stats_for_test().unwrap() });
+    eprintln!("K/V growth memory: {value}");
+    value
+}
+
+fn save_memory_records(records: &[Json]) {
+    if let Some(file) = std::env::var_os("KV_GROWTH_OUT") {
+        let mut path = PathBuf::from(file);
+        path.set_extension("memory.json");
+        std::fs::write(path, serde_json::to_vec_pretty(records).unwrap()).unwrap();
+    }
+}
+
 fn quantization() -> String {
     std::env::var("STRAYDOG_QUANT").unwrap_or_else(|_| {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/model.json");
@@ -38,7 +80,7 @@ fn open(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>) -> Model {
     Model::new(weights, group, &settings, &|_, _, _| {}).unwrap()
 }
 
-struct Seen { first: u32, logits: Vec<String>, state: Vec<String>, resumed: Json, cached: u64, generated: usize }
+struct Seen { first: u32, logits: Vec<String>, state: Vec<String>, resumed: Json, cached: u64, generated: usize, metrics: Json, memory: Option<Json> }
 
 fn go(model: &mut Model, prompt: &[u32], max_new: usize) -> Seen {
     model.logits_digests = Some(Vec::new());
@@ -48,7 +90,8 @@ fn go(model: &mut Model, prompt: &[u32], max_new: usize) -> Seen {
     Seen { first: tokens[0], logits: model.logits_digests.take().unwrap(), state: model.state_digest().unwrap(),
            resumed: model.last_metrics.get("resumed_from").cloned().unwrap_or(Json::Null),
            cached: model.last_metrics.get("cached_tokens").and_then(Json::as_u64).expect("numeric cached_tokens after generate"),
-           generated: tokens.len() }
+           generated: tokens.len(), metrics: Json::Object(model.last_metrics.clone()),
+           memory: observe_memory().then(|| memory_record(model, "after-request")) }
 }
 
 struct Positional {
@@ -189,6 +232,13 @@ fn record(out: &mut String, name: &str, seen: &Seen) {
     let state = Sha256::digest(seen.state.join("\n").as_bytes());
     let line = format!("{name} first {} logits {:?} state {state:x} resumed {}\n", seen.first, seen.logits, seen.resumed);
     eprint!("{line}");
+    if std::env::var("STRAYDOG_KV_CACHE_RETAIN").is_ok_and(|value| value == "1") {
+        let counters: serde_json::Map<String, Json> = seen.metrics.as_object().unwrap().iter()
+            .filter(|(key, _)| key.starts_with("kv_cache_retain_") || *key == "kv_growth_seconds")
+            .map(|(key, value)| (key.clone(), value.clone())).collect();
+        eprintln!("{name} retained growth metrics {}", Json::Object(counters));
+        if let Some(memory) = &seen.memory { eprintln!("{name} memory {memory}"); }
+    }
     out.push_str(&line);
 }
 
@@ -201,6 +251,9 @@ fn a_vram_kv_grows_and_the_slots_pay_for_it() {
     let text = text(140_100);
     let mut out = String::new();
     let mut model = open(&root, None);
+    let observe = observe_memory();
+    let mut memory_records = Vec::new();
+    if observe { memory_records.push(memory_record(&model, "startup")); }
     assert!(model.partial && !model.host_kv, "partial {} host K/V {}", model.partial, model.host_kv);
     let whole = std::env::var("STRAYDOG_KV_START").is_ok_and(|start| start == "0");
     let start = if whole { 262144 } else { STARTING_KV };
@@ -211,7 +264,23 @@ fn a_vram_kv_grows_and_the_slots_pay_for_it() {
     let before = go(&mut model, &text[..32000], 1);
     record(&mut out, "below", &before);
     assert_eq!(model.kv_positions(), start);
+    let retain = std::env::var("STRAYDOG_KV_CACHE_RETAIN").is_ok_and(|value| value == "1");
+    let retained_before = if retain { Some(model.kv_cache_retain_stats_for_test().unwrap()) } else { None };
+    if observe { memory_records.push(memory_record(&model, "before-allocation-only-growth")); }
+    let growth_began = std::time::Instant::now();
     model.ensure_kv_for_test(STARTING_KV + 1).unwrap();
+    let growth_seconds = growth_began.elapsed().as_secs_f64();
+    if observe {
+        memory_records.push(serde_json::json!({ "label": "allocation-only-growth", "seconds": growth_seconds,
+            "after": memory_record(&model, "after-allocation-only-growth") }));
+        save_memory_records(&memory_records);
+    }
+    if let Some(before) = retained_before.filter(|_| !whole) {
+        let after = model.kv_cache_retain_stats_for_test().unwrap();
+        let successes = |stats: &[(usize, [u64; 16])]| stats.iter().map(|(_, values)| values[1]).sum::<u64>();
+        assert!(successes(&after) > successes(&before), "the retained path must remain available after a long prefill's stage-only pool");
+        eprintln!("allocation-only retained growth counters before {before:?} after {after:?}");
+    }
     let allocated = model.state_digest().unwrap();
     eprintln!("{} positional parts preserved by allocation-only growth ({start} -> {})",
               kept_by_growth(&before.state, &allocated), model.kv_positions());
@@ -273,11 +342,21 @@ fn a_vram_kv_grows_with_a_drafter() {
     let Some(drafter) = common::model_env("STRAYDOG_DRAFTER", "the drafter directory") else { return };
     let text = text(70_100);
     let mut model = open(&root, Some(&drafter));
+    let observe = observe_memory();
+    let mut memory_records = Vec::new();
+    if observe { memory_records.push(memory_record(&model, "startup")); }
     assert!(model.partial && !model.host_kv, "partial {} host K/V {}", model.partial, model.host_kv);
     let mut out = String::new();
     for (name, end) in [("below", 32000), ("grown", 40000)] {
         let seen = go(&mut model, &text[..end], 1);
         record(&mut out, name, &seen);
+        if let Some(memory) = &seen.memory { memory_records.push(serde_json::json!({ "label": name, "after": memory })); }
+        if observe { save_memory_records(&memory_records); }
+        if name == "grown" && !std::env::var("STRAYDOG_KV_START").is_ok_and(|start| start == "0")
+            && std::env::var("STRAYDOG_KV_CACHE_RETAIN").is_ok_and(|value| value == "1") {
+            assert!(seen.metrics["kv_cache_retain_successes"].as_u64().unwrap_or(0) > 0,
+                    "the retained growth with a drafter must survive a long prefill's stage-only pool");
+        }
     }
     if let Some(file) = std::env::var_os("KV_GROWTH_OUT") {
         std::fs::write(file, out).unwrap();
