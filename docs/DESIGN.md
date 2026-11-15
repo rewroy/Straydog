@@ -427,6 +427,12 @@ The engine holds one sequence.
     window's rows and the incomplete groups' tails go back, since a later position never writes a
     complete group's compressed row or index key. Its copy may go on later; the copies of
     checkpoints above it are made first.
+  - A system prompt that shares its beginning with one read before and ends otherwise (a client that writes the folder,
+    the date or a list of its files into it) is checkpointed at that beginning too, 16 tokens before the place the two part:
+    its stem, a root of its own. Such prompts extend no root, and each new conversation read its system prompt from the first
+    token. The next one starts from the stem. A root a conversation starts from becomes the latest of the two roots kept, so
+    the stem stays while each conversation's own root replaces the one before. Qwen3.8 does the same with its root and the
+    root before it.
   - A long reply is marked as it grows: every 512 tokens, between two passes, the window's rows and the tails are
     copied (2 ms; no compressed row or index key), and the last two marks are kept. A client that keeps a reply only
     in part (an agent app that cuts a file being written at a line's end and has the model go on, a person who stops

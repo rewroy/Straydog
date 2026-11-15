@@ -347,8 +347,38 @@ fn demoted(checkpoints: &[Checkpoint], history: &[u32]) -> Vec<usize> {
     others[..(others.len() + 1).saturating_sub(ROOTS)].to_vec()
 }
 
+/// A root a conversation starts from becomes the latest root (the last in the order): the roots kept are the last ones used,
+/// so a stem that every new conversation starts from stays while the roots of the conversations' own system prompts come and go.
+/// Where the checkpoint now is.
+fn refreshed(checkpoints: &mut Vec<Checkpoint>, index: usize) -> usize {
+    if !checkpoints[index].root {
+        return index;
+    }
+    let root = checkpoints.remove(index);
+    checkpoints.push(root);
+    checkpoints.len() - 1
+}
+
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
+
+/// A stem is worth a checkpoint where it is this much longer than what the request resumed from.
+const STEM_GAIN: usize = 1024;
+/// How far before the place two system prompts part their stem ends: the tokens just before it can be split otherwise by what
+/// follows them (the first letters of a folder's name, the first digits of a date).
+const STEM_BACK: usize = 16;
+
+/// Where the system prompt of a new conversation is checkpointed before its end: at its stem, the beginning it shares with a
+/// system prompt the engines read before, when its end is another (a client that writes the folder, the date or its files
+/// into its system prompt). Such a prompt extends no root, and was read from its first token each time: two agent tools read
+/// their 5.5K- and 7K-token system prompts again at every new conversation (3.8 s on two R9700 with DeepSeek-V4.1), where a
+/// client whose system prompt stays the same waits 0.5 s from its root. The next conversation starts from the stem.
+/// `agreed`: how far the prompt agrees with what was held or checkpointed; `fed`: where the request resumed; `root`: where its
+/// system prompt ends.
+fn stem(agreed: usize, fed: usize, root: usize) -> Option<usize> {
+    let stem = agreed.min(root).saturating_sub(STEM_BACK);
+    (agreed < root && stem >= ROOT_MINIMUM && stem >= fed + STEM_GAIN).then_some(stem)
+}
 
 /// The tokens of a reply between two marks of its sequence ([`Engines::mark`]). A client that keeps a long reply only in
 /// part (it stopped a file being written at a line's end and has the model go on, or its person pressed stop) sends a prompt
@@ -782,7 +812,17 @@ impl<E: Engines> Session<E> {
         // (the seconds the checkpoints took: copies of the whole state, made before the first token)
         let mut checkpoint_seconds = 0.0;
         if let Some(root) = self.root_mark(tokens, reused) {
-            if self.feed(&tokens[reused..root], cancelled, &mut |done| progress(done, total))?.is_none() {
+            // (the beginning this system prompt shares with one read before, where it ends otherwise: a root of its own)
+            if let Some(stem) = stem(agreed, fed, root) {
+                if self.feed(&tokens[fed..stem], cancelled, &mut |done| progress(done, total))?.is_none() {
+                    return Ok(());
+                }
+                let saving = Instant::now();
+                self.save_checkpoint(true)?;
+                checkpoint_seconds += saving.elapsed().as_secs_f64();
+                fed = stem;
+            }
+            if self.feed(&tokens[fed..root], cancelled, &mut |done| progress(done, total))?.is_none() {
                 return Ok(());
             }
             let saving = Instant::now();
@@ -930,6 +970,7 @@ impl<E: Engines> Session<E> {
             self.reset();
             return Ok((0, "none"));
         };
+        let index = refreshed(&mut self.checkpoints, index);
         let checkpoint = &self.checkpoints[index];
         let kind = if checkpoint.root {
             "root"
@@ -1216,6 +1257,33 @@ mod tests {
 
     /// Decides: two clients with their own system prompts taking turns each keep their root, so a new conversation of either starts
     /// from it; a third system prompt makes the oldest root an ordinary checkpoint, and a root saved again demotes none.
+    /// Decides: a system prompt that shares its beginning with one read before and ends otherwise is checkpointed at that
+    /// beginning, a little before the place the two part; not one that is new, nor one that is the same to its end, nor one whose
+    /// beginning the request already resumed from, nor a short beginning. And the stem a conversation starts from stays a root
+    /// while each conversation's own root replaces the one before.
+    #[test]
+    fn a_system_prompt_with_another_end_is_checkpointed_at_its_stem_which_stays() {
+        // (agreed, fed, root)
+        assert_eq!(stem(5000, 0, 5400), Some(5000 - STEM_BACK), "the same for 5,000 tokens of 5,400");
+        assert_eq!(stem(0, 0, 5400), None, "a new system prompt");
+        assert_eq!(stem(5400, 0, 5400), None, "the same system prompt: its root is the checkpoint");
+        assert_eq!(stem(7000, 0, 5400), None, "the same conversation further on");
+        assert_eq!(stem(5010, 4984, 5400), None, "resumed from the stem already");
+        assert_eq!(stem(1030, 0, 5400), None, "too short to be worth a checkpoint");
+        assert_eq!(stem(3000, 1500, 5400), Some(3000 - STEM_BACK), "longer than what it resumed from by enough");
+        let checkpoint = |slot: usize, tokens: &[u32], root: bool| Checkpoint { slot, tokens: tokens.to_vec(), root };
+        // a stem, the first conversation's root and its turn; the second conversation starts from the stem
+        let mut held = vec![checkpoint(0, &[1, 1], true), checkpoint(1, &[1, 1, 5], true), checkpoint(2, &[1, 1, 5, 9], false)];
+        let at = refreshed(&mut held, 0);
+        assert_eq!((at, held[at].slot), (2, 0));
+        // its own root is saved: the first conversation's root is the one that stops being a root, the stem stays
+        let own = [1u32, 1, 6];
+        let demote = demoted(&held, &own);
+        assert_eq!(demote.iter().map(|&index| held[index].slot).collect::<Vec<_>>(), [1]);
+        // (a turn's checkpoint resumed from stays where it is)
+        assert_eq!(refreshed(&mut held, 1), 1);
+    }
+
     #[test]
     fn the_last_two_conversation_roots_stay_roots() {
         let checkpoint = |slot: usize, tokens: &[u32], root: bool| Checkpoint { slot, tokens: tokens.to_vec(), root };

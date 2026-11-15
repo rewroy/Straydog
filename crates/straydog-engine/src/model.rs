@@ -131,6 +131,20 @@ fn root_resumed<T>(held: &mut IndexMap<&'static str, T>, kind: &str) {
     }
     held.insert("root", before);
 }
+/// A stem is worth a checkpoint where it is this much longer than what the request resumed from.
+const STEM_GAIN: usize = 1024;
+/// How far before the place two system prompts part their stem ends: the tokens just before it can be split otherwise by what
+/// follows them (the first letters of a folder's name, the first digits of a date).
+const STEM_BACK: usize = 16;
+
+/// Where the system prompt of a new conversation is checkpointed before its end (a multiple of four): at its stem, the beginning
+/// it shares with a system prompt read before, when its end is another. `agreed`: how far the prompt agrees with what was held,
+/// parked or checkpointed; `reused`: where the request resumed; `root`: where its system prompt ends.
+fn stem_of(agreed: usize, reused: usize, root: usize) -> Option<usize> {
+    let stem = agreed.min(root).saturating_sub(STEM_BACK) / 4 * 4;
+    (agreed < root && stem >= ROOT_MINIMUM && stem >= reused + STEM_GAIN).then_some(stem)
+}
+
 /// Recurrent-state slots after the checkpoints' for parked sequences: one parked, one for the
 /// live sequence it trades places with.
 const PARK_SLOTS: [usize; 2] = [CHECKPOINTS.len(), CHECKPOINTS.len() + 1];
@@ -3008,19 +3022,28 @@ impl Model {
 
     /// Positions (multiples of four) this prefill checkpoints at, with their kinds. A request
     /// no later one continues (`keep` false) saves only the system-prompt root.
-    fn checkpoint_plan(&self, tokens: &[u32], reused: usize, turn: bool, keep: bool) -> Vec<(usize, Vec<&'static str>)> {
+    fn checkpoint_plan(&self, tokens: &[u32], reused: usize, agreed: usize, turn: bool, keep: bool) -> Vec<(usize, Vec<&'static str>)> {
         let mut plan: Vec<(usize, Vec<&'static str>)> = Vec::new();
         let mut add = |position: usize, kind: &'static str| match plan.iter_mut().find(|(at, _)| *at == position) {
             Some((_, kinds)) => kinds.push(kind),
             None => plan.push((position, vec![kind])),
         };
-        let root_held = ["root", ROOT_BEFORE].iter().filter_map(|kind| self.checkpoints.get(*kind)).any(|root| {
-            root.tokens.len() <= tokens.len() && root.tokens[..] == tokens[..root.tokens.len()]
-        });
+        // (the place this prompt's system prompt ends, and whether a root is held there: a stem, which is a root that ends before it, is
+        // not this system prompt's root)
+        let root_at = tokens.iter().position(|token| *token == IM_END).map(|end| (end + 1) / 4 * 4);
+        let root_held = root_at.is_some_and(|root| ["root", ROOT_BEFORE].iter().filter_map(|kind| self.checkpoints.get(*kind)).any(|held| {
+            held.tokens.len() == root && held.tokens[..] == tokens[..root]
+        }));
         if !root_held {
-            if let Some(end) = tokens.iter().position(|token| *token == IM_END) {
-                let root = (end + 1) / 4 * 4;
+            if let Some(root) = root_at {
                 if root >= ROOT_MINIMUM && reused < root && root < tokens.len() {
+                    // Its stem first, where this system prompt shares its beginning with one read before and ends otherwise (a client
+                    // that writes the folder or the date into it): a root of its own, which the next conversation starts from. The system
+                    // prompt's own root after it makes the stem the root before, and a conversation that starts from the root before
+                    // makes it the root again ([`root_resumed`]), so the stem stays while the conversations' own roots come and go.
+                    if let Some(stem) = stem_of(agreed, reused, root) {
+                        add(stem, "root");
+                    }
                     add(root, "root");
                 }
             }
@@ -5616,7 +5639,7 @@ impl Model {
             self.last_metrics.insert("park_borrowed_positions".into(), json!(borrowed));
         }
         let prefill_started = Instant::now();
-        let plan = self.checkpoint_plan(tokens, reused, turn, checkpoint);
+        let plan = self.checkpoint_plan(tokens, reused, agreed, turn, checkpoint);
         let pipelined = self.pipelined_prefill(tokens.len() - reused)?;
         if pipelined {
             self.group.prefill_defer(true)?;
@@ -5640,7 +5663,8 @@ impl Model {
         }
         let Some(output) = prefilled? else { return Ok(()) };
         // (a root this prompt made: the tokens it holds, and a digest that names it)
-        if let Some((root, _)) = plan.iter().find(|(_, kinds)| kinds.contains(&"root")) {
+        // (the last of the plan's: a stem saved before it is a root too, and not the system prompt's own)
+        if let Some((root, _)) = plan.iter().rev().find(|(_, kinds)| kinds.contains(&"root")) {
             self.last_metrics.insert("root_checkpoint".into(), json!(root));
             self.last_metrics.insert("root_digest".into(), json!(crate::prefix::tokens_digest(&tokens[..*root])));
         }
@@ -5741,7 +5765,30 @@ impl Model {
 
 #[cfg(test)]
 mod root_tests {
-    use super::{keep_root_before, root_resumed, ROOT_BEFORE};
+    use super::{keep_root_before, root_resumed, stem_of, ROOT_BEFORE, STEM_BACK};
+
+    /// Decides: a system prompt that shares its beginning with one read before and ends otherwise is checkpointed at that beginning, a
+    /// little before the place the two part and at a multiple of four; not a new one, the same one, one already resumed from its
+    /// stem, or a short beginning. Saved as a root before the system prompt's own root, the stem stays through the conversations.
+    #[test]
+    fn a_system_prompt_with_another_end_is_checkpointed_at_its_stem_which_stays() {
+        assert_eq!(stem_of(5003, 0, 5400), Some((5003 - STEM_BACK) / 4 * 4));
+        assert_eq!(stem_of(0, 0, 5400), None, "a new system prompt");
+        assert_eq!(stem_of(5400, 0, 5400), None, "the same system prompt");
+        assert_eq!(stem_of(5010, 4984, 5400), None, "resumed from the stem already");
+        assert_eq!(stem_of(2050, 0, 5400), None, "too short");
+        let (stem, first, second, third) = (vec![1u32, 1], vec![1u32, 1, 5], vec![1u32, 1, 6], vec![1u32, 1, 7]);
+        let mut held: IndexMap<&'static str, Vec<u32>> = IndexMap::new();
+        save(&mut held, &first);
+        // the second conversation: read from nothing, its stem and then its own root
+        save(&mut held, &stem);
+        save(&mut held, &second);
+        assert_eq!(roots(&held), (Some(second.clone()), Some(stem.clone())));
+        // the third starts from the stem (the root before), which is the root again, and saves its own
+        root_resumed(&mut held, ROOT_BEFORE);
+        assert_eq!(save(&mut held, &third), Some(second));
+        assert_eq!(roots(&held), (Some(third), Some(stem)));
+    }
     use indexmap::IndexMap;
 
     /// The roots held, by kind, as their tokens.
