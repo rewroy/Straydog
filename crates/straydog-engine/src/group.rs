@@ -935,6 +935,17 @@ impl Group {
     pub fn prefill_span_held(&mut self, layer: usize, first: u64, position: u64, steps: u64) -> Result<()> {
         self.backends[0].prefill_span_held(layer, first, position, steps)
     }
+    /// A pass's hidden rows on the host, moving to and from a ring in VRAM beside the compute ([`Backend::overlap_layer_rows`]).
+    pub fn overlap_layer_rows(&mut self, host: &mut [f32], batch: u64) -> Result<crate::gpu::RowsOverlapBegin> {
+        self.backends[0].overlap_layer_rows(host, batch)
+    }
+    pub fn rows_overlap_up(&mut self, chunk: u64, row: u64, steps: u64) -> Result<()> { self.backends[0].rows_overlap_up(chunk, row, steps) }
+    pub fn rows_overlap_load(&mut self, layer: usize, chunk: u64, steps: u64) -> Result<()> { self.backends[0].rows_overlap_load(layer, chunk, steps) }
+    pub fn rows_overlap_span(&mut self, layer: usize, chunk: u64, row: u64, position: u64, steps: u64) -> Result<()> {
+        self.backends[0].rows_overlap_span(layer, chunk, row, position, steps)
+    }
+    pub fn rows_overlap_wait(&mut self) -> Result<()> { self.backends[0].rows_overlap_wait() }
+    pub fn rows_overlap_times(&self) -> Result<[u64; 2]> { self.backends[0].rows_overlap_times() }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
         if self.backends.len() == 2 {
