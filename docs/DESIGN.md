@@ -349,7 +349,8 @@ conversation has met.
 There is no `-ngl`. Placement measures what fits, in this order:
 
 1. **Full residency.** Every weight in VRAM, the K/V too (Qwen3.8: at the prefill batch derived, 4096 from 48 GiB of
-   budgets, then at 2048; a batch given is not narrowed to keep the K/V in VRAM).
+   budgets, or given; it is not narrowed to keep the K/V in VRAM: on two R9700s the K/V in host memory at 4096 read a
+   95K prompt 12% faster than the K/V in VRAM at 2048 and decoded after it as fast).
 2. **Host K/V,** then a smaller prefill batch (Qwen3.8), with the MTP drafter, then without.
    The first choice that fits is taken; when it is not the first, the placement notes what the first
    would have needed, and with partial residency what full residency would (`resident_placement`),
