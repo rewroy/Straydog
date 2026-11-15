@@ -193,6 +193,12 @@ impl TokenBytes {
         self.bytes.is_empty()
     }
 
+    /// The bytes a token is in a rendered text: what it spells, a special or added one's own text (none for an id that is no
+    /// token).
+    pub fn bytes_of(&self, token: u32) -> &[u8] {
+        self.bytes.get(token as usize).map_or(&[], Vec::as_slice)
+    }
+
     /// What a token spells; none for a special one.
     pub fn text_of(&self, token: u32) -> Option<&[u8]> {
         let at = token as usize;

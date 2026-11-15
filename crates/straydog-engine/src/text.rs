@@ -214,6 +214,28 @@ impl Text {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// How far a rendered prompt goes on as `held` ids spell it: how many of them, and the bytes of the prompt they are. A
+    /// reply's ids are what the model wrote, and the same text encoded again can be split otherwise (the model writes "wor" and
+    /// "ld" where the tokenizer makes "world"): a prompt that sends the reply back then left the held sequence at the first such
+    /// place, and the engines read the rest of the reply again. With the held ids kept as far as their text is the prompt's, and
+    /// the rest of the prompt encoded after them, it goes on where the texts part. Ends at a character's boundary.
+    pub fn reach(&self, held: &[u32], text: &str) -> (usize, usize) {
+        let (bytes, spelled) = (self.token_bytes(), text.as_bytes());
+        let (mut count, mut at) = (0, 0);
+        for &token in held {
+            let piece = bytes.bytes_of(token);
+            if piece.is_empty() || !spelled[at..].starts_with(piece) {
+                break;
+            }
+            (count, at) = (count + 1, at + piece.len());
+        }
+        while count > 0 && !text.is_char_boundary(at) {
+            count -= 1;
+            at -= bytes.bytes_of(held[count]).len();
+        }
+        (count, at)
+    }
+
     /// Ids as text, special tokens included.
     pub fn decode(&self, ids: &[u32]) -> Result<String, TextError> {
         self.tokenizer.decode(ids, false).map_err(|exc| TextError(exc.to_string()))
@@ -320,5 +342,42 @@ mod memo_tests {
             assert_eq!(text.encode(&rendered).unwrap(), whole, "turn {turn}, from the kept segments");
         }
         assert!(text.memo.lock().unwrap().segments.len() >= 4);
+    }
+
+    /// Decides: a prompt that sends back a reply whose ids are not the tokenizer's own split of its text keeps those ids as far
+    /// as the texts agree, to a character's boundary, and no further (the real Qwen3.8 tokenizer; skipped where its file is not
+    /// on the machine).
+    #[test]
+    fn a_prompt_goes_on_as_the_held_ids_spell_it() {
+        let path = std::env::var("STRAYDOG_TOKENIZER_JSON")
+            .unwrap_or_else(|_| "/server/gguf-models/Qwen3.8-Flash-Next-GGUF/UD-IQ2_XS/tokenizer.json".into());
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let text = Text::new(&bytes).unwrap();
+        let head = "<|im_start|>user\nSay it.<|im_end|>\n<|im_start|>assistant\n";
+        let reply = "The meeting moved to Thursday, 日本語の行 and café.";
+        // the reply as a model may write it: split inside words and inside a character's bytes' neighbours
+        let mut held = text.encode(head).unwrap();
+        for part in ["The meet", "ing mov", "ed to Thurs", "day, 日本", "語の行 and caf", "é."] {
+            held.extend(text.encode(part).unwrap());
+        }
+        let written = held.len();
+        // (what the model wrote after the part the client kept)
+        held.extend(text.encode(" It was then cancelled.").unwrap());
+        let prompt = format!("{head}{reply}<|im_end|>\n<|im_start|>user\nWhen?<|im_end|>\n");
+        assert_ne!(text.encode(&prompt).unwrap()[..written], held[..written], "the tokenizer splits the reply otherwise");
+        let (count, at) = text.reach(&held, &prompt);
+        assert_eq!((count, at), (written, head.len() + reply.len()));
+        let mut ids = held[..count].to_vec();
+        ids.extend(text.encode(&prompt[at..]).unwrap());
+        assert_eq!(text.decode(&ids).unwrap(), prompt);
+        // a prompt that parts from the reply (here inside a character: 語 and 誤 share their first two bytes) is kept to a
+        // character's boundary before that
+        let parted = format!("{head}The meeting moved to Thursday, 日本誤");
+        let (count, at) = text.reach(&held, &parted);
+        assert!(parted.is_char_boundary(at) && at <= parted.len() - '誤'.len_utf8() && at > head.len(), "{count} ids, {at} bytes");
+        assert_eq!(text.decode(&held[..count]).unwrap(), parted[..at]);
+        // nothing held, or another conversation: nothing kept
+        assert_eq!(text.reach(&[], &prompt), (0, 0));
+        assert_eq!(text.reach(&text.encode("<|im_start|>system\nOther.").unwrap(), &prompt).0, text.encode("<|im_start|>").unwrap().len());
     }
 }
