@@ -173,6 +173,12 @@ pub trait Engines {
     fn whole_checkpoints(&self) -> bool {
         false
     }
+    /// Save a mark of the sequence state where it is, in the place of the last one (`save`), or go back to the mark: whether
+    /// one is now held, or the sequence is back at it. A mark is light (no copy of what a longer sequence only adds to) and
+    /// is good only while the held sequence extends it; engines that keep none say so.
+    fn mark(&mut self, _save: bool) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Whether checkpoint `slot` still holds its state (whole checkpoints may give theirs up to
     /// a budget).
     fn holds(&self, _slot: usize) -> bool {
@@ -343,6 +349,12 @@ fn demoted(checkpoints: &[Checkpoint], history: &[u32]) -> Vec<usize> {
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
 
+/// The tokens of a reply between two marks of its sequence ([`Engines::mark`]). A client that keeps a long reply only in
+/// part (it stopped a file being written at a line's end and has the model go on, or its person pressed stop) sends a prompt
+/// that leaves the held sequence a few tokens before its end: the next request then goes on from the last mark, where it
+/// read the whole reply again from the checkpoint before it.
+const MARK_EVERY: usize = 512;
+
 /// A placed model serving requests one at a time.
 pub struct Session<E: Engines> {
     pub engines: E,
@@ -363,6 +375,8 @@ pub struct Session<E: Engines> {
     /// Saved states, oldest first: the last ("turn") where the last prompt's reply began, the
     /// earlier ones ("prior") where earlier prompts' did, and the last root ("root").
     checkpoints: Vec<Checkpoint>,
+    /// The held sequence's length where the engines' mark of it was taken ([`Engines::mark`]), while it still extends it.
+    mark: Option<usize>,
     /// The last request's prompt tokens that agreed with what was held or checkpointed (more than
     /// it reused when it changed what came before).
     agreed: usize,
@@ -423,6 +437,10 @@ struct Decoded {
     accepted: usize,
     engine_drafted: usize,
     engine_accepted: usize,
+    /// The sequence's length at the last mark taken ([`MARK_EVERY`]), the marks taken and the seconds they took.
+    marked: Option<usize>,
+    marks: usize,
+    mark_seconds: f64,
 }
 
 /// How a drafter is to choose its tokens for a request with this sampling: drawn from its own distribution when
@@ -482,6 +500,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
     }
     let mut policy = Policy::new(rows);
     let mut done = Decoded::default();
+    let mut mark_at = history.len() + MARK_EVERY;
     let mut next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
     loop {
         if cancelled() || end.contains(&next) {
@@ -534,6 +553,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             let logits = engines.forward(&[next])?;
             history.push(next);
             (done.passes, done.fed) = (done.passes + 1, done.fed + 1);
+            mark(engines, history, &mut mark_at, &mut done)?;
             next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
             continue;
         }
@@ -581,9 +601,26 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         if stop {
             break;
         }
+        mark(engines, history, &mut mark_at, &mut done)?;
         next = token;
     }
     Ok(done)
+}
+
+/// Between two passes of a reply: a mark of the sequence where it has grown [`MARK_EVERY`] tokens past the last (or past the
+/// prompt), if the engines keep marks.
+fn mark<E: Engines>(engines: &mut E, history: &[u32], mark_at: &mut usize, done: &mut Decoded) -> Result<(), String> {
+    if history.len() < *mark_at {
+        return Ok(());
+    }
+    *mark_at = history.len() + MARK_EVERY;
+    let started = Instant::now();
+    if engines.mark(true)? {
+        done.marked = Some(history.len());
+        done.marks += 1;
+        done.mark_seconds += started.elapsed().as_secs_f64();
+    }
+    Ok(())
 }
 
 impl<E: Engines> Session<E> {
@@ -591,7 +628,7 @@ impl<E: Engines> Session<E> {
         Session {
             engines: placed.engines, files: placed.files, vocabulary: placed.vocabulary,
             context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, turn_start: placed.turn_start,
-            root_end: placed.root_end, checkpoints: Vec::new(), agreed: 0, card: placed.card,
+            root_end: placed.root_end, checkpoints: Vec::new(), mark: None, agreed: 0, card: placed.card,
             placement: placed.placement, state_bytes: placed.state_bytes, load_seconds: placed.load_seconds,
             last_metrics: Map::new(), prompt_logits: None, warmth: Warm::new(placed.layers, placed.experts),
         }
@@ -614,6 +651,12 @@ impl<E: Engines> Session<E> {
         self.checkpoints.clear();
     }
 
+    /// Tests only: forget the mark of the last long reply, as engines that keep none have none.
+    #[doc(hidden)]
+    pub fn forget_mark(&mut self) {
+        self.mark = None;
+    }
+
     /// The model's metadata, authenticated.
     pub fn header(&self) -> &straydog_gguf::ModelHeader {
         &self.files.header
@@ -627,6 +670,7 @@ impl<E: Engines> Session<E> {
     /// Forget the sequence (warm experts stay).
     pub fn reset(&mut self) {
         self.history.clear();
+        self.mark = None;
         self.engines.reset();
     }
 
@@ -781,6 +825,9 @@ impl<E: Engines> Session<E> {
             }
         };
         let decode_seconds = decoding.elapsed().as_secs_f64();
+        if decoded.marked.is_some() {
+            self.mark = decoded.marked;
+        }
         let emitted = decoded.emitted;
         let steps = emitted.saturating_sub(1);
         // (with DS41_PROFILE: the decode's phases, in milliseconds a token)
@@ -808,6 +855,7 @@ impl<E: Engines> Session<E> {
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
             "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
             "decode_profile": decode_profile,
+            "marks": decoded.marks, "mark_seconds": decoded.mark_seconds, "marked_tokens": decoded.marked,
         })
         .as_object()
         .unwrap()
@@ -840,11 +888,29 @@ impl<E: Engines> Session<E> {
         let best = self.checkpoints.iter().enumerate()
             .filter(|(_, checkpoint)| (whole || checkpoint.tokens.len() <= common) && checkpoint.tokens.len() <= limit
                     && tokens.starts_with(&checkpoint.tokens) && self.engines.holds(checkpoint.slot))
-            .max_by_key(|(_, checkpoint)| checkpoint.tokens.len());
-        let Some((index, checkpoint)) = best else {
+            .max_by_key(|(_, checkpoint)| checkpoint.tokens.len())
+            .map(|(index, _)| index);
+        // The mark of the reply the held sequence ends with, where the prompt keeps the sequence that far and no checkpoint
+        // reaches further: the sequence goes back to it in place.
+        let reach = best.map_or(0, |index| self.checkpoints[index].tokens.len());
+        if let Some(mark) = self.mark.filter(|&mark| mark > reach && mark <= common) {
+            match self.engines.mark(false) {
+                Ok(true) => {
+                    self.history.truncate(mark);
+                    return Ok((mark, "step"));
+                }
+                Ok(false) => self.mark = None,
+                Err(error) => {
+                    self.reset();
+                    return Err(error);
+                }
+            }
+        }
+        let Some(index) = best else {
             self.reset();
             return Ok((0, "none"));
         };
+        let checkpoint = &self.checkpoints[index];
         let kind = if checkpoint.root {
             "root"
         } else if self.checkpoints[index + 1..].iter().all(|later| later.root) {
@@ -857,6 +923,8 @@ impl<E: Engines> Session<E> {
             self.reset();
             return Err(error);
         }
+        // (the mark was above where the sequence now is, or of another sequence)
+        self.mark = None;
         self.history = saved;
         Ok((self.history.len(), kind))
     }
@@ -973,6 +1041,9 @@ mod tests {
         draws: Vec<Option<Draw>>,
         verified: Vec<Vec<u32>>,
         rewinds: Vec<usize>,
+        /// Whether it keeps marks, and the lengths of what it held at each one saved.
+        keeps_marks: bool,
+        marks: Vec<usize>,
     }
 
     impl Toy {
@@ -1044,6 +1115,49 @@ mod tests {
             self.held.truncate(from + keep);
             Ok(())
         }
+        fn mark(&mut self, save: bool) -> Result<bool, String> {
+            if !self.keeps_marks {
+                return Ok(false);
+            }
+            if save {
+                // (between passes: nothing of a verify pass is still to be taken back)
+                assert!(self.verified_from.is_none());
+                self.marks.push(self.held.len());
+                return Ok(true);
+            }
+            match self.marks.last() {
+                Some(&at) if at <= self.held.len() => {
+                    self.held.truncate(at);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+    }
+
+    /// Decides: a long reply is marked every [`MARK_EVERY`] tokens of its sequence, between passes and with what the session
+    /// holds, whatever the passes' widths; engines that keep no marks are asked and nothing is recorded.
+    #[test]
+    fn a_long_reply_is_marked_as_it_grows() {
+        for rows in [1, 4] {
+            let mut toy = Toy { vocabulary: 8, rows, keeps_marks: true, ..Toy::default() };
+            let mut history = PROMPT.to_vec();
+            let logits = toy.forward(&PROMPT).unwrap();
+            let max_new = 2 * MARK_EVERY + 40;
+            let done = decode(&mut toy, &mut history, logits, 8, &[], max_new, &Sampling::GREEDY, 1, &|| false, &mut |_| {}, None).unwrap();
+            assert_eq!(done.marks, 2, "rows {rows}: {:?}", toy.marks);
+            assert_eq!(done.marked, toy.marks.last().copied());
+            let mut last = PROMPT.len();
+            for &at in &toy.marks {
+                assert!(at >= last + MARK_EVERY && at < last + MARK_EVERY + rows, "rows {rows}: {:?}", toy.marks);
+                last = at;
+            }
+            // (back at the mark, the engines hold the sequence that far)
+            assert!(toy.mark(false).unwrap());
+            assert_eq!(toy.held, history[..last]);
+        }
+        let (_, done) = run(4, &PROMPT, &[], 2 * MARK_EVERY + 40, &Sampling::GREEDY, 1);
+        assert_eq!((done.marks, done.marked), (0, None));
     }
 
     /// Decides: a helper conversation between two requests of another (a sub-agent's, with its own system prompt) gives up
@@ -1262,7 +1376,7 @@ mod tests {
         assert_eq!(toy.verified, [vec![plain[0], plain[1], wrong, 7], plain[2..6].to_vec(), plain[6..8].to_vec()]);
         assert_eq!(toy.rewinds, [2, 4, 1]); // Rejection, all accepted, final emitted token stays unfed.
         assert_eq!(done, Decoded { emitted: 8, fed: 10, passes: 3, drafted: 7, accepted: 4,
-            engine_drafted: 7, engine_accepted: 4 });
+            engine_drafted: 7, engine_accepted: 4, ..Decoded::default() });
     }
 
     #[test]
