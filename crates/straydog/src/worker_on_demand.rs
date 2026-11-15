@@ -321,6 +321,12 @@ impl<E: Engines> Loaded<E> {
         // (a message's own text never writes the template's tokens: see Text::defuse)
         let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
         let prompt = self.template.render_with(messages, &tools, &variables).map_err(|exc| refused(exc.0))?;
+        // A reply asked with no reasoning in a conversation that thinks (`"reasoning": false`): the prompt as it is, its reasoning
+        // closed where it opens. That is how the template writes back a reply that had none, so the next request goes on from it.
+        const THINK_OPEN: &str = "<think>";
+        let unreasoned = thinking && matches!(body.get("reasoning"), Some(Py::Bool(false)));
+        let prompt = if unreasoned && prompt.ends_with(THINK_OPEN) { prompt + THINK_CLOSE } else { prompt };
+        let thinking = thinking && !unreasoned;
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         let images: Vec<images::Image> = images.iter().map(|bytes| images::prepare(bytes)).collect::<Result<_, _>>().map_err(refused)?;
         let (mut ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
