@@ -1334,4 +1334,17 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
     if (!count || count > limit) throw std::runtime_error("a Straydog op's launch is out of range");
     return unsigned(count);
 }
+#if defined(__HIPCC__)
+// RDNA4 vector types of the expert GEMM (moe_gemm.hpp, compiled in moe.cu) that the attention kernels (sparse_attention_compute.hpp,
+// qsa_prompt_attention.hpp, compiled in kernels.cpp) use as well.
+typedef _Float16 moe_half2 __attribute__((ext_vector_type(2)));
+typedef _Float16 moe_half8 __attribute__((ext_vector_type(8)));
+typedef float moe_float8 __attribute__((ext_vector_type(8)));
+typedef uint32_t moe_word4 __attribute__((ext_vector_type(4)));
+// Blocks of 110, 98, 82, 18 or 34 bytes start at any even address; RDNA4 loads them unaligned.
+typedef uint32_t moe_word_u __attribute__((aligned(2)));
+typedef uint2 moe_word2_u __attribute__((aligned(2)));
+typedef moe_word4 moe_word4_u __attribute__((aligned(2)));
+typedef moe_word4 moe_word4_b __attribute__((aligned(1)));   // MXFP4: 17-byte blocks at any byte
+#endif
 } // namespace sdgpu
