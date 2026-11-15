@@ -240,11 +240,21 @@ const LAYER_PREFILL_FIT_ROWS: u64 = 512;
 /// 12.7 s at 256 rows against the ordinary path's 16.0 s; about even at 128 rows by the 32.6K fits, losing below).
 const LAYER_PREFILL_SHORT_ROWS: u64 = 128;
 
-/// Whether the ordinary path's transfer of the routed experts costs enough every batch for layer order to win where the banks fit:
-/// Windows (IQ2_XS on an RTX 5070 Ti at 5.5 GiB, banks in RAM: 8.2K new 17.5 s at 512 rows against 25.4 s; 32.6K at 256 rows 73.7 s
-/// both; 3.8K at 128 rows 16.1 s against 10.0 s). Linux reads them faster (the same banks and budget on a Radeon AI PRO R9700: 14.9K new 22.4 s
-/// at 512 rows against 23.6 s, 3.7K 10.5 s against 6.4 s), and keeps the ordinary path.
-const LAYER_PREFILL_FITS: bool = cfg!(windows);
+/// The half ordinary batches of new tokens from which layer order wins where the banks fit (at [`LAYER_PREFILL_FIT_ROWS`] or more): every
+/// batch of the ordinary path transfers the routed experts again. Windows three (IQ2_XS on an RTX 5070 Ti at 5.5 GiB, banks in RAM: 8.2K new
+/// 17.5 s at 512 rows against 25.4 s; 32.6K at 256 rows 73.7 s both; 3.8K at 128 rows 16.1 s against 10.0 s). Linux reads them faster and
+/// takes five, with a pass's host rows moved beside the compute (UD-IQ1_S on a Radeon AI PRO R9700 at 5.5 GiB, ordinary batches of 4096 rows,
+/// layer order at 2048: 8045 new 5.86 s against 5.53, 11980 new 7.50 against 8.12, 15897 new 9.42 against 10.88, 31859 new 17.41 against
+/// 20.41, 95204 new 53.63 against 61.97: even near 9.4K); with the round trip that
+/// waits for each copy (STRAYDOG_LAYER_ROWS_OVERLAP=0) it keeps the ordinary path, as before the rows moved beside the compute (the same banks
+/// and budget, IQ2_XS: 14.9K new 22.4 s at 512 rows against 23.6 s, 3.7K 10.5 s against 6.4 s).
+fn layer_prefill_fit_halves(rows_overlap: bool) -> usize {
+    match (cfg!(windows), rows_overlap) {
+        (true, _) => 3,
+        (false, true) => 5,
+        (false, false) => 0,
+    }
+}
 
 /// The memory the banks may hold for a prefill: what RAM leaves beside `pinned` and [`crate::host::left_free`], bounded by what the system
 /// has for them now (`now`, from [`crate::host::bank_room_now`]) when other programs have taken it. None where RAM is unknown.
@@ -258,12 +268,12 @@ fn layer_prefill_room(memory: u64, pinned: u64, now: Option<u64>) -> Option<u64>
 /// [`layer_prefill_room`]): under memory pressure, the ordinary path reads them from the drive again every batch (32.6K new on the
 /// RTX 5070 Ti with 4.1 GiB available: 161.8 s, layer order 73.0 s at 256 rows). Large shortages amortize it over two ordinary batches; a
 /// slight shortage needs three full maximum-sized batches, and either [`LAYER_PREFILL_SHORT_ROWS`] (`rows`, from
-/// [`Group::layer_prefill_rows`]). Where the banks fit, `fits` (see [`LAYER_PREFILL_FITS`]) takes layer order from one and a half ordinary
-/// batches when it can take [`LAYER_PREFILL_FIT_ROWS`]: every batch of the ordinary path streams most of the absent experts again (IQ2_XS on
+/// [`Group::layer_prefill_rows`]). Where the banks fit, layer order is taken from `fit_halves` half ordinary batches (0: never; see
+/// [`layer_prefill_fit_halves`]) when it can take [`LAYER_PREFILL_FIT_ROWS`]: every batch of the ordinary path streams most of the absent experts again (IQ2_XS on
 /// an RTX 5070 Ti at 10 GiB, ordinary batches of 4096 rows, layer order at 2048: 8981 new 10.4 to 12.4 s against 8.4 to 8.6, 55 to 61
 /// thousand experts streamed against 25.5; 6357 new 7.9 to 8.5 s against 7.3 to 7.7; 4519 new 6.2 to 6.5 s against 6.4 to 6.7).
-fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, room: Option<u64>, rows: u64, fits: bool) -> bool {
-    if fits && rows >= LAYER_PREFILL_FIT_ROWS && new_tokens * 2 >= ordinary.max(batch).max(1) * 3 {
+fn layer_prefill_needed(new_tokens: usize, batch: usize, ordinary: usize, banks: u64, room: Option<u64>, rows: u64, fit_halves: usize) -> bool {
+    if fit_halves > 0 && rows >= LAYER_PREFILL_FIT_ROWS && new_tokens * 2 >= ordinary.max(batch).max(1) * fit_halves {
         return true;
     }
     let Some(room) = room else { return false };
@@ -4185,7 +4195,8 @@ impl Model {
             let room = layer_prefill_room(memory, pinned, crate::host::bank_room_now(pinned, self.locked_bank_bytes()?))
                 .map(|room| room.saturating_sub(hidden));
             let selected = self.layer_prefill_forced
-                || layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, room, rows, LAYER_PREFILL_FITS);
+                || layer_prefill_needed(tokens.len() - position, batch, ordinary, self.banks_bytes, room, rows,
+                                        layer_prefill_fit_halves(self.layer_rows_overlap));
             self.last_metrics.insert("layer_prefill_policy".into(), json!({"ordinary_batch_rows": ordinary, "layer_batch_rows": rows,
                                      "staging_kept": staging, "bank_bytes": self.banks_bytes, "bank_room": room, "selected": selected}));
             selected
@@ -6544,11 +6555,11 @@ mod partial_pair_tests {
 
 #[cfg(test)]
 mod layer_prefill_policy_tests {
-    use super::{layer_prefill_needed, layer_prefill_room};
+    use super::{layer_prefill_fit_halves, layer_prefill_needed, layer_prefill_room};
     const G:u64=1<<30;
     // The T284 cases: RAM `memory` with `pinned` state and nothing else taking memory (`now` unknown), Linux (no fit rule).
     fn needed(new:usize,batch:usize,ordinary:usize,banks:u64,memory:u64,pinned:u64)->bool{
-        layer_prefill_needed(new,batch,ordinary,banks,layer_prefill_room(memory,pinned,None),512,false)
+        layer_prefill_needed(new,batch,ordinary,banks,layer_prefill_room(memory,pinned,None),512,0)
     }
     #[test]
     fn a_small_shortage_needs_three_full_maximum_batches() {
@@ -6583,18 +6594,18 @@ mod layer_prefill_policy_tests {
         let banks=42283827200;
         for (new,room) in [(32646,8472035328),(3832,21448052736)] {
             let room=layer_prefill_room(62*G,2*G,Some(room));
-            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,true));
-            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,false));
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,3));
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,256,0));
             // narrower than 128 rows its MoE loses what the drive costs the ordinary path
-            assert!(layer_prefill_needed(new,2048,2048,banks,room,128,false));
-            assert!(!layer_prefill_needed(new,2048,2048,banks,room,64,false));
+            assert!(layer_prefill_needed(new,2048,2048,banks,room,128,0));
+            assert!(!layer_prefill_needed(new,2048,2048,banks,room,64,0));
         }
         // Unpressured the room was 46 GiB: the banks fit, and only Windows' fit rule takes layer order (8.2K at 512 rows: 17.5 s against
         // 25.4 s); 32.6K at 256 rows and 3.8K at 128 rows stayed ordinary (74.5 and 9.0 s; layer order 73.7 and 16.1 s).
         let room=layer_prefill_room(62*G,2*G,Some(49839136768));
-        assert!(layer_prefill_needed(8210,2048,2048,banks,room,512,true));
-        assert!(!layer_prefill_needed(32646,2048,2048,banks,room,256,true));
-        assert!(!layer_prefill_needed(3832,2048,2048,banks,room,128,true));
+        assert!(layer_prefill_needed(8210,2048,2048,banks,room,512,3));
+        assert!(!layer_prefill_needed(32646,2048,2048,banks,room,256,3));
+        assert!(!layer_prefill_needed(3832,2048,2048,banks,room,128,3));
         // what the system says never raises what the RAM leaves
         assert_eq!(layer_prefill_room(32*G,G,Some(100*G)),Some(32*G-G-4*G));
         assert_eq!(layer_prefill_room(0,G,Some(100*G)),None);
@@ -6604,21 +6615,44 @@ mod layer_prefill_policy_tests {
         // Windows, banks in RAM, ordinary batch 2048: 8.2K new at 512 rows layer order, 3.8K follow-up at 128 rows and 32.6K at 256 rows
         // ordinary.
         let room=Some(60*G);
-        assert!(layer_prefill_needed(8210,2048,2048,50*G,room,512,true));
-        assert!(!layer_prefill_needed(3832,2048,2048,50*G,room,128,true));
-        assert!(!layer_prefill_needed(32646,2048,2048,50*G,room,256,true));
-        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,1024,true));
-        assert!(!layer_prefill_needed(3*1024-1,2048,2048,50*G,room,512,true));
-        assert!(layer_prefill_needed(3*1024,2048,2048,50*G,room,512,true));
+        assert!(layer_prefill_needed(8210,2048,2048,50*G,room,512,3));
+        assert!(!layer_prefill_needed(3832,2048,2048,50*G,room,128,3));
+        assert!(!layer_prefill_needed(32646,2048,2048,50*G,room,256,3));
+        assert!(layer_prefill_needed(32646,2048,2048,50*G,room,1024,3));
+        assert!(!layer_prefill_needed(3*1024-1,2048,2048,50*G,room,512,3));
+        assert!(layer_prefill_needed(3*1024,2048,2048,50*G,room,512,3));
         // the RTX 5070 Ti at 10 GiB, ordinary batches of 4096 rows, layer order at 2048, banks 33.0 GiB in a room of 38 to 42 GiB: 8981 and
         // 6357 new take layer order (8.4 against 10.4 to 12.4 s, 7.3 to 7.7 against 7.9 to 8.5); 4519 new is even and stays ordinary
         let banks=33*G;
-        assert!(layer_prefill_needed(8981,4096,4096,banks,Some(38*G),2048,true));
-        assert!(layer_prefill_needed(6357,4096,4096,banks,Some(40*G),2048,true));
-        assert!(!layer_prefill_needed(4519,4096,4096,banks,Some(41*G),2048,true));
-        // Linux keeps the ordinary path for banks that fit (14.9K new at 512 rows: 22.4 s against 23.6 s, 3.7K 10.5 against 6.4).
-        assert!(!layer_prefill_needed(14937,2048,2048,50*G,Some(98*G),512,false));
-        assert!(!layer_prefill_needed(30000,0,0,0,None,0,true));
+        assert!(layer_prefill_needed(8981,4096,4096,banks,Some(38*G),2048,3));
+        assert!(layer_prefill_needed(6357,4096,4096,banks,Some(40*G),2048,3));
+        assert!(!layer_prefill_needed(4519,4096,4096,banks,Some(41*G),2048,3));
+        // Linux with the round trip keeps the ordinary path for banks that fit (14.9K new at 512 rows: 22.4 s against 23.6 s, 3.7K 10.5 against 6.4).
+        assert!(!layer_prefill_needed(14937,2048,2048,50*G,Some(98*G),512,0));
+        assert!(!layer_prefill_needed(30000,0,0,0,None,0,3));
+    }
+    #[test]
+    fn fitting_banks_take_layer_order_from_two_and_a_half_ordinary_batches_on_linux_with_the_rows_beside_the_compute() {
+        // A Radeon AI PRO R9700 at 5.5 GiB, UD-IQ1_S, banks in RAM, ordinary batches of 4096 rows, layer order at 2048: 8045 new stays
+        // ordinary (5.53 s against 5.86), 11980, 15897, 31859 and 95204 new take layer order (7.50 against 8.12 s, 9.42 against 10.88,
+        // 17.41 against 20.41, 53.63 against 61.97).
+        let (banks,room)=(10*G,Some(100*G));
+        let linux=5;
+        assert!(!layer_prefill_needed(8045,4096,4096,banks,room,2048,linux));
+        assert!(!layer_prefill_needed(5*2048-1,4096,4096,banks,room,2048,linux));
+        assert!(layer_prefill_needed(5*2048,4096,4096,banks,room,2048,linux));
+        assert!(layer_prefill_needed(11980,4096,4096,banks,room,2048,linux));
+        assert!(layer_prefill_needed(15897,4096,4096,banks,room,2048,linux));
+        assert!(layer_prefill_needed(31859,4096,4096,banks,room,2048,linux));
+        assert!(layer_prefill_needed(95204,4096,4096,banks,room,2048,linux));
+        // narrower than the fit rows the ordinary path stays
+        assert!(!layer_prefill_needed(95204,4096,4096,banks,room,256,linux));
+        // the platform's halves: Windows three whatever the copies; Linux five with the rows beside the compute, none with the round trip
+        if cfg!(windows) {
+            assert_eq!((layer_prefill_fit_halves(true),layer_prefill_fit_halves(false)),(3,3));
+        } else {
+            assert_eq!((layer_prefill_fit_halves(true),layer_prefill_fit_halves(false)),(5,0));
+        }
     }
 }
 
