@@ -651,6 +651,11 @@ impl<E: Engines> Session<E> {
         self.checkpoints.clear();
     }
 
+    /// The tokens the engines hold, in order: the last request's prompt and what its reply fed.
+    pub fn held(&self) -> &[u32] {
+        &self.history
+    }
+
     /// Tests only: forget the mark of the last long reply, as engines that keep none have none.
     #[doc(hidden)]
     pub fn forget_mark(&mut self) {
