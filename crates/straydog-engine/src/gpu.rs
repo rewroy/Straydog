@@ -12,6 +12,63 @@ use straydog_gpu::ffi;
 
 use crate::formats;
 
+/// A diagnostic snapshot of requested bytes and the independently charged allocation reserve.
+/// Pool, K/V and CPU-partial amounts are disjoint; the runtime's free memory is queried separately.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryAccounting {
+    pub requested_used: u64,
+    pub budget: u64,
+    pub reserve: u64,
+    pub live_allocations: u64,
+    pub peak_reserve: u64,
+    pub chunk_bytes: u64,
+    pub pool_requested: u64,
+    pub pool_reserve: u64,
+    pub pool_allocations: u64,
+    pub kv_requested: u64,
+    pub kv_reserve: u64,
+    pub kv_allocations: u64,
+    pub partial_requested: u64,
+    pub partial_reserve: u64,
+    pub partial_allocations: u64,
+    pub flags: u64,
+}
+
+impl MemoryAccounting {
+    fn from_words(values: [u64; 16]) -> Self {
+        let [requested_used, budget, reserve, live_allocations, peak_reserve, chunk_bytes,
+             pool_requested, pool_reserve, pool_allocations, kv_requested, kv_reserve,
+             kv_allocations, partial_requested, partial_reserve, partial_allocations, flags] = values;
+        Self { requested_used, budget, reserve, live_allocations, peak_reserve, chunk_bytes,
+               pool_requested, pool_reserve, pool_allocations, kv_requested, kv_reserve,
+               kv_allocations, partial_requested, partial_reserve, partial_allocations, flags }
+    }
+
+    pub fn effective_used(&self) -> Result<u64> {
+        self.requested_used.checked_add(self.reserve).ok_or_else(|| "Straydog effective memory accounting overflow".into())
+    }
+
+    pub fn record(&self) -> serde_json::Value {
+        serde_json::json!({ "requested_used_bytes": self.requested_used, "budget_bytes": self.budget,
+            "reserve_bytes": self.reserve, "charged_live_allocations": self.live_allocations, "peak_reserve_bytes": self.peak_reserve,
+            "chunk_payload_bytes": self.chunk_bytes, "pool_requested_bytes": self.pool_requested,
+            "pool_reserve_bytes": self.pool_reserve, "pool_live_allocations": self.pool_allocations,
+            "kv_requested_bytes": self.kv_requested, "kv_reserve_bytes": self.kv_reserve,
+            "kv_live_allocations": self.kv_allocations, "cpu_partial_requested_bytes": self.partial_requested,
+            "cpu_partial_reserve_bytes": self.partial_reserve, "cpu_partial_live_allocations": self.partial_allocations,
+            "requested": self.flags & 1 != 0, "segmented": self.flags & 2 != 0, "disabled": self.flags & 4 != 0 })
+    }
+}
+
+/// The effective bytes after lending the pool, retaining a stage-only allocation when requested.
+/// K/V and CPU-partial reserves remain charged because releasing the pool does not release their owners.
+fn after_lending_pool(used: u64, pool_requested: u64, pool_reserve: u64, stage_requested: u64, stage_reserve: u64) -> Result<u64> {
+    used.checked_sub(pool_requested).and_then(|bytes| bytes.checked_sub(pool_reserve))
+        .and_then(|bytes| bytes.checked_add(stage_requested)).and_then(|bytes| bytes.checked_add(stage_reserve))
+        .ok_or_else(|| "Straydog lent pool accounting overflow".into())
+}
+
 /// What a drafter's head says of its row: its most likely token and that token's probability, or, asked for its `top`, those
 /// logits and tokens, most likely first (the probability then 1: the host draws the draft from them).
 pub struct Draft {
@@ -26,6 +83,21 @@ fn top_pairs(row: &[f32], top: usize) -> Vec<(f32, u32)> {
 }
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// The development-only retained expert-cache allocator is selected before placement.
+pub fn kv_cache_retention_requested() -> bool {
+    std::env::var("STRAYDOG_KV_CACHE_RETAIN").is_ok_and(|value| value == "1")
+}
+
+/// Cumulative native retained-growth counters, in the order of `sd_expert_slots_retain_stats`.
+pub const KV_CACHE_RETAIN_COUNTERS: [&str; 16] = [
+    "kv_cache_retain_attempts", "kv_cache_retain_successes", "kv_cache_retain_fallbacks",
+    "kv_cache_retain_in_place_experts", "kv_cache_retain_d2d_experts", "kv_cache_retain_d2d_bytes",
+    "kv_cache_retain_new_h2d_experts", "kv_cache_retain_new_h2d_bytes", "kv_cache_retain_temporary_evicted_experts",
+    "kv_cache_retain_temporary_h2d_experts", "kv_cache_retain_temporary_h2d_bytes", "kv_cache_retain_freed_bytes",
+    "kv_cache_retain_pack_launches", "kv_cache_retain_allocated_chunks", "kv_cache_retain_freed_chunks",
+    "kv_cache_retain_temporary_evicted_bytes",
+];
 
 /// A software wait timeout whose native queues were drained and export counters aligned.
 pub const HYBRID_WAIT_RECOVERED: &str = "the GPU wait timed out; the interrupted pass was discarded";
@@ -643,6 +715,26 @@ impl Backend {
         Ok((used, budget))
     }
 
+    /// Requested bytes plus live allocator reserve for admission; raw memory telemetry is unchanged.
+    fn budget_memory(&self) -> Result<(u64, u64)> {
+        if !kv_cache_retention_requested() { return self.memory(); }
+        let (mut used, mut budget) = (0, 0);
+        // SAFETY: a live handle and two out-parameters; this reads native accounting only.
+        check(unsafe { ffi::sd_memory_effective(self.handle, &mut used, &mut budget) })?;
+        Ok((used, budget))
+    }
+
+    /// Requested and charged bytes in their native ownership domains; this does not synchronize the GPU.
+    #[doc(hidden)]
+    pub fn memory_accounting(&self) -> Result<MemoryAccounting> {
+        let mut words = [0; 16];
+        // SAFETY: a live handle and storage for the sixteen documented accounting words.
+        check(unsafe { ffi::sd_expert_slots_accounting(self.handle, words.as_mut_ptr(), words.len() as u64) })?;
+        let value = MemoryAccounting::from_words(words);
+        value.effective_used()?;
+        Ok(value)
+    }
+
     /// Raise the budget to `budget` and place the expert slots again at what fits then, with the experts that use them most (as after a K/V
     /// growth, [`Backend::grow_kv`]): GPU memory that other programs freed since the start, under `auto`. The slots before and after; a device
     /// with no slots placed, or in a long prompt's prefill, only takes the budget.
@@ -668,7 +760,7 @@ impl Backend {
     /// changing the budget, retaining the fixed state and the staging space a pass needs.
     /// A refused allocation leaves the smaller budget in force and the pool retryable.
     pub fn resize_budget(&mut self, budget: u64) -> Result<(u64, u64)> {
-        let (used, previous) = self.memory()?;
+        let (used, previous) = self.budget_memory()?;
         if budget >= previous {
             return self.raise_budget(budget);
         }
@@ -685,8 +777,9 @@ impl Backend {
         // copies and clears every slot's table entry before freeing its arena.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
         self.slots_absent = true;
-        let fixed = self.memory()?.0;
-        let minimum = fixed.saturating_add(self.slot_stage.saturating_mul(self.slot_size)).saturating_add(self.slot_margin);
+        let fixed = self.budget_memory()?.0;
+        let minimum = stage_only_minimum(fixed, self.slot_stage, self.slot_size, self.slot_margin,
+                                         kv_cache_retention_requested());
         let smaller = budget.max(minimum).min(previous);
         // SAFETY: fixed allocations fit; the old arena has already been released.
         check(unsafe { ffi::sd_set_budget(self.handle, smaller) })?;
@@ -785,7 +878,7 @@ impl Backend {
                 if piece.at != 0 {
                     return Err(format!("Straydog part pieces do not fill {}", operand.key));
                 }
-                let (used, budget) = self.memory()?;
+                let (used, budget) = self.budget_memory()?;
                 if used + size as u64 > budget {
                     return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
                 }
@@ -812,7 +905,7 @@ impl Backend {
             if quantized.len() != size {
                 return Err(format!("Straydog GPU weight size mismatch: {}", operand.key));
             }
-            let (used, budget) = self.memory()?;
+            let (used, budget) = self.budget_memory()?;
             if used + size as u64 > budget {
                 return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
             }
@@ -845,7 +938,7 @@ impl Backend {
         if decode.is_none() && data.len() != size {
             return Err(format!("Straydog GPU weight size mismatch: {}", operand.key));
         }
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         if used + size as u64 > budget {
             return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
         }
@@ -880,7 +973,7 @@ impl Backend {
         if placed != size as u64 || !fits {
             return Err(format!("Straydog part pieces do not fill {}", operand.key));
         }
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         if used + size as u64 > budget {
             return Err(format!("{} cannot fit in the Straydog VRAM budget", operand.key));
         }
@@ -969,7 +1062,7 @@ impl Backend {
             let device = pointer(unsafe { ffi::sd_host_state(self.handle, rows * cols * 4) })?;
             Entry { pointer: device, kind: 0, rows, cols }
         } else {
-            let (used, budget) = self.memory()?;
+            let (used, budget) = self.budget_memory()?;
             if used + rows * cols * 4 > budget {
                 return Err(format!("{key} cannot fit in the Straydog VRAM budget"));
             }
@@ -1135,6 +1228,55 @@ impl Backend {
     /// Every layer's K/V to `capacity` positions, a sequence's `valid` kept (see `sd_kv_grow`), where the K/V is: in host memory or in VRAM. The
     /// slots give up the VRAM and take what is left after, so a K/V in VRAM takes its bytes from them for good, a host K/V's longer indexers only.
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
+        if kv_cache_retention_requested() && self.slot_stage > 0 && self.long_prefill.is_none() {
+            let layers: Vec<u64> = self.states.keys()
+                .filter_map(|key| key.strip_prefix("@qsa:blk.")?.strip_suffix('.')?.parse().ok())
+                .collect();
+            let mut retained = 0;
+            // SAFETY: the live device is exclusive; layer IDs have the same order as grow_kv_layers, and all pointers outlive the call.
+            check(unsafe {
+                ffi::sd_expert_slots_retain_prepare(self.handle, layers.as_ptr(), layers.len() as u64,
+                    capacity, self.slot_margin, &mut retained)
+            })?;
+            if retained != 0 {
+                crate::host::commit_note("K/V retained growth");
+                match self.grow_kv_layers(capacity, valid) {
+                    Ok(()) => {
+                        // SAFETY: prepare left an active transaction and every requested layer has now grown.
+                        check(unsafe { ffi::sd_expert_slots_retain_finish(self.handle, &mut retained) })?;
+                        if retained != 0 { return Ok(()); }
+                        // An allocation-only refusal: K/V is already grown, so rebuild only the expert pool.
+                        // SAFETY: the live device is exclusive; release owns the remaining transaction allocations.
+                        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+                        return self.restore_after_kv_growth();
+                    }
+                    Err(error) => {
+                        // Save the original error before another FFI call changes the thread's error text. Only the native allocator's
+                        // explicit budget/OOM classification permits another device allocation attempt.
+                        // SAFETY: the transaction is still active on this live device.
+                        let no_vram = check(unsafe { ffi::sd_expert_slots_retain_oom(self.handle) })? != 0;
+                        // SAFETY: between passes, after prepare quiesced the device; releases the whole remaining pool and transaction.
+                        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+                        self.slots_absent = true;
+                        if no_vram {
+                            let grown = self.grow_kv_layers(capacity, valid);
+                            if let Err(error) = &grown {
+                                // SAFETY: the live device retains the last growth's explicit OOM classification after pool release too.
+                                let refused = check(unsafe { ffi::sd_expert_slots_retain_oom(self.handle) })? != 0;
+                                if !refused && !error.ends_with(crate::model::KV_NO_MEMORY) { return grown; }
+                            }
+                            self.restore_after_kv_growth()?;
+                            return grown;
+                        }
+                        if error.ends_with(crate::model::KV_NO_MEMORY) {
+                            // Host-memory refusal retains the existing give-back/retry contract.
+                            self.restore_after_kv_growth()?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
         // The slots give up their VRAM for the longer indexers and take what is left, whether every layer grew or memory ran out.
         crate::host::commit_note("K/V growth");
         // SAFETY: a live handle, between requests.
@@ -1142,12 +1284,28 @@ impl Backend {
         crate::host::commit_note("slots released");
         let grown = self.grow_kv_layers(capacity, valid);
         crate::host::commit_note("K/V grown");
+        if kv_cache_retention_requested() {
+            if let Err(error) = &grown {
+                // A declined retain plan still uses strict allocation errors throughout the legacy fallback.
+                // SAFETY: a live handle, whose most recent growth owns the classification flag.
+                let refused = check(unsafe { ffi::sd_expert_slots_retain_oom(self.handle) })? != 0;
+                if !refused && !error.ends_with(crate::model::KV_NO_MEMORY) {
+                    self.slots_absent = self.slot_stage > 0;
+                    return grown;
+                }
+            }
+        }
+        self.restore_after_kv_growth()?;
+        grown
+    }
+
+    fn restore_after_kv_growth(&mut self) -> Result<()> {
         if self.slot_stage > 0 {
             let cache = if self.long_prefill.is_some() { 0 } else { self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)? };
             self.restore_slots(cache)?;
             self.rebalance(0)?;
         }
-        grown
+        Ok(())
     }
 
     fn grow_kv_layers(&mut self, capacity: u64, valid: u64) -> Result<()> {
@@ -1198,9 +1356,13 @@ impl Backend {
         let mut arena = 0;
         // SAFETY: a live device and a valid out-parameter; this only reads its current allocation accounting.
         check(unsafe { ffi::sd_hybrid_cache_bytes(self.handle, &mut arena) })?;
-        let (used, budget) = self.memory()?;
-        // release_expert_slots then restore_slots(0) retains staging and removes exactly the cache arena.
-        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_add(self.slot_margin))
+        let (used, budget) = self.budget_memory()?;
+        // Replacing the pool releases its reserve too, while K/V and CPU-partial owners remain.
+        let lent = if kv_cache_retention_requested() {
+            let accounting = self.memory_accounting()?;
+            after_lending_pool(used, accounting.pool_requested, accounting.pool_reserve, self.slot_stage * self.slot_size, 2 << 20)?
+        } else { used.saturating_sub(arena) };
+        let free = budget.saturating_sub(lent.saturating_add(self.slot_margin))
             .saturating_add(prefill_workspace_bytes(self.prefill_capacity));
         Ok(batch.max(widened_prefill_rows(self.prefill_capacity, free)))
     }
@@ -1216,7 +1378,7 @@ impl Backend {
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
         self.long_prefill = Some(self.prefill_capacity);
         self.restore_slots(0)?;
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         let free = budget.saturating_sub(used + self.slot_margin) + prefill_workspace_bytes(self.prefill_capacity);
         let capacity = widened_prefill_rows(self.prefill_capacity, free);
         if capacity > self.prefill_capacity { self.prefill_buffers(capacity)?; }
@@ -1266,9 +1428,13 @@ impl Backend {
             check(unsafe { ffi::sd_allocation_bytes(self.handle, entry.pointer, &mut head) })?;
         }
         let stage = if staging || self.slots_absent { 0 } else { self.slot_stage * self.slot_size };
-        let (used, budget) = self.memory()?;
-        let free = budget.saturating_sub(used.saturating_sub(arena).saturating_sub(stage).saturating_sub(head))
-            + prefill_workspace_bytes(self.prefill_capacity);
+        let (used, budget) = self.budget_memory()?;
+        let lent = if kv_cache_retention_requested() {
+            let accounting = self.memory_accounting()?;
+            let (stage_requested, stage_reserve) = if staging { (self.slot_stage * self.slot_size, 2 << 20) } else { (0, 0) };
+            after_lending_pool(used, accounting.pool_requested, accounting.pool_reserve, stage_requested, stage_reserve)?.saturating_sub(head)
+        } else { used.saturating_sub(arena).saturating_sub(stage).saturating_sub(head) };
+        let free = budget.saturating_sub(lent) + prefill_workspace_bytes(self.prefill_capacity);
         Ok(self.layer_prefill_capacity(bank_bytes, free).unwrap_or(0))
     }
 
@@ -1290,7 +1456,7 @@ impl Backend {
             check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
         }
         self.prefill_buffers(2)?;
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         let free = budget.saturating_sub(used) + prefill_workspace_bytes(self.prefill_capacity);
         let Some(capacity) = self.layer_prefill_capacity(bank_bytes, free) else { return Ok(None) };
         self.prefill_buffers(capacity)?;
@@ -1310,7 +1476,7 @@ impl Backend {
         if self.layer_rows.is_some() {
             return Ok(Some("rows already held".into()));
         }
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         if let Some(reason) = layer_rows_refusal(rows, budget.saturating_sub(used), self.slot_margin) {
             return Ok(Some(reason));
         }
@@ -1510,7 +1676,7 @@ impl Backend {
         // (in the stage's rows of 1024 floats: a position takes a row of kv_row_floats() a plane, four planes for a whole layer, a part's two)
         let needed: u64 = self.states.keys().filter(|key| key.starts_with("@qsa:"))
             .map(|key| (self.kv_planes(key) * context * kv_row_floats()).div_ceil(1024)).sum();
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         let free = budget.saturating_sub(used + Self::slack(budget) + ALLOCATION_TAIL);
         let rows = (stage.rows / 4 + free / 4096).min(needed);
         if rows < stage.rows / 4 + 256 {
@@ -1563,7 +1729,7 @@ impl Backend {
         if self.batch_capacity != 256 {
             return Ok(u64::MAX);
         }
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         let reserved = reserved.unwrap_or(if self.states.contains_key("@scratch:decoder") {
             0
         } else {
@@ -2598,7 +2764,7 @@ impl Backend {
         // A few kilobytes (rolling histories) go to host memory: a VRAM allocation and its
         // release cost more than their copy.
         let floats: u64 = parts.iter().map(|part| part.width * part.height).sum();
-        let (used, budget) = self.memory()?;
+        let (used, budget) = self.budget_memory()?;
         let in_vram = floats * 4 > HOST_COPY_BYTES && used + floats * 4 + PARK_MARGIN <= budget;
         let copied = (|| {
             for part in &mut parts {
@@ -2885,7 +3051,14 @@ impl Backend {
             match check(unsafe { ffi::sd_expert_slots(self.handle, cache, stage, slot, c_int::from(mirror)) }) {
                 Ok(_) => {
                     (self.slot_stage, self.slot_margin, self.slot_size, self.slot_mirror) = (stage, margin, slot, mirror);
-                    return Ok(cache);
+                    let accepted = if kv_cache_retention_requested() {
+                        let nominal = self.memory_accounting()?.pool_requested;
+                        let stage_bytes = stage.checked_mul(slot).ok_or("Straydog stage size overflow")?;
+                        let arena = nominal.checked_sub(stage_bytes).ok_or("Straydog expert pool smaller than stage")?;
+                        if arena % slot != 0 { return Err("Straydog expert pool size is not an integer cache".into()); }
+                        arena / slot
+                    } else { cache };
+                    return Ok(accepted);
                 }
                 Err(error) => {
                     let Some(next) = next_slot_attempt(stage, cache, mirror, &error) else { return Err(error) };
@@ -2905,6 +3078,15 @@ impl Backend {
     }
 
     fn slots_that_fit(&self, stage: u64, margin: u64, slot: u64) -> Result<u64> {
+        if kv_cache_retention_requested() {
+            let cap = 65536u64.checked_sub(stage).ok_or("Straydog expert stage exceeds slot limit")?;
+            let (mut cache, mut nominal, mut reserve) = (0, 0, 0);
+            // SAFETY: a live handle and out-parameters. Native predicts a replacement pool without GPU operations.
+            // It includes a not-yet-created CPU-partial buffer; extra=0 requests no other workspace.
+            let planned = check(unsafe { ffi::sd_expert_slots_plan(self.handle, cap, stage, slot, margin, 0,
+                                                                  &mut cache, &mut nominal, &mut reserve) });
+            return slot_plan_estimate(planned.map(|_| cache));
+        }
         let (used, budget) = self.memory()?;
         let free = i128::from(budget) - i128::from(used) - i128::from(margin) - i128::from(stage * slot) - 8192 * 4;
         Ok((free.max(0) as u64) / slot)
@@ -3012,6 +3194,28 @@ impl Backend {
         // SAFETY: a live handle and out-parameters.
         check(unsafe { ffi::sd_hybrid_slots(self.handle, &mut slots, &mut held) })?;
         Ok((slots, held))
+    }
+
+    /// Native counters for the optional expert-cache retention path; reading them does not synchronize the GPU.
+    pub fn kv_cache_retain_stats(&self) -> Result<[u64; 16]> {
+        let mut values = [0; 16];
+        // SAFETY: a live handle and storage for the documented sixteen counters.
+        check(unsafe { ffi::sd_expert_slots_retain_stats(self.handle, values.as_mut_ptr(), values.len() as u64) })?;
+        Ok(values)
+    }
+
+    /// A synchronized diagnostic snapshot of occupied cache slots: layer, expert, group, slot, address, payload bytes, layout mask, byte hash.
+    /// Hashes cover the complete expert image as it is stored, including packed gate/up matrices, and exclude unused slot padding.
+    pub fn expert_cache_residency(&mut self) -> Result<Vec<[u64; 8]>> {
+        let mut rows = 0;
+        // SAFETY: a live exclusive handle and a valid row-count output; a null buffer requests the required size.
+        check(unsafe { ffi::sd_expert_slots_residency(self.handle, std::ptr::null_mut(), 0, &mut rows) })?;
+        let count = usize::try_from(rows).map_err(|_| "expert cache residency size overflow")?;
+        let mut values = vec![[0; 8]; count];
+        // SAFETY: eight u64 words per row, exactly the capacity queried above; the handle remains exclusive between calls.
+        check(unsafe { ffi::sd_expert_slots_residency(self.handle, values.as_mut_ptr().cast(), rows, &mut rows) })?;
+        if usize::try_from(rows).ok() != Some(count) { return Err("expert cache residency changed during snapshot".into()); }
+        Ok(values)
     }
 
     pub fn enable_assist(&mut self, routes: u32) -> Result<u64> {
@@ -3428,6 +3632,25 @@ fn bytemuck_bytes(values: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
 }
 
+const RETAINED_CACHE_OOM: &str = "not enough VRAM for retained expert cache (code 2)";
+
+fn retained_cache_oom(error: &str) -> bool {
+    error.strip_prefix("Straydog GPU: ").unwrap_or(error) == RETAINED_CACHE_OOM
+}
+
+/// A stage that does not fit predicts no cache; actual creation still enters the ordinary stage-reduction retry.
+fn slot_plan_estimate(planned: Result<u64>) -> Result<u64> {
+    match planned {
+        Err(error) if retained_cache_oom(&error) => Ok(0),
+        result => result,
+    }
+}
+
+fn stage_only_minimum(fixed: u64, stage: u64, slot: u64, margin: u64, retained: bool) -> u64 {
+    let minimum = fixed.saturating_add(stage.saturating_mul(slot)).saturating_add(margin);
+    if retained { minimum.saturating_add(32768).saturating_add(2 << 20) } else { minimum }
+}
+
 /// One more try after an expert-slot allocation answered `code 2`. `refit` means the cache count has to be measured
 /// again for the new staging count. Nothing here asks the device.
 #[derive(Debug, PartialEq, Eq)]
@@ -3439,7 +3662,7 @@ pub(crate) struct SlotAttempt {
 }
 
 pub(crate) fn next_slot_attempt(stage: u64, cache: u64, mirror: bool, error: &str) -> Option<SlotAttempt> {
-    if !error.contains(", code 2)") {
+    if !error.contains(", code 2)") && !retained_cache_oom(error) {
         return None;
     }
     // Halve the staging count first, and never below 2: a stage of 1 cannot gather a prefill.
@@ -3660,5 +3883,96 @@ mod wide_batch_workspace_tests {
                 assert!(floats >= rows.min(MOE_CHUNK_ROWS) * row + 65536 && floats >= rows * scratch, "{rows} rows, parts {parts}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reserve_accounting_tests {
+    use super::{after_lending_pool, MemoryAccounting};
+
+    #[test]
+    fn lending_returns_pool_reserve_but_keeps_kv_and_partial_charges() {
+        // Raw fixed state=500, old pool=400; reserves: pool60, KV30 and CPU-partial10.
+        // A100-byte stage with one20-byte reserve replaces the pool.
+        assert_eq!(after_lending_pool(1000, 400, 60, 100, 20).unwrap(), 660);
+        // Without staging, both the pool's raw bytes and its reserve are returned.
+        assert_eq!(after_lending_pool(1000, 400, 60, 0, 0).unwrap(), 540);
+    }
+
+    #[test]
+    fn lending_an_absent_pool_charges_the_new_stage() {
+        assert_eq!(after_lending_pool(540, 0, 0, 100, 20).unwrap(), 660);
+    }
+
+    #[test]
+    fn lending_rejects_unowned_bytes_and_overflow() {
+        assert!(after_lending_pool(10, 11, 0, 0, 0).is_err());
+        assert!(after_lending_pool(10, 5, 6, 0, 0).is_err());
+        assert!(after_lending_pool(u64::MAX, 0, 0, 1, 0).is_err());
+    }
+
+    #[test]
+    fn memory_snapshot_retains_raw_telemetry_and_disjoint_domains() {
+        let snapshot = MemoryAccounting::from_words([900, 2000, 100, 5, 120, 256 << 20,
+            400, 60, 3, 200, 20, 1, 100, 20, 1, 3]);
+        assert_eq!(snapshot.requested_used, 900);
+        assert_eq!(snapshot.effective_used().unwrap(), 1000);
+        assert_eq!(snapshot.pool_reserve + snapshot.kv_reserve + snapshot.partial_reserve, snapshot.reserve);
+        let record = snapshot.record();
+        assert_eq!(record["requested_used_bytes"], 900);
+        assert_eq!(record["cpu_partial_reserve_bytes"], 20);
+        assert_eq!(record["requested"], true);
+        assert_eq!(record["segmented"], true);
+        assert_eq!(record["disabled"], false);
+        let overflow = MemoryAccounting::from_words([u64::MAX, u64::MAX, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(overflow.effective_used().is_err());
+    }
+}
+
+#[cfg(test)]
+mod reserve_stage_retry_tests {
+    use super::{next_slot_attempt, slot_plan_estimate, stage_only_minimum, Result, RETAINED_CACHE_OOM};
+
+    fn stage_fixture(max_stage: u64, fatal: Option<&str>) -> Result<Vec<u64>> {
+        let mut stage = 32;
+        let mut attempted = Vec::new();
+        loop {
+            attempted.push(stage);
+            let plan = if let Some(error) = fatal { Err(error.to_owned()) }
+                else if stage <= max_stage { Ok(7) }
+                else { Err(format!("Straydog GPU: {RETAINED_CACHE_OOM}")) };
+            let cache = slot_plan_estimate(plan)?;
+            if stage <= max_stage { return Ok(attempted); }
+            // The native create repeats its exact fit before allocating and emits this refusal.
+            let error = format!("Straydog GPU: {RETAINED_CACHE_OOM}");
+            let Some(next) = next_slot_attempt(stage, cache, true, &error) else { return Err(error) };
+            stage = next.stage;
+        }
+    }
+
+    #[test]
+    fn reserve_stage_refusal_reaches_the_existing_halving_retry() {
+        assert_eq!(stage_fixture(8, None).unwrap(), [32, 16, 8]);
+        assert_eq!(slot_plan_estimate(Err(RETAINED_CACHE_OOM.into())).unwrap(), 0);
+        assert!(stage_fixture(1, None).is_err(), "stage2 must stop instead of retrying forever");
+        assert!(next_slot_attempt(2, 0, true, RETAINED_CACHE_OOM).is_none());
+    }
+
+    #[test]
+    fn reserve_stage_retry_does_not_swallow_non_oom_or_cleanup_errors() {
+        for error in ["invalid expert slot capacity plan", "GPU copy failure", "another failure (code 2)",
+                      "Straydog GPU: not enough VRAM for retained expert cache (code 2); cleanup failed"] {
+            assert_eq!(stage_fixture(8, Some(error)).unwrap_err(), error);
+            assert!(next_slot_attempt(32, 0, true, error).is_none());
+        }
+        assert!(next_slot_attempt(32, 0, true, "out of memory (file.hpp:1, code 2)").is_some());
+    }
+
+    #[test]
+    fn reserve_stage_only_floor_keeps_legacy_allowance_and_fixed_reserve() {
+        let fixed = 5000 + (4 << 20); // Includes live K/V and CPU-partial reserves already.
+        let raw_floor = fixed + 2 * 65536 + 4096;
+        assert_eq!(stage_only_minimum(fixed, 2, 65536, 4096, false), raw_floor);
+        assert_eq!(stage_only_minimum(fixed, 2, 65536, 4096, true), raw_floor + 32768 + (2 << 20));
     }
 }

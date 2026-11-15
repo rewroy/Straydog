@@ -3168,6 +3168,26 @@ impl Model {
         self.group.slots().unwrap_or((0, 0))
     }
 
+    /// Tests only: each device's settled expert-cache images, including their stored-byte hashes.
+    #[doc(hidden)]
+    pub fn expert_cache_residency_for_test(&mut self) -> Result<Vec<(usize, Vec<[u64; 8]>)>> {
+        self.group.backends.iter_mut().enumerate()
+            .map(|(device, backend)| backend.expert_cache_residency().map(|rows| (device, rows))).collect()
+    }
+
+    /// Tests only: each device's cumulative retained-growth counters.
+    #[doc(hidden)]
+    pub fn kv_cache_retain_stats_for_test(&self) -> Result<Vec<(usize, [u64; 16])>> {
+        self.group.backends.iter().enumerate()
+            .map(|(device, backend)| backend.kv_cache_retain_stats().map(|stats| (device, stats))).collect()
+    }
+
+    /// Tests only: each GPU's requested bytes and independently charged allocation reserve.
+    #[doc(hidden)]
+    pub fn memory_accounting_for_test(&self) -> Result<Vec<(usize, crate::gpu::MemoryAccounting)>> {
+        self.group.backends.iter().map(|backend| backend.memory_accounting().map(|value| (backend.ordinal, value))).collect()
+    }
+
     /// The K/V's next size for `positions`: twice over where the commit and the memory have room for that, else a quarter more, else what the
     /// sequence needs, which only the commit can refuse: a sequence at 66K locked 6 GiB for 131072 positions. The commit is read
     /// with the slots' VRAM still charged to it: they give it up for the growth and take it back after, so what the growth takes of it
@@ -3213,11 +3233,14 @@ impl Model {
             return Ok(());
         }
         let growing = Instant::now();
+        let cache_before = crate::gpu::kv_cache_retention_requested()
+            .then(|| self.group.kv_cache_retain_stats()).transpose()?;
         if let Some(parked) = self.parked.take() {
             self.discard(parked)?;
         }
         if !self.host_kv {
             self.grow_vram_kv(positions, growing)?;
+            self.record_kv_cache_growth(cache_before)?;
             self.after_kv_growth();
             return Ok(());
         }
@@ -3249,7 +3272,18 @@ impl Model {
         self.refresh_kv_ahead();
         // (what a growth costs a request: the case for growing by less than doubling)
         self.metric_add("kv_growth_seconds", growing.elapsed().as_secs_f64());
+        self.record_kv_cache_growth(cache_before)?;
         self.after_kv_growth();
+        Ok(())
+    }
+
+    fn record_kv_cache_growth(&mut self, before: Option<[u64; 16]>) -> Result<()> {
+        if let Some(before) = before {
+            let after = self.group.kv_cache_retain_stats()?;
+            for ((key, after), before) in crate::gpu::KV_CACHE_RETAIN_COUNTERS.iter().zip(after).zip(before) {
+                self.metric_count(key, after.saturating_sub(before));
+            }
+        }
         Ok(())
     }
 

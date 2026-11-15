@@ -44,7 +44,8 @@ void verify_buffers(Device& d, DecoderLayer& plan) {
     const size_t bytes = (verify_snapshot_floats(plan) + rows * verify_projection_floats(plan)) * 4;
     // (a pipelined device holds a second window beside the first: the pass behind one in flight saves its own)
     for (int copy = plan.snapshot ? 1 : 0; copy < (d.pipelined ? 2 : 1); ++copy) {
-        if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes)
+        const size_t available=budget_available(d);
+        if (bytes > available || allocation_tail > available - bytes)
             throw std::runtime_error("speculative verification state exceeds the Straydog VRAM budget");
         float* buffer = nullptr;
         check(hipMalloc(reinterpret_cast<void**>(&buffer), bytes + allocation_tail));

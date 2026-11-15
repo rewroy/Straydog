@@ -143,6 +143,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <condition_variable>
 #include <cstddef>   // (before the namespace below: a header in it that includes this first would declare a `std` inside it)
 #include <cstdint>
@@ -294,17 +295,50 @@ private:
 };
 #endif
 // Fixed-size device slots holding one routed expert's gate, up and down slices.
+struct ExpertCacheChunk {
+    uint8_t* base=nullptr;
+    size_t bytes=0, stride=0, count=0;
+    uint8_t group=0;
+    size_t reserve=0;
+};
+struct RetainedExpert {
+    ResidentMoe* plan=nullptr;
+    size_t expert=0;
+    uint8_t* original=nullptr;
+    bool temporary=false, moved=false;
+};
+struct ExpertCacheGrowth {
+    size_t arena=0, expected_fixed=0, expected_reserve=0;
+    std::vector<size_t> stride, counts;
+    std::vector<RetainedExpert> target;
+};
 struct ExpertSlots {
     uint8_t* base=nullptr;
     uint8_t* host=nullptr;   // page-locked mirror of the staging slots: prefill gathers absent experts here
     size_t cache=0, stage=0, bytes=0;   // slots, staging slots, a staging slot's bytes
     size_t chunk=0;                     // of the staging slots, those a prompt batch streams its experts through in chunks; the rest (prestage) hold a layer's experts ahead
-    size_t arena=0;                     // the slots' bytes, all before the staging slots
-    size_t soa_scratch=0;               // private tail of this same arena, never a cache or staging slot
-    std::vector<size_t> at;             // a slot's offset from base: an expert takes its own layer's size
+    size_t arena=0;                     // pool bytes apart from nominal staging; contiguous before stage only in legacy mode
+    size_t soa_scratch=0;               // conversion payload size; legacy arena tail or a separate fixed allocation
+    std::vector<size_t> at;             // legacy offsets; segmented slots use pointers below
     std::vector<uint8_t> group;         // and only a slot of its size group
     std::vector<std::pair<ResidentMoe*,int32_t>> owner;
     std::vector<size_t> pending;   // decode swaps still loading on the copy stream
+    // Opt-in cache allocations are independent; base then owns only the fixed stage.
+    bool retained_requested=[]() { const char* v=std::getenv("STRAYDOG_KV_CACHE_RETAIN"); return v && std::strcmp(v,"1")==0; }();
+    bool segmented=false, retained_disabled=false, retained_oom=false;
+    bool restore_cap_live=false;
+    size_t restore_cap=0;
+    uint8_t* scratch=nullptr;
+    uint8_t* padding=nullptr;
+    uint8_t* untracked_kv=nullptr;       // owns malloc before the allocation map can accept it
+    size_t untracked_kv_bytes=0;
+    size_t untracked_kv_reserve=0;
+    size_t scratch_bytes=0, padding_bytes=0, stage_bytes=0;
+    size_t base_reserve=0, scratch_reserve=0, padding_reserve=0;
+    std::vector<ExpertCacheChunk> chunks;
+    std::vector<uint8_t*> pointers;
+    std::unique_ptr<ExpertCacheGrowth> growth;
+    uint64_t retained_stats[16]{};
 };
 struct DecoderLayer {
     std::vector<void*> pointers,dependencies;
@@ -551,6 +585,10 @@ inline void abort_flag_release(AbortFlag* flag) {
 struct Device {
     int ordinal;
     size_t budget = 0, used = 0;
+    // Requested bytes remain in used. Independently owned retained allocations
+    // also keep a conservative allocator charge until their checked free succeeds.
+    size_t retained_reserve=0, retained_reserve_peak=0, cpu_partial_reserve=0;
+    std::vector<void*> retained_kv_allocations;
     size_t batch_capacity = 32, input_capacity = 32 * max_cols, output_capacity = max_rows;
     size_t gemm_min_batch = 8;
     bool half_gemm = false;
@@ -675,6 +713,7 @@ struct Device {
     size_t readback_bytes = 0;
     // Allocations that live in mapped, page-locked host memory (sd_host_state): device pointer -> host pointer.
     std::unordered_map<void*, void*> host_states;
+    std::vector<void*> retained_host_new; // new host K/V owned until commit or checked cleanup
     // sd_upload's allocations by address (weights: none of them is written after), and the FP16
     // expansions of their matrices that a prompt pass's GEMMs keep for its next batches (op_linear):
     // a ring in `expansions` (sd_expansions).
@@ -848,6 +887,10 @@ struct Device {
             cleanup(hipGraphDestroy(entry.second.graph));
         }
         decoder.clear(); resident.clear();
+        for (const auto& chunk : slots.chunks) if (chunk.base) cleanup(hipFree(chunk.base));
+        if (slots.scratch) cleanup(hipFree(slots.scratch));
+        if (slots.padding) cleanup(hipFree(slots.padding));
+        if (slots.untracked_kv) cleanup(hipFree(slots.untracked_kv));
         if (slots.base) cleanup(hipFree(slots.base));
         if (slots.host) cleanup(hipHostFree(slots.host));
         if (prestage.event) cleanup(hipEventDestroy(prestage.event));
@@ -887,6 +930,7 @@ struct Device {
             cleanup(host == host_states.end() ? hipFree(entry.first) : hipHostFree(host->second));
         }
         for (auto entry : checkpoints) cleanup(hipHostFree(entry.first));
+        for (void* pointer : retained_host_new) cleanup(hipHostFree(pointer));
         for (auto& entry : exchanges) cleanup(hipHostFree(entry.second.host));
         if (input) cleanup(hipFree(input));
         if (output) cleanup(hipFree(output));
@@ -1582,6 +1626,28 @@ inline size_t checked_sum(std::initializer_list<uint64_t> terms) {
         if (add_overflows(sum, term, &sum)) throw std::runtime_error("a Straydog op's shape overflows");
     return size_t(sum);
 }
+constexpr size_t expert_cache_allocation_reserve=2*1024*1024;
+size_t budget_available(const Device& d) {
+    if (d.used>d.budget || d.retained_reserve>d.budget-d.used) return 0;
+    return d.budget-d.used-d.retained_reserve;
+}
+void retained_reserve_add(Device& d,size_t bytes) {
+    d.retained_reserve=checked_sum({uint64_t(d.retained_reserve),uint64_t(bytes)});
+    d.retained_reserve_peak=std::max(d.retained_reserve_peak,d.retained_reserve);
+}
+bool retained_kv_charged(const Device& d,const void* pointer) {
+    return std::find(d.retained_kv_allocations.begin(),d.retained_kv_allocations.end(),pointer)!=d.retained_kv_allocations.end();
+}
+// The allocation map is erased by the caller after this succeeds. On a failed
+// GPU free, both requested bytes and the allocation's reserve remain owned.
+void retained_tracked_free(Device& d,void* pointer,size_t total) {
+    const auto charged=std::find(d.retained_kv_allocations.begin(),d.retained_kv_allocations.end(),pointer);
+    const size_t reserve=charged==d.retained_kv_allocations.end() ? 0 : expert_cache_allocation_reserve;
+    if (total>d.used || reserve>d.retained_reserve) throw std::runtime_error("invalid retained allocation accounting");
+    check(hipFree(pointer));
+    d.used-=total; d.retained_reserve-=reserve;
+    if (charged!=d.retained_kv_allocations.end()) d.retained_kv_allocations.erase(charged);
+}
 inline unsigned checked_blocks(size_t count) {
     const size_t blocks = count / 256 + (count % 256 != 0);
     if (blocks > size_t(INT32_MAX)) throw std::runtime_error("a Straydog op's launch is too large");
@@ -1616,6 +1682,7 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "qsa_prompt_attention.hpp"
 #include "kv_stage.hpp"
 #include "sparse_attention.hpp"
+void expert_cache_quiesce(Device& d);
 #include "hybrid_slots.hpp"
 #include "resident_moe.hpp"
 #include "experts.hpp"
@@ -1627,6 +1694,62 @@ inline unsigned checked_dim(uint64_t count, uint64_t limit = 65535) {
 #include "ops.hpp"
 #include "ds_attention_wmma.hpp"
 #include "transfer.hpp"
+
+// Cache relocation owns these devices at a request boundary. Drain every reader,
+// including asynchronous peer/stage work, without resetting healthy handshakes.
+void expert_cache_quiesce(Device& d) {
+    std::string failure;
+    auto attempt=[&](auto&& work) {
+        try { work(); }
+        catch (const std::exception& error) { if (failure.empty()) failure=error.what(); }
+    };
+    Device* peer=d.link.peer;
+    if (peer && (peer==&d || peer->link.peer!=&d)) throw std::runtime_error("invalid expert-cache peer ownership");
+    Device* sides[2]={&d,peer};
+    for (Device* side : sides) if (side)
+        attempt([&]() { head_on_device(side->ordinal,[&]() { flush_launches(*side); }); });
+    for (Device* side : sides) if (side) attempt([&]() {
+        head_on_device(side->ordinal,[&]() {
+            if (side->copier) attempt([&]() { side->copier->wait(); });
+            attempt([&]() { hybrid_settle(*side,true); });
+            attempt([&]() { check(hipStreamSynchronize(side->stream)); });
+            for (hipStream_t stream : {side->copy_stream,side->kv_stream,side->helper_stream,side->side_stream,
+                                      side->send_stream,side->stage_stream,side->rows_stream})
+                if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
+            if (side->transfers) for (auto stream : side->transfers->streams)
+                if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
+        });
+    });
+    check(hipSetDevice(d.ordinal));
+    if (!failure.empty()) throw std::runtime_error(failure);
+}
+
+// Retained mode must distinguish allocation refusal from an asynchronous GPU
+// failure. In particular, memset after malloc is not an allocation refusal.
+void* expert_cache_kv_allocate(Device& d,size_t bytes) {
+    if (d.slots.untracked_kv) throw std::runtime_error("unreleased retained K/V allocation");
+    const size_t total=checked_sum({uint64_t(bytes),allocation_tail});
+    d.retained_kv_allocations.reserve(d.retained_kv_allocations.size()+1);
+    uint8_t* pointer=expert_cache_allocate(d,total,d.slots.untracked_kv_reserve);
+    d.slots.untracked_kv=pointer; d.slots.untracked_kv_bytes=total;
+    bool tracked=false;
+    try {
+        tracked=d.allocations.emplace(pointer,bytes).second;
+        if (!tracked) throw std::runtime_error("duplicate retained K/V allocation");
+        d.retained_kv_allocations.push_back(pointer);
+        d.slots.untracked_kv=nullptr; d.slots.untracked_kv_bytes=0; d.slots.untracked_kv_reserve=0;
+        check(hipMemsetAsync(pointer+bytes,0,allocation_tail,d.stream));
+        return pointer;
+    } catch (...) {
+        auto original=std::current_exception();
+        if (tracked) {
+            retained_tracked_free(d,pointer,total); d.allocations.erase(pointer);
+        } else {
+            expert_cache_free(d,d.slots.untracked_kv,d.slots.untracked_kv_bytes,d.slots.untracked_kv_reserve);
+        }
+        std::rethrow_exception(original);
+    }
+}
 
 // HybridAwait has already published every launched graph's missing CPU result.
 // A successful drain makes the interrupted pass disposable and aligns the next export.
@@ -2034,7 +2157,7 @@ int sd_draft_vocabulary(void* handle, void* head, int kind, uint64_t vocabulary,
         d.draft_rows = size_t(rows);
         if (rows && !d.draft_extras) {
             const size_t bytes = draft_vocabulary_capacity * (row_bytes + 4);
-            if (bytes > d.budget - d.used) throw std::runtime_error("the Straydog draft vocabulary exceeds the VRAM budget");
+            if (bytes > budget_available(d)) throw std::runtime_error("the Straydog draft vocabulary exceeds the VRAM budget");
             check(hipMalloc(reinterpret_cast<void**>(&d.draft_extras), draft_vocabulary_capacity * row_bytes));
             check(hipMalloc(reinterpret_cast<void**>(&d.draft_extra_tokens), draft_vocabulary_capacity * 4));
             d.used += bytes;
@@ -2321,7 +2444,8 @@ int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage) {
         if (!storage || !bytes) throw std::runtime_error("invalid layer bank allocation");
         *storage = nullptr;
         auto& d = device(handle);
-        if (bytes > d.budget - d.used || allocation_tail > d.budget - d.used - bytes) return 1;
+        const size_t available=budget_available(d);
+        if (bytes > available || allocation_tail > available - bytes) return 1;
         const hipError_t status = hipMalloc(storage, size_t(bytes) + allocation_tail);
         if (status == hipErrorOutOfMemory) { (void)hipGetLastError(); *storage = nullptr; return 1; }
         check(status);
@@ -2627,8 +2751,337 @@ int sd_expert_slots_release(void* handle) {
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_expert_slots_restore(void* handle,uint64_t cache) {
-    try { restore_expert_slots(device(handle),size_t(cache)); return 0; }
-    catch (const std::exception& e) { last_error=e.what(); return -1; }
+    Device* active=nullptr;
+    try { active=&device(handle); restore_expert_slots(*active,size_t(cache)); return 0; }
+    catch (const std::exception& e) { if (active) active->slots.restore_cap_live=false; last_error=e.what(); return -1; }
+}
+int sd_expert_slots_plan(void* handle,uint64_t cap,uint64_t stage,uint64_t bytes,
+                         uint64_t margin,uint64_t extra,uint64_t* cache,uint64_t* nominal,uint64_t* reserve) {
+    try {
+        if (!cache || !nominal || !reserve || cap>SIZE_MAX || stage>SIZE_MAX || bytes>SIZE_MAX || margin>SIZE_MAX || extra>SIZE_MAX)
+            throw std::runtime_error("invalid expert slot capacity output");
+        auto plan=expert_cache_plan(device(handle),size_t(cap),size_t(stage),size_t(bytes),size_t(margin),size_t(extra));
+        *cache=plan.cache; *nominal=plan.nominal; *reserve=plan.reserve;
+        return 0;
+    } catch (const std::exception& error) { last_error=error.what(); return -1; }
+}
+int sd_expert_slots_accounting(void* handle,uint64_t* out,uint64_t count) {
+    try {
+        if (!out || count!=16) throw std::runtime_error("invalid expert allocation accounting output");
+        const auto& d=device(handle);
+        const size_t pool=expert_cache_physical(d),pool_reserve=expert_cache_pool_reserve(d);
+        size_t pool_count=size_t(d.slots.base!=nullptr)+size_t(d.slots.scratch!=nullptr)+size_t(d.slots.padding!=nullptr);
+        for (const auto& chunk:d.slots.chunks) pool_count+=chunk.base!=nullptr;
+        size_t kv=d.slots.untracked_kv_bytes;
+        for (void* pointer:d.retained_kv_allocations) kv=checked_sum({uint64_t(kv),uint64_t(d.allocations.at(pointer)),allocation_tail});
+        const size_t kv_count=d.retained_kv_allocations.size()+size_t(d.slots.untracked_kv!=nullptr);
+        const size_t kv_reserve=checked_sum({uint64_t(checked_product({uint64_t(d.retained_kv_allocations.size()),uint64_t(expert_cache_allocation_reserve)})),uint64_t(d.slots.untracked_kv_reserve)});
+        const size_t cpu=d.cpu_partial ? (hybrid_partial_floats+hybrid_check_scratch_floats())*4 : 0;
+        const size_t reserve=checked_sum({uint64_t(pool_reserve),uint64_t(kv_reserve),uint64_t(d.cpu_partial_reserve)});
+        if (reserve!=d.retained_reserve) throw std::runtime_error("retained allocation reserve owner mismatch");
+        const uint64_t words[16]={d.used,d.budget,reserve,reserve/expert_cache_allocation_reserve,d.retained_reserve_peak,
+            expert_cache_chunk_bytes,pool,pool_reserve,pool_count,kv,kv_reserve,kv_count,cpu,d.cpu_partial_reserve,uint64_t(d.cpu_partial!=nullptr),
+            uint64_t(d.slots.retained_requested)|uint64_t(d.slots.segmented)<<1|uint64_t(d.slots.retained_disabled)<<2};
+        std::copy_n(words,16,out); return 0;
+    } catch (const std::exception& error) { last_error=error.what(); return -1; }
+}
+
+int sd_expert_slots_retain_prepare(void* handle,const uint64_t* layers,uint64_t count,
+                                   uint64_t capacity,uint64_t margin,int* retained) {
+    try {
+        auto& d=device(handle);
+        if (!retained || (count && !layers) || count>49 || capacity>262144)
+            throw std::runtime_error("invalid retained expert cache growth");
+        *retained=0; d.slots.retained_oom=false;
+        if (d.slots.growth) throw std::runtime_error("retained expert growth already active");
+        d.slots.restore_cap_live=false;
+        if (!d.slots.retained_requested || !d.slots.base) return 0;
+        ++d.slots.retained_stats[0];
+        if (!d.slots.segmented || d.slots.retained_disabled) { ++d.slots.retained_stats[2]; return 0; }
+        for (const auto& item : d.resident) if (item.second->hybrid && item.second->layer_prefill) {
+            ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0;
+        }
+        expert_cache_quiesce(d);
+        const size_t fixed=d.used-expert_cache_physical(d);
+        const size_t fixed_reserve=d.retained_reserve-expert_cache_pool_reserve(d);
+        size_t delta=0,reserve_delta=0,peak=checked_sum({uint64_t(fixed),uint64_t(fixed_reserve)});
+        std::map<void*,std::pair<size_t,bool>> scratch_sizes;
+        std::set<uint64_t> visited;
+        for (size_t i=0;i<size_t(count);++i) {
+            if (!visited.insert(layers[i]).second) throw std::runtime_error("duplicate retained K/V layer");
+            auto found=d.decoder.find(size_t(layers[i]));
+            if (found==d.decoder.end() || decoder_linear(size_t(layers[i])) || found->second.parts!=1)
+                throw std::runtime_error("invalid retained K/V layer");
+            const auto& plan=found->second;
+            if (capacity<=plan.context) continue;
+            const size_t pool=size_t(capacity)/4+1;
+            size_t added=0,removed=0,added_reserve=0,removed_reserve=0;
+            if (!d.host_states.count(plan.states[0])) {
+                const size_t bytes=checked_product({capacity,4,uint64_t(d.kv_row)});
+                added=checked_sum({uint64_t(bytes),allocation_tail});
+                removed=checked_sum({uint64_t(d.allocations.at(plan.states[0])),allocation_tail});
+                added_reserve+=expert_cache_allocation_reserve;
+                removed_reserve+=retained_kv_charged(d,plan.states[0]) ? expert_cache_allocation_reserve : 0;
+            }
+            const size_t index_bytes=checked_product({uint64_t(checked_sum({uint64_t(checked_product({uint64_t(pool),128})),qsa_history*128})),4});
+            const size_t old_index=d.allocations.at(plan.states[1]);
+            if (old_index<index_bytes) {
+                added=checked_sum({uint64_t(added),uint64_t(index_bytes),allocation_tail});
+                removed=checked_sum({uint64_t(removed),uint64_t(old_index),allocation_tail});
+                added_reserve+=expert_cache_allocation_reserve;
+                removed_reserve+=retained_kv_charged(d,plan.states[1]) ? expert_cache_allocation_reserve : 0;
+            }
+            if (plan.states[2]) {
+                auto inserted=scratch_sizes.emplace(plan.states[2],std::make_pair(d.allocations.at(plan.states[2]),retained_kv_charged(d,plan.states[2])));
+                size_t& old=inserted.first->second.first;
+                const size_t bytes=checked_product({256,uint64_t(pool),4});
+                if (old<bytes) {
+                    added=checked_sum({uint64_t(added),uint64_t(bytes),allocation_tail});
+                    removed=checked_sum({uint64_t(removed),uint64_t(old),allocation_tail}); old=bytes;
+                    added_reserve+=expert_cache_allocation_reserve;
+                    removed_reserve+=inserted.first->second.second ? expert_cache_allocation_reserve : 0;
+                    inserted.first->second.second=true;
+                }
+            }
+            peak=std::max(peak,checked_sum({uint64_t(fixed),uint64_t(delta),uint64_t(added),
+                                         uint64_t(fixed_reserve),uint64_t(reserve_delta),uint64_t(added_reserve)}));
+            if (removed>added || removed_reserve>added_reserve) throw std::runtime_error("invalid retained K/V allocation delta");
+            delta=checked_sum({uint64_t(delta),uint64_t(added-removed)});
+            reserve_delta=checked_sum({uint64_t(reserve_delta),uint64_t(added_reserve-removed_reserve)});
+        }
+        auto growth=std::make_unique<ExpertCacheGrowth>();
+        growth->expected_fixed=checked_sum({uint64_t(fixed),uint64_t(delta)});
+        growth->expected_reserve=checked_sum({uint64_t(fixed_reserve),uint64_t(reserve_delta)});
+        const size_t reserved=checked_sum({uint64_t(growth->expected_fixed),uint64_t(growth->expected_reserve),margin,32768});
+        ExpertCacheFootprint footprint;
+        try { footprint=expert_cache_fit(d,65536-d.slots.stage,d.slots.stage,d.slots.bytes,d.budget>reserved ? d.budget-reserved : 0); }
+        catch (const ExpertCacheOOM&) { ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0; }
+        d.slots.restore_cap=footprint.cache; d.slots.restore_cap_live=true;
+        growth->arena=footprint.cache*d.slots.bytes;
+        auto layout=expert_cache_layout(d,growth->arena);
+        if (layout.scratch!=d.slots.soa_scratch) { ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0; }
+        try { (void)expert_cache_padding(layout); }
+        catch (const ExpertCacheOOM&) { ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0; }
+        growth->stride=layout.stride; growth->counts=layout.counts;
+        std::vector<RetainedExpert> candidates;
+        for (auto& item : d.resident) if (item.second->hybrid) {
+            auto& plan=*item.second;
+            for (size_t expert=0;expert<plan.experts;++expert) if (plan.usage[expert]>0) {
+                if (!std::isfinite(plan.usage[expert])) throw std::runtime_error("non-finite expert cache score");
+                uint8_t* original=nullptr;
+                if (plan.slot_of[expert]>=0) {
+                    const size_t slot=size_t(plan.slot_of[expert]);
+                    if (d.slots.owner.at(slot)!=std::make_pair(&plan,int32_t(expert)))
+                        throw std::runtime_error("invalid original expert cache owner");
+                    original=expert_slot_pointer(d,slot);
+                    if (plan.weights[expert*3].data!=original) throw std::runtime_error("invalid original expert cache pointer");
+                }
+                candidates.push_back({&plan,expert,original,false});
+            }
+        }
+        std::sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b) {
+            const double x=a.plan->usage[a.expert],y=b.plan->usage[b.expert];
+            return x!=y ? x>y : a.plan!=b.plan ? a.plan<b.plan : a.expert<b.expert;
+        });
+        std::vector<size_t> filled(layout.counts.size(),0),intersection(layout.counts.size(),0);
+        for (const auto& entry : candidates) {
+            const size_t group=entry.plan->slot_group;
+            if (filled.at(group)==layout.counts[group]) continue;
+            ++filled[group]; growth->target.push_back(entry); intersection[group]+=entry.original!=nullptr;
+        }
+        const size_t permanent=checked_sum({uint64_t(peak),uint64_t(d.slots.stage_bytes),uint64_t(d.slots.scratch_bytes),
+                                           uint64_t(d.slots.base_reserve),uint64_t(d.slots.scratch_reserve)});
+        if (permanent>d.budget) { ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0; }
+        const size_t available=d.budget-permanent;
+        std::vector<size_t> during=layout.counts;
+        // Empty final slots go first. If more physical room is required, each
+        // next removal buys the most bytes, stopping as soon as the peak fits.
+        for (bool occupied : {false,true}) {
+            while (expert_cache_counts_cost(layout.stride,during)>available) {
+                size_t chosen=SIZE_MAX,best=0;
+                for (size_t g=0;g<during.size();++g) {
+                    if (!during[g] || (!occupied && during[g]<=intersection[g])) continue;
+                    const size_t step=expert_cache_chunk_slots(layout.stride[g]);
+                    const size_t gain=layout.stride[g]+((during[g]-1)%step==0 ? allocation_tail+expert_cache_allocation_reserve : 0);
+                    if (gain>best) { chosen=g; best=gain; }
+                }
+                if (chosen==SIZE_MAX) break;
+                --during[chosen];
+            }
+        }
+        if (expert_cache_counts_cost(layout.stride,during)>available) { ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0; }
+        if (!expert_cache_trim_during(d,*growth,peak,during)) { ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0; }
+        std::vector<size_t> kept(during.size(),0);
+        std::set<std::pair<ResidentMoe*,size_t>> keep;
+        for (auto& entry : growth->target) if (entry.original) {
+            const size_t g=entry.plan->slot_group;
+            entry.temporary=kept[g]>=during[g];
+            if (!entry.temporary) { ++kept[g]; keep.emplace(entry.plan,entry.expert); }
+        }
+        kv_clear_graphs(d);
+        d.prestage.plan=nullptr; d.prestage.experts.clear();
+        d.slots.growth=std::move(growth);
+        for (auto& item : d.resident) if (item.second->hybrid) {
+            auto& plan=*item.second;
+            for (size_t expert=0;expert<plan.experts;++expert) if (plan.slot_of[expert]>=0 && !keep.count({&plan,expert})) {
+                set_expert(d,plan,expert,nullptr,d.stream); plan.slot_of[expert]=-1;
+            }
+        }
+        check(hipStreamSynchronize(d.stream));
+        for (const auto& entry : d.slots.growth->target) if (entry.temporary) {
+            ++d.slots.retained_stats[8]; d.slots.retained_stats[15]+=expert_slot_bytes(*entry.plan);
+        }
+        const size_t padding=d.slots.padding_bytes;
+        expert_cache_free(d,d.slots.padding,d.slots.padding_bytes,d.slots.padding_reserve); d.slots.retained_stats[11]+=padding;
+        expert_cache_account(d);
+        try { expert_cache_resize(d,layout.stride,during); }
+        catch (const ExpertCacheOOM&) {
+            ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0;
+        }
+        *retained=1;
+        return 0;
+    } catch (const std::exception& error) { last_error=error.what(); return -1; }
+}
+
+int sd_expert_slots_retain_finish(void* handle,int* retained) {
+    try {
+        auto& d=device(handle);
+        if (!retained || !d.slots.growth || !d.slots.segmented) throw std::runtime_error("no retained expert growth to finish");
+        *retained=0;
+        expert_cache_quiesce(d);
+        auto& growth=*d.slots.growth;
+        if (d.used-expert_cache_physical(d)!=growth.expected_fixed) throw std::runtime_error("retained K/V allocation accounting changed");
+        if (d.retained_reserve-expert_cache_pool_reserve(d)!=growth.expected_reserve) throw std::runtime_error("retained K/V reserve accounting changed");
+        try {
+            expert_cache_resize(d,growth.stride,growth.counts);
+            const size_t wanted=checked_sum({uint64_t(growth.arena),uint64_t(d.slots.stage*d.slots.bytes)});
+            const size_t physical=expert_cache_physical(d);
+            if (physical>wanted) throw std::runtime_error("retained expert cache exceeds legacy arena");
+            const size_t padding=wanted-physical;
+            if (padding) { d.slots.padding=expert_cache_allocate(d,padding,d.slots.padding_reserve); d.slots.padding_bytes=padding; }
+            expert_cache_account(d);
+        } catch (const ExpertCacheOOM&) {
+            ++d.slots.retained_stats[2]; d.slots.retained_disabled=true; return 0;
+        }
+        std::vector<std::vector<size_t>> vacant(growth.counts.size());
+        for (size_t slot=0;slot<d.slots.cache;++slot) if (!d.slots.owner[slot].first) vacant[d.slots.group[slot]].push_back(slot);
+        std::vector<size_t> used(vacant.size(),0);
+        std::vector<std::pair<const RetainedExpert*,size_t>> loaded;
+        loaded.reserve(growth.target.size());
+        for (const auto& entry : growth.target) {
+            if (entry.plan->slot_of[entry.expert]>=0) continue;
+            const size_t group=entry.plan->slot_group;
+            if (used[group]>=vacant[group].size()) throw std::runtime_error("missing retained expert destination");
+            const size_t slot=vacant[group][used[group]++];
+            uint8_t* base=expert_slot_pointer(d,slot);
+            copy_expert(d,*entry.plan,entry.expert,base,d.copy_stream);
+            const size_t metric=entry.temporary ? 9 : 6;
+            ++d.slots.retained_stats[metric]; d.slots.retained_stats[metric+1]+=expert_slot_bytes(*entry.plan);
+            for (size_t role=0;role<2;++role) d.slots.retained_stats[12]+=slot_soa_layout(d,*entry.plan,base,role)!=0;
+            loaded.emplace_back(&entry,slot);
+        }
+        check(hipStreamSynchronize(d.copy_stream));
+        for (const auto& item : loaded) {
+            const auto& entry=*item.first; const size_t slot=item.second;
+            set_expert(d,*entry.plan,entry.expert,expert_slot_pointer(d,slot),d.stream);
+            entry.plan->slot_of[entry.expert]=int32_t(slot); d.slots.owner[slot]={entry.plan,int32_t(entry.expert)};
+        }
+        // Repair all host matrix mirrors as well as the device table, including
+        // in-place residents that originally arrived through hybrid_settle.
+        for (const auto& entry : growth.target) {
+            if (entry.plan->slot_of[entry.expert]<0) throw std::runtime_error("unpublished retained target expert");
+            uint8_t* base=expert_slot_pointer(d,size_t(entry.plan->slot_of[entry.expert]));
+            set_expert(d,*entry.plan,entry.expert,base,d.stream);
+            if (entry.original==base && !entry.temporary && !entry.moved) ++d.slots.retained_stats[3];
+        }
+        check(hipStreamSynchronize(d.stream));
+        // At this quiescent boundary the published pool is exactly the legacy
+        // target, not merely a pool containing every requested target identity.
+        std::set<std::pair<ResidentMoe*,size_t>> expected,actual;
+        for (const auto& entry : growth.target)
+            if (!expected.emplace(entry.plan,entry.expert).second) throw std::runtime_error("duplicate retained target identity");
+        if (d.slots.owner.size()!=d.slots.cache || d.slots.pointers.size()!=d.slots.cache || d.slots.group.size()!=d.slots.cache)
+            throw std::runtime_error("retained slot catalogue size mismatch");
+        for (size_t slot=0;slot<d.slots.cache;++slot) {
+            const auto owner=d.slots.owner[slot];
+            if (!owner.first) continue;
+            const size_t expert=size_t(owner.second);
+            if (owner.second<0 || expert>=owner.first->experts || owner.first->slot_of[expert]!=int32_t(slot)
+                || d.slots.group[slot]!=owner.first->slot_group || !actual.emplace(owner.first,expert).second)
+                throw std::runtime_error("retained owner/slot identity mismatch");
+            const uint8_t* base=expert_slot_pointer(d,slot);
+            size_t offset=0;
+            for (size_t role=0;role<3;++role) {
+                const auto& matrix=owner.first->weights[expert*3+role];
+                if (matrix.data!=base+offset || matrix.layout!=slot_soa_layout(d,*owner.first,base,role))
+                    throw std::runtime_error("retained expert matrix identity mismatch");
+                offset+=owner.first->host_bytes[role];
+            }
+        }
+        if (actual!=expected) throw std::runtime_error("retained resident set differs from legacy target");
+        for (const auto& item : d.resident) if (item.second->hybrid) {
+            auto* plan=item.second.get();
+            for (size_t expert=0;expert<plan->experts;++expert) {
+                const int32_t slot=plan->slot_of[expert];
+                if (slot < -1 || (slot>=0 && (size_t(slot)>=d.slots.cache || d.slots.owner[size_t(slot)]!=std::make_pair(plan,int32_t(expert)))))
+                    throw std::runtime_error("retained slot/owner reverse identity mismatch");
+            }
+        }
+        ++d.slots.retained_stats[1]; d.hybrid_tokens=0; d.slots.growth.reset(); d.slots.restore_cap_live=false;
+        *retained=1;
+        return 0;
+    } catch (const std::exception& error) { last_error=error.what(); return -1; }
+}
+
+int sd_expert_slots_retain_oom(void* handle) {
+    try { return int(device(handle).slots.retained_oom); }
+    catch (const std::exception& error) { last_error=error.what(); return -1; }
+}
+int sd_expert_slots_retain_stats(void* handle,uint64_t* out,uint64_t count) {
+    try {
+        if (!out || count!=16) throw std::runtime_error("invalid retained expert cache counters");
+        const auto& d=device(handle); std::copy_n(d.slots.retained_stats,16,out); return 0;
+    } catch (const std::exception& error) { last_error=error.what(); return -1; }
+}
+int sd_expert_slots_residency(void* handle,uint64_t* out,uint64_t capacity,uint64_t* rows) {
+    try {
+        auto& d=device(handle);
+        if (!rows) throw std::runtime_error("invalid expert cache residency output");
+        expert_cache_quiesce(d);
+        size_t count=0;
+        for (const auto& owner : d.slots.owner) count+=owner.first!=nullptr;
+        *rows=count;
+        if (!out) return 0;
+        if (capacity<count) throw std::runtime_error("expert cache residency output too small");
+        std::map<ResidentMoe*,size_t> layers;
+        for (const auto& item : d.decoder) if (item.second.moe) {
+            auto found=d.resident.find(item.second.moe);
+            if (found!=d.resident.end()) {
+                auto inserted=layers.emplace(found->second.get(),item.first);
+                if (!inserted.second && inserted.first->second!=item.first) throw std::runtime_error("ambiguous expert cache layer");
+            }
+        }
+        size_t row=0;
+        std::vector<uint8_t> bytes;
+        for (size_t slot=0;slot<d.slots.owner.size();++slot) {
+            const auto owner=d.slots.owner[slot];
+            if (!owner.first) continue;
+            auto layer=layers.find(owner.first);
+            if (layer==layers.end()) throw std::runtime_error("expert cache owner has no decoder layer");
+            const size_t expert=size_t(owner.second),size=expert_slot_bytes(*owner.first);
+            if (owner.first->slot_of[expert]!=int32_t(slot)) throw std::runtime_error("expert residency slot mismatch");
+            const uint8_t* base=expert_slot_pointer(d,slot);
+            bytes.resize(size); check(hipMemcpy(bytes.data(),base,size,hipMemcpyDeviceToHost));
+            uint64_t hash=0xcbf29ce484222325ULL;
+            for (uint8_t byte : bytes) { hash^=byte; hash*=0x100000001b3ULL; }
+            uint64_t layout=0;
+            for (size_t role=0;role<3;++role) layout|=uint64_t(slot_soa_layout(d,*owner.first,base,role))<<role;
+            const uint64_t values[8]={uint64_t(layer->second),uint64_t(expert),uint64_t(d.slots.group[slot]),uint64_t(slot),
+                                      uint64_t(reinterpret_cast<uintptr_t>(base)),uint64_t(size),layout,hash};
+            std::copy_n(values,8,out+row*8); ++row;
+        }
+        return 0;
+    } catch (const std::exception& error) { last_error=error.what(); return -1; }
 }
 // Speed first: a route whose expert the CPU would run, of a router weight below `floor`, is left out of its token (its weight
 // taken as 0); 0 leaves none out. The GPU's routes are kept whatever their weight: they cost no read from host memory.
@@ -4168,8 +4621,9 @@ void sd_destroy(void* handle) { delete static_cast<Device*>(handle); }
 int sd_set_budget(void* handle, uint64_t budget) {
     try {
         auto& value = device(handle);
-        if (budget < value.used || budget > SIZE_MAX) throw std::runtime_error("invalid Straydog VRAM budget");
+        if (budget < checked_sum({uint64_t(value.used),uint64_t(value.retained_reserve)}) || budget > SIZE_MAX) throw std::runtime_error("invalid Straydog VRAM budget");
         value.budget = size_t(budget);
+        value.slots.restore_cap_live=false;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
@@ -4180,6 +4634,14 @@ int sd_memory(void* handle, uint64_t* used, uint64_t* budget) {
         *used = value.used; *budget = value.budget;
         return 0;
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+int sd_memory_effective(void* handle,uint64_t* used,uint64_t* budget) {
+    try {
+        const auto& d=device(handle);
+        if (!used || !budget) throw std::runtime_error("invalid effective memory counters");
+        *used=checked_sum({uint64_t(d.used),uint64_t(d.retained_reserve)}); *budget=d.budget;
+        return 0;
+    } catch (const std::exception& error) { last_error=error.what(); return -1; }
 }
 
 void* sd_upload(void* handle, const void* data, uint64_t bytes) {
@@ -4326,7 +4788,7 @@ int sd_release(void* handle, void* pointer) {
         if (host != value.host_states.end()) {
             check(hipHostFree(host->second)); value.host_states.erase(host);
         } else {
-            check(hipFree(pointer)); value.used -= found->second + allocation_tail;
+            retained_tracked_free(value,pointer,found->second+allocation_tail);
         }
         value.expert_layouts.erase(static_cast<const uint8_t*>(pointer));
         value.allocations.erase(found);
@@ -4521,6 +4983,7 @@ int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, ui
 int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, void** state, void** index_state) {
     try {
         auto& d = device(handle);
+        d.slots.retained_oom=false;
         auto found = d.decoder.find(size_t(layer));
         if (found == d.decoder.end() || decoder_linear(size_t(layer)) || !state || !index_state) throw std::runtime_error("invalid Straydog K/V growth");
         DecoderLayer& plan = found->second;
@@ -4541,6 +5004,26 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         void* grown_scratch = nullptr;
         // What a growth that fails gives back: nothing is handed to a plan yet, every state stays as it was.
         const auto discard_new = [&]() {
+            if (d.slots.retained_requested) {
+                std::string failure;
+                auto note=[&](hipError_t status) {
+                    if (status!=hipSuccess && failure.empty()) failure=hipGetErrorString(status);
+                    return status==hipSuccess;
+                };
+                if (grown && on_host && note(hipHostFree(grown))) {
+                    auto owned=std::find(d.retained_host_new.begin(),d.retained_host_new.end(),grown);
+                    if (owned!=d.retained_host_new.end()) d.retained_host_new.erase(owned);
+                    grown=nullptr;
+                }
+                for (void* made : {on_host ? nullptr : grown,grown_index,grown_scratch}) {
+                    auto allocation=made ? d.allocations.find(made) : d.allocations.end();
+                    if (allocation==d.allocations.end()) continue;
+                    try { retained_tracked_free(d,made,allocation->second+allocation_tail); d.allocations.erase(allocation); }
+                    catch (const std::exception& error) { if (failure.empty()) failure=error.what(); }
+                }
+                if (!failure.empty()) { d.slots.retained_oom=false; throw std::runtime_error(failure); }
+                return;
+            }
             if (grown && on_host) cleanup(hipHostFree(grown));
             for (void* made : {on_host ? nullptr : grown, grown_index, grown_scratch}) {
                 const auto allocation = made ? d.allocations.find(made) : d.allocations.end();
@@ -4552,6 +5035,14 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         };
         // VRAM the budget or the device cannot give: the request fails and the engine stays (see kv_no_vram).
         const auto vram = [&](size_t bytes) {
+            if (d.slots.retained_requested) {
+                try { return expert_cache_kv_allocate(d,bytes); }
+                catch (const ExpertCacheOOM&) {
+                    d.slots.retained_oom=true; d.slots.retained_disabled=true;
+                    if (d.slots.growth) ++d.slots.retained_stats[2];
+                    throw std::runtime_error(kv_no_vram);
+                }
+            }
             try { return allocate(d, bytes); }
             catch (const std::exception& e) {
                 (void)hipGetLastError();
@@ -4561,9 +5052,17 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
         };
         // No memory leaves every state as it was: the request fails, the engine stays (see kv_no_memory); the engine may give page locks
         // back and ask again (Model::ensure_kv): a layer grown by an earlier call is left as it is.
-        if (on_host && host_allocate(&grown, kv_bytes + allocation_tail, hipHostMallocMapped) != hipSuccess) {
-            (void)hipGetLastError();
-            throw std::runtime_error(kv_no_memory);
+        if (on_host) {
+            if (d.slots.retained_requested) {
+                try { d.retained_host_new.reserve(d.retained_host_new.size()+1); }
+                catch (const std::bad_alloc&) { throw std::runtime_error(kv_no_memory); }
+            }
+            const auto status=host_allocate(&grown,kv_bytes+allocation_tail,hipHostMallocMapped);
+            if (status!=hipSuccess) {
+                if (d.slots.retained_requested && status!=hipErrorOutOfMemory) check(status);
+                (void)hipGetLastError(); throw std::runtime_error(kv_no_memory);
+            }
+            if (d.slots.retained_requested) d.retained_host_new.push_back(grown);
         }
         try {
             if (on_host) {
@@ -4604,6 +5103,10 @@ int sd_kv_grow(void* handle, uint64_t layer, uint64_t capacity, uint64_t valid, 
             check(hipHostFree(host->second));
             d.host_states.erase(host); d.allocations.erase(old_kv); d.kv_mirrors.erase(old_kv);
             d.host_states.emplace(pointer, grown); d.allocations.emplace(pointer, kv_bytes);
+            if (d.slots.retained_requested) {
+                auto owned=std::find(d.retained_host_new.begin(),d.retained_host_new.end(),grown);
+                if (owned!=d.retained_host_new.end()) d.retained_host_new.erase(owned);
+            }
         }
         std::replace(plan.dependencies.begin(), plan.dependencies.end(), old_kv, pointer);
         plan.states[0] = pointer; plan.context = to;
@@ -4987,7 +5490,8 @@ int sd_gemm_check_read(void* handle, uint64_t* counters, uint64_t count) {
 void* sd_buffer(void* handle, uint64_t bytes) {
     try {
         auto& value = device(handle);
-        if (!bytes || bytes > value.budget - value.used || allocation_tail > value.budget - value.used - bytes)
+        const size_t available=budget_available(value);
+        if (!bytes || bytes > available || allocation_tail > available - bytes)
             throw std::runtime_error(budget_exceeded(value, bytes));
         void* pointer = nullptr;
         check(hipMalloc(&pointer, size_t(bytes) + allocation_tail));
