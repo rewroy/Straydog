@@ -875,6 +875,10 @@ struct Class {
     /// Those of `host_lru` whose expert a VRAM slot holds too: its eviction writes nothing back,
     /// and a host slot needed comes from here first (the tier then still holds what it alone holds).
     copies: BTreeSet<(u64, usize)>,
+    /// Copies to give up first, the best last ([`DeviceExperts::spare_copy`]), and the count of VRAM
+    /// changes from which they may be looked for again.
+    spare: Vec<usize>,
+    spare_at: u64,
 }
 
 /// Counters since creation.
@@ -950,6 +954,9 @@ pub struct DeviceExperts {
     /// The clock when that pass took its first layer (a prompt of several passes takes layer 0 again).
     pass_clock: u64,
     heads_first: bool,
+    /// A host slot needed takes the copy of an expert that stays in VRAM before the oldest copy
+    /// ([`spare_copy`](Self::spare_copy)).
+    spare_copies: bool,
     tails: Vec<Tail>,
     /// The experts a begun request still fills, and the read chunk it fills them with
     /// ([`request_begin`](Self::request_begin)).
@@ -1093,7 +1100,7 @@ impl DeviceExperts {
             classes.push(Class {
                 vram_bytes, host_bytes, vram: gpu.buffer(vram_bytes * count as u64)?, first, count, free: (first..first + count).collect(),
                 lru: BTreeSet::new(), reserve, host_capacity, per_arena, arenas: Vec::new(), pinner: Some(pinner), hosts: 0,
-                host_free: VecDeque::new(), host_lru: BTreeSet::new(), copies: BTreeSet::new(),
+                host_free: VecDeque::new(), host_lru: BTreeSet::new(), copies: BTreeSet::new(), spare: Vec::new(), spare_at: 0,
             });
         }
         let (done_tx, done_rx) = channel();
@@ -1103,6 +1110,7 @@ impl DeviceExperts {
             stream_layer: 0,
             pass_clock: 0,
             heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
+            spare_copies: std::env::var("STRAYDOG_EXPERT_COPIES").map_or(true, |value| value != "oldest"),
             tails: Vec::new(),
             unfilled: VecDeque::new(),
             unfilled_chunk: CHUNK,
@@ -2346,7 +2354,8 @@ impl DeviceExperts {
             // The least recently used expert's slot (its copies long done), before an emptied slot
             // whose upload is still running.
             // (while streaming, not the copy of an expert a streamed slot holds, and next an expert of a layer the pass has done: see evict)
-            let copy = self.classes[class].copies.iter().map(|&(_, host)| host).find(|&host| !self.streaming || !self.streamed_copy(host));
+            let spare = if self.spare_copies && !self.streaming { self.spare_copy(class) } else { None };
+            let copy = spare.or_else(|| self.classes[class].copies.iter().map(|&(_, host)| host).find(|&host| !self.streaming || !self.streamed_copy(host)));
             let done = if copy.is_none() && self.streaming { self.done_layer_host(gpu, class)? } else { None };
             let candidate = copy.or(done)
                 .or_else(|| self.classes[class].host_lru.iter().map(|&(_, host)| host).next())
@@ -2389,6 +2398,42 @@ impl DeviceExperts {
                 }
             }
             return Ok(host);
+        }
+    }
+
+    /// The copy to give up for a host slot outside a prefill's streaming: that of an expert likely to stay in VRAM. An expert whose
+    /// copy is gone is written back when it leaves VRAM, and that write-back takes another copy in turn, so the experts in VRAM with
+    /// no copy stay as many whichever copies go: taken oldest first, the lack moved among the experts that come and go, and six
+    /// in ten of a DeepSeek-V4.1 decode pass's fills on two R9700s wrote an expert back. The copies given up first are those of the
+    /// experts used in the more recent half and by the most passes ([`uses`](Self::uses)): an eighth of them a look, and the next
+    /// look after `SPARE_GAP` more changes to what VRAM holds. Which experts each tier holds does not change by it.
+    fn spare_copy(&mut self, class: usize) -> Option<usize> {
+        const SPARE_GAP: u64 = 256;
+        loop {
+            while let Some(host) = self.classes[class].spare.pop() {
+                let entry = &self.host[host];
+                if entry.key.is_some() && self.classes[class].copies.contains(&(entry.used, host)) {
+                    return Some(host);
+                }
+            }
+            if self.vram_changes < self.classes[class].spare_at {
+                return None;
+            }
+            self.classes[class].spare_at = self.vram_changes + SPARE_GAP;
+            let mut found: Vec<(u64, u32, usize)> = self.classes[class].copies.iter().filter_map(|&(_, host)| {
+                let key = self.host[host].key?;
+                let slot = *self.map.get(&key)?;
+                Some((self.slots[slot].used, self.uses.get(&key).copied().unwrap_or(0), host))
+            }).collect();
+            if found.len() < 8 {
+                return None;
+            }
+            let half = found.len() / 2;
+            found.select_nth_unstable(half);
+            let mut recent: Vec<(u32, u64, usize)> = found[half..].iter().map(|&(used, uses, host)| (uses, used, host)).collect();
+            recent.sort_unstable();
+            let keep = (found.len() / 8).max(1).min(recent.len());
+            self.classes[class].spare = recent[recent.len() - keep..].iter().map(|&(_, _, host)| host).collect();
         }
     }
 
