@@ -75,7 +75,8 @@ pub enum SubmitError {
 /// `{"messages": [...], "tools": [...] | null, "max_tokens": n | null, "temperature": t,
 /// "top_k": k, "top_p": p, "min_p": p, "presence_penalty": x, "seed": n, "thinking": bool,
 /// "reasoning_effort": "low" | "medium" | "xhigh",
-/// "checkpoint": bool}`, and `"suppress": "not_cp932_han"` only when asked for. `"request_id"` follows only when the
+/// "checkpoint": bool}`, and `"suppress": "not_cp932_han"` only when asked for. `straydog.tool_writing` is the API's own: it
+/// never reaches the worker. `"request_id"` follows only when the
 /// client sent one ([`REQUEST_ID`]): the worker reads nothing of it, and the server's log line for the request names it.
 ///
 /// Each message keeps, in the client's order, the fields the template reads or a client
@@ -302,7 +303,7 @@ async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<
     api.authorize(&headers)?;
     let config = &api.config;
     let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false, "vision": api.vision(),
-                          "suppress": [NOT_CP932_HAN]});
+                          "suppress": [NOT_CP932_HAN], "tool_writing": true});
     if let EngineState::Ready { context, placement, .. } = api.engine.state() {
         meta["n_ctx"] = context.into();
         meta["ready"] = true.into();
@@ -321,6 +322,8 @@ async fn props(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<s
         "modalities": {"vision": api.vision(), "audio": false},
         // (what a chat completion's `suppress` may name)
         "suppress": [NOT_CP932_HAN],
+        // (a streamed chat completion with tools may ask for the calls as they are written: `straydog.tool_writing`)
+        "tool_writing": true,
         "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false,
     })))
 }
