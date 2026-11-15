@@ -325,6 +325,21 @@ fn evicted(checkpoints: &[Checkpoint], history: &[u32]) -> usize {
         .unwrap_or(0)
 }
 
+/// The conversation roots kept as roots: the last two system prompts' states. With one, a second client's request (a team's test, a
+/// helper with its own system prompt) made the first client's root an ordinary checkpoint, which the first client's next conversation
+/// then gave up as an earlier turn of its own (see [`evicted`]), so the conversation after that read its whole system prompt again:
+/// on two R9700 with DeepSeek-V4.1 two clients taking turns, each with a 5.8K-token system prompt and a new question, waited 3.4 to
+/// 3.5 s for the first token of every other new conversation, and 0.3 to 0.5 s where the root was still there.
+const ROOTS: usize = 2;
+
+/// The roots that become ordinary checkpoints when a root of `history` is saved: the oldest, so that [`ROOTS`] stay with the new one
+/// (which may be one of them saved again).
+fn demoted(checkpoints: &[Checkpoint], history: &[u32]) -> Vec<usize> {
+    let others: Vec<usize> = checkpoints.iter().enumerate().filter(|(_, checkpoint)| checkpoint.root && checkpoint.tokens != history)
+        .map(|(index, _)| index).collect();
+    others[..(others.len() + 1).saturating_sub(ROOTS)].to_vec()
+}
+
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
 
@@ -871,7 +886,9 @@ impl<E: Engines> Session<E> {
         let engines = &self.engines;
         self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
         if root {
-            self.checkpoints.iter_mut().for_each(|checkpoint| checkpoint.root = false);
+            for index in demoted(&self.checkpoints, &self.history) {
+                self.checkpoints[index].root = false;
+            }
         }
         if let Some(index) = self.checkpoints.iter().position(|checkpoint| checkpoint.tokens == self.history) {
             let mut same = self.checkpoints.remove(index);
@@ -888,7 +905,8 @@ impl<E: Engines> Session<E> {
             self.engines.checkpoint(slot, true)?;
             self.checkpoints.push(Checkpoint { slot, tokens: self.history.clone(), root });
         }
-        let kept = self.checkpoints.iter().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
+        // (the root a budget gives up last: the latest conversation's)
+        let kept = self.checkpoints.iter().rev().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
         self.engines.keep_checkpoint(kept);
         Ok(())
     }
@@ -1057,6 +1075,26 @@ mod tests {
         let alone = vec![checkpoint(0, &[1], true), checkpoint(1, &[1, 2], false), checkpoint(2, &[1, 2, 3], false)];
         assert_eq!(evicted(&alone, &[1, 2, 3, 4]), 1);
         assert_eq!(evicted(&[checkpoint(0, &[1], true)], &[1, 2]), 0);
+    }
+
+    /// Decides: two clients with their own system prompts taking turns each keep their root, so a new conversation of either starts
+    /// from it; a third system prompt makes the oldest root an ordinary checkpoint, and a root saved again demotes none.
+    #[test]
+    fn the_last_two_conversation_roots_stay_roots() {
+        let checkpoint = |slot: usize, tokens: &[u32], root: bool| Checkpoint { slot, tokens: tokens.to_vec(), root };
+        let (first, second, third) = ([1u32, 1], [2u32, 2], [3u32, 3]);
+        // one root and a turn of its conversation: a second client's root demotes nothing
+        let mut held = vec![checkpoint(0, &first, true), checkpoint(1, &[1, 1, 5], false)];
+        assert!(demoted(&held, &second).is_empty());
+        held.push(checkpoint(2, &second, true));
+        // the first client's next conversation saves a turn with every slot taken: its own earlier turn goes, neither root
+        held.push(checkpoint(3, &[2, 2, 6], false));
+        let given_up = evicted(&held, &[1, 1, 7]);
+        assert_eq!(held[given_up].tokens, [1, 1, 5]);
+        // the first root saved again (a prompt that reached it from nothing) demotes none
+        assert!(demoted(&held, &first).is_empty());
+        // a third system prompt: the oldest root becomes an ordinary checkpoint
+        assert_eq!(demoted(&held, &third), [0]);
     }
 
     /// A cancel is seen before every pass, the first too: a prompt's next stretch (after a
