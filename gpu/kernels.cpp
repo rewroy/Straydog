@@ -4977,7 +4977,7 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
     // (ds_attention_wmma.hpp). Decode and short passes keep the F32 kernels below.
     const size_t wmma_chunks = (stride + ds_attention_chunk - 1) / ds_attention_chunk;
     const size_t wmma_need = score_bytes + size_t(rows * heads) * wmma_chunks * 8;
-    if (value.rdna4 && value.half_gemm && rows >= 32 && dim % 64 == 0 && (heads == 32 || heads == 64) && scratch &&
+    if (value.rdna4 && value.half_gemm && rows > 4 && dim % 64 == 0 && (heads == 32 || heads == 64) && scratch &&
         scratch_bytes >= wmma_need && stride * sizeof(float*) <= 32 * 1024) {
         op_span(value, scratch, wmma_need, "attention scratch");
         float* scores = scratch;
@@ -5180,7 +5180,7 @@ int sd_op_index_select(void* handle, const float* q, const float* keys, const fl
 #if defined(__HIPCC__)
     // An FP16 prompt pass on RDNA4: the scores through WMMA (ds_index_scores_wmma_rows), every index head
     // of 32 rows and 256 groups a block, then each row's top groups. Decode keeps the kernel below.
-    if (value.rdna4 && value.half_gemm && rows >= 32 && dim == 128 && (heads == 32 || heads == 64)) {
+    if (value.rdna4 && value.half_gemm && rows > 4 && dim == 128 && (heads == 32 || heads == 64)) {
         // The queries FP16 and rotated once a row (ds_index_query_rows), then the scores, ds_index_query_capacity rows at a time.
         _Float16* queries = ds_index_queries(value);
         for (uint64_t first = 0; first < rows; first += ds_index_query_capacity) {
