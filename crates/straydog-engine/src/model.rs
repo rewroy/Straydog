@@ -638,6 +638,29 @@ fn layer_rows_vram_named(value: Option<&str>) -> bool {
     value.map_or(true, |value| value.trim() != "0")
 }
 
+/// STRAYDOG_LAYER_ROWS_OVERLAP: anything but 0 (or unset) lets a layer-order pass whose rows do not fit in VRAM move them between the host and
+/// a ring of two chunks in VRAM beside the compute, where the ring fits and the rows can be page-locked; 0 keeps the rows' round trip through the
+/// host, one chunk at a time, each copy waited for.
+fn layer_rows_overlap_named(value: Option<&str>) -> bool {
+    value.map_or(true, |value| value.trim() != "0")
+}
+
+/// Where a layer-order pass keeps its hidden rows: on the host, each chunk's copies up and down waited for; held whole in VRAM; or on the host,
+/// moving to and from a ring of two chunk slots in VRAM beside the compute ([`crate::gpu::RowsOverlap`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PassRows { Host, Held, Overlapped }
+
+/// The chunks of a layer whose rows come up before the layer's banks load (the ring has two slots).
+fn rows_overlap_prime(chunks: usize) -> std::ops::Range<usize> {
+    0..chunks.min(2)
+}
+
+/// The chunk whose rows come up once chunk `computed`'s span is queued, and its rows' copy down behind it: the slot is that chunk's, which the
+/// rows of the chunk after the next take while the next is computed. None past the layer's last chunk (the next layer brings up its own first two).
+fn rows_overlap_after_span(chunks: usize, computed: usize) -> Option<usize> {
+    (computed + 2 < chunks).then_some(computed + 2)
+}
+
 /// STRAYDOG_HC=blas: every read keeps its HyperConnections' up projection (hipblasGemmEx) and finish as two kernels (anything else: one kernel
 /// from [`CHUNKED_SCAN_READ`] new tokens, gpu/hc_fused.hpp).
 fn hc_fused_from_named(value: Option<&str>) -> usize {
@@ -1240,6 +1263,9 @@ pub struct Model {
     /// A layer-order pass holds its hidden rows in VRAM where they fit (STRAYDOG_LAYER_ROWS_VRAM=0: on the host, moved to the GPU and back
     /// for every layer, as before; [`Model::layer_rows_in_vram`] for a test).
     layer_rows_vram: bool,
+    /// A layer-order pass whose rows stay on the host moves them beside the compute where it can (STRAYDOG_LAYER_ROWS_OVERLAP=0: waiting for each
+    /// copy; [`Model::layer_rows_overlapped`] for a test).
+    layer_rows_overlap: bool,
     /// New tokens from which a read scans its DeltaNet layers in chunks ([`CHUNKED_SCAN_READ`]; [`Model::chunked_scan_from`] for a test).
     chunked_scan_from: usize,
     /// New tokens from which a read's HyperConnections run their up projection and finish as one kernel ([`CHUNKED_SCAN_READ`], never with
@@ -1532,6 +1558,7 @@ impl Model {
             // choice would not make it, e.g. a machine whose RAM holds the banks)
             layer_prefill_forced: std::env::var("STRAYDOG_LAYER_PREFILL").is_ok_and(|v| v == "force"),
             layer_rows_vram: layer_rows_vram_named(std::env::var("STRAYDOG_LAYER_ROWS_VRAM").ok().as_deref()),
+            layer_rows_overlap: layer_rows_overlap_named(std::env::var("STRAYDOG_LAYER_ROWS_OVERLAP").ok().as_deref()),
             chunked_scan_from: chunked_scan_from_named(std::env::var("STRAYDOG_DELTA_SCAN").ok().as_deref()),
             hc_fused_from: hc_fused_from_named(std::env::var("STRAYDOG_HC").ok().as_deref()),
             layer_prefill_restore_failure: None,
@@ -4226,6 +4253,11 @@ impl Model {
         self.layer_rows_vram = held;
     }
 
+    /// Whether a layer-order pass whose rows stay on the host moves them beside the compute where it can (a test compares the two ways).
+    pub fn layer_rows_overlapped(&mut self, overlapped: bool) {
+        self.layer_rows_overlap = overlapped;
+    }
+
     /// The read length (new tokens) from which the DeltaNet layers scan in chunks: `usize::MAX` for never, 0 for always (a test compares
     /// the two scans on a prompt shorter than the rule's).
     #[doc(hidden)]
@@ -4259,6 +4291,34 @@ impl Model {
         Ok(bank_bytes)
     }
 
+    /// A layer-order pass's hidden rows (`hidden`) are on the host, not held in VRAM whole: move them beside the compute, to and from a ring of two
+    /// chunk slots of `batch` rows in VRAM ([`crate::gpu::Backend::overlap_layer_rows`]), if STRAYDOG_LAYER_ROWS_OVERLAP allows, the page-locked rows
+    /// are within what [`crate::host::lockable`] leaves, and the ring fits in the VRAM beside what layer order holds. The guard (None where the rows
+    /// stay as before, with `prefill_rows_overlap_reason` in the metrics) and the bytes page-locked, which count in `pinned_other` (for the K/V's
+    /// growth and the working set's limit) until the caller gives them back with the guard's end.
+    fn begin_rows_overlap(&mut self, hidden: &mut [f32], batch: u64) -> Result<(Option<crate::gpu::RowsOverlap>, u64)> {
+        let bytes = hidden.len() as u64 * 4;
+        let refusal = if !self.layer_rows_overlap {
+            Some("STRAYDOG_LAYER_ROWS_OVERLAP=0".to_string())
+        } else {
+            crate::gpu::rows_lock_refusal(bytes, crate::host::lockable(self.weights.host_memory_bytes, 0))
+        };
+        let refusal = match refusal {
+            Some(reason) => reason,
+            None => match self.group.overlap_layer_rows(hidden, batch)? {
+                crate::gpu::RowsOverlapBegin::Begun(guard) => {
+                    self.pinned_other += bytes;
+                    self.hold_memory();
+                    self.last_metrics.insert("prefill_rows_overlap".into(), json!(true));
+                    return Ok((Some(guard), bytes));
+                }
+                crate::gpu::RowsOverlapBegin::Refused(reason) => reason,
+            },
+        };
+        self.last_metrics.insert("prefill_rows_overlap_reason".into(), json!(refusal));
+        Ok((None, 0))
+    }
+
     fn try_layer_prefill(&mut self, tokens: &[u32], position: usize, plan: &[(usize, Vec<&'static str>)],
                          cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
         if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
@@ -4267,7 +4327,8 @@ impl Model {
         self.ensure_kv(tokens.len())?;
         let segment = layer_prefill_rows();
         let count = (tokens.len() - position).min(segment);
-        let Some(mut hidden) = crate::gpu::zeroed_floats(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
+        // (page-aligned: the pass may page-lock the rows to move them beside the compute)
+        let Some(mut hidden) = crate::gpu::PageAlignedFloats::zeroed(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
         let bank_bytes = self.layer_bank_bytes()?;
         let (layer_end, staging) = layer_prefill_split(position, tokens.len(), plan, segment);
         let preparing = Instant::now();
@@ -4288,16 +4349,36 @@ impl Model {
                 Some(reason) => { self.last_metrics.insert("prefill_rows_host_reason".into(), json!(reason)); }
                 None => { self.last_metrics.insert("prefill_rows_vram".into(), json!(true)); }
             }
+            // (not held whole: on the host, moving beside the compute where it can, the rows page-locked until the segments end)
+            let (overlap, locked) = if host.is_none() { (None, 0) } else { self.begin_rows_overlap(&mut hidden, rows)? };
+            let rows_in = if host.is_none() { PassRows::Held } else if overlap.is_some() { PassRows::Overlapped } else { PassRows::Host };
             let moved = self.group.prefill_row_transfers().ok();
-            let done = self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, host.is_none(),
+            let waited = self.group.rows_overlap_times().ok();
+            let done = self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, rows_in,
                                                    cancelled, progress);
-            // (the hidden rows to the GPU and back, every layer of every pass: what holding them in VRAM would save)
+            // (however the segments ended, the copies are waited for and the pages let go before the rows are freed)
+            let ended = overlap.map(crate::gpu::RowsOverlap::finish);
+            if locked > 0 {
+                self.pinned_other = self.pinned_other.saturating_sub(locked);
+                self.hold_memory();
+            }
+            // (the hidden rows to the GPU and back, every layer of every pass: what holding them in VRAM would save; moving beside the compute,
+            // the copies' own times on their streams)
             if let (Some(before), Ok(after)) = (moved, self.group.prefill_row_transfers()) {
                 self.metric_add("prefill_rows_up_seconds", after[0].saturating_sub(before[0]) as f64 / 1e9);
                 self.metric_add("prefill_rows_up_bytes", after[1].saturating_sub(before[1]) as f64);
                 self.metric_add("prefill_rows_down_seconds", after[2].saturating_sub(before[2]) as f64 / 1e9);
                 self.metric_add("prefill_rows_down_bytes", after[3].saturating_sub(before[3]) as f64);
             }
+            // (and what the compute still waited for: the device stream for rows to come up, the host for the last rows to go down)
+            if let (PassRows::Overlapped, Some(before), Ok(after)) = (rows_in, waited, self.group.rows_overlap_times()) {
+                self.metric_add("prefill_rows_overlap_stream_wait_seconds", after[0].saturating_sub(before[0]) as f64 / 1e9);
+                self.metric_add("prefill_rows_overlap_host_wait_seconds", after[1].saturating_sub(before[1]) as f64 / 1e9);
+            }
+            let done = match (done, ended) {
+                (Ok(_), Some(Err(error))) => Err(error),
+                (done, _) => done,
+            };
             done.map(Some)
         })();
         let restoring = Instant::now();
@@ -4333,7 +4414,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn layer_prefill_segments(&mut self, tokens: &[u32], position: usize, end: usize, staging: bool, plan: &[(usize, Vec<&'static str>)],
-                              batch: usize, hidden: &mut [f32], held: bool, cancelled: &dyn Fn() -> bool,
+                              batch: usize, hidden: &mut [f32], rows_in: PassRows, cancelled: &dyn Fn() -> bool,
                               progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
         let layers = 48 + usize::from(self.speculative > 0);
@@ -4369,24 +4450,33 @@ impl Model {
                 }
                 drop(trace_embedding);
                 // (held in VRAM: the pass's rows go up once, and come back once after its last layer)
-                if held {
+                if rows_in == PassRows::Held {
                     self.group.put_layer_rows(0, rows)?;
                 }
+                // Avoid a final prefill call of one row; the existing one-row path is a different API.
+                let chunks = layer_prefill_chunks(begin, stop, batch);
                 let previous = self.final_hidden.clone();
                 for layer in 0..48 {
+                    // (moving beside the compute: the layer's first chunks' rows come up while its banks load, the ring's two slots being free)
+                    if rows_in == PassRows::Overlapped {
+                        for chunk in rows_overlap_prime(chunks.len()) {
+                            let (first, end) = chunks[chunk];
+                            self.group.rows_overlap_up(chunk as u64, (first - begin) as u64, (end - first) as u64)?;
+                        }
+                    }
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
                     let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
                     self.load_prefill_bank_copy(layer, layers, &mut bank_reader)?;
                     drop(trace_bank);
                     let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
-                    // Avoid a final prefill call of one row; the existing one-row path is a different API.
-                    for (first, end) in layer_prefill_chunks(begin, stop, batch) {
+                    for (chunk, &(first, end)) in chunks.iter().enumerate() {
                         let low = (first - begin) * WIDTH;
                         let high = (end - begin) * WIDTH;
-                        if held {
-                            self.group.prefill_rows_held(layer, (first - begin) as u64, (end - first) as u64)?;
-                        } else {
-                            self.group.prefill_rows(layer, &rows[low..high])?;
+                        match rows_in {
+                            PassRows::Held => self.group.prefill_rows_held(layer, (first - begin) as u64, (end - first) as u64)?,
+                            PassRows::Host => self.group.prefill_rows(layer, &rows[low..high])?,
+                            // (the device stream waits for this chunk's rows to arrive in its slot, which it then copies into the workspace)
+                            PassRows::Overlapped => self.group.rows_overlap_load(layer, chunk as u64, (end - first) as u64)?,
                         }
                         if layer == 1 {
                             let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
@@ -4398,16 +4488,27 @@ impl Model {
                             self.ple_wait += reading.elapsed().as_secs_f64();
                             self.with_operands(Model::ple_operands, |group, operands| group.prefill_ple("blk.1.", &embeddings, operands))?;
                         }
-                        if held {
-                            self.group.prefill_span_held(layer, (first - begin) as u64, first as u64, (end - first) as u64)?;
-                        } else {
+                        match rows_in {
+                            PassRows::Held => self.group.prefill_span_held(layer, (first - begin) as u64, first as u64, (end - first) as u64)?,
                             // (in place: a new vector a chunk faulted every row's pages in again for each layer)
-                            self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?;
+                            PassRows::Host => self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?,
+                            PassRows::Overlapped => {
+                                // (the span, then its rows down to the host behind it)
+                                self.group.rows_overlap_span(layer, chunk as u64, (first - begin) as u64, first as u64, (end - first) as u64)?;
+                                // (the slot is the next chunk but one's once these rows have gone down: they come up while the next is computed)
+                                if let Some(ahead) = rows_overlap_after_span(chunks.len(), chunk) {
+                                    let (next, last) = chunks[ahead];
+                                    self.group.rows_overlap_up(ahead as u64, (next - begin) as u64, (last - next) as u64)?;
+                                }
+                            }
                         }
                     }
                 }
-                if held {
-                    self.group.get_layer_rows(0, rows)?;
+                match rows_in {
+                    PassRows::Held => self.group.get_layer_rows(0, rows)?,
+                    // (the last layer's rows are on the host before anything reads them: the MTP layer, the last row, the checkpoints, the next pass)
+                    PassRows::Overlapped => self.group.rows_overlap_wait()?,
+                    PassRows::Host => {}
                 }
                 if self.speculative > 0 {
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, 48)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
@@ -4417,7 +4518,7 @@ impl Model {
                     let _trace_compute = crate::layer_trace::Span::new("compute", Some(48), begin, stop, 0);
                     // Preserve the ordinary chunk order's pair positions and prologue batch shapes. The bank stays loaded once.
                     let mut previous = previous;
-                    for (first, end) in layer_prefill_chunks(begin, stop, batch) {
+                    for &(first, end) in &chunks {
                         let chunk = &rows[(first - begin) * WIDTH..(end - begin) * WIDTH];
                         self.mtp_prompt_batched(&tokens[first..end], chunk, previous, batch.min(512), first)?;
                         previous = Some(last_row(chunk).to_vec());
@@ -6850,6 +6951,65 @@ mod layer_prefill_tests {
         use super::layer_rows_vram_named;
         assert!(layer_rows_vram_named(None) && layer_rows_vram_named(Some("1")) && layer_rows_vram_named(Some("yes")));
         assert!(!layer_rows_vram_named(Some("0")) && !layer_rows_vram_named(Some(" 0 ")));
+    }
+
+    /// Decides: STRAYDOG_LAYER_ROWS_OVERLAP=0 keeps the round trip through the host that waits for each copy; unset or anything else moves a pass's
+    /// rows that stay on the host beside the compute.
+    #[test]
+    fn the_rows_on_the_host_move_beside_the_compute_unless_the_variable_says_0() {
+        use super::layer_rows_overlap_named;
+        assert!(layer_rows_overlap_named(None) && layer_rows_overlap_named(Some("1")) && layer_rows_overlap_named(Some("yes")));
+        assert!(!layer_rows_overlap_named(Some("0")) && !layer_rows_overlap_named(Some(" 0 ")));
+    }
+
+    /// Decides: the order in which a pass makes its calls on the ring of two chunk slots keeps the protocol the native side checks and its
+    /// events order. A slot's rows come up only when it is free (its last rows have been queued out), are loaded after they came up, computed
+    /// after they were loaded, and every chunk of every layer is loaded and computed once, in order; the first two chunks of a layer come up
+    /// before its banks load (and only they), and the chunk after the next one comes up behind each span, so that no more than two chunks are
+    /// ever in the ring. Whatever the number of chunks, one included.
+    #[test]
+    fn the_ring_of_two_slots_is_fed_in_an_order_that_keeps_every_slot_free_when_rows_come_up() {
+        use super::{layer_prefill_chunks, rows_overlap_after_span, rows_overlap_prime};
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Slot { Free, Uploaded, Loaded }
+        for (rows, batch) in [(512usize, 2048usize), (2048, 2048), (2049, 2048), (4096, 2048), (6000, 2048), (16384, 2048), (16384, 256), (5000, 7)] {
+            let chunks = layer_prefill_chunks(0, rows, batch);
+            let n = chunks.len();
+            let mut slots = [Slot::Free; 2];
+            let mut computed = Vec::new();
+            let mut in_ring = 0;
+            for layer in 0..3 {
+                let up = |chunk: usize, slots: &mut [Slot; 2], in_ring: &mut usize| {
+                    assert_eq!(slots[chunk % 2], Slot::Free, "{rows}/{batch}: chunk {chunk} of layer {layer} comes up into a slot in use");
+                    slots[chunk % 2] = Slot::Uploaded;
+                    *in_ring += 1;
+                    assert!(*in_ring <= 2);
+                };
+                for chunk in rows_overlap_prime(n) {
+                    up(chunk, &mut slots, &mut in_ring);
+                }
+                assert_eq!(rows_overlap_prime(n).count(), n.min(2));
+                for chunk in 0..n {
+                    assert_eq!(slots[chunk % 2], Slot::Uploaded, "{rows}/{batch}: chunk {chunk} of layer {layer} is loaded before its rows came up");
+                    slots[chunk % 2] = Slot::Loaded;
+                    assert_eq!(slots[chunk % 2], Slot::Loaded);
+                    slots[chunk % 2] = Slot::Free;
+                    in_ring -= 1;
+                    computed.push((layer, chunk));
+                    if let Some(ahead) = rows_overlap_after_span(n, chunk) {
+                        assert_eq!(ahead, chunk + 2);
+                        up(ahead, &mut slots, &mut in_ring);
+                    }
+                }
+                assert_eq!(slots, [Slot::Free; 2], "{rows}/{batch}: a chunk is left in the ring at the layer's end");
+            }
+            let expected: Vec<(usize, usize)> = (0..3).flat_map(|layer| (0..n).map(move |chunk| (layer, chunk))).collect();
+            assert_eq!(computed, expected, "{rows}/{batch}");
+        }
+        assert_eq!(rows_overlap_after_span(1, 0), None);
+        assert_eq!(rows_overlap_after_span(2, 0), None);
+        assert_eq!(rows_overlap_after_span(3, 0), Some(2));
+        assert_eq!(rows_overlap_after_span(3, 1), None);
     }
 
     /// Decides: STRAYDOG_LAYER_PREFILL_ROWS sets the rows a pass takes, a count from the least a layer-order segment takes to the
