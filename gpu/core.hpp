@@ -59,6 +59,8 @@
 #define hipEventElapsedTime cudaEventElapsedTime
 #define hipStream_t cudaStream_t
 #define hipStreamCreate cudaStreamCreate
+#define hipStreamCreateWithFlags cudaStreamCreateWithFlags
+#define hipStreamNonBlocking cudaStreamNonBlocking
 #define hipStreamCreateWithPriority cudaStreamCreateWithPriority
 #define hipDeviceGetStreamPriorityRange cudaDeviceGetStreamPriorityRange
 #define hipStreamDefault cudaStreamDefault
@@ -573,6 +575,44 @@ struct RowStaging {
     size_t refused = 0;   // the size (floats) the system refused to page-lock last: not asked for again at or over it
     unsigned turn = 0;
 };
+// Layer order's hidden rows kept on the host (page-locked for the pass) and moved beside the compute (sd_rows_overlap_*, kernels.cpp): a ring of
+// two chunk slots in VRAM stands for the rows a pass would hold there, fed by the up stream and drained by the down stream, the device stream
+// working between them. Everything is ordered by events: a slot is written only after its rows have left it, and a chunk's rows are read
+// from the host only after the layer before has written them there.
+struct RowsOverlap {
+    // A copy's start and end on its stream (or the device stream's wait for rows coming up), summed into the device's counters when done.
+    struct Timed { hipEvent_t first = nullptr, last = nullptr; int kind = 0; };   // kind: 0 up, 1 down, 2 the device stream's wait
+    enum SlotState : uint8_t { slot_free, slot_uploaded, slot_loaded };   // rows queued up into it; copied on into the layer's workspace
+    hipStream_t up = nullptr, down = nullptr;
+    // By slot: its rows are on the device (queued on up); the span's rows are in it (device stream); they have reached the host (down).
+    hipEvent_t uploaded[2] = {nullptr, nullptr}, computed[2] = {nullptr, nullptr}, left[2] = {nullptr, nullptr};
+    // By chunk: its rows have reached the host (the last layer's), and whether a layer of this pass has written them (else the host's are the CPU's).
+    std::vector<hipEvent_t> written;
+    std::vector<char> valid;
+    SlotState state[2] = {slot_free, slot_free};
+    size_t slot_steps[2] = {0, 0};        // the rows queued up into it
+    bool slot_used[2] = {false, false};   // `left` is of a copy out of the slot
+    bool active = false;
+    void* ring = nullptr;          // the ring's allocation (sd_prefill_bank_allocate): `slots` slots of `slot_rows` rows
+    size_t slot_rows = 0, slots = 0;
+    float* host = nullptr;         // the pass's rows, page-locked from sd_rows_overlap_begin to its end
+    size_t host_rows = 0;
+    std::vector<Timed> timed, spare;
+    ~RowsOverlap() {
+        if (up) cleanup(hipStreamSynchronize(up));
+        if (down) cleanup(hipStreamSynchronize(down));
+        if (active && host) cleanup(hipHostUnregister(host));
+        for (hipEvent_t event : {uploaded[0], uploaded[1], computed[0], computed[1], left[0], left[1]}) if (event) cleanup(hipEventDestroy(event));
+        for (hipEvent_t event : written) if (event) cleanup(hipEventDestroy(event));
+        for (auto* list : {&timed, &spare})
+            for (auto& entry : *list) {
+                if (entry.first) cleanup(hipEventDestroy(entry.first));
+                if (entry.last) cleanup(hipEventDestroy(entry.last));
+            }
+        if (up) cleanup(hipStreamDestroy(up));
+        if (down) cleanup(hipStreamDestroy(down));
+    }
+};
 struct Device;
 void phase_report(Device& d);
 // The flag that tells the span running on a device to stop (sd_abort_flag): its own counted allocation, one reference the device's and one
@@ -740,6 +780,10 @@ struct Device {
     // Layer order's hidden rows to the device (sd_prefill_rows) and back (prefill_span's output), wall nanoseconds and bytes so far
     // (sd_prefill_row_transfers): each timed between waits the transfers make anyway, none added.
     uint64_t rows_up_ns = 0, rows_up_bytes = 0, rows_down_ns = 0, rows_down_bytes = 0;
+    // Where rows moved beside the compute (rows_overlap): the copies' own times are the ones above (each between its events on its stream);
+    // these are the time the device stream waited for rows to come up, and the time the host waited for the last rows to go down.
+    uint64_t rows_overlap_stream_wait_ns = 0, rows_overlap_host_wait_ns = 0;
+    std::unique_ptr<RowsOverlap> rows_overlap;
     size_t qwen_parts = 1;    // Qwen3.8's layers split across this many GPUs (DecoderLayer::parts)
     // A draft's vocabulary on the device holding the head (sd_draft_vocabulary): the head's first `draft_rows` rows, and
     // `draft_extra_count` rows of tokens past them, copied into `draft_extras` (their tokens in `draft_extra_tokens`).
@@ -881,6 +925,7 @@ struct Device {
         for (auto& pair : staging_ready) for (float* ready : pair) if (ready) cleanup(hipHostFree(ready));
         copier.reset();
         transfers.reset();   // waits for its copies before the allocations go
+        rows_overlap.reset();
         if (stream) cleanup(hipStreamSynchronize(stream));
         if (helper_stream) cleanup(hipStreamSynchronize(helper_stream));
         if (kv_stream) cleanup(hipStreamSynchronize(kv_stream));
