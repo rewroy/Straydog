@@ -1,0 +1,16 @@
+: prefill 512/1024
+
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"Qwen3.8-Flash-Next-IQ3_S","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me check"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"Qwen3.8-Flash-Next-IQ3_S","choices":[{"index":0,"delta":{"reasoning_content":" the file.\n"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"Qwen3.8-Flash-Next-IQ3_S","choices":[{"index":0,"delta":{"content":"Reading it"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"Qwen3.8-Flash-Next-IQ3_S","choices":[{"index":0,"delta":{"content":" now.\n"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"Qwen3.8-Flash-Next-IQ3_S","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ID","type":"function","function":{"name":"read_file","arguments":"{\"path\": \"src/main.rs\", \"limit\": 50}"}},{"index":1,"id":"call_ID","type":"function","function":{"name":"read_file","arguments":"{\"path\": \"src/lib \\\"two\\\".rs\\nline\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-ID","object":"chat.completion.chunk","created":0,"model":"Qwen3.8-Flash-Next-IQ3_S","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"timings":{"prefill_seconds":0.25,"decode_tokens_per_second":97.5}}
+
+data: [DONE]
+
