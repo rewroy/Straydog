@@ -154,6 +154,8 @@ fn a_fill_waits_for_a_write_back_behind_the_pass() {
     // so those are in VRAM alone when they are evicted, and their write-backs go to the next oldest copies, where they stay until they
     // come back. (With 8 the later reads take the written-back ones too; with a slot for every expert nothing is written back.)
     let (path, mut gpu, mut store, _) = open(&layers, 16, 12);
+    // (plain LRU order: what leaves VRAM is the oldest, not the newly filled)
+    store.set_probation(0);
     let first: Vec<usize> = (0..12).collect();
     let slots = store.acquire(&mut gpu, 0, &first).unwrap();
     check_slots(&mut gpu, &roles, &first, &slots, "the first twelve");
@@ -183,6 +185,46 @@ fn a_fill_waits_for_a_write_back_behind_the_pass() {
     store.settle(&mut gpu).unwrap();
     let counts = store.counts();
     assert!(counts.writebacks >= 4 && counts.host_hits >= 4, "{counts:?}");
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// A newly filled expert goes in near the cold end of the LRU order and is given up before the experts a later pass used again.
+#[test]
+fn a_new_expert_leaves_before_the_ones_a_later_pass_used_again() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    // 16 slots and a reserve of 4; a host tier for every expert
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    store.set_probation(100);
+    let pass = |store: &mut DeviceExperts, gpu: &mut Backend, experts: std::ops::Range<usize>, what: &str| {
+        let experts: Vec<usize> = experts.collect();
+        let slots = store.acquire(gpu, 0, &experts).unwrap();
+        check_slots(gpu, &roles, &experts, &slots, what);
+        store.release(gpu).unwrap();
+    };
+    // Eight experts, used again by a second pass; four more, used once; then four more, for which four must leave.
+    pass(&mut store, &mut gpu, 0..8, "the first eight");
+    pass(&mut store, &mut gpu, 0..8, "the first eight again");
+    pass(&mut store, &mut gpu, 8..12, "four used once");
+    pass(&mut store, &mut gpu, 12..16, "four more");
+    store.settle(&mut gpu).unwrap();
+    let held = |store: &DeviceExperts, experts: std::ops::Range<usize>| experts.filter(|&expert| store.in_vram(0, expert)).count();
+    // (a tenth of 16 slots is one deep: one or two of the oldest go with the new ones, as slots of the same place fall)
+    assert_eq!(held(&store, 2..8), 6, "the experts used again stay");
+    assert!(held(&store, 8..16) <= 6, "the experts used once leave first");
+    assert_eq!(held(&store, 0..16), 12);
+    // Plain LRU order gives up the four oldest instead.
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    store.set_probation(0);
+    pass(&mut store, &mut gpu, 0..8, "the first eight");
+    pass(&mut store, &mut gpu, 0..8, "the first eight again");
+    pass(&mut store, &mut gpu, 8..12, "four used once");
+    pass(&mut store, &mut gpu, 12..16, "four more");
+    store.settle(&mut gpu).unwrap();
+    assert_eq!((held(&store, 0..4), held(&store, 4..16)), (0, 12));
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
@@ -470,6 +512,8 @@ fn a_lent_region_holds_experts_and_goes_back_to_its_lender() {
     let roles = layers[0].clone().unwrap();
     // 16 slots and a reserve of 4; a host tier for every expert
     let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    // (plain LRU order: which experts are still in VRAM below follows from the oldest leaving first)
+    store.set_probation(0);
     let slot_bytes = store.slot_size(0).unwrap();
     let region = gpu.buffer(slot_bytes * 12 + 1000).unwrap();
     assert_eq!(store.lend(region).unwrap(), 12);
