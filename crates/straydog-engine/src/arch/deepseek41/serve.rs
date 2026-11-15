@@ -914,7 +914,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     // engine's devices (each keeps its rows).
     let group_experts: Vec<u64> = groups.iter().map(|(_, range)| expert_bytes[range.clone()].iter().sum()).collect();
     let loading = std::sync::atomic::AtomicBool::new(true);
-    eprintln!("Straydog DeepSeek prompt-pass products: {}; passes below 32 rows F32, up to four rows GEMV",
+    eprintln!("Straydog DeepSeek prompt-pass products: {}; passes below 8 rows F32, up to four rows GEMV",
               if settings.half_gemm { "FP16 inputs/weights, F32 sums/output" } else { "FP32" });
     let (engines, drafter) = std::thread::scope(|scope| {
         // The dense weights verify as the engines take them: their bytes are the progress.

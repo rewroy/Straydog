@@ -837,8 +837,11 @@ and a 102.2 GiB host tier (12,629 experts' worth, of 15,360).
   1 + (layers − 1 − k) × (window − 1) rows, plus the K/V of the window − 1 rows before them. The
   kv source still compresses every row. This is exact; `DS41_FULL_DECODER` computes every row,
   for comparisons.
-- **Products in prompt passes of 32 rows or more** use FP16 operands; smaller passes use F32
-  (README, Numerics).
+- **Products in prompt passes of 8 rows or more** use FP16 operands; smaller passes use F32
+  (README, Numerics). The limit was 32 rows until a request that added 9 to 32 tokens to a held conversation (a short
+  tool result, a short message) was found to wait longer than one that added 36 to 88: in F32 a row of such a pass cost
+  about what a decode pass costs (12 tokens 358-403 ms, 28 tokens 651-682 ms, against 233-324 ms for 36 to 88; at 8 rows
+  144-155 and 201-237 ms; two R9700, UD-IQ1_M).
 - **What a long pass's kernels share.** The attention's output kernel splits a row into dim / 64
   blocks: a kernel before them forms each row's softmax weights and denominators once, in place. The
   HC step takes 16 rows a block, each thread holding its column's mixing weights, and forms its 26
