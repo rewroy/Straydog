@@ -823,6 +823,9 @@ struct VramSlot {
     warmed: bool,
     /// Acquired or requested since the last release: not evicted before it.
     held: bool,
+    /// Filled and not yet released by the pass that took it: at that release it takes a place near the cold end of the LRU order
+    /// ([`DeviceExperts::settle_touches`]).
+    fresh: bool,
     /// Filled while a prefill streams its experts through ([`DeviceExperts::set_streaming`]): the
     /// host tier keeps its copy, and the release empties the slot without a write-back.
     streamed: bool,
@@ -879,6 +882,27 @@ struct Class {
     /// changes from which they may be looked for again.
     spare: Vec<usize>,
     spare_at: u64,
+}
+
+/// How deep from the cold end of a class's LRU order a newly filled expert goes in, in thousandths of the class's slots (0: as just
+/// used; see `DeviceExperts::settle_touches`): `STRAYDOG_EXPERT_PROBATION`, 100 where it is not set, or what [`set_probation`] set.
+static PROBATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn probation() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    match PROBATION.load(Relaxed) {
+        usize::MAX => {
+            let depth = std::env::var("STRAYDOG_EXPERT_PROBATION").ok().and_then(|value| value.parse().ok()).map_or(100, |value: usize| value.min(1000));
+            PROBATION.store(depth, Relaxed);
+            depth
+        }
+        depth => depth,
+    }
+}
+
+/// Development: the probation's depth from here on, for a comparison of depths in one process (ds41_quality --probation).
+pub fn set_probation(thousandths: usize) {
+    PROBATION.store(thousandths.min(1000), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Counters since creation.
@@ -957,6 +981,8 @@ pub struct DeviceExperts {
     /// A host slot needed takes the copy of an expert that stays in VRAM before the oldest copy
     /// ([`spare_copy`](Self::spare_copy)).
     spare_copies: bool,
+    /// This store's own probation depth ([`set_probation`](Self::set_probation)); None: the process's ([`probation`]).
+    probation: Option<usize>,
     tails: Vec<Tail>,
     /// The experts a begun request still fills, and the read chunk it fills them with
     /// ([`request_begin`](Self::request_begin)).
@@ -1093,7 +1119,7 @@ impl DeviceExperts {
             let pinner = Pinner::new(arenas, per_arena * host_bytes as usize, allocated.clone());
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
-                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false, held: false, streamed: false, class: index,
+                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false, held: false, fresh: false, streamed: false, class: index,
                 place: None,
                 taken_back: false,
             }));
@@ -1111,6 +1137,7 @@ impl DeviceExperts {
             pass_clock: 0,
             heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
             spare_copies: std::env::var("STRAYDOG_EXPERT_COPIES").map_or(true, |value| value != "oldest"),
+            probation: None,
             tails: Vec::new(),
             unfilled: VecDeque::new(),
             unfilled_chunk: CHUNK,
@@ -1568,6 +1595,7 @@ impl DeviceExperts {
                 }
                 let slot = self.fill(gpu, key, false, chunk)?;
                 self.slots[slot].speculative = true;
+                self.slots[slot].fresh = false;
                 self.slots[slot].warmed = !guess;
                 self.speculative.entry(layer as u32).or_default().push(slot);
                 self.counts.prefetched += u64::from(guess);
@@ -1591,6 +1619,7 @@ impl DeviceExperts {
         for &slot in &released {
             self.slots[slot].guards[0] = Some(mark);
             self.slots[slot].held = false;
+            self.slots[slot].fresh = false;
         }
         self.requested.clear();
         // A streamed expert's slot comes free for the prefill's next wave; the host tier holds
@@ -1637,7 +1666,7 @@ impl DeviceExperts {
             let slot = self.slots.len();
             self.slots.push(VramSlot {
                 key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false,
-                held: false, streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
+                held: false, fresh: false, streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
             });
             self.classes[class].free.push_back(slot);
             self.lent.push(LentSlot { slot, region: number, offset: start, out: false });
@@ -1732,8 +1761,32 @@ impl DeviceExperts {
 
     /// Mark `slot` just used (its place in the LRU order).
     /// The LRU order as [`hold`](Self::hold)s since the last call would have left it.
+    ///
+    /// An expert filled for the pass that now releases it (`fresh`) does not take the place of one just used: it goes in at the
+    /// probation's depth from the cold end (`probation` of the class's slots in a thousand), and takes the place of one just used
+    /// only when a later pass uses it again. A route's expert that no later token wants is then given up before the experts that
+    /// passes keep coming back to, which plain LRU order let it push out. On the accesses of a DeepSeek-V4.1 server answering the fixed
+    /// scenarios (two R9700, UD-IQ1_M, 3.2 million accesses of 14,789 experts in about 5,900 slots a GPU), a simulation of the orders
+    /// gives 13.0% fewer misses for a tenth of the slots than plain LRU's 6.19% of accesses (a twentieth 11.4%, a fifth 10.5%, a half
+    /// 4.1%; 2Q and ARC with their histories 0.5% to 1.8%; least use count among the coldest more misses; the optimum 58.8% fewer).
+    /// Which experts are computed does not change, nor a logit. `STRAYDOG_EXPERT_PROBATION=0` keeps plain LRU order.
     fn settle_touches(&mut self) {
-        for (slot, used) in std::mem::take(&mut self.touched) {
+        let probation = self.probation.unwrap_or_else(probation);
+        let mut depth: Vec<Option<Option<u64>>> = vec![None; self.classes.len()];
+        for (slot, mut used) in std::mem::take(&mut self.touched) {
+            let class = self.slots[slot].class;
+            // (every hold of a fresh slot in this pass: a request's fill holds it, and the acquire after it again)
+            if self.slots[slot].fresh && probation > 0 && self.slots[slot].key.is_some() {
+                // (the stamp of the slot at the probation's depth, found once a class a release: the fresh ones of a pass share it)
+                let stamp = *depth[class].get_or_insert_with(|| {
+                    let lru = &self.classes[class].lru;
+                    let at = lru.len() * probation / 1000;
+                    if at == 0 { None } else { lru.iter().nth(at).map(|&(stamp, _)| stamp) }
+                });
+                if let Some(stamp) = stamp {
+                    used = used.min(stamp);
+                }
+            }
             let entry = &mut self.slots[slot];
             let lru = &mut self.classes[entry.class].lru;
             if entry.key.is_some() {
@@ -1775,6 +1828,7 @@ impl DeviceExperts {
         self.vram_changes += 1;
         entry.speculative = false;
         entry.warmed = false;
+        entry.fresh = false;
         let class = &mut self.classes[entry.class];
         class.lru.remove(&(entry.used, slot));
         class.free.push_back(slot);
@@ -1801,6 +1855,7 @@ impl DeviceExperts {
         self.map.insert(key, slot);
         self.slots[slot].key = Some(key);
         self.slots[slot].streamed = self.streaming;
+        self.slots[slot].fresh = !self.streaming;
         self.classes[class].lru.insert((self.slots[slot].used, slot));
         self.touch(slot);
         let stream = if urgent { Stream::Upload } else { Stream::LaterUpload };
@@ -2250,6 +2305,12 @@ impl DeviceExperts {
             return Err("a lent expert slot its lender has back came free".into());
         }
         Ok(slot)
+    }
+
+    /// This store's probation depth in thousandths of a class's slots, whatever the process's is (0: plain LRU order; see
+    /// [`settle_touches`](Self::settle_touches)).
+    pub fn set_probation(&mut self, thousandths: usize) {
+        self.probation = Some(thousandths.min(1000));
     }
 
     fn victim(&self, class: usize) -> Result<usize> {
@@ -2903,6 +2964,7 @@ impl DeviceExperts {
         }
         self.settled = false;
         let slot = self.fill(gpu, (layer as u32, expert as u32), false, CHUNK)?;
+        self.slots[slot].fresh = false;
         let (_, mark) = self.slots[slot].ready.ok_or("a promoted expert has no upload")?;
         Ok(Some((self.slot_buffer(slot).base() as u64, mark)))
     }
