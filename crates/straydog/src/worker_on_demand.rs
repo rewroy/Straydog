@@ -323,7 +323,21 @@ impl<E: Engines> Loaded<E> {
         let prompt = self.template.render_with(messages, &tools, &variables).map_err(|exc| refused(exc.0))?;
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         let images: Vec<images::Image> = images.iter().map(|bytes| images::prepare(bytes)).collect::<Result<_, _>>().map_err(refused)?;
-        let (ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
+        let (mut ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
+        // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
+        // encoded again can be split otherwise, and the engines then read the reply again from the first such place.
+        if images.is_empty() {
+            let held = self.model.held();
+            let shared = ids.iter().zip(held).take_while(|(new, old)| new == old).count();
+            if shared < held.len() && shared < ids.len() {
+                let (count, at) = text.reach(held, &prompt);
+                if count > shared {
+                    let mut kept = held[..count].to_vec();
+                    kept.extend(text.encode(&prompt[at..]).map_err(Failure::from)?);
+                    ids = kept;
+                }
+            }
+        }
         let encode_seconds = started.elapsed().as_secs_f64();
         let image_started = Instant::now();
         let rows = self.image_rows(&images, &spans)?;

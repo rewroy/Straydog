@@ -219,4 +219,12 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     // (another sequence has left the mark)
     go(&mut model, &first, 8);
     assert!(!model.engines.mark(false).unwrap());
+
+    // The ids of a reply are kept where its text comes back (Text::reach): all of them spell the text they decode to,
+    // whether or not the tokenizer splits that text as the model wrote it.
+    let ids: Vec<u32> = long.iter().chain(&written.tokens).copied().collect();
+    let spelled = text.decode(&ids).unwrap();
+    assert_eq!(text.reach(&ids, &spelled), (ids.len(), spelled.len()));
+    let encoded = text.encode(&spelled).unwrap();
+    eprintln!("the reply's text encoded again: the same ids for {} of {}", encoded.iter().zip(&ids).take_while(|(a, b)| a == b).count(), ids.len());
 }
