@@ -235,6 +235,34 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     go(&mut model, &first, 8);
     assert!(!model.engines.mark(Some(at)).unwrap());
 
+    // A client that writes its folder and the date into its system prompt sends a system prompt that ends otherwise at every new
+    // conversation: none extends another's root. The second such prompt is checkpointed where it parts from the first (its
+    // stem), and the third starts from there, with the first token of a model that reads it whole.
+    let ending = |folder: &str| -> Vec<u32> {
+        let system = format!("{{\"role\": \"system\", \"content\": {}}}",
+                             serde_json::to_string(&format!("{document}\n\nWorking folder: /work/{folder}\nToday is a day in November.")).unwrap());
+        render(&format!("[{system}, {}]", user("What is this project?")))
+    };
+    let (one, two, three) = (ending("alpha-run"), ending("bravo-run"), ending("charlie-run"));
+    let shared = one.iter().zip(&two).take_while(|(a, b)| a == b).count();
+    assert!(shared > 2000 && shared < one.len() - 8, "the system prompts part near their end: {shared} of {}", one.len());
+    model.forget();
+    go(&mut model, &one, 8);
+    let second = go(&mut model, &two, 8);
+    assert_eq!(second.cached, Some(0), "the second ending extends nothing yet");
+    let from_stem = go(&mut model, &three, 8);
+    let from_stem_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(model.last_metrics["resumed_from"], "root");
+    assert!(from_stem.cached.is_some_and(|cached| (cached as usize) < shared && (cached as usize) + 64 > shared), "from the stem: {:?} of {shared} shared", from_stem.cached);
+    model.forget();
+    let whole = go(&mut model, &three, 8);
+    let whole_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(whole.cached, Some(0));
+    let widest = from_stem_logits.iter().zip(&whole_logits).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    eprintln!("from the stem ({:?} of {} tokens) and read whole: the largest logit difference {widest}, {} of {} tokens the same", from_stem.cached, three.len(),
+              from_stem.tokens.iter().zip(&whole.tokens).take_while(|(a, b)| a == b).count(), whole.tokens.len());
+    assert_eq!(top(&from_stem_logits), top(&whole_logits), "the first token from the stem");
+
     // The ids of a reply are kept where its text comes back (Text::reach): all of them spell the text they decode to,
     // whether or not the tokenizer splits that text as the model wrote it.
     let ids: Vec<u32> = long.iter().chain(&written.tokens).copied().collect();

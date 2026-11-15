@@ -230,6 +230,47 @@ fn kept_part(drafter: Option<&std::ffi::OsStr>, root_dir: &std::ffi::OsStr) {
     assert!(model.last_metrics["cached_tokens"].as_u64().is_some_and(|cached| (cached as usize) <= prompt.len()), "{:?}", model.last_metrics["resumed_from"]);
 }
 
+/// A client that writes its folder into its system prompt sends a system prompt that ends otherwise at every new conversation:
+/// none extends another's root. The second such prompt is checkpointed where it parts from the first (its stem, a root of its
+/// own), every later one starts from there, and a new conversation with the same system prompt starts from that prompt's own root.
+#[test]
+fn a_system_prompt_with_another_end_starts_from_its_stem() {
+    let Some(root_dir) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut model, text) = open(&root_dir, None);
+    let document: String = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/DESIGN.md")).unwrap().chars().take(14000).collect();
+    let prompt = |folder: &str, question: &str| -> Vec<u32> {
+        text.encode(&format!("<|im_start|>system\n{document}\n\nWorking folder: /work/{folder}\nToday is a day in November.<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n")).unwrap()
+    };
+    let (one, two, three, four) = (prompt("alpha-run", "What is this project?"), prompt("bravo-run", "What is this project?"),
+                                   prompt("charlie-run", "What is this project?"), prompt("delta-run", "What is this project?"));
+    let shared = one.iter().zip(&two).take_while(|(a, b)| a == b).count();
+    assert!(shared > 2200 && shared + 8 < one.len(), "the system prompts part near their end: {shared} of {}", one.len());
+    let top = |logits: &[f32]| logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(token, _)| token);
+    first_logits(&mut model, &one);
+    first_logits(&mut model, &two);
+    assert_eq!(model.last_metrics["cached_tokens"].as_u64(), Some(0), "the second ending extends nothing yet");
+    for later in [&three, &four] {
+        let from_stem = first_logits(&mut model, later);
+        let cached = model.last_metrics["cached_tokens"].as_u64().unwrap() as usize;
+        eprintln!("resumed from {:?} at {cached} of {} ({shared} shared)", model.last_metrics["resumed_from"], later.len());
+        assert!(matches!(model.last_metrics["resumed_from"].as_str(), Some("root") | Some("root_before")), "{:?}", model.last_metrics["resumed_from"]);
+        assert!(cached % 4 == 0 && cached < shared && cached + 64 > shared, "from the stem: {cached} of {shared} shared");
+        if std::ptr::eq(later, &four) {
+            // (the same prompt read whole chooses the same first token)
+            model.reset().unwrap();
+            let whole = first_logits(&mut model, later);
+            eprintln!("from the stem and read whole: relative difference {:.4}", relative_difference(&from_stem, &whole));
+            assert_eq!(top(&from_stem), top(&whole), "the first token from the stem");
+        }
+    }
+    // (a new conversation with the last system prompt itself starts from that prompt's own root, past the stem)
+    let same = prompt("delta-run", "Name its main parts.");
+    first_logits(&mut model, &same);
+    let cached = model.last_metrics["cached_tokens"].as_u64().unwrap() as usize;
+    assert!(cached > shared && cached + 64 > reply_place(&same) - 32, "from its own root: {cached} ({shared} shared, {:?})", model.last_metrics["resumed_from"]);
+}
+
 #[test]
 fn a_reply_kept_in_part_goes_on_from_its_mark() {
     let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
