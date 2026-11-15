@@ -427,6 +427,13 @@ The engine holds one sequence.
     window's rows and the incomplete groups' tails go back, since a later position never writes a
     complete group's compressed row or index key. Its copy may go on later; the copies of
     checkpoints above it are made first.
+  - A long reply is marked as it grows: every 512 tokens, between two passes, the window's rows and the tails are
+    copied (2 ms; no compressed row or index key), and the last two marks are kept. A client that keeps a reply only
+    in part (an agent app that cuts a file being written at a line's end and has the model go on, a person who stops
+    a reply) sends a prompt that leaves the held sequence a few tokens before its end; the sequence cannot go back by
+    a few tokens, so the request goes back in place to the last mark the prompt reaches (`resumed_from` is `step`)
+    and reads at most some 500 tokens again, where it read the whole reply again from the checkpoint before it
+    (6,327 tokens in 3.2 s after a reply stopped at 24,000 characters; 517 tokens in 1.05 s from the mark).
   - The checkpoints take at most 2 GiB of host memory, or room for two at the full context when that is
     more: a checkpoint is ~0.85 GB at 262144 tokens and ~3.4 GB at 1048576, so a 1048576-token context
     gets ~6.3 GiB. A checkpoint over the budget is not saved.
