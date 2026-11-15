@@ -88,8 +88,18 @@ const DRAFT_ROWS: u64 = 100_000;
 const DRAFT_EXTRAS: usize = 16384;
 /// Conversation checkpoints, each a page-locked host copy of the recurrent state (~118 MB):
 /// root (the end of the system prompt), root_before (the root of the system prompt before, see [`ROOT_BEFORE`]), turn (where the reply
-/// to the last user message began), prior (the same for the message before) and step (the reply to the last tool result).
-const CHECKPOINTS: [&str; 5] = ["root", "root_before", "turn", "prior", "step"];
+/// to the last user message began), prior (the same for the message before), step (the reply to the last tool result), and the last
+/// two marks of the reply being written ([`MARK_EVERY`]).
+const CHECKPOINTS: [&str; 7] = ["root", "root_before", "turn", "prior", "step", "mark", MARK_BEFORE];
+/// The mark before the last, kept beside it: a prompt that leaves the reply between the two has the one before to go on from.
+const MARK_BEFORE: &str = "mark_before";
+/// The tokens of a reply between two marks of its sequence. A client that keeps a long reply only in part (an agent app that cuts a file
+/// being written at a line's end to get it on disk and has the model go on, a person who stops a reply) sends a prompt that leaves the held
+/// sequence a few tokens before its end. The recurrent state cannot go back, so the request went back to the checkpoint where the reply's
+/// generation prompt began and read the whole reply again: on an RTX 5070 Ti with IQ2_XS, 23,819 tokens in 20.9 s and 7,395 in 11.1 s after
+/// two such cuts of one file. A mark is the recurrent state where the reply stands, taken between two passes at a position that is a
+/// multiple of four (as every checkpoint: the layers' indexers pool by four), each time the sequence has grown this far.
+const MARK_EVERY: usize = 512;
 /// The root of the system prompt before the last, kept beside it: with one root, a second client's request (a team's test, another
 /// program) took the first client's root, and the first client's next conversation, whose state the departure had parked, could not be
 /// resumed from it and read its whole system prompt again. The root a prompt resumes from is the root afterwards, so a third system
@@ -1234,6 +1244,11 @@ pub struct Model {
     pub history: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
     checkpoints: IndexMap<&'static str, Checkpoint>,
+    /// The length of the held sequence from which the reply being written is marked next ([`MARK_EVERY`]); `usize::MAX` for a reply that
+    /// is not marked.
+    mark_at: usize,
+    /// Tests only: false takes no marks ([`Model::set_reply_marks`]).
+    reply_marks: bool,
     parked: Option<Parked>,
     /// Host bytes parked positions may take.
     park_budget: u64,
@@ -1506,6 +1521,8 @@ impl Model {
             history: Vec::new(),
             final_hidden: None,
             checkpoints: IndexMap::new(),
+            mark_at: usize::MAX,
+            reply_marks: true,
             parked: None,
             park_budget: crate::host::host_memory_bytes() / 8,
             park_whole: false,
@@ -2652,6 +2669,19 @@ impl Model {
                 self.checkpoints.insert("prior", turn);
             }
         }
+        if kind == "mark" {
+            // (the last mark becomes the one before it where the sequence still goes on from it; one the sequence has left is given up)
+            if let Some(mark) = self.checkpoints.shift_remove("mark") {
+                let before = self.checkpoints.shift_remove(MARK_BEFORE);
+                let (kept, given_up) = if self.history.starts_with(&mark.tokens) { (Some(mark), before) } else { (before, Some(mark)) };
+                if let Some(given_up) = given_up {
+                    self.release_checkpoint(given_up)?;
+                }
+                if let Some(kept) = kept {
+                    self.checkpoints.insert(MARK_BEFORE, kept);
+                }
+            }
+        }
         let used: Vec<usize> =
             self.checkpoints.iter().filter(|(name, _)| **name != kind).map(|(_, checkpoint)| checkpoint.slot).collect();
         let slot = (0..CHECKPOINTS.len()).find(|slot| !used.contains(slot)).unwrap();
@@ -2668,6 +2698,29 @@ impl Model {
             self.release_checkpoint(replaced)?;
         }
         Ok(())
+    }
+
+    /// Between two passes of a reply: a mark of the sequence where it has grown [`MARK_EVERY`] tokens past the last (or past the prompt),
+    /// at the next position that is a multiple of four.
+    fn mark_reply(&mut self) -> Result<()> {
+        if self.history.len() < self.mark_at || self.history.len() % 4 != 0 {
+            return Ok(());
+        }
+        let started = Instant::now();
+        self.mark_at = self.history.len() + MARK_EVERY;
+        self.save_checkpoint("mark")?;
+        self.metric_count("marks", 1);
+        self.metric_add("mark_seconds", started.elapsed().as_secs_f64());
+        let mut marked = self.last_metrics.get("marked_tokens").and_then(Value::as_array).cloned().unwrap_or_default();
+        marked.push(json!(self.history.len()));
+        self.last_metrics.insert("marked_tokens".into(), marked.into());
+        Ok(())
+    }
+
+    /// Tests only: whether replies are marked as they grow.
+    #[doc(hidden)]
+    pub fn set_reply_marks(&mut self, on: bool) {
+        self.reply_marks = on;
     }
 
     /// Free what a checkpoint holds besides its slot.
@@ -3696,6 +3749,11 @@ impl Model {
         }
         self.ensure_kv(tokens.max(positions))?;
         self.prefix_plan(tokens, hidden)
+    }
+
+    /// The tokens the model holds, in order: the last request's prompt and what its reply fed.
+    pub fn held(&self) -> &[u32] {
+        &self.history
     }
 
     /// Of `tokens`, how many the model holds already, in the live sequence or the parked one.
@@ -5286,6 +5344,9 @@ impl Model {
                 forced.passes.push((rows.len(), 1e3 * pass_started.elapsed().as_secs_f64()));
             }
             self.final_hidden = Some(hidden[(kept - 1) * WIDTH..kept * WIDTH].to_vec());
+            if self.forced_rows.is_none() {
+                self.mark_reply()?;
+            }
             let assist_measured = assist_layers.is_some();
             if assist_measured {
                 self.assist_complete(assist_layers, emitted.len() as u64)?;
@@ -5516,6 +5577,10 @@ impl Model {
         }
         self.group.ensure_slots()?;
         let parking = Instant::now();
+        // (how far the prompt agrees with what is held, parked or checkpointed: where a client changed it, for the request's line)
+        let agreed = [&self.history[..]].into_iter().chain(self.parked.iter().map(|parked| &parked.tokens[..]))
+            .chain(self.checkpoints.values().map(|checkpoint| &checkpoint.tokens[..]))
+            .map(|held| shared(held, &tokens[..tokens.len() - 1])).max().unwrap_or(0);
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
@@ -5530,7 +5595,7 @@ impl Model {
             _ => resumed,
         };
         self.last_metrics = json!({
-            "cached_tokens": reused, "resumed_from": resumed, "prefill_tokens": tokens.len() - reused,
+            "cached_tokens": reused, "resumed_from": resumed, "agreed_tokens": agreed.max(reused), "prefill_tokens": tokens.len() - reused,
             "parked": parked, "park_seconds": park_seconds, "park_copied_positions": 0,
             "decode_forward_tokens": 0, "decode_seconds": 0.0, "decode_tokens_per_second": null,
             "generated_tokens": 0, "ttft_seconds": null,
@@ -5601,6 +5666,9 @@ impl Model {
         self.assist_request();
         let applies = self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token)
             && self.pipeline_applies(sampling, constraint.as_deref());
+        // The reply is marked as it grows, where a later request may continue it. (Not a pipelined one: its passes overlap, and
+        // the state between two of them is not the sequence's.)
+        self.mark_at = if checkpoint && self.reply_marks && !applies { self.history.len() + MARK_EVERY } else { usize::MAX };
         self.pipeline_live_for(applies)?;
         if self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token) {
             // (greedy requests of a partially resident model on two GPUs, STRAYDOG_PIPELINE=1: the first GPU runs the next pass's
@@ -5664,6 +5732,7 @@ impl Model {
                     self.assist_complete(None, 1)?;
                 }
                 self.update_rate();
+                self.mark_reply()?;
             }
         }
         Ok(())

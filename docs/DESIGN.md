@@ -454,6 +454,13 @@ The engine holds one sequence.
     request line), 0.20 s now, the bytes the same (every part compared with the runtime's copy).
   - So a one-off request with another prefix (a title, a summary, a subagent) does not cost the
     conversation it interrupted its whole prompt again.
+- **Qwen3.8** marks a long reply as DeepSeek-V4.1 does, for the same prompts: the recurrent state (a page-locked
+  slot, as a checkpoint's) where the reply stands, every 512 tokens at the next position that is a multiple of four,
+  the last two kept (`resumed_from` is `mark` or `mark_before`). The K/V below a mark is the held sequence's. A
+  pipelined reply (two GPUs, partially resident) is not marked: its passes overlap.
+- A reply sent back keeps the ids the model wrote it in, as far as the bytes they spell are the prompt's
+  (`Text::reach`): the same text encoded again can be split otherwise, and the request then left the held sequence
+  at the first such place.
 - A request may mark itself one-off (`"straydog": {"checkpoint": false}`) so it saves no
   checkpoint.
 
