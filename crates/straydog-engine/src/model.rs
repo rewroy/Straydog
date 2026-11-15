@@ -4293,20 +4293,25 @@ impl Model {
 
     /// A layer-order pass's hidden rows (`hidden`) are on the host, not held in VRAM whole: move them beside the compute, to and from a ring of two
     /// chunk slots of `batch` rows in VRAM ([`crate::gpu::Backend::overlap_layer_rows`]), if STRAYDOG_LAYER_ROWS_OVERLAP allows, the page-locked rows
-    /// are within what [`crate::host::lockable`] leaves, and the ring fits in the VRAM beside what layer order holds. The guard (None where the rows
+    /// are within what [`crate::host::rows_lockable`] leaves, and the ring fits in the VRAM beside what layer order holds. The guard (None where the rows
     /// stay as before, with `prefill_rows_overlap_reason` in the metrics) and the bytes page-locked, which count in `pinned_other` (for the K/V's
-    /// growth and the working set's limit) until the caller gives them back with the guard's end.
+    /// growth and the working set's limit) until the caller gives them back with the guard's end. What the lock took of the commit is in the
+    /// metrics (`prefill_rows_lock_commit_bytes`, on Windows): whether it charges rows that were charged when they were allocated is what it says.
     fn begin_rows_overlap(&mut self, hidden: &mut [f32], batch: u64) -> Result<(Option<crate::gpu::RowsOverlap>, u64)> {
         let bytes = hidden.len() as u64 * 4;
         let refusal = if !self.layer_rows_overlap {
             Some("STRAYDOG_LAYER_ROWS_OVERLAP=0".to_string())
         } else {
-            crate::gpu::rows_lock_refusal(bytes, crate::host::lockable(self.weights.host_memory_bytes, 0))
+            crate::gpu::rows_lock_refusal(bytes, crate::host::rows_lockable())
         };
+        let commit_before = crate::host::commit_left().map(|(_, commit)| commit);
         let refusal = match refusal {
             Some(reason) => reason,
             None => match self.group.overlap_layer_rows(hidden, batch)? {
                 crate::gpu::RowsOverlapBegin::Begun(guard) => {
+                    if let (Some(before), Some((_, after))) = (commit_before, crate::host::commit_left()) {
+                        self.last_metrics.insert("prefill_rows_lock_commit_bytes".into(), json!(before.saturating_sub(after)));
+                    }
                     self.pinned_other += bytes;
                     self.hold_memory();
                     self.last_metrics.insert("prefill_rows_overlap".into(), json!(true));
