@@ -510,6 +510,44 @@ async fn suppress_reaches_the_worker_only_when_given() {
     assert_eq!(pyjson::dumps(&asking), pyjson::dumps(&absent).strip_suffix('}').unwrap().to_string() + r#", "suppress": "not_cp932_han"}"#);
 }
 
+/// `straydog.reasoning` false asks one reply with no reasoning in a conversation that thinks: the worker's request is the thinking
+/// one with `"reasoning": false` after it (its prompt is not another mode's), and the answer is read as words from its first.
+/// Only where the template closes a reasoning by its own token (DSML, which says so in `/props`); elsewhere, and when not asked, the
+/// request is the request it always was.
+#[tokio::test]
+async fn a_reply_asked_with_no_reasoning_keeps_the_thinking_request() {
+    let sent = |markup: Markup, fields: serde_json::Value| async move {
+        let mock = Mock::new(vec![Script::Events(vec![delta("Written."), done("stop")])]);
+        let app = router(mock.clone(), ApiConfig { markup, ..config() });
+        let (status, body) = fetch(app, chat(ask(fields).to_string())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (mock.requests()[0].clone(), body["choices"][0]["message"].clone())
+    };
+    let (plain, thought) = sent(Markup::Dsml, json!({"seed": 1})).await;
+    assert_eq!(plain.get("thinking"), Some(&pyjson::Value::Bool(true)));
+    assert_eq!((thought["reasoning_content"].as_str(), thought["content"].as_str()), (Some("Written."), Some("")), "a thinking reply that never closed its reasoning");
+    let (asking, written) = sent(Markup::Dsml, json!({"seed": 1, "straydog": {"reasoning": false}})).await;
+    assert_eq!(pyjson::dumps(&asking), pyjson::dumps(&plain).strip_suffix('}').unwrap().to_string() + r#", "reasoning": false}"#);
+    assert_eq!((written.get("reasoning_content").and_then(|reasoning| reasoning.as_str()), written["content"].as_str()), (None, Some("Written.")));
+    for fields in [json!({"seed": 1, "straydog": {"reasoning": true}}), json!({"seed": 1, "straydog": {"reasoning": null}})] {
+        assert_eq!(pyjson::dumps(&sent(Markup::Dsml, fields).await.0), pyjson::dumps(&plain));
+    }
+    // (a request that does not think has no reasoning to leave out)
+    let chat_mode = json!({"seed": 1, "chat_template_kwargs": {"enable_thinking": false}});
+    let mut both = chat_mode.clone();
+    both["straydog"] = json!({"reasoning": false});
+    assert_eq!(pyjson::dumps(&sent(Markup::Dsml, both).await.0), pyjson::dumps(&sent(Markup::Dsml, chat_mode).await.0));
+    let (qwen, _) = sent(Markup::Qwen, json!({"seed": 1, "reasoning_effort": "medium"})).await;
+    let (qwen_asking, _) = sent(Markup::Qwen, json!({"seed": 1, "reasoning_effort": "medium", "straydog": {"reasoning": false}})).await;
+    assert_eq!(pyjson::dumps(&qwen_asking), pyjson::dumps(&qwen));
+    let mock = Mock::new(vec![]);
+    mock.set_state(EngineState::Ready { context: 65536, speculative: 0, processing: false, placement: json!({}) });
+    let (_, props) = fetch(router(mock.clone(), ApiConfig { markup: Markup::Dsml, ..config() }), get("/props")).await;
+    assert_eq!(props["reasoning_off"], true);
+    let (status, body) = fetch(router(mock, ApiConfig { markup: Markup::Dsml, ..config() }), chat(ask(json!({"straydog": {"reasoning": 0}})).to_string())).await;
+    assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some("straydog.reasoning must be a boolean")));
+}
+
 /// A client's X-Request-Id reaches the worker request as its `request_id`, for the server's log: printable ASCII but the space
 /// and at most 64 of it, nothing at all when none is left, and a request without one is the request it always was.
 #[tokio::test]
@@ -714,8 +752,8 @@ async fn invalid_requests_are_refused() {
         (ask(json!({"stop": seventeen})), "stop must be a string or a list of at most 16 strings"),
         (ask(json!({"straydog": {"checkpoint": "no"}})), "straydog.checkpoint must be a boolean"),
         (ask(json!({"straydog": {"tool_writing": "yes"}})), "straydog.tool_writing must be a boolean"),
-        (ask(json!({"straydog": {"cache": false}})), "the straydog object supports checkpoint and tool_writing"),
-        (ask(json!({"straydog": true})), "the straydog object supports checkpoint and tool_writing"),
+        (ask(json!({"straydog": {"cache": false}})), "the straydog object supports checkpoint, tool_writing and reasoning"),
+        (ask(json!({"straydog": true})), "the straydog object supports checkpoint, tool_writing and reasoning"),
         (ask(json!({"stream": "yes"})), "stream must be a boolean"),
         (ask(json!({"stream_options": true})), "stream_options must be an object"),
         (ask(json!({"stream_options": {"include_usage": 1}})), "stream_options.include_usage must be a boolean"),
@@ -804,7 +842,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(models, json!({"object": "list", "data": [{
         "id": "Qwen3.8-Flash-Next-IQ3_S", "object": "model", "created": 1_760_000_000, "owned_by": "straydog",
         "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false, "vision": false, "suppress": ["not_cp932_han"],
-                 "tool_writing": true}}]}));
+                 "tool_writing": true, "reasoning_off": false}}]}));
     for path in ["/props", "/slots"] {
         assert_eq!(fetch(app(&mock), get(path)).await, refused(503, "unavailable_error", "Loading model"), "{path}");
     }
@@ -814,7 +852,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(fetch(app(&mock), get("/health")).await, (StatusCode::OK, json!({"status": "ok"})));
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
     assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true, "vision": false, "suppress": ["not_cp932_han"],
-                                                 "tool_writing": true, "placement": {"resident": true, "host_kv": false}}));
+                                                 "tool_writing": true, "reasoning_off": false, "placement": {"resident": true, "host_kv": false}}));
     // llama-server's endpoints, where its clients read the context.
     let slot = json!({"id": 0, "n_ctx": 131072, "speculative": true, "is_processing": true,
                       "params": {"n_predict": -1, "seed": 0, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
@@ -823,7 +861,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(props, json!({"default_generation_settings": slot, "total_slots": 1,
                              "model_alias": "Qwen3.8-Flash-Next-IQ3_S", "modalities": {"vision": false, "audio": false},
-                             "suppress": ["not_cp932_han"], "tool_writing": true,
+                             "suppress": ["not_cp932_han"], "tool_writing": true, "reasoning_off": false,
                              "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false}));
     assert_eq!(fetch(app(&mock), get("/slots")).await, (StatusCode::OK, json!([slot])));
 
