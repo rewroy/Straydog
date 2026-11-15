@@ -1384,6 +1384,14 @@ pub struct ForcedRows {
     pub digest: sha2::Sha256,
     pub logits_digest: sha2::Sha256,
     pub read_logits: bool,
+    /// With `keep_logits` (and `read_logits`): the kept rows' logits themselves, a row after another, for a comparison with
+    /// what another path gives after the same tokens.
+    pub keep_logits: bool,
+    pub kept_logits: Vec<f32>,
+    /// The tokens are fed whatever the model would choose (every draft kept, the token after them the next of `tokens`): for the
+    /// logits of the decode path after a given text, where the model's own choice differs from run to run (a partially resident
+    /// model) or is another text's.
+    pub teacher: bool,
     /// Passes with a draft that was not accepted (without `reject`, not zero means the rows are not the one-token arithmetic's).
     pub rejected: usize,
     /// Every this many passes (0: none), a draft made wrong, its place going round: what follows must not see the rows taken back.
@@ -5229,6 +5237,9 @@ impl Model {
         } else {
             generated = Generated::new(VOCABULARY);
             token = constraint::pick(logits, sampling, &generated, rng, &mut held)?;
+            if let Some(first) = self.forced_rows.as_ref().filter(|forced| forced.teacher).and_then(|forced| forced.tokens.first()) {
+                token = *first;
+            }
             generated.insert(token);
             if END_TOKENS.contains(&token) {
                 return Ok(None);
@@ -5341,6 +5352,11 @@ impl Model {
                     _ => Self::accept(&drafts, &proposed, &targets, scores.as_ref(), sampling, &mut generated, rng),
                 },
             };
+            // (a known text fed whatever the model chooses: every draft is kept, and the next token is the text's)
+            let (accepted, following) = match self.forced_rows.as_ref().filter(|forced| forced.teacher) {
+                Some(forced) => (drafts.len(), forced.tokens.get(produced + drafts.len()).copied().unwrap_or(following)),
+                None => (accepted, following),
+            };
             self.phase("accept", &mut clock);
             if self.pipeline.pass_log() {
                 eprintln!("Straydog pass: position {position} rows {rows:?} accepted {accepted} following {following}");
@@ -5362,6 +5378,9 @@ impl Model {
                 sha2::Digest::update(&mut forced.digest, bytes(&hidden[..kept * WIDTH]));
                 if let Some(Scores::Logits(logits)) = scores.as_ref() {
                     sha2::Digest::update(&mut forced.logits_digest, bytes(&logits[..kept * VOCABULARY]));
+                    if forced.keep_logits {
+                        forced.kept_logits.extend_from_slice(&logits[..kept * VOCABULARY]);
+                    }
                 }
                 forced.rejected += usize::from(accepted < drafts.len());
                 forced.passes.push((rows.len(), 1e3 * pass_started.elapsed().as_secs_f64()));
