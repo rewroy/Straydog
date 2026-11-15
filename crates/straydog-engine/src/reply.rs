@@ -640,7 +640,8 @@ impl CallWriter {
         };
         let name = match after.find('>') {
             Some(end) => Some((&after[..end], end)),
-            None if after.chars().any(python_space) => None,
+            // (a name has no whitespace, and is not thousands of characters long)
+            None if after.len() > 4096 || after.chars().any(python_space) => None,
             None => {
                 self.pending.drain(..skipped);
                 return false;
