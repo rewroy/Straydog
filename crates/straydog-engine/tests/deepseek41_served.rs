@@ -166,27 +166,34 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
 
     // A long reply is marked as it grows. A client that keeps it only in part (a file it cut at a line's end to have the
     // model go on, a reply its person stopped) sends a prompt that leaves the held sequence before its end: the request goes
-    // on from the last mark, where it read the reply again from the checkpoint before it.
+    // on from the last mark the part kept reaches, where it read the reply again from the checkpoint before it.
     model.forget();
     let long = render(&format!("[{}]", user("Write a long and detailed essay about the sea in winter, of at least two thousand words.")));
     let written = go(&mut model, &long, 1300);
-    let (marks, marked) = (model.last_metrics["marks"].as_u64().unwrap(), model.last_metrics["marked_tokens"].as_u64().unwrap_or(0) as usize);
-    eprintln!("a reply of {} tokens: {marks} marks, {:.1} ms each, the last at {marked} of {}", written.tokens.len(),
+    let marks = model.last_metrics["marks"].as_u64().unwrap();
+    let marked: Vec<usize> = model.last_metrics["marked_tokens"].as_array().unwrap().iter().map(|at| at.as_u64().unwrap() as usize).collect();
+    eprintln!("a reply of {} tokens: {marks} marks, {:.1} ms each, kept at {marked:?} of {}", written.tokens.len(),
               1e3 * model.last_metrics["mark_seconds"].as_f64().unwrap() / marks.max(1) as f64, long.len() + written.tokens.len());
-    assert!(marks >= 2 && marked > long.len(), "the reply was long enough to be marked twice: {} tokens", written.tokens.len());
-    let kept = marked - long.len() + 40;
-    assert!(kept + 8 < written.tokens.len(), "the part kept ends before the reply does");
+    assert!(marks >= 2 && marked.len() == 2 && marked[0] > long.len(), "the reply was long enough to be marked twice: {} tokens", written.tokens.len());
     let tail = text.encode("\n\nGo on from there.").unwrap();
-    let next: Vec<u32> = long.iter().chain(&written.tokens[..kept]).chain(&tail).copied().collect();
+    // (the part kept ends 40 tokens past a mark: past the last, and between the two, where the last is of no use)
+    let part = |mark: usize| -> Vec<u32> { long.iter().chain(&written.tokens[..mark - long.len() + 40]).chain(&tail).copied().collect() };
+    assert!(marked[1] - long.len() + 48 < written.tokens.len() && marked[0] + 40 < marked[1], "the parts kept end before the reply and the last mark");
+    let next = part(marked[1]);
     let stepped = go(&mut model, &next, 8);
     let stepped_logits = model.prompt_logits.clone().unwrap();
     assert_eq!(model.last_metrics["resumed_from"], "step");
-    assert_eq!(stepped.cached, Some(marked as u64), "from the last mark");
-    // Without the mark the same request starts where the reply's generation prompt began; its first token is the same.
+    assert_eq!(stepped.cached, Some(marked[1] as u64), "from the last mark");
     model.forget();
     let again = go(&mut model, &long, 1300);
     assert_eq!(again.tokens, written.tokens, "the reply written again");
-    model.forget_mark();
+    let earlier = go(&mut model, &part(marked[0]), 8);
+    assert_eq!(model.last_metrics["resumed_from"], "step");
+    assert_eq!(earlier.cached, Some(marked[0] as u64), "from the mark before the last");
+    // Without the marks the same request starts where the reply's generation prompt began; its first token is the same.
+    model.forget();
+    go(&mut model, &long, 1300);
+    model.forget_marks();
     let turned = go(&mut model, &next, 8);
     let turned_logits = model.prompt_logits.clone().unwrap();
     assert_eq!(model.last_metrics["resumed_from"], "turn");
@@ -198,27 +205,35 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     assert_eq!(top(&stepped_logits), top(&turned_logits), "the first token");
 
     // Back at a mark the engines are where they were when it was taken: the same pass then gives the same logits, bit for
-    // bit, after a pass of one token and after a batch that wrote over the whole window and began new groups.
+    // bit, after a pass of one token and after batches that wrote over the whole window and began new groups; at the last
+    // mark and at the one before it, which leaves the last behind.
     model.forget();
     go(&mut model, &other, 8);
+    let at = model.held().len();
     let probe = &written.tokens[..3];
     let batch = &written.tokens[3..303];
-    assert!(model.engines.mark(true).unwrap());
+    assert!(model.engines.mark(None).unwrap());
     let one = model.engines.forward(&probe[..1]).unwrap();
     model.engines.forward(batch).unwrap();
-    assert!(model.engines.mark(false).unwrap());
-    assert!(one == model.engines.forward(&probe[..1]).unwrap(), "a pass of one token from the mark");
-    assert!(model.engines.mark(false).unwrap());
+    assert!(model.engines.mark(None).unwrap());
+    let far = model.engines.forward(&probe[..1]).unwrap();
+    model.engines.forward(batch).unwrap();
+    assert!(model.engines.mark(Some(at + 301)).unwrap());
+    assert!(far == model.engines.forward(&probe[..1]).unwrap(), "a pass of one token from the last mark");
+    assert!(model.engines.mark(Some(at)).unwrap());
+    assert!(one == model.engines.forward(&probe[..1]).unwrap(), "a pass of one token from the mark before it");
+    assert!(!model.engines.mark(Some(at + 301)).unwrap(), "the mark the sequence went back past");
+    assert!(model.engines.mark(Some(at)).unwrap());
     let rows = model.engines.verify(probe).unwrap();
     model.engines.rewind(2).unwrap();
     model.engines.forward(batch).unwrap();
-    assert!(model.engines.mark(false).unwrap());
+    assert!(model.engines.mark(Some(at)).unwrap());
     assert!(rows == model.engines.verify(probe).unwrap(), "a verify pass from the mark");
     model.engines.rewind(1).unwrap();
     model.forget();
     // (another sequence has left the mark)
     go(&mut model, &first, 8);
-    assert!(!model.engines.mark(false).unwrap());
+    assert!(!model.engines.mark(Some(at)).unwrap());
 
     // The ids of a reply are kept where its text comes back (Text::reach): all of them spell the text they decode to,
     // whether or not the tokenizer splits that text as the model wrote it.
