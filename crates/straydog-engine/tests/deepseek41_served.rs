@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 use straydog_engine::arch::deepseek41::serve::{place, Model, CHECKPOINT_BYTES};
-use straydog_engine::arch::served::Settings;
+use straydog_engine::arch::served::{Engines as _, Settings};
 use straydog_engine::group::SplitMode;
 use straydog_engine::chat::ChatTemplate;
 use straydog_engine::pyjson;
@@ -163,4 +163,60 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     assert_eq!(retried.tokens[..5], clean.tokens[..5], "the tokens sent before the void");
     eprintln!("after a void pass: {} of {} tokens as the uninterrupted run's", retried.tokens.iter().zip(&clean.tokens).take_while(|(a, b)| a == b).count(),
               clean.tokens.len());
+
+    // A long reply is marked as it grows. A client that keeps it only in part (a file it cut at a line's end to have the
+    // model go on, a reply its person stopped) sends a prompt that leaves the held sequence before its end: the request goes
+    // on from the last mark, where it read the reply again from the checkpoint before it.
+    model.forget();
+    let long = render(&format!("[{}]", user("Write a long and detailed essay about the sea in winter, of at least two thousand words.")));
+    let written = go(&mut model, &long, 1300);
+    let (marks, marked) = (model.last_metrics["marks"].as_u64().unwrap(), model.last_metrics["marked_tokens"].as_u64().unwrap_or(0) as usize);
+    eprintln!("a reply of {} tokens: {marks} marks, {:.1} ms each, the last at {marked} of {}", written.tokens.len(),
+              1e3 * model.last_metrics["mark_seconds"].as_f64().unwrap() / marks.max(1) as f64, long.len() + written.tokens.len());
+    assert!(marks >= 2 && marked > long.len(), "the reply was long enough to be marked twice: {} tokens", written.tokens.len());
+    let kept = marked - long.len() + 40;
+    assert!(kept + 8 < written.tokens.len(), "the part kept ends before the reply does");
+    let tail = text.encode("\n\nGo on from there.").unwrap();
+    let next: Vec<u32> = long.iter().chain(&written.tokens[..kept]).chain(&tail).copied().collect();
+    let stepped = go(&mut model, &next, 8);
+    let stepped_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(model.last_metrics["resumed_from"], "step");
+    assert_eq!(stepped.cached, Some(marked as u64), "from the last mark");
+    // Without the mark the same request starts where the reply's generation prompt began; its first token is the same.
+    model.forget();
+    let again = go(&mut model, &long, 1300);
+    assert_eq!(again.tokens, written.tokens, "the reply written again");
+    model.forget_mark();
+    let turned = go(&mut model, &next, 8);
+    let turned_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(model.last_metrics["resumed_from"], "turn");
+    assert!(turned.cached.is_some_and(|cached| (cached as usize) < long.len()), "from before the reply: {:?}", turned.cached);
+    let top = |logits: &[f32]| logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(token, _)| token);
+    let widest = stepped_logits.iter().zip(&turned_logits).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    eprintln!("from the mark and from the turn: the largest logit difference {widest}, {} of {} tokens the same",
+              stepped.tokens.iter().zip(&turned.tokens).take_while(|(a, b)| a == b).count(), turned.tokens.len());
+    assert_eq!(top(&stepped_logits), top(&turned_logits), "the first token");
+
+    // Back at a mark the engines are where they were when it was taken: the same pass then gives the same logits, bit for
+    // bit, after a pass of one token and after a batch that wrote over the whole window and began new groups.
+    model.forget();
+    go(&mut model, &other, 8);
+    let probe = &written.tokens[..3];
+    let batch = &written.tokens[3..303];
+    assert!(model.engines.mark(true).unwrap());
+    let one = model.engines.forward(&probe[..1]).unwrap();
+    model.engines.forward(batch).unwrap();
+    assert!(model.engines.mark(false).unwrap());
+    assert!(one == model.engines.forward(&probe[..1]).unwrap(), "a pass of one token from the mark");
+    assert!(model.engines.mark(false).unwrap());
+    let rows = model.engines.verify(probe).unwrap();
+    model.engines.rewind(2).unwrap();
+    model.engines.forward(batch).unwrap();
+    assert!(model.engines.mark(false).unwrap());
+    assert!(rows == model.engines.verify(probe).unwrap(), "a verify pass from the mark");
+    model.engines.rewind(1).unwrap();
+    model.forget();
+    // (another sequence has left the mark)
+    go(&mut model, &first, 8);
+    assert!(!model.engines.mark(false).unwrap());
 }
