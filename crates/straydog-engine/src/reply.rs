@@ -20,6 +20,9 @@ const DSML_INVOKE_OPEN: &str = "<｜DSML｜ invoke";
 const DSML_INVOKE_CLOSE: &str = "</｜DSML｜ invoke";
 const DSML_PARAMETER_OPEN: &str = "<｜DSML｜ parameter";
 const DSML_PARAMETER_CLOSE: &str = "/｜DSML｜ parameter";
+/// The closes of an invoke and of a parameter, whole (the pieces of a call being written read up to their `>`).
+const DSML_INVOKE_END: &str = "</｜DSML｜ invoke>";
+const DSML_PARAMETER_END: &str = "</｜DSML｜ parameter>";
 
 /// How a family's template marks the end of reasoning and writes tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +194,8 @@ pub struct ToolCallSplitter {
     pub repaired: bool,
     /// [`ToolCallSplitter::finish`] released markup that held no call it could read, as text.
     pub unread: bool,
+    /// The calls as they are being written ([`ToolCallSplitter::writing`]); none unless asked for.
+    writer: Option<CallWriter>,
 }
 
 fn is_string_schema(schema: Option<&Value>) -> bool {
@@ -238,7 +243,24 @@ impl ToolCallSplitter {
             cut: false,
             repaired: false,
             unread: false,
+            writer: None,
         }
+    }
+
+    /// The same, also reading the markup as it arrives for the calls being written ([`ToolCallSplitter::take_pieces`]). What
+    /// [`ToolCallSplitter::feed`] and [`ToolCallSplitter::finish`] return is the same with or without it.
+    pub fn writing(mut self) -> ToolCallSplitter {
+        if self.enabled {
+            self.writer = Some(CallWriter::new(self.format));
+        }
+        self
+    }
+
+    /// The pieces of the calls being written that the text fed since the last call made known (none unless
+    /// [`ToolCallSplitter::writing`]). Display data: a repair, a dropped block or markup released as text at the end changes
+    /// nothing in what was shown, and what was shown changes nothing in the calls [`ToolCallSplitter::finish`] returns.
+    pub fn take_pieces(&mut self) -> Vec<ToolPiece> {
+        self.writer.as_mut().map(|writer| std::mem::take(&mut writer.pieces)).unwrap_or_default()
     }
 
     /// The answer text safe to show for one delta.
@@ -248,6 +270,9 @@ impl ToolCallSplitter {
         }
         if let Some(markup) = self.markup.as_mut() {
             markup.push_str(text);
+            if let Some(writer) = self.writer.as_mut() {
+                writer.feed(text, &self.string_parameters);
+            }
             return String::new();
         }
         let mut buffer = std::mem::take(&mut self.carry) + text;
@@ -256,7 +281,11 @@ impl ToolCallSplitter {
             Markup::Dsml => (DSML_CALLS_OPEN, buffer.find(DSML_CALLS_OPEN)),
         };
         if let Some(start) = start {
-            self.markup = Some(buffer.split_off(start));
+            let markup = buffer.split_off(start);
+            if let Some(writer) = self.writer.as_mut() {
+                writer.feed(&markup, &self.string_parameters);
+            }
+            self.markup = Some(markup);
             return buffer;
         }
         let hold = split_tail(&buffer, open);
@@ -396,6 +425,448 @@ impl ToolCallSplitter {
             });
         }
         Some(calls)
+    }
+}
+
+/// A piece of a tool call being written, as far as the markup read so far shows ([`ToolCallSplitter::writing`]): part of its
+/// arguments JSON. A call's pieces, joined, are what the markup read so far makes of the arguments the call has once whole
+/// (`pyjson::dumps` of its object: the same key order, separators and escaping): the whole of them when the markup is well
+/// formed, and otherwise not guaranteed to be JSON, or to match. Display data, never the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPiece {
+    /// The call's place among the calls the markup opened (a block dropped for a slip is counted here, not in the final calls).
+    pub index: usize,
+    /// The tool's name: on the call's first piece only, which carries no arguments (the name is known as soon as the
+    /// `<function=NAME>` is whole, before any parameter text).
+    pub name: Option<String>,
+    /// The next part of the arguments JSON.
+    pub arguments: String,
+}
+
+/// Where [`CallWriter`] is in the markup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// Qwen: past a block, or before the first, looking for the next `<tool_call>` that opens a line.
+    Between,
+    /// Qwen: past `<tool_call>`, before its `<function=NAME>`.
+    Block,
+    /// DSML: the calls' open.
+    Calls,
+    /// DSML: between invokes.
+    Invoke,
+    /// Inside a call, between its parameters.
+    Body,
+    /// A string parameter's value, shown as it arrives.
+    Text,
+    /// Any other parameter's value, shown whole once it has ended.
+    Whole,
+    /// Markup that is no call it can follow (a block of JSON: the rare Hermes form shows nothing before the call is whole; a slip):
+    /// nothing is shown up to the block's close.
+    Skip,
+    /// Nothing more is shown.
+    Done,
+}
+
+/// Where a parameter's value ends in the text held.
+enum End {
+    /// The value is `..value` and the markup goes on at `after`.
+    Closed { value: usize, after: usize },
+    /// No end yet: the first `sure` bytes are the value's, the rest may still be its close.
+    Open { sure: usize },
+}
+
+/// Reads tool-call markup as it arrives, without reading it again: a call's name when its opener is whole, then its arguments
+/// JSON, a string parameter's text as it comes (escaped) and any other parameter's value once it has ended. Only what could still
+/// be a close (and, for Qwen, the one newline the template writes before it) is held, so a piece never has to be taken back.
+struct CallWriter {
+    format: Markup,
+    part: Part,
+    /// Markup received and not yet read: a tag perhaps split across deltas, or a value's held tail.
+    pending: String,
+    /// The text before `pending` ended a line (Qwen: a `<tool_call>` opens a block only there).
+    line_start: bool,
+    /// Calls opened so far.
+    started: usize,
+    /// Parameters begun in the call in hand.
+    parameters: usize,
+    /// The tool of the call in hand.
+    tool: String,
+    /// The call in hand's current parameter, `, "key": ` as its JSON writes it: shown with a value that is shown whole.
+    key: String,
+    /// Qwen: a string value's one leading newline (the template's) is still to be read away.
+    lead: bool,
+    /// The bytes of `pending` that hold no close of a value read whole.
+    checked: usize,
+    pieces: Vec<ToolPiece>,
+}
+
+/// A tag at the start of `text`: whole, the start of one still to come, or not there.
+fn tag_at(text: &str, tag: &str) -> Option<bool> {
+    if text.starts_with(tag) {
+        Some(true)
+    } else if tag.starts_with(text) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// A string as JSON writes it, without its quotes.
+fn escaped(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    pyjson::write_string(&mut quoted, text);
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// A DSML parameter's tag past `<｜DSML｜ parameter`, up to its `>`: (name, whether it is a string).
+fn dsml_parameter(head: &str) -> Option<(&str, bool)> {
+    let (name, flag) = head.strip_prefix(" name=\"")?.split_once("\" string=\"")?;
+    match flag.strip_suffix('"')? {
+        "true" => Some((name, true)),
+        "false" => Some((name, false)),
+        _ => None,
+    }
+}
+
+impl CallWriter {
+    fn new(format: Markup) -> CallWriter {
+        CallWriter {
+            format,
+            part: if format == Markup::Qwen { Part::Between } else { Part::Calls },
+            pending: String::new(),
+            line_start: true,
+            started: 0,
+            parameters: 0,
+            tool: String::new(),
+            key: String::new(),
+            lead: false,
+            checked: 0,
+            pieces: Vec::new(),
+        }
+    }
+
+    fn qwen(&self) -> bool {
+        self.format == Markup::Qwen
+    }
+
+    fn feed(&mut self, text: &str, tools: &[(String, Vec<String>)]) {
+        self.pending.push_str(text);
+        while self.step(tools) {}
+    }
+
+    /// Reads what `pending` holds in the part in hand: whether that moved on, so that there may be more to read.
+    fn step(&mut self, tools: &[(String, Vec<String>)]) -> bool {
+        match self.part {
+            Part::Done => {
+                self.pending.clear();
+                false
+            }
+            Part::Skip => self.skip(),
+            Part::Between => self.between(),
+            Part::Block => self.block(),
+            Part::Calls => self.calls(),
+            Part::Invoke => self.invoke(),
+            Part::Body => self.body(tools),
+            Part::Text => self.text(),
+            Part::Whole => self.whole(),
+        }
+    }
+
+    /// The next part of the call in hand's arguments, joined to the piece before it when that is one of the same call's
+    /// arguments (the name's piece carries none).
+    fn show(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let index = self.started - 1;
+        match self.pieces.last_mut() {
+            Some(last) if last.index == index && last.name.is_none() => last.arguments.push_str(text),
+            _ => self.pieces.push(ToolPiece { index, name: None, arguments: text.to_string() }),
+        }
+    }
+
+    /// A call opens: its name is shown at once, as a piece of its own.
+    fn open(&mut self, name: &str) {
+        self.pieces.push(ToolPiece { index: self.started, name: Some(name.to_string()), arguments: String::new() });
+        self.started += 1;
+        self.parameters = 0;
+        self.tool = name.to_string();
+        self.show("{");
+    }
+
+    /// A call ends; the markup goes on with the next block or invoke.
+    fn close(&mut self) {
+        self.show("}");
+        (self.part, self.line_start) = (if self.qwen() { Part::Between } else { Part::Invoke }, true);
+    }
+
+    /// Drops what is read, keeping the tail of `pending` that could still be the start of `tag`.
+    fn keep_tail(&mut self, tag: &str) {
+        let drop = self.pending.len() - split_tail(&self.pending, tag);
+        self.pending.drain(..drop);
+    }
+
+    /// Qwen: to the next `<tool_call>` that opens a line.
+    fn between(&mut self) -> bool {
+        if let Some(at) = line_tag(&self.pending, TOOL_CALL_OPEN, self.line_start) {
+            self.pending.drain(..at + TOOL_CALL_OPEN.len());
+            self.part = Part::Block;
+            return true;
+        }
+        let drop = self.pending.len() - split_tail(&self.pending, TOOL_CALL_OPEN);
+        if drop > 0 {
+            self.line_start = self.pending[..drop].ends_with('\n');
+            self.pending.drain(..drop);
+        }
+        false
+    }
+
+    /// Qwen: past `<tool_call>`, the `<function=NAME>` that opens the call.
+    fn block(&mut self) -> bool {
+        let rest = python_strip_start(&self.pending);
+        let skipped = self.pending.len() - rest.len();
+        let Some(after) = rest.strip_prefix("<function=") else {
+            // (a block of JSON, or a slip: nothing is shown of it before the call is whole)
+            if "<function=".starts_with(rest) {
+                self.pending.drain(..skipped);
+                return false;
+            }
+            // (a block of JSON is a call of the final answer: it keeps its place among them)
+            if rest.starts_with('{') {
+                self.started += 1;
+            }
+            self.part = Part::Skip;
+            return true;
+        };
+        let name = match after.find('>') {
+            Some(end) => Some((&after[..end], end)),
+            None if after.chars().any(python_space) => None,
+            None => {
+                self.pending.drain(..skipped);
+                return false;
+            }
+        };
+        match name {
+            Some((name, end)) if !name.is_empty() && !name.chars().any(python_space) => {
+                let name = name.to_string();
+                self.pending.drain(..skipped + "<function=".len() + end + 1);
+                self.open(&name);
+                self.part = Part::Body;
+            }
+            _ => self.part = Part::Skip,
+        }
+        true
+    }
+
+    /// DSML: the calls' open, `>` and the line it ends.
+    fn calls(&mut self) -> bool {
+        match self.pending.strip_prefix(DSML_CALLS_OPEN) {
+            Some(after) if after.starts_with('>') => {
+                self.pending.drain(..DSML_CALLS_OPEN.len() + 1);
+                self.part = Part::Invoke;
+            }
+            Some(after) if after.is_empty() => return false,
+            _ => self.part = Part::Done,
+        }
+        true
+    }
+
+    /// DSML: the next invoke, `<｜DSML｜ invoke name="NAME">`, or the calls' close.
+    fn invoke(&mut self) -> bool {
+        let rest = python_strip_start(&self.pending);
+        let skipped = self.pending.len() - rest.len();
+        let (opens, closes) = (tag_at(rest, DSML_INVOKE_OPEN), tag_at(rest, DSML_CALLS_CLOSE));
+        if closes == Some(true) {
+            self.part = Part::Done;
+            return true;
+        }
+        let Some(after) = rest.strip_prefix(DSML_INVOKE_OPEN) else {
+            if opens == Some(false) || closes == Some(false) {
+                self.pending.drain(..skipped);
+                return false;
+            }
+            self.part = Part::Done;
+            return true;
+        };
+        let Some(end) = after.find('>') else {
+            if after.len() > 4096 {
+                self.part = Part::Done;
+                return true;
+            }
+            self.pending.drain(..skipped);
+            return false;
+        };
+        let name = python_strip_start(&after[..end]).strip_prefix("name=\"").and_then(|name| name.strip_suffix('"'));
+        match name {
+            Some(qualified) => {
+                // (the namespace is the call's own field, not part of its name)
+                let name = qualified.split_once("::").map_or(qualified, |(_, name)| name).to_string();
+                self.pending.drain(..skipped + DSML_INVOKE_OPEN.len() + end + 1);
+                self.open(&name);
+                self.part = Part::Body;
+            }
+            None => self.part = Part::Skip,
+        }
+        true
+    }
+
+    /// Qwen: a function's body, DSML: an invoke's: its next parameter, or its close.
+    fn body(&mut self, tools: &[(String, Vec<String>)]) -> bool {
+        let rest = python_strip_start(&self.pending);
+        let skipped = self.pending.len() - rest.len();
+        let qwen = self.qwen();
+        let (end, open) = if qwen { ("</function>", "<parameter=") } else { (DSML_INVOKE_END, DSML_PARAMETER_OPEN) };
+        if rest.starts_with(end) {
+            self.pending.drain(..skipped + end.len());
+            self.close();
+            return true;
+        }
+        if qwen && rest.starts_with("</tool_call>") {
+            // (the function's close left out)
+            self.pending.drain(..skipped);
+            self.show("}");
+            self.part = Part::Skip;
+            return true;
+        }
+        let Some(after) = rest.strip_prefix(open) else {
+            if end.starts_with(rest) || open.starts_with(rest) || (qwen && "</tool_call>".starts_with(rest)) {
+                self.pending.drain(..skipped);
+                return false;
+            }
+            self.part = Part::Skip;
+            return true;
+        };
+        let Some(stop) = after.find('>') else {
+            // (a Qwen key has no whitespace; a DSML tag is short)
+            if (qwen && after.chars().any(python_space)) || after.len() > 4096 {
+                self.part = Part::Skip;
+                return true;
+            }
+            self.pending.drain(..skipped);
+            return false;
+        };
+        let head = &after[..stop];
+        let parameter = if qwen {
+            let strings = tools.iter().rev().find(|(tool, _)| *tool == self.tool).map(|(_, keys)| keys);
+            (!head.is_empty() && !head.chars().any(python_space))
+                .then(|| (head, strings.is_some_and(|keys| keys.iter().any(|key| key == head))))
+        } else {
+            dsml_parameter(head)
+        };
+        let Some((key, string)) = parameter else {
+            self.part = Part::Skip;
+            return true;
+        };
+        self.key = format!("{}{}: ", if self.parameters > 0 { ", " } else { "" }, pyjson::dumps(&Value::Str(key.to_string())));
+        self.pending.drain(..skipped + open.len() + stop + 1);
+        self.parameters += 1;
+        self.checked = 0;
+        self.lead = string && qwen;
+        if string {
+            let key = std::mem::take(&mut self.key);
+            self.show(&format!("{key}\""));
+        }
+        self.part = if string { Part::Text } else { Part::Whole };
+        true
+    }
+
+    /// Where the value ends in `pending`, its first `from` bytes known to hold no end. Qwen's `</parameter>` ends it only where
+    /// the markup goes on with a tag or the text ends (as `read_parameters` reads it); one before other text is the value's own.
+    fn value_end(&self, from: usize) -> End {
+        let text = &self.pending;
+        if !self.qwen() {
+            return match text[from..].find(DSML_PARAMETER_END) {
+                Some(at) => End::Closed { value: from + at, after: from + at + DSML_PARAMETER_END.len() },
+                None => End::Open { sure: text.len() - split_tail(&text[from..], DSML_PARAMETER_END) },
+            };
+        }
+        const CLOSE: &str = "</parameter>";
+        const NEXT: [&str; 3] = ["<parameter=", "</function>", "</tool_call>"];
+        let mut from = from;
+        loop {
+            let Some(found) = text[from..].find(CLOSE) else {
+                return End::Open { sure: text.len() - split_tail(&text[from..], CLOSE) };
+            };
+            let (close, after) = (from + found, from + found + CLOSE.len());
+            let next = python_strip_start(&text[after..]);
+            if NEXT.iter().any(|tag| next.starts_with(tag)) {
+                return End::Closed { value: close, after };
+            }
+            // (the text ends, or ends inside the tag that would decide)
+            if NEXT.iter().any(|tag| tag.starts_with(next)) {
+                return End::Open { sure: close };
+            }
+            from = after;
+        }
+    }
+
+    /// A string parameter's value, up to what could still be its close.
+    fn text(&mut self) -> bool {
+        let qwen = self.qwen();
+        if self.lead {
+            if self.pending.is_empty() {
+                return false;
+            }
+            if self.pending.starts_with('\n') {
+                self.pending.remove(0);
+            }
+            self.lead = false;
+        }
+        // (Qwen's template writes a newline before the close, which is not the value's: held until more follows it)
+        let own = |raw: &str| if qwen { raw.strip_suffix('\n').unwrap_or(raw).len() } else { raw.len() };
+        match self.value_end(0) {
+            End::Closed { value, after } => {
+                let shown = escaped(&self.pending[..own(&self.pending[..value])]);
+                self.pending.drain(..after);
+                self.show(&(shown + "\""));
+                self.part = Part::Body;
+                true
+            }
+            End::Open { sure } => {
+                let shown = own(&self.pending[..sure]);
+                let text = escaped(&self.pending[..shown]);
+                self.pending.drain(..shown);
+                self.show(&text);
+                false
+            }
+        }
+    }
+
+    /// Any other parameter's value, whole, as the final arguments write it.
+    fn whole(&mut self) -> bool {
+        match self.value_end(self.checked) {
+            End::Closed { value, after } => {
+                let raw = &self.pending[..value];
+                let value = if self.qwen() { template_value(raw) } else { raw };
+                let shown = match pyjson::parse(value) {
+                    // (a DSML value that is JSON stays as the model wrote it)
+                    Ok(parsed) if self.qwen() => pyjson::dumps(&parsed),
+                    Ok(_) => value.to_string(),
+                    Err(_) => pyjson::dumps(&Value::Str(value.to_string())),
+                };
+                self.pending.drain(..after);
+                let key = std::mem::take(&mut self.key);
+                self.show(&(key + &shown));
+                self.part = Part::Body;
+                true
+            }
+            End::Open { sure } => {
+                self.checked = sure;
+                false
+            }
+        }
+    }
+
+    /// Markup no call is read from: dropped up to the block's close.
+    fn skip(&mut self) -> bool {
+        let close = if self.qwen() { "</tool_call>" } else { DSML_INVOKE_END };
+        let Some(at) = self.pending.find(close) else {
+            self.keep_tail(close);
+            return false;
+        };
+        self.pending.drain(..at + close.len());
+        (self.part, self.line_start) = (if self.qwen() { Part::Between } else { Part::Invoke }, true);
+        true
     }
 }
 
@@ -925,6 +1396,266 @@ mod tests {
         let trailing = format!("\n\n<｜DSML｜ calls>\n{good}</｜DSML｜ calls>\nmore");
         let (_, answer, calls) = split_dsml(&[&trailing], false, Some(&tools));
         assert_eq!((answer, calls.len()), (trailing.clone(), 0));
+    }
+
+    // The calls as they are written (`ToolCallSplitter::writing`).
+
+    fn create_file() -> Value {
+        pyjson::parse(r#"[{"type": "function", "function": {"name": "create_file", "parameters": {"type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "executable": {"type": "boolean"},
+                           "lines": {"type": "array"}}}}}]"#).unwrap()
+    }
+
+    /// `deltas` through a splitter that shows the calls being written: the pieces after each delta, the answer text and the
+    /// calls at the end.
+    fn write_calls(format: Markup, deltas: &[&str], tools: &Value) -> (Vec<Vec<ToolPiece>>, String, Vec<ToolCall>) {
+        let mut splitter = ToolCallSplitter::with_markup(Some(tools), format).writing();
+        let (mut answer, mut seen) = (String::new(), Vec::new());
+        for delta in deltas {
+            answer += &splitter.feed(delta);
+            seen.push(splitter.take_pieces());
+        }
+        let (late, calls) = splitter.finish();
+        assert!(splitter.take_pieces().is_empty());
+        (seen, answer + &late, calls)
+    }
+
+    /// What the pieces show of each call: (name, arguments joined). A call's name comes first and alone.
+    fn joined(pieces: &[Vec<ToolPiece>]) -> Vec<(String, String)> {
+        let mut calls: Vec<(String, String)> = Vec::new();
+        for piece in pieces.iter().flatten() {
+            if let Some(name) = &piece.name {
+                assert_eq!((piece.index, piece.arguments.as_str()), (calls.len(), ""), "a call's name comes first, with no arguments");
+                calls.push((name.clone(), String::new()));
+            } else {
+                assert!(!piece.arguments.is_empty());
+                calls.get_mut(piece.index).expect("arguments follow the call's name").1 += &piece.arguments;
+            }
+        }
+        calls
+    }
+
+    /// Every way a stream could cut `text` into two deltas, and into single characters.
+    fn cuts(text: &str) -> Vec<Vec<&str>> {
+        let mut all: Vec<Vec<&str>> = (0..=text.len()).filter(|cut| text.is_char_boundary(*cut)).map(|cut| vec![&text[..cut], &text[cut..]]).collect();
+        all.push(text.char_indices().map(|(at, c)| &text[at..at + c.len_utf8()]).collect());
+        all
+    }
+
+    /// Whatever the stream's cuts, the pieces joined are the call's arguments, to the character, and at every delta a prefix of them.
+    fn assert_written(format: Markup, markup: &str, tools: &Value, names: &[&str], answer: &str) -> Vec<ToolCall> {
+        let mut last = Vec::new();
+        for deltas in cuts(markup) {
+            let (seen, text, calls) = write_calls(format, &deltas, tools);
+            assert_eq!(text, answer, "{deltas:?}");
+            assert_eq!(calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(), names, "{deltas:?}");
+            for upto in 1..=seen.len() {
+                for ((_, shown), call) in joined(&seen[..upto]).iter().zip(&calls) {
+                    assert!(call.arguments.starts_with(shown.as_str()), "{shown:?} is no start of {:?}", call.arguments);
+                }
+            }
+            let shown = joined(&seen);
+            assert_eq!(shown.len(), calls.len(), "{deltas:?}");
+            for ((name, arguments), call) in shown.iter().zip(&calls) {
+                assert_eq!((name, arguments), (&call.name, &call.arguments), "{deltas:?}");
+            }
+            last = calls;
+        }
+        last
+    }
+
+    #[test]
+    fn the_pieces_of_a_well_formed_call_make_its_arguments() {
+        let tools = create_file();
+        let content = "fn main() {\n    println!(\"héllo \\ wörld\");\n}\n\n\ttab </parameter> not a close, nor </param\n";
+        let markup = format!("I will write it.\n\n<tool_call>\n<function=create_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n\
+                              <parameter=content>\n{content}\n</parameter>\n<parameter=executable>\ntrue\n</parameter>\n\
+                              <parameter=lines>\n[1,  2]\n</parameter>\n</function>\n</tool_call>");
+        let calls = assert_written(Markup::Qwen, &markup, &tools, &["create_file"], "I will write it.\n\n");
+        let arguments = pyjson::parse(&calls[0].arguments).unwrap();
+        assert_eq!(arguments.get("content").and_then(Value::as_str), Some(content));
+        assert!(calls[0].arguments.ends_with(r#", "executable": true, "lines": [1, 2]}"#), "{}", calls[0].arguments);
+    }
+
+    #[test]
+    fn two_calls_are_written_in_turn() {
+        let tools = create_file();
+        let one = "<tool_call>\n<function=create_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=content>\nfn a() {}\n</parameter>\n</function>\n</tool_call>";
+        let two = "<tool_call>\n<function=create_file>\n<parameter=content>\n\n\nb\n</parameter>\n<parameter=path>\nb.rs\n</parameter>\n</function>\n</tool_call>";
+        let calls = assert_written(Markup::Qwen, &format!("{one}\n{two}\n"), &tools, &["create_file", "create_file"], "");
+        assert_eq!(calls[1].arguments, r#"{"content": "\n\nb", "path": "b.rs"}"#);
+        // (a call with no parameters is `{}`)
+        let empty = "<tool_call>\n<function=read_file>\n</function>\n</tool_call>";
+        let calls = assert_written(Markup::Qwen, empty, &read_file(), &["read_file"], "");
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    /// What is held back at the end of a delta is what could still be a close, and the one newline before it.
+    #[test]
+    fn what_could_still_be_a_close_is_held_back() {
+        let tools = create_file();
+        let head = "<tool_call>\n<function=create_file>\n<parameter=path>\nsrc/a.rs\n</parameter>\n<parameter=content>";
+        let args = |seen: &[Vec<ToolPiece>], delta: usize| -> String {
+            seen[delta].iter().filter(|piece| piece.name.is_none()).map(|piece| piece.arguments.as_str()).collect()
+        };
+        let first = format!("{head}\nline one\nline two\n</para");
+        let (seen, _, calls) = write_calls(Markup::Qwen, &[&first, "meter>\n</function>"], &tools);
+        // the name alone, then the arguments: the template's newline after `<parameter=content>` is never sent, nor the one
+        // before the close it holds, nor the start of the close
+        assert_eq!(seen[0][0], ToolPiece { index: 0, name: Some("create_file".into()), arguments: String::new() });
+        assert_eq!(args(&seen, 0), r#"{"path": "src/a.rs", "content": "line one\nline two"#);
+        assert_eq!(args(&seen, 1), r#""}"#);
+        assert_eq!(calls[0].arguments, r#"{"path": "src/a.rs", "content": "line one\nline two"}"#);
+        // the value's own newlines: held until more follows, then sent
+        let (seen, _, calls) = write_calls(Markup::Qwen, &[&format!("{head}\nab\n"), "\ncd\n</parameter>", "\n</function>"], &tools);
+        assert_eq!(args(&seen, 0), r#"{"path": "src/a.rs", "content": "ab"#);
+        assert_eq!(args(&seen, 1), r#"\n\ncd"#);
+        assert_eq!(args(&seen, 2), r#""}"#);
+        assert_eq!(calls[0].arguments, r#"{"path": "src/a.rs", "content": "ab\n\ncd"}"#);
+        // nothing of the value before its first character
+        let (seen, ..) = write_calls(Markup::Qwen, &[&format!("{head}\n")], &tools);
+        assert_eq!(args(&seen, 0), r#"{"path": "src/a.rs", "content": ""#);
+        // the name is shown with the opener, before any parameter
+        let (seen, ..) = write_calls(Markup::Qwen, &["Text.\n<tool_call>\n<function=create_f"], &tools);
+        assert!(seen[0].is_empty());
+        let (seen, ..) = write_calls(Markup::Qwen, &["Text.\n<tool_call>\n<function=create_file>\n<paramet"], &tools);
+        assert_eq!(seen[0], [ToolPiece { index: 0, name: Some("create_file".into()), arguments: String::new() },
+                             ToolPiece { index: 0, name: None, arguments: "{".into() }]);
+    }
+
+    /// A `</parameter>` the markup does not go on from is the value's text, held until the markup shows which it is.
+    #[test]
+    fn a_close_the_markup_does_not_go_on_from_is_the_values_text() {
+        let tools = create_file();
+        let head = "<tool_call>\n<function=create_file>\n<parameter=content>\n";
+        let tail = "\n</parameter>\n</function>\n</tool_call>";
+        // (undecided after the close: nothing of it is sent; text follows, and it is the value's)
+        let (seen, _, calls) = write_calls(Markup::Qwen, &[&format!("{head}the </parameter>"), " tag", tail], &tools);
+        let shown: Vec<String> = seen.iter().map(|pieces| pieces.iter().filter(|p| p.name.is_none()).map(|p| p.arguments.as_str()).collect()).collect();
+        assert_eq!(shown, [r#"{"content": "the "#, "</parameter> tag", r#""}"#]);
+        assert_eq!(calls[0].arguments, r#"{"content": "the </parameter> tag"}"#);
+        // (a tag that goes on as a parameter's: it was the close)
+        let markup = "<tool_call>\n<function=create_file>\n<parameter=content>\nthe </parameter>\n<parameter=path>\np\n</parameter>\n</function>\n</tool_call>";
+        let calls = assert_written(Markup::Qwen, markup, &tools, &["create_file"], "");
+        assert_eq!(calls[0].arguments, r#"{"content": "the ", "path": "p"}"#);
+        // (a close before other text, however often)
+        let markup = "<tool_call>\n<function=create_file>\n<parameter=content>\nx </parameter>  y </parameter>\n</parameter>\n</function>\n</tool_call>";
+        let calls = assert_written(Markup::Qwen, markup, &tools, &["create_file"], "");
+        assert_eq!(calls[0].arguments, r#"{"content": "x </parameter>  y </parameter>"}"#);
+    }
+
+    #[test]
+    fn a_parameter_that_is_not_a_string_is_sent_whole_once_it_ends() {
+        let tools = create_file();
+        let (seen, _, calls) = write_calls(Markup::Qwen, &[
+            "<tool_call>\n<function=create_file>\n<parameter=path>\na\n</parameter>\n<parameter=lines>\n[1,", " 2,\n", "3]\n</param",
+            "eter>\n<parameter=executable>\nfalse", "\n</parameter>\n</function>"], &tools);
+        let shown: Vec<String> = seen.iter().map(|pieces| pieces.iter().filter(|p| p.name.is_none()).map(|p| p.arguments.as_str()).collect()).collect();
+        assert_eq!(shown, [r#"{"path": "a""#, "", "", r#", "lines": [1, 2, 3]"#, r#", "executable": false}"#]);
+        assert_eq!(calls[0].arguments, r#"{"path": "a", "lines": [1, 2, 3], "executable": false}"#);
+        // a value that is no JSON goes as the string it is, as in the final arguments
+        let markup = "<tool_call>\n<function=create_file>\n<parameter=lines>\nnot json\n</parameter>\n</function>\n</tool_call>";
+        let calls = assert_written(Markup::Qwen, markup, &tools, &["create_file"], "");
+        assert_eq!(calls[0].arguments, r#"{"lines": "not json"}"#);
+        // (a tool the request does not list: every value is read as JSON where it can be)
+        let markup = "<tool_call>\n<function=unknown>\n<parameter=a>\n5\n</parameter>\n<parameter=b>\nfive\n</parameter>\n</function>\n</tool_call>";
+        let calls = assert_written(Markup::Qwen, markup, &tools, &["unknown"], "");
+        assert_eq!(calls[0].arguments, r#"{"a": 5, "b": "five"}"#);
+    }
+
+    /// A block of JSON is a call only once it is whole: nothing is shown before. A slip shows what it showed and changes nothing.
+    #[test]
+    fn a_json_block_and_a_slip_show_no_call() {
+        let tools = read_file();
+        let block = "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\", \"limit\": 5}}\n</tool_call>";
+        let (seen, _, calls) = write_calls(Markup::Qwen, &cuts(block).pop().unwrap(), &tools);
+        assert!(seen.iter().all(|pieces| pieces.is_empty()));
+        assert_eq!(calls[0].arguments, r#"{"path": "a.rs", "limit": 5}"#);
+        // (the call after it still has the place in the final calls it will have)
+        let both = format!("{block}\n{CALL}");
+        let (seen, _, calls) = write_calls(Markup::Qwen, &[&both], &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(seen[0][0], ToolPiece { index: 1, name: Some("read_file".into()), arguments: String::new() });
+    }
+
+    /// Whatever is shown, the splitter's answer text and calls are what they are without it.
+    #[test]
+    fn showing_the_calls_changes_nothing_in_the_answer() {
+        let tools = read_file();
+        let open = "<tool_call>\n<function=read_file>\n<parameter=path>\na.rs\n</parameter>\n";
+        let slip = "<tool_call>\n<function=read_file>\n<parameter=path>\na\n</parameter>\n<parameter=path>\nb\n</parameter>\n</function>\n</tool_call>";
+        let json = "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>";
+        let quoted = "<tool_call>\n<function=read_file>\n<parameter=path>\nthe </parameter> tag\n</parameter>\n</function>\n</tool_call>";
+        let cases = [
+            format!("Text.\n{CALL}\n{CALL}\n"), format!("{CALL}\nI will now read it."), format!("{CALL}\nThen:\n{CALL}"),
+            format!("{open}</function>\n"), format!("{open}</tool_call>"), open.to_string(), format!("{slip}\n{CALL}"), slip.to_string(),
+            json.to_string(), format!("{json}\n{CALL}"), quoted.to_string(), "<tool_call>\n<function=read_file>\nnot a parameter\n</function>\n</tool_call>".into(),
+            "Example: <tool_call><function=read_file>oops</tool_call> done".into(), "Qwen wraps calls in <tool_call> blocks.\n".into(),
+            "Text.\n<tool_call>\n<function=read_file>\n<parameter=path>\nhalf of a".to_string(),
+        ];
+        for text in &cases {
+            for cut in [false, true] {
+                for deltas in cuts(text) {
+                    let run = |writing: bool| {
+                        let splitter = ToolCallSplitter::new(Some(&tools));
+                        let mut splitter = if writing { splitter.writing() } else { splitter };
+                        splitter.cut = cut;
+                        let mut answer: String = deltas.iter().map(|delta| splitter.feed(delta)).collect();
+                        let (late, calls) = splitter.finish();
+                        answer += &late;
+                        let calls: Vec<_> = calls.into_iter().map(|call| (call.index, call.name, call.arguments)).collect();
+                        (answer, calls, splitter.dropped, splitter.repaired, splitter.unread, splitter.take_pieces().len())
+                    };
+                    let (shown, plain) = (run(true), run(false));
+                    assert_eq!(shown.0, plain.0, "{text:?} {deltas:?}");
+                    assert_eq!(shown.1, plain.1, "{text:?} {deltas:?}");
+                    assert_eq!((shown.2, shown.3, shown.4, plain.5), (plain.2, plain.3, plain.4, 0), "{text:?} {deltas:?}");
+                }
+            }
+        }
+    }
+
+    /// A call is read once as it arrives: a file of 24,000 characters in 6,000 deltas, whole in its pieces.
+    #[test]
+    fn a_long_call_is_read_as_it_arrives() {
+        let tools = create_file();
+        let content: String = (0..1000).map(|line| format!("    let value_{line} = \"text\\n\"; // </p>\n")).collect();
+        assert!(content.len() > 24_000);
+        let markup = format!("<tool_call>\n<function=create_file>\n<parameter=path>\nbig.rs\n</parameter>\n<parameter=content>\n{content}\n</parameter>\n</function>\n</tool_call>");
+        let deltas = cuts(&markup).pop().unwrap();
+        let deltas: Vec<String> = deltas.chunks(4).map(|chars| chars.concat()).collect();
+        let deltas: Vec<&str> = deltas.iter().map(String::as_str).collect();
+        let (seen, _, calls) = write_calls(Markup::Qwen, &deltas, &tools);
+        assert_eq!(joined(&seen)[0].1, calls[0].arguments);
+        // (the value arrives as it is written: most deltas carry a piece)
+        assert!(seen.iter().filter(|pieces| !pieces.is_empty()).count() > deltas.len() * 3 / 4);
+    }
+
+    #[test]
+    fn dsml_calls_are_written_too() {
+        let tools = create_file();
+        let markup = "Looking.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ns::create_file\">\n\
+                      <｜DSML｜ parameter name=\"path\" string=\"true\">a \"b\"\nc</｜DSML｜ parameter>\n\
+                      <｜DSML｜ parameter name=\"lines\" string=\"false\">[1, 2]</｜DSML｜ parameter>\n\
+                      <｜DSML｜ parameter name=\"content\" string=\"true\">fn main() {}\n\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n\
+                      <｜DSML｜ invoke name=\"now\">\n\n</｜DSML｜ invoke>\n\
+                      <｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"x\" string=\"false\">oops</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n\
+                      </｜DSML｜ calls>";
+        let calls = assert_written(Markup::Dsml, markup, &tools, &["create_file", "now", "f"], "Looking.");
+        assert_eq!(calls[0].arguments, "{\"path\": \"a \\\"b\\\"\\nc\", \"lines\": [1, 2], \"content\": \"fn main() {}\\n\\n\"}");
+        assert_eq!((calls[0].namespace.as_deref(), calls[1].arguments.as_str(), calls[2].arguments.as_str()), (Some("ns"), "{}", r#"{"x": "oops"}"#));
+    }
+
+    #[test]
+    fn nothing_is_shown_without_asking() {
+        let tools = read_file();
+        let mut splitter = ToolCallSplitter::new(Some(&tools));
+        assert_eq!(splitter.feed(&format!("Let me look.\n\n{CALL}")), "Let me look.\n\n");
+        assert!(splitter.take_pieces().is_empty());
+        // (and none for text that holds no tools)
+        let mut splitter = ToolCallSplitter::new(None).writing();
+        assert_eq!(splitter.feed(CALL), CALL);
+        assert!(splitter.take_pieces().is_empty());
     }
 
     #[test]

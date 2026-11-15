@@ -1826,6 +1826,22 @@ with a model of its own reads no file it was not given.
   - `max_tokens` / `max_completion_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
     `presence_penalty`, `seed`, `stop`;
   - `suppress`: `not_cp932_han` (§6), listed in `/props` and `/v1/models`' `meta`;
+  - `straydog.tool_writing` (boolean; `checkpoint` is the other key of the `straydog` object): on a streamed request with
+    tools, the chunks also carry the calls as the model writes them. The server holds a call's markup back and sends the call
+    whole at the end, so a client would otherwise see nothing for the minutes a file takes to write. It is listed as
+    `tool_writing: true` in `/props` and `/v1/models`' `meta` (a server without it refuses the key with a 400). The final
+    `tool_calls` are the same with or without it; a request that does not ask streams what it always did.
+    - A chunk's `delta` may hold `straydog_tool_writing`, a list of `{"index": i, "name": "<tool>", "arguments": "<piece>"}`
+      in the order the calls are written. A call's first piece has its `name` and empty `arguments`, as soon as the
+      `<function=NAME>` is whole; the next pieces have `arguments` only. `index` counts the blocks of the markup, which is
+      the final call's place unless a block the final reading drops (a slip) came before it.
+    - A call's pieces, joined, are what the markup read so far makes of its arguments JSON in the final form (key order,
+      separators and string escaping as `tool_calls` writes it): all of it when the markup is well formed, otherwise a
+      partial string that need not be JSON. They are display data: a repair, a dropped block or markup released as text
+      changes nothing in them, and nothing in the answer. Only `tool_calls` is authoritative.
+    - A string parameter's text is sent as it arrives, held back only where it could still be the close (and the one newline
+      the template writes before it); any other parameter, with its key, once its close is seen. A call written as a block
+      of JSON (`<tool_call>{...}`) sends no pieces. DeepSeek-V4.1's DSML calls are sent the same way.
   - `reasoning_effort` (`none` to `xhigh`) and `chat_template_kwargs`;
   - `stream_options.include_usage`.
 
