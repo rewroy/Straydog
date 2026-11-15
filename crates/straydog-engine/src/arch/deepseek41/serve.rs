@@ -83,9 +83,9 @@ pub struct Engines {
     kept: Option<usize>,
     /// Host bytes they may take ([`checkpoint_budget`]).
     budget: u64,
-    /// Each engine's mark of the reply being written ([`served::Engines::mark`]), if one is held: beside the budget, which it
-    /// is far below (the window's rows and the tails).
-    marked: Option<Vec<Snapshot>>,
+    /// The marks of the reply being written ([`served::Engines::mark`]), oldest first, each every engine's: beside the budget,
+    /// which they are far below (the window's rows and the tails).
+    marked: Vec<Vec<Snapshot>>,
     /// Floats a step between requests copies of their pending rows ([`CHECKPOINT_STEP`]).
     step: usize,
     /// The model's files (the drafter reads the token embeddings from them).
@@ -436,27 +436,30 @@ impl served::Engines for Engines {
         self.kept = slot;
     }
 
-    /// A mark of every engine's state ([`Engine::mark_into`]) in the place of the last, or every engine back to it where
-    /// the held sequence still extends it; a mark it has left is dropped.
-    fn mark(&mut self, save: bool) -> Result<bool, String> {
-        if save {
-            let mut marks = self.marked.take().unwrap_or_default();
+    /// A mark of every engine's state ([`Engine::mark_into`]) in the place of the oldest of [`served::MARKS`], or every
+    /// engine back to the mark taken at `back_to` tokens where the held sequence still extends it. Marks it has left are dropped.
+    fn mark(&mut self, back_to: Option<usize>) -> Result<bool, String> {
+        let engines = &self.engines;
+        let held = |marks: &Vec<Snapshot>| engines.iter().zip(marks).all(|(engine, mark)| engine.extends(mark));
+        let Some(position) = back_to else {
+            self.marked.retain(held);
+            // (the oldest's buffers are taken again)
+            let mut marks = if self.marked.len() >= served::MARKS { self.marked.remove(0) } else { Vec::new() };
             marks.resize_with(self.engines.len(), Snapshot::default);
             for (engine, mark) in self.engines.iter_mut().zip(&mut marks) {
                 engine.mark_into(mark)?;
             }
-            self.marked = Some(marks);
+            self.marked.push(marks);
             return Ok(true);
-        }
-        let Some(marks) = self.marked.as_ref().filter(|marks| self.engines.iter().zip(marks.iter()).all(|(engine, mark)| engine.extends(mark))) else {
-            self.marked = None;
+        };
+        let Some(index) = self.marked.iter().position(|marks| marks.first().is_some_and(|mark| mark.position() == position) && held(marks)) else {
             return Ok(false);
         };
         // (as a checkpoint the held sequence extends: the copies of the checkpoints above it are made first)
-        let position = marks.first().map_or(0, Snapshot::position);
         self.finish_checkpoints_above(position)?;
-        let marks = self.marked.as_ref().ok_or("the Straydog mark was given up")?;
-        self.engines.iter_mut().zip(marks).try_for_each(|(engine, mark)| engine.rewind_to(mark))?;
+        self.engines.iter_mut().zip(&self.marked[index]).try_for_each(|(engine, mark)| engine.rewind_to(mark))?;
+        // (those taken after it are of what the sequence has left)
+        self.marked.truncate(index + 1);
         // (the drafter's history refills as the sequence goes on)
         if let Some(drafting) = self.drafting.as_mut() {
             drafting.forget();
@@ -994,7 +997,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
                            saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
-                           budget: checkpoints, marked: None, step: CHECKPOINT_STEP, files, drafting },
+                           budget: checkpoints, marked: Vec::new(), step: CHECKPOINT_STEP, files, drafting },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("read and place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
