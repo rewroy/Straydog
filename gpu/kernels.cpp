@@ -1238,21 +1238,22 @@ int sd_layer_rows_get(void* handle, void* storage, uint64_t first, float* rows, 
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // sd_prefill_rows from rows held in VRAM: a device copy into the layer's workspace.
+static void prefill_rows_held(Device& d, uint64_t layer, void* storage, uint64_t first, uint64_t steps) {
+    const auto found = d.decoder.find(size_t(layer));
+    if (found == d.decoder.end() || !steps || steps > found->second.capacity)
+        throw std::runtime_error("invalid prefill hidden rows");
+    const float* held = held_layer_rows(d, storage, first, steps);
+    check(hipMemcpyAsync(found->second.workspace, held, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+}
 int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t first, uint64_t steps) {
     try {
-        auto& d = device(handle);
-        const auto found = d.decoder.find(size_t(layer));
-        if (found == d.decoder.end() || !steps || steps > found->second.capacity)
-            throw std::runtime_error("invalid prefill hidden rows");
-        const float* held = held_layer_rows(d, storage, first, steps);
-        check(hipMemcpyAsync(found->second.workspace, held, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+        prefill_rows_held(device(handle), layer, storage, first, steps);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // sd_prefill_span of the rows a workspace holds, its output copied back into the rows held in VRAM: the same span, with its check of
 // the values each span (as with an output to the host), and a device copy where the host's was.
-int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first) {
-    auto& d = device(handle);
+static void prefill_span_held(Device& d, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first) {
     const bool deferred = d.prefill_deferred;
     try {
         float* held = held_layer_rows(d, storage, first, steps);
@@ -1262,8 +1263,203 @@ int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t po
         prefill_span(d, size_t(begin), size_t(end), size_t(position), size_t(steps), nullptr, nullptr, 0, nullptr);
         d.prefill_deferred = deferred;
         check(hipMemcpyAsync(held, found->second.workspace, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
+    } catch (...) { d.prefill_deferred = deferred; throw; }
+}
+int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first) {
+    try {
+        prefill_span_held(device(handle), begin, end, position, steps, storage, first);
         return 0;
-    } catch (const std::exception& e) { d.prefill_deferred = deferred; last_error=e.what(); return -1; }
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Layer order's hidden rows kept on the host and moved beside the compute (RowsOverlap, core.hpp). The held path's work, on a ring of two
+// chunk slots in VRAM that stands for the rows a pass would hold there. For the chunk c of a layer, slot s = c % 2:
+//   up stream:     wait left[s] (the slot's rows of its last use have reached the host) and written[c] (the layer before has written this chunk's
+//                  rows to the host) -> copy host rows c into slot s -> record uploaded[s]
+//   device stream: wait uploaded[s] -> copy slot s into the layer's workspace -> (the layer's PLE) -> the span, its rows copied back into slot s,
+//                  as sd_prefill_rows_held and sd_prefill_span_held do -> record computed[s]
+//   down stream:   wait computed[s] -> copy slot s out to host rows c -> record left[s] and written[c]
+// Every wait is an event recorded before the wait is queued (the calls come in that order from the caller), so a stream waits for exactly the
+// work it depends on and nothing else.
+static RowsOverlap& rows_overlap_active(Device& d) {
+    if (!d.rows_overlap || !d.rows_overlap->active) throw std::runtime_error("no layer rows are moving beside the compute");
+    return *d.rows_overlap;
+}
+static float* rows_overlap_slot(RowsOverlap& o, size_t slot) { return static_cast<float*>(o.ring) + slot * o.slot_rows * 10240; }
+// Adds the copies whose events are done to the device's time counters; the others are left for later. Never waits.
+static void rows_overlap_reap(Device& d, RowsOverlap& o) {
+    size_t kept = 0;
+    for (size_t i = 0; i < o.timed.size(); ++i) {
+        const RowsOverlap::Timed entry = o.timed[i];
+        const hipError_t state = hipEventQuery(entry.last);
+        if (state == hipErrorNotReady) { o.timed[kept++] = entry; continue; }
+        float milliseconds = 0;
+        if (state != hipSuccess || hipEventElapsedTime(&milliseconds, entry.first, entry.last) != hipSuccess) { (void)hipGetLastError(); milliseconds = 0; }
+        const uint64_t nanoseconds = milliseconds > 0 ? uint64_t(double(milliseconds) * 1e6) : 0;
+        (entry.kind == 0 ? d.rows_up_ns : entry.kind == 1 ? d.rows_down_ns : d.rows_overlap_stream_wait_ns) += nanoseconds;
+        o.spare.push_back(entry);
+    }
+    o.timed.resize(kept);
+}
+// A new entry of the timed copies (kind: see RowsOverlap::Timed), its first event recorded on `stream`; rows_overlap_stop records its last, after the
+// copy is queued. (No reaping between the two: the index holds.)
+static size_t rows_overlap_start(RowsOverlap& o, hipStream_t stream, int kind) {
+    RowsOverlap::Timed entry;
+    if (!o.spare.empty()) { entry = o.spare.back(); o.spare.pop_back(); }
+    entry.kind = kind;
+    // (owned by the list before an event is made: a failing creation leaves none behind)
+    o.timed.push_back(entry);
+    const size_t at = o.timed.size() - 1;
+    if (!o.timed[at].first) check(hipEventCreate(&o.timed[at].first));
+    if (!o.timed[at].last) check(hipEventCreate(&o.timed[at].last));
+    check(hipEventRecord(o.timed[at].first, stream));
+    return at;
+}
+static void rows_overlap_stop(RowsOverlap& o, hipStream_t stream, size_t at) { check(hipEventRecord(o.timed[at].last, stream)); }
+// The pass's rows (`host_rows` rows of 10240 floats) are page-locked here, until sd_rows_overlap_end, and `storage` (an allocation of
+// sd_prefill_bank_allocate of `slots` slots of `slot_rows` rows, one or two) is the ring. 1 where the host rows could not be page-locked (nothing
+// has changed; the error says why), -1 on an error.
+int sd_rows_overlap_begin(void* handle, void* storage, uint64_t slot_rows, float* host, uint64_t host_rows) {
+    try {
+        auto& d = device(handle);
+        if (d.rows_overlap && d.rows_overlap->active) throw std::runtime_error("layer rows are already moving beside the compute");
+        const auto ring = d.allocations.find(storage);
+        if (!storage || ring == d.allocations.end() || !slot_rows || !host || !host_rows || ring->second < size_t(slot_rows) * 10240 * 4)
+            throw std::runtime_error("invalid layer rows ring");
+        const size_t slots = std::min<size_t>(2, ring->second / (size_t(slot_rows) * 10240 * 4));
+        const hipError_t locked = hipHostRegister(host, size_t(host_rows) * 10240 * 4, hipHostRegisterPortable);
+        if (locked != hipSuccess) {
+            (void)hipGetLastError();
+            last_error = std::string("the hidden rows could not be page-locked (") + gpu_error_text(locked) + ")";
+            return 1;
+        }
+        try {
+            if (!d.rows_overlap) d.rows_overlap = std::make_unique<RowsOverlap>();
+            auto& o = *d.rows_overlap;
+            // (streams of their own, that do not wait for the legacy default stream nor the device's: the copies run beside its work)
+            if (!o.up) check(hipStreamCreateWithFlags(&o.up, hipStreamNonBlocking));
+            if (!o.down) check(hipStreamCreateWithFlags(&o.down, hipStreamNonBlocking));
+            for (size_t s = 0; s < 2; ++s)
+                for (hipEvent_t* event : {&o.uploaded[s], &o.computed[s], &o.left[s]})
+                    if (!*event) check(hipEventCreateWithFlags(event, hipEventDisableTiming));
+            std::fill(o.valid.begin(), o.valid.end(), 0);
+            o.state[0] = o.state[1] = RowsOverlap::slot_free;
+            o.slot_used[0] = o.slot_used[1] = false;
+            o.ring = storage; o.slot_rows = size_t(slot_rows); o.slots = slots;
+            o.host = host; o.host_rows = size_t(host_rows);
+            o.active = true;
+        } catch (...) { cleanup(hipHostUnregister(host)); throw; }
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Chunk `chunk`'s `steps` rows from host row `row` up into its slot, queued on the up stream behind the copy out of the slot's last rows and
+// the layer before's copy out of this chunk's rows.
+int sd_rows_overlap_up(void* handle, uint64_t chunk, uint64_t row, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        auto& o = rows_overlap_active(d);
+        const size_t slot = size_t(chunk % 2);
+        if (slot >= o.slots || !steps || steps > o.slot_rows || row + steps > o.host_rows || o.state[slot] != RowsOverlap::slot_free)
+            throw std::runtime_error("invalid layer rows to bring up");
+        if (o.timed.size() >= 64) rows_overlap_reap(d, o);
+        if (o.slot_used[slot]) check(hipStreamWaitEvent(o.up, o.left[slot], 0));
+        if (chunk < o.valid.size() && o.valid[chunk]) check(hipStreamWaitEvent(o.up, o.written[chunk], 0));
+        const size_t bytes = size_t(steps) * 10240 * 4;
+        const size_t timer = rows_overlap_start(o, o.up, 0);
+        check(hipMemcpyAsync(rows_overlap_slot(o, slot), o.host + size_t(row) * 10240, bytes, hipMemcpyHostToDevice, o.up));
+        rows_overlap_stop(o, o.up, timer);
+        check(hipEventRecord(o.uploaded[slot], o.up));
+        o.state[slot] = RowsOverlap::slot_uploaded;
+        o.slot_steps[slot] = size_t(steps);
+        d.rows_up_bytes += bytes;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// sd_prefill_rows_held of the chunk's slot, after the device stream has waited for the rows to come up.
+int sd_rows_overlap_load(void* handle, uint64_t layer, uint64_t chunk, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        auto& o = rows_overlap_active(d);
+        const size_t slot = size_t(chunk % 2);
+        if (slot >= o.slots || o.state[slot] != RowsOverlap::slot_uploaded || steps != o.slot_steps[slot])
+            throw std::runtime_error("invalid layer rows to load");
+        const size_t timer = rows_overlap_start(o, d.stream, 2);
+        check(hipStreamWaitEvent(d.stream, o.uploaded[slot], 0));
+        rows_overlap_stop(o, d.stream, timer);
+        prefill_rows_held(d, layer, o.ring, uint64_t(slot * o.slot_rows), steps);
+        o.state[slot] = RowsOverlap::slot_loaded;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// sd_prefill_span_held of the chunk's slot (the span with its check of the values, its rows copied into the slot), then the slot out to host
+// row `row` on the down stream, behind the span.
+int sd_rows_overlap_span(void* handle, uint64_t layer, uint64_t chunk, uint64_t row, uint64_t position, uint64_t steps) {
+    try {
+        auto& d = device(handle);
+        auto& o = rows_overlap_active(d);
+        const size_t slot = size_t(chunk % 2);
+        if (slot >= o.slots || o.state[slot] != RowsOverlap::slot_loaded || steps != o.slot_steps[slot] || row + steps > o.host_rows)
+            throw std::runtime_error("invalid layer rows to compute");
+        prefill_span_held(d, layer, layer + 1, position, steps, o.ring, uint64_t(slot * o.slot_rows));
+        check(hipEventRecord(o.computed[slot], d.stream));
+        check(hipStreamWaitEvent(o.down, o.computed[slot], 0));
+        const size_t bytes = size_t(steps) * 10240 * 4;
+        const size_t timer = rows_overlap_start(o, o.down, 1);
+        check(hipMemcpyAsync(o.host + size_t(row) * 10240, rows_overlap_slot(o, slot), bytes, hipMemcpyDeviceToHost, o.down));
+        rows_overlap_stop(o, o.down, timer);
+        check(hipEventRecord(o.left[slot], o.down));
+        if (chunk >= o.written.size()) { o.written.resize(size_t(chunk) + 1, nullptr); o.valid.resize(size_t(chunk) + 1, 0); }
+        if (!o.written[chunk]) check(hipEventCreateWithFlags(&o.written[chunk], hipEventDisableTiming));
+        check(hipEventRecord(o.written[chunk], o.down));
+        o.valid[chunk] = 1;
+        o.slot_used[slot] = true;
+        o.state[slot] = RowsOverlap::slot_free;
+        d.rows_down_bytes += bytes;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The pass's rows are on the host again: waits for every copy out (and in), and the next pass starts clean.
+int sd_rows_overlap_wait(void* handle) {
+    try {
+        auto& d = device(handle);
+        auto& o = rows_overlap_active(d);
+        if (o.state[0] != RowsOverlap::slot_free || o.state[1] != RowsOverlap::slot_free)
+            throw std::runtime_error("layer rows moving beside the compute ended with a chunk in flight");
+        const auto started = std::chrono::steady_clock::now();
+        check(hipStreamSynchronize(o.down));
+        d.rows_overlap_host_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        check(hipStreamSynchronize(o.up));
+        rows_overlap_reap(d, o);
+        std::fill(o.valid.begin(), o.valid.end(), 0);
+        o.slot_used[0] = o.slot_used[1] = false;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Ends the rows' moving, however the pass ended: waits for the copies, and lets the host rows' pages go. Nothing where none is moving.
+int sd_rows_overlap_end(void* handle) {
+    try {
+        auto& d = device(handle);
+        if (!d.rows_overlap || !d.rows_overlap->active) return 0;
+        auto& o = *d.rows_overlap;
+        const hipError_t down = hipStreamSynchronize(o.down), up = hipStreamSynchronize(o.up);
+        const hipError_t unlocked = hipHostUnregister(o.host);
+        o.active = false; o.host = nullptr; o.ring = nullptr; o.host_rows = 0;
+        o.state[0] = o.state[1] = RowsOverlap::slot_free;
+        o.slot_used[0] = o.slot_used[1] = false;
+        std::fill(o.valid.begin(), o.valid.end(), 0);
+        rows_overlap_reap(d, o);
+        check(down); check(up); check(unlocked);
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// Rows moved beside the compute: nanoseconds the device stream waited for rows to come up, nanoseconds the host waited for the last rows to go
+// down (the copies' own times and bytes are sd_prefill_row_transfers').
+int sd_rows_overlap_times(void* handle, uint64_t* out) {
+    try {
+        auto& d = device(handle);
+        if (!out) throw std::runtime_error("no place for the overlap times");
+        out[0] = d.rows_overlap_stream_wait_ns; out[1] = d.rows_overlap_host_wait_ns;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 // Layer order's hidden rows moved so far: up nanoseconds, up bytes, down nanoseconds, down bytes.
 int sd_prefill_row_transfers(void* handle, uint64_t* out) {
