@@ -696,6 +696,14 @@ struct Device {
     int layer_bank_half = -1;
     hipEvent_t layer_bank_free[2] = {nullptr, nullptr};
     bool layer_bank_used[2] = {false, false};
+    // A layer-order pass's chunks' expert counts and last routes, copied to the host behind each chunk's routing on the device's stream and
+    // observed for the slots in order once they have landed (observe_deferred), so that the host does not wait for each chunk's routing:
+    // a ring of page-locked entries, each with its event, and the entries not yet observed, oldest first.
+    struct DeferredObservation { ResidentMoe* plan; size_t steps, tail, slot; };
+    uint8_t* deferred_host = nullptr;
+    std::vector<hipEvent_t> deferred_events;
+    std::deque<DeferredObservation> deferred;
+    size_t deferred_next = 0;
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     sd_prefill_observer prefill_observer = nullptr;
     void* prefill_observer_context = nullptr;
@@ -951,6 +959,8 @@ struct Device {
         if (prestage.event) cleanup(hipEventDestroy(prestage.event));
         if (counts_event) cleanup(hipEventDestroy(counts_event));
         for (hipEvent_t& event : layer_bank_free) if (event) cleanup(hipEventDestroy(event));
+        for (hipEvent_t& event : deferred_events) if (event) cleanup(hipEventDestroy(event));
+        if (deferred_host) cleanup(hipHostFree(deferred_host));
         if (exchange) cleanup(hipHostFree(exchange));
         if (prompt_host && prompt_host_pinned) cleanup(hipHostFree(prompt_host));
         if (prompt_rows) cleanup(hipEventDestroy(prompt_rows));

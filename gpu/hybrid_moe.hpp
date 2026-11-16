@@ -774,6 +774,7 @@ void hybrid_host_experts_rows(Device& d, ResidentMoe& plan, size_t rows, const f
             }
         }
         counts[r] = uint32_t(count - before);
+        if (!d.deferred.empty()) observe_deferred(d, true);
         hybrid_observe_token(plan, selected);
     }
     if (count) {
