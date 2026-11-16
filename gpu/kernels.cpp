@@ -1253,17 +1253,14 @@ int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t f
 }
 // sd_prefill_span of the rows a workspace holds, its output copied back into the rows held in VRAM: the same span, with its check of
 // the values each span (as with an output to the host), and a device copy where the host's was.
+// (deferred where the caller deferred the spans, sd_prefill_defer: their rows' check then waits for the pass's sd_prefill_settle, and the host
+// does not wait for each span; else checked at its end, as the host's way is)
 static void prefill_span_held(Device& d, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first) {
-    const bool deferred = d.prefill_deferred;
-    try {
-        float* held = held_layer_rows(d, storage, first, steps);
-        const auto found = d.decoder.find(size_t(begin));
-        if (found == d.decoder.end()) throw std::runtime_error("prefill span has no compatible resident layer");
-        d.prefill_deferred = false;
-        prefill_span(d, size_t(begin), size_t(end), size_t(position), size_t(steps), nullptr, nullptr, 0, nullptr);
-        d.prefill_deferred = deferred;
-        check(hipMemcpyAsync(held, found->second.workspace, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
-    } catch (...) { d.prefill_deferred = deferred; throw; }
+    float* held = held_layer_rows(d, storage, first, steps);
+    const auto found = d.decoder.find(size_t(begin));
+    if (found == d.decoder.end()) throw std::runtime_error("prefill span has no compatible resident layer");
+    prefill_span(d, size_t(begin), size_t(end), size_t(position), size_t(steps), nullptr, nullptr, 0, nullptr);
+    check(hipMemcpyAsync(held, found->second.workspace, size_t(steps) * 10240 * 4, hipMemcpyDeviceToDevice, d.stream));
 }
 int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first) {
     try {
