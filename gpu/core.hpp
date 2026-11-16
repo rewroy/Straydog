@@ -626,6 +626,8 @@ inline void abort_flag_retain(AbortFlag* flag) {
 inline void abort_flag_release(AbortFlag* flag) {
     if (flag && flag->references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete flag;
 }
+// Device::flags[5]: deferred prefill spans' non-finite check (sd_prefill_defer, sd_prefill_settle).
+constexpr size_t prefill_deferred_flag = 5;
 struct Device {
     int ordinal;
     size_t budget = 0, used = 0;
@@ -686,8 +688,10 @@ struct Device {
     void* blas_workspace = nullptr;
     unsigned* flags = nullptr;
     // Deferred prefill (sd_prefill_defer): spans end without a host wait; their non-finite
-    // check accumulates in flags[1] until sd_prefill_settle. `handoff` orders a row handoff
-    // between this device's stream and its peer's.
+    // check accumulates in flags[prefill_deferred_flag] until sd_prefill_settle (its own slot:
+    // flags[1] is a partially resident model's export count, hybrid_tick, which a layer-order
+    // pass's deferral zeroed and the next decode then waited for in vain). `handoff` orders a row
+    // handoff between this device's stream and its peer's.
     bool prefill_deferred = false;
     ResidentMoe* layer_prefill_plan = nullptr;
     void* layer_prefill_storage = nullptr;
