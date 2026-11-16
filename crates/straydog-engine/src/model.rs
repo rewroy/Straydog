@@ -614,6 +614,11 @@ struct AssistScript {
 /// STRAYDOG_LAYER_PREFILL_ROWS sets it, to measure ([`layer_prefill_rows`]).
 const LAYER_PREFILL_ROWS: usize = 16384;
 const LAYER_PREFILL_MIN: usize = 512;
+/// The chunks of a layer queued before the next layer's bank loads ahead ([`Model::load_prefill_bank_copy`]): the GPU has them to compute while
+/// the host gathers a copied layer (some 50-90 ms on an RTX 5070 Ti PC). A layer of fewer chunks loads the next after its last, as before.
+const LAYER_BANK_AHEAD_AFTER: usize = 3;
+/// The chunks ahead of layer 1's whose PLE rows are asked for (the row cache keeps them: within its gigabyte where memory is scarce).
+const LAYER_PLE_AHEAD: usize = 2;
 /// The part of the host's memory a pass's hidden rows may take: a 16th, 4 GiB of 64 (98,304 rows; 49,152 of 32). On a 5070 Ti with 64 GB
 /// and a 9 GiB budget, UD-IQ2_XS read 90,000 tokens in 76.1 s at 16,384 rows a pass, 52.7 s at 49,152 and 44.9 s at 98,304 (one pass), the
 /// logits the same to the bit; served there, a new 95K prompt took 50.0 s with Strata 0.2.14 and 53.1 s with a 32nd (two runs each).
@@ -4572,7 +4577,13 @@ impl Model {
                 // RTX 5070 Ti PC, UD-IQ2_XS at --vram 9: the host's compute of a layer took 70 ms beside the GPU's 80, and its bank 105 after it)
                 let defer = !self.deferred;
                 if defer { self.group.prefill_defer(true)?; }
+                // (a pool of two banks for every layer: the next layer's bank loads once the layer's first chunks are queued, into the half the
+                // layer does not use, and is pointed at at its turn; its copies, and the gather of a copied layer before them, have the rest of the
+                // layer's compute to finish in. A 90,000-token prompt on an RTX 5070 Ti PC queues 44 chunks a layer, of which the host keeps a
+                // few ahead of the GPU: loaded at its turn, a bank's gather and copies left the GPU waiting 50-150 ms at each layer's start, 3.2 s)
+                let bank_ahead = (0..layers).map(|layer| self.group.layer_bank_halves(layer)).collect::<Result<Vec<bool>>>()?.into_iter().all(|halves| halves);
                 let layers_run = (|| -> Result<()> {
+                    if bank_ahead { self.load_prefill_bank_copy(0, layers, &mut bank_reader, true)?; }
                     for layer in 0..48 {
                         // (moving beside the compute: the layer's first chunks' rows come up while its banks load, the ring's two slots being free)
                         if rows_in == PassRows::Overlapped {
@@ -4583,7 +4594,11 @@ impl Model {
                         }
                         let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
                         let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
-                        self.load_prefill_bank_copy(layer, layers, &mut bank_reader)?;
+                        if bank_ahead {
+                            self.group.commit_layer_bank(layer)?;
+                        } else {
+                            self.load_prefill_bank_copy(layer, layers, &mut bank_reader, false)?;
+                        }
                         drop(trace_bank);
                         let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
                         for (chunk, &(first, end)) in chunks.iter().enumerate() {
@@ -4595,10 +4610,16 @@ impl Model {
                                 // (the device stream waits for this chunk's rows to arrive in its slot, which it then copies into the workspace)
                                 PassRows::Overlapped => self.group.rows_overlap_load(layer, chunk as u64, (end - first) as u64)?,
                             }
+                            // (layer 1's PLE rows are asked for LAYER_PLE_AHEAD chunks ahead, its first ones while layer 0 computes: read a chunk
+                            // ahead, a 90,000-token prompt's 44 chunks waited 13-42 ms each for theirs on an RTX 5070 Ti PC, 1.2 s)
+                            if layer == 0 && chunk < LAYER_PLE_AHEAD {
+                                self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
+                            }
                             if layer == 1 {
                                 let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
-                                let next = (end + batch).min(stop);
-                                self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
+                                if let Some(&(ahead, after)) = chunks.get(chunk + LAYER_PLE_AHEAD) {
+                                    self.prefetch_ple(&tokens[..ahead], &tokens[ahead..after])?;
+                                }
                                 self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
                                 let reading = Instant::now();
                                 let embeddings = self.weights.rows(PLE_TABLE, &self.ple_indices(&tokens[..first], &tokens[first..end])?)?;
@@ -4619,6 +4640,9 @@ impl Model {
                                     }
                                 }
                             }
+                            if bank_ahead && chunk == LAYER_BANK_AHEAD_AFTER.min(chunks.len() - 1) && layer + 1 < layers {
+                                self.load_prefill_bank_copy(layer + 1, layers, &mut bank_reader, true)?;
+                            }
                         }
                     }
                     Ok(())
@@ -4636,7 +4660,11 @@ impl Model {
                 if self.speculative > 0 {
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, 48)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
                     let trace_bank = crate::layer_trace::Span::new("bank", Some(48), begin, stop, bank_bytes);
-                    self.load_prefill_bank_copy(48, layers, &mut bank_reader)?;
+                    if bank_ahead {
+                        self.group.commit_layer_bank(48)?;
+                    } else {
+                        self.load_prefill_bank_copy(48, layers, &mut bank_reader, false)?;
+                    }
                     drop(trace_bank);
                     let _trace_compute = crate::layer_trace::Span::new("compute", Some(48), begin, stop, 0);
                     // Preserve the ordinary chunk order's pair positions and prologue batch shapes. The bank stays loaded once.
@@ -4673,7 +4701,8 @@ impl Model {
         }
     }
 
-    fn load_prefill_bank_copy(&mut self, layer: usize, layers: usize, reader: &mut Option<crate::layer_bank::Prefetch>) -> Result<()> {
+    /// `ahead`: into the half the computing layer does not use, pointed at by [`Group::commit_layer_bank`] at the layer's turn.
+    fn load_prefill_bank_copy(&mut self, layer: usize, layers: usize, reader: &mut Option<crate::layer_bank::Prefetch>, ahead: bool) -> Result<()> {
         if injected_bank_failure() {
             return Err(format!("layer {layer}'s bank for a layer-order pass: an injected failure"));
         }
@@ -4689,7 +4718,7 @@ impl Model {
                 // (the mapping's pages, which its locks keep checked, not the file's again)
                 BankSource::Registered => {
                     self.metric_add("prefill_bank_registered_layers", 1.0);
-                    self.group.load_layer_bank(layer)?;
+                    self.group.load_layer_bank(layer, ahead)?;
                 }
                 // (passed by while it was registered, and given up since: its pages are no longer kept checked, so a checked copy now)
                 BankSource::ReadNow => {
@@ -4698,13 +4727,13 @@ impl Model {
                     self.metric_add("prefill_bank_wait_seconds", reading.elapsed().as_secs_f64());
                     self.metric_add("prefill_bank_read_late_layers", 1.0);
                     if copy.is_none() {
-                        self.group.load_layer_bank(layer)?;
+                        self.group.load_layer_bank(layer, ahead)?;
                     }
                 }
-                BankSource::Mapping => self.group.load_layer_bank(layer)?,
+                BankSource::Mapping => self.group.load_layer_bank(layer, ahead)?,
             }
             if let Some(copy) = &copy {
-                self.group.load_layer_bank_from(layer, copy.sources())?;
+                self.group.load_layer_bank_from(layer, copy.sources(), ahead)?;
                 self.metric_add("prefill_bank_copied_layers", 1.0);
             }
             Ok(())

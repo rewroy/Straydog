@@ -517,11 +517,15 @@ int sd_decode_span(void* handle, uint64_t begin, uint64_t end, uint64_t position
 /* Temporarily bind one layer's routed banks to an owned allocation. Requires an empty expert cache; clear before releasing storage. */
 /* 1 when memory was refused (no allocation), 0 when allocated. */
 int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage);
-int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes);
-/* Three authenticated host copies, kept alive until return (all H2D reads have settled).
+int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes, int ahead);
+/* Three authenticated host copies, kept alive until return (gathered into the staging by then; the bank's copies land behind it).
    The decoder's ordinary host pointers are unchanged. source_bytes holds each whole bank's size. */
 int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
-                         const uint8_t* const* sources, const uint64_t* source_bytes);
+                         const uint8_t* const* sources, const uint64_t* source_bytes, int ahead);
+/* A bank loaded `ahead` (sd_prefill_bank, sd_prefill_bank_from) goes into the half of a pool of two banks that the computing layer does not use,
+   and its layer's turn points the table at it: sd_prefill_bank_commit. 1 where a pool of `bytes` holds two of `layer`'s banks, 0 where not. */
+int sd_prefill_bank_commit(void* handle, uint64_t layer);
+int sd_prefill_bank_halves(void* handle, uint64_t layer, uint64_t bytes);
 int sd_prefill_bank_clear(void* handle);
 /* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
    3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.
