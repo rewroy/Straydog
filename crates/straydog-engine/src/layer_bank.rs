@@ -88,8 +88,8 @@ impl Copy {
     }
 }
 
-/// How a layer-order pass reads the banks it does not hold registered (STRAYDOG_LAYER_BANK_DIRECT): through the page cache (`0`, the
-/// default), around it (`1`), or around it only where the memory available could not keep them for the next pass (`auto`). Through it,
+/// How a layer-order pass reads the banks it does not hold registered (STRAYDOG_LAYER_BANK_DIRECT): through the page cache (`0`), around
+/// it (`1`), or around it only where the memory available could not keep them for the next pass (`auto`, the default). Through it,
 /// a host whose memory keeps the banks reads them from memory on the next pass; where it does not keep them (an RTX 5070 Ti PC with 64 GB,
 /// UD-IQ2_XS at 9 GiB: 33 GB off the drive for a 32K read at some 3.4 GB/s), each pass reads the drive again, which direct reads with deep
 /// queues may read faster.
@@ -99,8 +99,8 @@ enum BankReads { Cached, Direct, Auto }
 fn bank_reads_named(value: Option<&str>) -> BankReads {
     match value.map(str::trim) {
         Some("1") => BankReads::Direct,
-        Some("auto") => BankReads::Auto,
-        _ => BankReads::Cached,
+        Some("0") => BankReads::Cached,
+        _ => BankReads::Auto,
     }
 }
 
@@ -223,13 +223,13 @@ impl Drop for Prefetch {
 mod bank_reads_tests {
     use super::{bank_reads_named, reads_direct, BankReads};
 
-    /// Decides: STRAYDOG_LAYER_BANK_DIRECT=1 reads around the page cache, =auto only where the bytes read again each pass exceed the
-    /// memory available to keep them, and anything else (unset included) through it, as before.
+    /// Decides: STRAYDOG_LAYER_BANK_DIRECT=1 reads around the page cache, =0 through it, and anything else (unset included) around it
+    /// only where the bytes read again each pass exceed the memory available to keep them.
     #[test]
     fn the_variable_chooses_how_a_pass_reads_its_banks() {
-        assert_eq!(bank_reads_named(None), BankReads::Cached);
+        assert_eq!(bank_reads_named(None), BankReads::Auto);
         assert_eq!(bank_reads_named(Some("0")), BankReads::Cached);
-        assert_eq!(bank_reads_named(Some("yes")), BankReads::Cached);
+        assert_eq!(bank_reads_named(Some("yes")), BankReads::Auto);
         assert_eq!(bank_reads_named(Some(" 1 ")), BankReads::Direct);
         assert_eq!(bank_reads_named(Some("auto")), BankReads::Auto);
         let gib = 1u64 << 30;
