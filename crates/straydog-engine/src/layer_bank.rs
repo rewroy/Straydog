@@ -141,7 +141,7 @@ pub(crate) struct Prefetch {
 }
 
 impl Prefetch {
-    /// Up to [`READS_AHEAD`] layers' anonymous copies, each only while the memory available keeps 1 GiB beside them all. Under pressure,
+    /// Up to [`READS_AHEAD`] layers' anonymous copies, each only while the memory available keeps a GiB beside them all (the first two, a quarter of one). Under pressure,
     /// or without a pinned tree, retain the existing authenticated mapping path instead.
     pub(crate) fn new(weights: &Weights, layers: usize, registered: Arc<crate::banks::Registered>) -> Option<Self> {
         // (the bytes of the layers not registered now, which this pass reads from the file: whether to read them around the page cache)
@@ -155,7 +155,11 @@ impl Prefetch {
         // (development: STRAYDOG_LAYER_BANK_BUFFERS=N reads ahead into N buffers at most, to see a pass the memory left one or two)
         let most = std::env::var("STRAYDOG_LAYER_BANK_BUFFERS").ok().and_then(|value| value.trim().parse::<usize>().ok())
             .map_or(READS_AHEAD, |most| most.clamp(1, READS_AHEAD));
-        while free.len() < most && (free.len() as u64 + 1) * bytes as u64 + (1 << 30) <= available {
+        // (two buffers keep a quarter of a GiB beside them, the rest a GiB: with one, a layer's read begins only once the copy before it has
+        // gone up, and a 90,000-token prompt on an RTX 5070 Ti PC took 39.1 s where it took 36.8 with two; a 95K prompt served after an 8K
+        // and a 32K one got one in three of seven requests, 6 GiB free after them)
+        let margin = |buffers: usize| if buffers < 2 { 1u64 << 28 } else { 1u64 << 30 };
+        while free.len() < most && (free.len() as u64 + 1) * bytes as u64 + margin(free.len()) <= available {
             match Buffer::try_new(bytes) { Some(buffer) => free.push(buffer), None => break }
         }
         if free.is_empty() { return None; }
