@@ -4533,54 +4533,66 @@ impl Model {
                 // Avoid a final prefill call of one row; the existing one-row path is a different API.
                 let chunks = layer_prefill_chunks(begin, stop, batch);
                 let previous = self.final_hidden.clone();
-                for layer in 0..48 {
-                    // (moving beside the compute: the layer's first chunks' rows come up while its banks load, the ring's two slots being free)
-                    if rows_in == PassRows::Overlapped {
-                        for chunk in rows_overlap_prime(chunks.len()) {
-                            let (first, end) = chunks[chunk];
-                            self.group.rows_overlap_up(chunk as u64, (first - begin) as u64, (end - first) as u64)?;
+                // (the spans' check of their rows is deferred to the pass's end, where it is waited for once: checked at each span, it kept the host
+                // behind the GPU, so the next layer's bank began loading only once the layer's last chunk had computed. An 8000-token prompt on an
+                // RTX 5070 Ti PC, UD-IQ2_XS at --vram 9: the host's compute of a layer took 70 ms beside the GPU's 80, and its bank 105 after it)
+                let defer = !self.deferred;
+                if defer { self.group.prefill_defer(true)?; }
+                let layers_run = (|| -> Result<()> {
+                    for layer in 0..48 {
+                        // (moving beside the compute: the layer's first chunks' rows come up while its banks load, the ring's two slots being free)
+                        if rows_in == PassRows::Overlapped {
+                            for chunk in rows_overlap_prime(chunks.len()) {
+                                let (first, end) = chunks[chunk];
+                                self.group.rows_overlap_up(chunk as u64, (first - begin) as u64, (end - first) as u64)?;
+                            }
                         }
-                    }
-                    let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
-                    let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
-                    self.load_prefill_bank_copy(layer, layers, &mut bank_reader)?;
-                    drop(trace_bank);
-                    let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
-                    for (chunk, &(first, end)) in chunks.iter().enumerate() {
-                        let low = (first - begin) * WIDTH;
-                        let high = (end - begin) * WIDTH;
-                        match rows_in {
-                            PassRows::Held => self.group.prefill_rows_held(layer, (first - begin) as u64, (end - first) as u64)?,
-                            PassRows::Host => self.group.prefill_rows(layer, &rows[low..high])?,
-                            // (the device stream waits for this chunk's rows to arrive in its slot, which it then copies into the workspace)
-                            PassRows::Overlapped => self.group.rows_overlap_load(layer, chunk as u64, (end - first) as u64)?,
-                        }
-                        if layer == 1 {
-                            let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
-                            let next = (end + batch).min(stop);
-                            self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
-                            self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
-                            let reading = Instant::now();
-                            let embeddings = self.weights.rows(PLE_TABLE, &self.ple_indices(&tokens[..first], &tokens[first..end])?)?;
-                            self.ple_wait += reading.elapsed().as_secs_f64();
-                            self.with_operands(Model::ple_operands, |group, operands| group.prefill_ple("blk.1.", &embeddings, operands))?;
-                        }
-                        match rows_in {
-                            PassRows::Held => self.group.prefill_span_held(layer, (first - begin) as u64, first as u64, (end - first) as u64)?,
-                            // (in place: a new vector a chunk faulted every row's pages in again for each layer)
-                            PassRows::Host => self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?,
-                            PassRows::Overlapped => {
-                                // (the span, then its rows down to the host behind it)
-                                self.group.rows_overlap_span(layer, chunk as u64, (first - begin) as u64, first as u64, (end - first) as u64)?;
-                                // (the slot is the next chunk but one's once these rows have gone down: they come up while the next is computed)
-                                if let Some(ahead) = rows_overlap_after_span(chunks.len(), chunk) {
-                                    let (next, last) = chunks[ahead];
-                                    self.group.rows_overlap_up(ahead as u64, (next - begin) as u64, (last - next) as u64)?;
+                        let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
+                        let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
+                        self.load_prefill_bank_copy(layer, layers, &mut bank_reader)?;
+                        drop(trace_bank);
+                        let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
+                        for (chunk, &(first, end)) in chunks.iter().enumerate() {
+                            let low = (first - begin) * WIDTH;
+                            let high = (end - begin) * WIDTH;
+                            match rows_in {
+                                PassRows::Held => self.group.prefill_rows_held(layer, (first - begin) as u64, (end - first) as u64)?,
+                                PassRows::Host => self.group.prefill_rows(layer, &rows[low..high])?,
+                                // (the device stream waits for this chunk's rows to arrive in its slot, which it then copies into the workspace)
+                                PassRows::Overlapped => self.group.rows_overlap_load(layer, chunk as u64, (end - first) as u64)?,
+                            }
+                            if layer == 1 {
+                                let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
+                                let next = (end + batch).min(stop);
+                                self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
+                                self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
+                                let reading = Instant::now();
+                                let embeddings = self.weights.rows(PLE_TABLE, &self.ple_indices(&tokens[..first], &tokens[first..end])?)?;
+                                self.ple_wait += reading.elapsed().as_secs_f64();
+                                self.with_operands(Model::ple_operands, |group, operands| group.prefill_ple("blk.1.", &embeddings, operands))?;
+                            }
+                            match rows_in {
+                                PassRows::Held => self.group.prefill_span_held(layer, (first - begin) as u64, first as u64, (end - first) as u64)?,
+                                // (in place: a new vector a chunk faulted every row's pages in again for each layer)
+                                PassRows::Host => self.group.prefill_layers_into(layer, layer + 1, None, first as u64, (end - first) as u64, &mut rows[low..high])?,
+                                PassRows::Overlapped => {
+                                    // (the span, then its rows down to the host behind it)
+                                    self.group.rows_overlap_span(layer, chunk as u64, (first - begin) as u64, first as u64, (end - first) as u64)?;
+                                    // (the slot is the next chunk but one's once these rows have gone down: they come up while the next is computed)
+                                    if let Some(ahead) = rows_overlap_after_span(chunks.len(), chunk) {
+                                        let (next, last) = chunks[ahead];
+                                        self.group.rows_overlap_up(ahead as u64, (next - begin) as u64, (last - next) as u64)?;
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                    Ok(())
+                })();
+                // (settled whether the layers ran or not: a pass that failed leaves no span deferred, and its own error goes first)
+                let settled = if defer { self.group.prefill_settle() } else { Ok(()) };
+                layers_run?;
+                settled?;
                 match rows_in {
                     PassRows::Held => self.group.get_layer_rows(0, rows)?,
                     // (the last layer's rows are on the host before anything reads them: the MTP layer, the last row, the checkpoints, the next pass)
