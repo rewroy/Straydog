@@ -528,6 +528,9 @@ int sd_prefill_bank_commit(void* handle, uint64_t layer);
 int sd_prefill_bank_halves(void* handle, uint64_t layer, uint64_t bytes);
 /* 1 where no bank loaded ahead is still being gathered (its copy may be given back), 0 where one is. */
 int sd_prefill_bank_ahead_ready(void* handle);
+/* 1 where the half of the pool a bank loaded ahead would take is free now (the compute of the layer that used it last has ended), 0 where
+   not yet: a load ahead's copies would wait for it, and its gather behind them. */
+int sd_prefill_bank_half_free(void* handle);
 /* A layer-order pass's bank loads since the device began: out[0] loads, then in ns their time, their waits for the staging's copies and
    their gathers. */
 int sd_prefill_bank_times(void* handle, uint64_t* out);

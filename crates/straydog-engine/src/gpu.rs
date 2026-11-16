@@ -1690,6 +1690,12 @@ impl Backend {
         Ok(out)
     }
 
+    /// Whether the half of the pool a bank loaded ahead would take is free now (the layer that used it last has computed).
+    pub fn layer_bank_half_free(&self) -> Result<bool> {
+        // SAFETY: a live device.
+        check(unsafe { ffi::sd_prefill_bank_half_free(self.handle) }).map(|free| free == 1)
+    }
+
     /// Whether no bank loaded ahead is still being gathered on its thread: its copy may then go back to the reader.
     pub fn layer_bank_ahead_ready(&self) -> Result<bool> {
         // SAFETY: a live device.

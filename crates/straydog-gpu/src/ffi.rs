@@ -1837,6 +1837,9 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_prefill_bank_half_free(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_prefill_bank_times(
         handle: *mut ::std::os::raw::c_void,
         out: *mut u64,

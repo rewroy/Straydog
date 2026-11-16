@@ -1179,6 +1179,17 @@ int sd_prefill_bank_times(void* handle, uint64_t* out) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_prefill_bank_half_free(void* handle) {
+    try {
+        auto& d = device(handle);
+        const int use = d.layer_bank_half < 0 ? 0 : 1 - d.layer_bank_half;
+        if (!d.layer_bank_used[use] || !d.layer_bank_free[use]) return 1;
+        const hipError_t state = hipEventQuery(d.layer_bank_free[use]);
+        if (state == hipErrorNotReady) return 0;
+        check(state);
+        return 1;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_prefill_bank_ahead_ready(void* handle) {
     try { auto& d = device(handle); return !d.bank_loader || !d.bank_loader->busy() ? 1 : 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
