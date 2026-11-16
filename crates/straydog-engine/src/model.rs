@@ -4756,6 +4756,11 @@ impl Model {
                 }
                 // (passed by while it was registered, and given up since: its pages are no longer kept checked, so a checked copy now)
                 BankSource::ReadNow => {
+                    if !self.last_metrics.contains_key("prefill_bank_first_late") {
+                        if let Some(reader) = reader.as_ref() {
+                            self.last_metrics.insert("prefill_bank_first_late".into(), json!(reader.missed(layer)));
+                        }
+                    }
                     let reading = Instant::now();
                     copy = reader.as_mut().map(|reader| reader.read_now(layer)).transpose()?.flatten();
                     self.metric_add("prefill_bank_wait_seconds", reading.elapsed().as_secs_f64());
@@ -4797,6 +4802,8 @@ impl Model {
         self.group.commit_layer_bank(layer)?;
         if let (Some(reader), Some(copy)) = (reader.as_mut(), self.bank_copy_ahead.take()) {
             reader.recycle(Some(copy));
+            // (the next read goes into it now: the load ahead started what reads it could, with this buffer still held)
+            reader.start(layer + 1);
         }
         Ok(())
     }
