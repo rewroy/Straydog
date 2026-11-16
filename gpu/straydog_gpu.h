@@ -522,10 +522,6 @@ int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes)
    The decoder's ordinary host pointers are unchanged. source_bytes holds each whole bank's size. */
 int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
                          const uint8_t* const* sources, const uint64_t* source_bytes);
-/* sd_prefill_bank_from with sources the device can read in place (page-locked, mapped host memory: sd_host_alloc_on): their experts are copied
-   by the copy engine straight into the bank, with no gather through the staging. */
-int sd_prefill_bank_from_pinned(void* handle, uint64_t layer, void* storage, uint64_t bytes,
-                                const uint8_t* const* sources, const uint64_t* source_bytes);
 int sd_prefill_bank_clear(void* handle);
 /* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
    3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.
