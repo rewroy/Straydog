@@ -29,6 +29,17 @@ void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, si
 void hybrid_point_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count, const uint8_t* base,
                           uint8_t* const* regions = nullptr);
 void hybrid_observe_batch(ResidentMoe& plan, const unsigned* counts, size_t tokens, const int32_t* tail, size_t tail_tokens);
+// The deferred observations of a layer-order pass's chunks (Device::deferred): those whose copies have landed, oldest first, or with `all`
+// every one, each waited for.
+void observe_deferred(Device& d, bool all);
+// Copies a chunk's expert counts and last routes to the host behind its routing, on the device's stream, to be observed by observe_deferred;
+// false (nothing done) where an entry cannot hold them.
+bool defer_observation(Device& d, ResidentMoe& plan, const unsigned* counts, size_t groups_count, const int32_t* selected, size_t steps);
+// Whether an entry holds a chunk's counts and last routes (defer_observation does not refuse them).
+constexpr size_t deferred_entry_bytes = 16384, deferred_tail_offset = 8192, deferred_slots = 256;
+inline bool observation_deferrable(size_t groups_count, size_t steps) {
+    return groups_count * 4 <= deferred_tail_offset && deferred_tail_offset + std::min<size_t>(steps, hybrid_prompt_tail) * 40 <= deferred_entry_bytes;
+}
 #if !defined(__HIPCC__)
 void hybrid_point_staged(Device& d, ResidentMoe& plan, const size_t* experts, size_t count, bool clear);
 void prestage_issue(Device& d, ResidentMoe& plan);
