@@ -699,8 +699,22 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         cuda_launch(tiles,0,shared_tiles,experts,true);
     }
 #endif
+#if !defined(__HIPCC__)
+    // A layer-order pass's layer has every expert in its bank: none streams, none is prestaged, none goes to the CPU, and the device's tile list
+    // has queued them all above. The host reads the counts only for the slots' statistics: they are copied behind the routing and observed in
+    // order once landed (observe_deferred), and the host goes on at once to the next chunk and to the next layer's bank, which then loads while
+    // this layer computes. Reading them here kept the host one chunk behind the GPU's routing, so the next layer's bank began loading only as
+    // the layer's last chunk computed: an 8000-token prompt on an RTX 5070 Ti PC (UD-IQ2_XS at --vram 9) waited 85 ms at each layer's start,
+    // 4.27 of its 9.14 s, with a layer's compute of 82 ms beside it (STRAYDOG_PREFILL_PHASES=2).
+    if (eager && plan.layer_prefill) {
+        observe_deferred(d,false);
+        if (defer_observation(d,plan,counts,groups_count,selected,steps)) { phase(d,"moe_resident"); return; }
+    }
+#endif
 #if defined(__HIPCC__)
-    if (!plan.hybrid) {
+    // (a layer-order pass's layer, every expert in its bank, as one all on the device: its counts are observed later, as on CUDA above)
+    const bool banked=plan.hybrid && plan.layer_prefill && observation_deferrable(groups_count,steps);
+    if (!plan.hybrid || banked) {
         // All on the device: the host queues the experts (and then the peer's half, the next
         // layer) without waiting for this layer's routing.
         auto* tile_count=reinterpret_cast<unsigned*>(tiles+max_tiles);
@@ -716,6 +730,10 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         moe_expert_launch<2560,640,10,true>(d.stream,moe_kinds(plan,0),moe_kinds(plan,experts),groups,tiles,positions,steps,resident_shape,half_input,
                           product,outputs,tile_count,unsigned(max_tiles),shared);
         check(hipGetLastError());
+        if (banked) {
+            observe_deferred(d,false);
+            defer_observation(d,plan,counts,groups_count,selected,steps);
+        }
         return;
     }
 #endif
@@ -731,6 +749,8 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         if (eager) download_side(d,d.rows_stream,host,device,bytes); else download(d,host,device,bytes);
     };
 #endif
+    // (observations deferred before this one go first, in order)
+    if (!d.deferred.empty()) observe_deferred(d,true);
     std::vector<unsigned> host_counts(groups_count);
     read_back(host_counts.data(),counts,groups_count*4);
     const size_t tail=plan.hybrid ? std::min(steps,hybrid_prompt_tail) : 0;

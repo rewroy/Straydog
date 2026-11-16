@@ -685,6 +685,51 @@ void hybrid_observe_batch(ResidentMoe& plan, const unsigned* counts, size_t toke
     for (size_t expert = 0; expert < plan.experts; ++expert)
         plan.usage[expert] = plan.usage[expert] * keep + (counts[expert] - tail_counts[expert]) * head_weight + recent[expert];
 }
+// (an entry: the counts, then from deferred_tail_offset the last routes, ten a token; deferred_slots entries, 4 MiB page-locked)
+void observe_deferred(Device& d, bool all) {
+    while (!d.deferred.empty()) {
+        const Device::DeferredObservation next = d.deferred.front();
+        const hipEvent_t landed = d.deferred_events[next.slot];
+        if (all) {
+            check(hipEventSynchronize(landed));
+        } else {
+            const hipError_t state = hipEventQuery(landed);
+            if (state == hipErrorNotReady) return;
+            check(state);
+        }
+        const uint8_t* entry = d.deferred_host + next.slot * deferred_entry_bytes;
+        const auto* counts = reinterpret_cast<const unsigned*>(entry);
+        hybrid_observe_batch(*next.plan, counts, next.steps, reinterpret_cast<const int32_t*>(entry + deferred_tail_offset), next.tail);
+        if (d.phase_on) for (size_t expert = 0; expert < next.plan->experts; ++expert) d.phase_routes[0] += counts[expert];
+        d.deferred.pop_front();
+    }
+}
+bool defer_observation(Device& d, ResidentMoe& plan, const unsigned* counts, size_t groups_count, const int32_t* selected, size_t steps) {
+    const size_t tail = std::min(steps, hybrid_prompt_tail);
+    if (!observation_deferrable(groups_count, steps)) return false;
+    if (!d.deferred_host) {
+        void* host = nullptr;
+        check(hipHostMalloc(&host, deferred_slots * deferred_entry_bytes, hipHostMallocDefault));
+        d.deferred_host = static_cast<uint8_t*>(host);
+        d.deferred_events.assign(deferred_slots, nullptr);
+        for (hipEvent_t& event : d.deferred_events) check(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+    }
+    // (every entry waiting: the oldest is observed, its copies waited for, before its entry takes this chunk's)
+    if (d.deferred.size() == deferred_slots) {
+        const Device::DeferredObservation oldest = d.deferred.front();
+        check(hipEventSynchronize(d.deferred_events[oldest.slot]));
+        observe_deferred(d, false);
+    }
+    const size_t slot = d.deferred_next;
+    d.deferred_next = (slot + 1) % deferred_slots;
+    uint8_t* entry = d.deferred_host + slot * deferred_entry_bytes;
+    // (on the device's stream: the next chunk's routing, queued after, writes the same counts and routes)
+    check(hipMemcpyAsync(entry, counts, groups_count * 4, hipMemcpyDeviceToHost, d.stream));
+    if (tail) check(hipMemcpyAsync(entry + deferred_tail_offset, selected + (steps - tail) * 10, tail * 40, hipMemcpyDeviceToHost, d.stream));
+    check(hipEventRecord(d.deferred_events[slot], d.stream));
+    d.deferred.push_back({&plan, steps, tail, slot});
+    return true;
+}
 void hybrid_observe_token(ResidentMoe& plan, const size_t* selected) {
     for (double& value : plan.usage) value *= hybrid_token_decay;
     for (size_t route = 0; route < 10; ++route) plan.usage[selected[route]] += 1;
@@ -823,6 +868,7 @@ void restore_expert_slots(Device& d, size_t cache) {
 // unmapped in stream order, the copy stream loads the new experts after that,
 // and hybrid_settle maps them once loaded. A refresh in flight skips the round.
 void hybrid_rebalance(Device& d, size_t max_swaps, bool wait) {
+    observe_deferred(d, true);
     if (!d.slots.base || !hybrid_settle(d, wait)) return;
     struct Entry { ResidentMoe* plan; size_t expert; double score; };
     const auto order = [](const Entry& a, const Entry& b) {
@@ -1228,6 +1274,8 @@ inline bool hybrid_refresh_due(Device& d) {
 void clear_prefill_bank(Device& d) {
     if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
     check(hipStreamSynchronize(d.stream));
+    // (the pass's last chunks' observations, before anything chooses the slots from them)
+    observe_deferred(d, true);
     if (!d.layer_prefill_plan) return;
     auto& plan = *d.layer_prefill_plan;
     std::vector<std::pair<size_t, const uint8_t*>> absent;
