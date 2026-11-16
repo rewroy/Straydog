@@ -403,7 +403,16 @@ IQ2_XXS with DSpark, 2026-10-28):
 - Predicting the next layer's experts (`DS41_PREDICT`, off) reaches 30% of the misses only by
   uploading 4-5 times the experts actually missed.
 - Computing misses on the CPU did not pay either.
-- So the store is plain LRU, and capacity is the lever: 10% more slots cut misses by 16%.
+- A newly filled expert goes in a tenth of a class's slots from the cold end of the LRU order and
+  is promoted by a later pass's use (`STRAYDOG_EXPERT_PROBATION`, thousandths, 100): on a served
+  trace of UD-IQ1_M (two R9700, `--vram 30`, 3.2 M accesses, 2026-11-15) 13% fewer misses than LRU,
+  a decode pass 36.96 to 35.61 ms; Belady's optimum there is 58.8% fewer.
+- The router's ranking below its choices does not foretell the next pass well enough to keep those
+  experts: of a row's experts ranked 7th-10th, 9.0% are acquired at that layer in the next pass,
+  against 28.8% of those it chose (0.98% of any other). Moving them up the order costs 2.6-13% more
+  misses; moving them to the warm end of the probation alone saves 1.6% (served trace with the
+  scores, 2026-11-16).
+- So capacity is the lever: 10% more slots cut misses by 16%.
 
 ## 6. Generation
 
