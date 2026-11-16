@@ -608,17 +608,30 @@ struct AssistScript {
     trace: Vec<(u32, [u64; 3], f64)>,
 }
 
-/// The rows a layer-order pass takes through every layer at most: the prompt's hidden rows it holds (40 KB a row, F32), and the passes a
-/// prompt takes, each of which reads every layer's banks (a 250K prompt on Windows with 64 GB: 16 passes read some 36 GB of banks from the
-/// drive each). STRAYDOG_LAYER_PREFILL_ROWS changes it, to measure ([`layer_prefill_rows`]).
+/// The fewest rows a layer-order pass takes through every layer at most: the prompt's hidden rows it holds (40 KB a row, F32), and the
+/// passes a prompt takes, each of which reads again every layer's banks that memory does not keep (a 250K prompt on Windows with 64 GB: 16
+/// passes read some 36 GB of banks from the drive each). A host with more memory takes more ([`layer_prefill_rows_for`]);
+/// STRAYDOG_LAYER_PREFILL_ROWS sets it, to measure ([`layer_prefill_rows`]).
 const LAYER_PREFILL_ROWS: usize = 16384;
 const LAYER_PREFILL_MIN: usize = 512;
+/// The part of the host's memory a pass's hidden rows may take: a 32nd, 2 GiB of 64 (49,152 rows). On a 5070 Ti with 64 GB and a 9 GiB
+/// budget, UD-IQ2_XS read 90,000 tokens in 76.1 s at 16,384 rows a pass and 52.4 s at 49,152, the logits the same to the bit.
+const LAYER_PREFILL_MEMORY_SHARE: u64 = 32;
 
-/// The rows a layer-order pass takes: [`LAYER_PREFILL_ROWS`], or STRAYDOG_LAYER_PREFILL_ROWS when the process starts (from
-/// [`LAYER_PREFILL_MIN`] to the context's limit; a value outside them, or not a number, keeps the default).
+/// The rows a layer-order pass takes: [`layer_prefill_rows_for`] this host's memory, or STRAYDOG_LAYER_PREFILL_ROWS when the process
+/// starts (from [`LAYER_PREFILL_MIN`] to the context's limit; a value outside them, or not a number, keeps the default).
 fn layer_prefill_rows() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| layer_prefill_rows_named(std::env::var("STRAYDOG_LAYER_PREFILL_ROWS").ok().as_deref()))
+    *ROWS.get_or_init(|| layer_prefill_rows_named(std::env::var("STRAYDOG_LAYER_PREFILL_ROWS").ok().as_deref(), crate::host::host_memory_bytes()))
+}
+
+/// The rows a pass takes on a host of `memory` bytes: those whose hidden rows fill a [`LAYER_PREFILL_MEMORY_SHARE`]th of it, in whole
+/// [`LAYER_PREFILL_ROWS`], up to the context's limit. Fewer passes read the banks memory does not keep off the drive fewer times; whole
+/// 16,384s keep a pass's batches breaking where they did, so the logits are the same to the bit on any host (at 50,176 rows a 90,000-token
+/// read's were not).
+fn layer_prefill_rows_for(memory: u64) -> usize {
+    let rows = (memory / LAYER_PREFILL_MEMORY_SHARE / (WIDTH as u64 * 4)) as usize / LAYER_PREFILL_ROWS * LAYER_PREFILL_ROWS;
+    rows.clamp(LAYER_PREFILL_ROWS, CONTEXT_LIMIT)
 }
 
 /// Where a layer-order pass loads a layer's banks from.
@@ -704,13 +717,14 @@ fn chunked_scan_from_named(value: Option<&str>) -> usize {
     if value.is_some_and(|value| value.trim() == "token") { usize::MAX } else { CHUNKED_SCAN_READ }
 }
 
-fn layer_prefill_rows_named(value: Option<&str>) -> usize {
+fn layer_prefill_rows_named(value: Option<&str>, memory: u64) -> usize {
+    let default = layer_prefill_rows_for(memory);
     match value.map(|value| value.trim().replace('_', "").parse::<usize>()) {
-        None => LAYER_PREFILL_ROWS,
+        None => default,
         Some(Ok(rows)) if (LAYER_PREFILL_MIN..=CONTEXT_LIMIT).contains(&rows) => rows,
         Some(_) => {
-            eprintln!("WARN STRAYDOG_LAYER_PREFILL_ROWS must be a count from {LAYER_PREFILL_MIN} to {CONTEXT_LIMIT}; {LAYER_PREFILL_ROWS} rows a pass");
-            LAYER_PREFILL_ROWS
+            eprintln!("WARN STRAYDOG_LAYER_PREFILL_ROWS must be a count from {LAYER_PREFILL_MIN} to {CONTEXT_LIMIT}; {default} rows a pass");
+            default
         }
     }
 }
@@ -6943,7 +6957,7 @@ mod same_text_tests {
 }
 #[cfg(test)]
 mod layer_prefill_tests {
-    use super::{layer_prefill_chunks, layer_prefill_rows_named, layer_prefill_split, layer_prefill_stops, LAYER_PREFILL_MIN, LAYER_PREFILL_ROWS as N};
+    use super::{layer_prefill_chunks, layer_prefill_rows_for, layer_prefill_rows_named, layer_prefill_split, layer_prefill_stops, LAYER_PREFILL_MIN, LAYER_PREFILL_ROWS as N};
 
     fn layer_prefill_stops_default(begin: usize, end: usize, checkpoints: &[usize]) -> Vec<usize> {
         layer_prefill_stops(begin, end, checkpoints, N)
@@ -7098,17 +7112,32 @@ mod layer_prefill_tests {
     }
 
     /// Decides: STRAYDOG_LAYER_PREFILL_ROWS sets the rows a pass takes, a count from the least a layer-order segment takes to the
-    /// context's limit; anything else keeps 16,384.
+    /// context's limit; anything else keeps what the host's memory gives.
     #[test]
     fn the_rows_a_pass_takes_are_the_variables_within_bounds() {
-        assert_eq!(layer_prefill_rows_named(None), N);
-        assert_eq!(layer_prefill_rows_named(Some("65536")), 65_536);
-        assert_eq!(layer_prefill_rows_named(Some("131_072")), 131_072);
-        assert_eq!(layer_prefill_rows_named(Some(" 262144 ")), 262_144);
-        assert_eq!(layer_prefill_rows_named(Some(&LAYER_PREFILL_MIN.to_string())), LAYER_PREFILL_MIN);
+        let memory = 16u64 << 30;
+        assert_eq!(layer_prefill_rows_named(None, memory), N);
+        assert_eq!(layer_prefill_rows_named(Some("65536"), memory), 65_536);
+        assert_eq!(layer_prefill_rows_named(Some("131_072"), memory), 131_072);
+        assert_eq!(layer_prefill_rows_named(Some(" 262144 "), memory), 262_144);
+        assert_eq!(layer_prefill_rows_named(Some(&LAYER_PREFILL_MIN.to_string()), memory), LAYER_PREFILL_MIN);
         for refused in ["511", "0", "262145", "many", "", "-1"] {
-            assert_eq!(layer_prefill_rows_named(Some(refused)), N, "{refused}");
+            assert_eq!(layer_prefill_rows_named(Some(refused), memory), N, "{refused}");
+            assert_eq!(layer_prefill_rows_named(Some(refused), 64 << 30), 49_152, "{refused}");
         }
+    }
+
+    /// Decides: without the variable, a pass's hidden rows (40 KB a row) take a 32nd of the host's memory in whole 16,384s, never fewer
+    /// than 16,384 rows nor more than the context's limit: up to 32 GB keeps 16,384, 64 GB takes 49,152, 128 GB 98,304, and 1 TB the limit.
+    #[test]
+    fn a_host_with_more_memory_takes_a_prompt_in_fewer_passes() {
+        assert_eq!(layer_prefill_rows_for(8 << 30), N);
+        assert_eq!(layer_prefill_rows_for(32 << 30), N);
+        assert_eq!(layer_prefill_rows_for(62 << 30), 49_152);
+        assert_eq!(layer_prefill_rows_for(64 << 30), 49_152);
+        assert_eq!(layer_prefill_rows_for(128 << 30), 98_304);
+        assert_eq!(layer_prefill_rows_for(1 << 40), crate::weights::CONTEXT_LIMIT);
+        assert_eq!(layer_prefill_rows_named(None, 64 << 30), 49_152);
     }
 
     /// Decides: a pass of more rows takes a long prompt in fewer passes, each still stopping at a checkpoint: 249,925 tokens in 16 at 16,384,
