@@ -152,12 +152,21 @@ impl Prefetch {
         let bytes = plans.iter().flatten().map(|plan| plan.bytes).max()?;
         let available = crate::host::prefetch_available_bytes();
         let mut free = Vec::new();
-        while free.len() < READS_AHEAD && (free.len() as u64 + 1) * bytes as u64 + (1 << 30) <= available {
+        // (development: STRAYDOG_LAYER_BANK_BUFFERS=N reads ahead into N buffers at most, to see a pass the memory left one or two)
+        let most = std::env::var("STRAYDOG_LAYER_BANK_BUFFERS").ok().and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(READS_AHEAD, |most| most.clamp(1, READS_AHEAD));
+        while free.len() < most && (free.len() as u64 + 1) * bytes as u64 + (1 << 30) <= available {
             match Buffer::try_new(bytes) { Some(buffer) => free.push(buffer), None => break }
         }
         if free.is_empty() { return None; }
         let buffers = free.len();
         Some(Self { plans, reader: Reader::shared(), free, pending: std::collections::VecDeque::new(), next: 0, registered, buffers, direct })
+    }
+
+    /// Where the reads stand when `layer` found none of its own (for the request's metrics): the layer, the read at the front, the next layer
+    /// to read, and the buffers free.
+    pub(crate) fn missed(&self, layer: usize) -> String {
+        format!("layer {layer}: reading {:?}, next {}, {} free", self.pending.iter().map(|(at, _)| *at).collect::<Vec<_>>(), self.next, self.free.len())
     }
 
     /// The buffers the pass reads ahead into (at most [`READS_AHEAD`], as the memory available allowed), and whether it reads around the page
