@@ -1171,6 +1171,14 @@ int sd_prefill_bank_commit(void* handle, uint64_t layer) {
     try { commit_prefill_bank(device(handle), size_t(layer)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_prefill_bank_times(void* handle, uint64_t* out) {
+    try {
+        if (!out) throw std::runtime_error("missing bank load times");
+        auto& d = device(handle);
+        out[0] = d.bank_loads; out[1] = d.bank_load_ns; out[2] = d.bank_staging_wait_ns; out[3] = d.bank_gather_ns;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_prefill_bank_ahead_ready(void* handle) {
     try { auto& d = device(handle); return !d.bank_loader || !d.bank_loader->busy() ? 1 : 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
