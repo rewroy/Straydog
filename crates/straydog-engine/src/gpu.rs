@@ -1682,6 +1682,14 @@ impl Backend {
         check(unsafe { ffi::sd_prefill_bank_commit(self.handle, layer as u64) }).map(drop)
     }
 
+    /// The layer-order bank loads since the device began: loads, then in ns their time, their waits for the staging's copies, their gathers.
+    pub fn bank_load_times(&self) -> Result<[u64; 4]> {
+        let mut out = [0u64; 4];
+        // SAFETY: a live device, four values written.
+        check(unsafe { ffi::sd_prefill_bank_times(self.handle, out.as_mut_ptr()) })?;
+        Ok(out)
+    }
+
     /// Whether no bank loaded ahead is still being gathered on its thread: its copy may then go back to the reader.
     pub fn layer_bank_ahead_ready(&self) -> Result<bool> {
         // SAFETY: a live device.
