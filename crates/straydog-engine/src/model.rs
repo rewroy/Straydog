@@ -1370,6 +1370,8 @@ pub struct Model {
     slots_refill_ahead: bool,
     /// The registrations a layer-order pass's bank loads read from, held until their copies are known to have landed ([`Model::load_prefill_bank_copy`]).
     bank_held: Vec<crate::banks::RegisteredRead>,
+    /// The copy a bank loaded ahead is gathered from on the device's thread, kept until the layer's turn ([`Model::commit_prefill_bank`]).
+    bank_copy_ahead: Option<crate::layer_bank::Copy>,
     /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
     mtp_kept: u64,
     /// A draft's vocabulary (DRAFT_ROWS) in use; the tokens past DRAFT_ROWS it holds, and those noted but not yet on the device.
@@ -1648,6 +1650,7 @@ impl Model {
             deferred: false,
             slots_refill_ahead: false,
             bank_held: Vec::new(),
+            bank_copy_ahead: None,
             mtp_kept: 0,
             draft_vocabulary: false,
             draft_extras: HashSet::new(),
@@ -4499,8 +4502,10 @@ impl Model {
         let trace_restore = crate::layer_trace::Span::new("restore", None, position, tokens.len(), 0);
         // Always attempt every restoration step. The head must be back before the cache takes the remaining VRAM.
         let bank = self.group.finish_layer_prefill();
-        // (the bank's clearing waited for every copy: the registrations the last loads read from go)
+        // (the bank's clearing waited for every copy: the registrations the last loads read from go, and a copy loaded ahead and never
+        // pointed at)
         self.bank_held.clear();
+        self.bank_copy_ahead = None;
         let head = self.with_operands(Model::head_operands, Group::pin);
         let cache = self.end_long_prefill();
         self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
@@ -4595,7 +4600,7 @@ impl Model {
                         let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, layer)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
                         let trace_bank = crate::layer_trace::Span::new("bank", Some(layer), begin, stop, bank_bytes);
                         if bank_ahead {
-                            self.group.commit_layer_bank(layer)?;
+                            self.commit_prefill_bank(layer, &mut bank_reader)?;
                         } else {
                             self.load_prefill_bank_copy(layer, layers, &mut bank_reader, false)?;
                         }
@@ -4661,7 +4666,7 @@ impl Model {
                     let bank_bytes = if cfg!(feature = "prefill-observer") { Self::host_banks(&self.weights, 48)?.iter().map(|b| b.len() as u64).sum() } else { 0 };
                     let trace_bank = crate::layer_trace::Span::new("bank", Some(48), begin, stop, bank_bytes);
                     if bank_ahead {
-                        self.group.commit_layer_bank(48)?;
+                        self.commit_prefill_bank(48, &mut bank_reader)?;
                     } else {
                         self.load_prefill_bank_copy(48, layers, &mut bank_reader, false)?;
                     }
@@ -4746,8 +4751,23 @@ impl Model {
         if let Some(reader) = reader {
             // The GPU now owns the entire bank: the same host buffer can receive the
             // next layer while this layer computes, without keeping two host copies.
-            reader.recycle(copy);
+            // (loaded ahead, the copy is gathered on a thread of its own: its buffer is kept until the layer's turn, whose commit waits for it)
+            if ahead && copy.is_some() {
+                self.bank_copy_ahead = copy;
+            } else {
+                reader.recycle(copy);
+            }
             if layer + 1 < layers { reader.start(layer + 1); }
+        }
+        Ok(())
+    }
+
+    /// `layer`'s turn in a pass that loads its banks ahead: the bank loaded for it is pointed at, and the copy it was gathered from goes back to the
+    /// reader.
+    fn commit_prefill_bank(&mut self, layer: usize, reader: &mut Option<crate::layer_bank::Prefetch>) -> Result<()> {
+        self.group.commit_layer_bank(layer)?;
+        if let (Some(reader), Some(copy)) = (reader.as_mut(), self.bank_copy_ahead.take()) {
+            reader.recycle(Some(copy));
         }
         Ok(())
     }

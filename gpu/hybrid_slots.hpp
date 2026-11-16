@@ -1272,6 +1272,8 @@ inline bool hybrid_refresh_due(Device& d) {
 
 // A whole prompt segment uses one layer at a time. Its table may point into a borrowed bank pool only until it is cleared.
 void clear_prefill_bank(Device& d) {
+    // (a bank loading ahead on its thread: its copies issued, or its failure, which a commit would have said, left behind)
+    if (d.bank_loader) { try { d.bank_loader->wait(); } catch (...) {} }
     if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
     check(hipStreamSynchronize(d.stream));
     d.layer_bank_loading = false;
@@ -1337,6 +1339,7 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
         throw std::runtime_error("invalid layer prefill bank storage");
     auto& plan = *d.resident.at(decoder->second.moe);
     const size_t entry = expert_slot_bytes(plan), required = plan.experts * entry;
+    if (d.bank_loader) d.bank_loader->wait();   // (a bank loaded ahead on its thread: its copies are issued)
     // (the load before's copies have landed before this one fills the staging again, and before its caller lets that layer's registration go:
     // issued a layer's compute ago, they are done by now, where waiting for them at their own load's end kept the host from queueing the
     // layer's compute behind them)
@@ -1366,6 +1369,18 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
                 throw std::runtime_error("invalid copied layer bank source");
     }
     if (d.copier) d.copier->wait();
+    // (the copies: the hint, the gather of a copied layer and its copies, behind the half's last compute on the copy stream, then the event
+    // after them. Loaded ahead, they run on a thread of their own (bank_loader) while this thread queues the layer's compute: a copied layer's
+    // gather, 41-73 ms on an RTX 5070 Ti PC, left the GPU without queued work in the middle of a 90,000-token prompt's layers, 1.2 s. The next
+    // load, the commit and the clearing wait for them)
+    const uint8_t* const copied[3] = {sources ? sources[0] : nullptr, sources ? sources[1] : nullptr, sources ? sources[2] : nullptr};
+    const bool from_copies = sources != nullptr;
+    auto* bank = static_cast<uint8_t*>(storage) + (halves ? size_t(use) * half : 0);
+    const bool after_free = halves && d.layer_bank_used[use];
+    auto copies = [&d, &plan, layer, required, entry, bank, use, after_free, from_copies, c0 = copied[0], c1 = copied[1], c2 = copied[2]]() {
+    const uint8_t* const own[3] = {c0, c1, c2};
+    const uint8_t* const* sources = from_copies ? own : nullptr;
+    (void)layer; (void)required; (void)use;
     std::vector<size_t> experts(plan.experts);
     for (size_t i = 0; i < experts.size(); ++i) experts[i] = i;
 #if defined(STRAYDOG_PREFILL_OBSERVER)
@@ -1376,8 +1391,7 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     trace.hint_ns += layer_trace_tick() - hint_started;
 #endif
-    auto* bank = static_cast<uint8_t*>(storage) + (halves ? size_t(use) * half : 0);
-    if (halves && d.layer_bank_used[use]) check(hipStreamWaitEvent(d.copy_stream, d.layer_bank_free[use], 0));
+    if (after_free) check(hipStreamWaitEvent(d.copy_stream, d.layer_bank_free[use], 0));
     if (!sources && plan.mapped[0]) {
         size_t offset = 0;
 #if defined(STRAYDOG_PREFILL_OBSERVER)
@@ -1439,6 +1453,20 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
     check(hipStreamSynchronize(d.copy_stream));
     trace.emit();
 #endif
+    };
+#if !defined(STRAYDOG_PREFILL_OBSERVER)
+    if (ahead) {
+        if (!d.bank_loader) d.bank_loader = std::make_unique<Background>(d.ordinal);
+        d.bank_loader->run(copies);
+        d.layer_bank_ahead_plan = &plan;
+        d.layer_bank_ahead_layer = layer;
+        d.layer_bank_ahead_half = use;
+        d.layer_bank_ahead_bank = bank;
+        d.layer_bank_ahead_storage = storage;
+        return;
+    }
+#endif
+    copies();
     if (ahead) {
         d.layer_bank_ahead_plan = &plan;
         d.layer_bank_ahead_layer = layer;
@@ -1452,6 +1480,7 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 // `layer`'s turn: a bank loaded ahead for it takes over from the layer before, whose bank is given up behind its compute, and the table points
 // at it behind its copies. A bank loaded at its turn has been pointed at already.
 void commit_prefill_bank(Device& d, size_t layer) {
+    if (d.bank_loader) d.bank_loader->wait();
     if (!d.layer_bank_ahead_plan) {
         const auto decoder = d.decoder.find(layer);
         if (decoder == d.decoder.end() || d.layer_prefill_plan != d.resident.at(decoder->second.moe).get())
