@@ -921,6 +921,7 @@ struct Device {
     size_t head_graph_extras=SIZE_MAX;   // the extra rows of the draft's head whose graph is cached (output_head_forget)
     hipEvent_t swapped=nullptr;   // the pending swaps' copies have landed
     std::unique_ptr<Background> copier;   // issues bounded swaps' copies (hybrid_rebalance)
+    std::unique_ptr<Background> bank_loader;   // gathers and copies a layer-order pass's bank loaded ahead (load_prefill_bank)
     std::shared_ptr<struct Transfers> transfers;   // asynchronous uploads (transfer.hpp), from the first use
 #if defined(__linux__)
     std::unique_ptr<ReadAhead> read_ahead;   // started by the first expert read-ahead hint
@@ -952,6 +953,7 @@ struct Device {
         if (staging_prefetch.joinable()) staging_prefetch.join();
         for (auto& pair : staging_ready) for (float* ready : pair) if (ready) cleanup(hipHostFree(ready));
         copier.reset();
+        bank_loader.reset();
         transfers.reset();   // waits for its copies before the allocations go
         rows_overlap.reset();
         if (stream) cleanup(hipStreamSynchronize(stream));
