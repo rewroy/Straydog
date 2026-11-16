@@ -164,3 +164,42 @@ fn layer_order_preserves_logits_checkpoints_and_cancelled_prefixes() {
         assert!(exact, "inspect all reported logit and state differences before accepting");
     }
 }
+
+/// A layer-order pass whose layer's banks fail to load mid-pass (as Windows' working-set quota refused a read of them, with the layers before it
+/// queued and the rows moving beside the compute) ends the request with that error and leaves the model whole: no restore failure, the reset the
+/// worker runs after a failed request succeeds, and the same prompt read again gives the logits, token and state of a model that never failed,
+/// bit for bit. Early in the pass and late in it.
+#[test]
+fn a_failed_bank_load_in_a_layer_order_pass_leaves_the_model_whole() {
+    let (Some(root), Some(drafter)) = (common::model_env("STRAYDOG_LAYER_MODEL", "the Qwen model bundle directory"),
+                                     common::model_env("STRAYDOG_DRAFTER", "the MTP bundle directory")) else { return };
+    let line = "A printed source lets readers compare the same words, check the evidence, and correct errors in the next edition. ";
+    let open_moving = || {
+        let (mut model, text) = open(Path::new(&root), Path::new(&drafter), true);
+        model.layer_rows_in_vram(false);
+        model.layer_rows_overlapped(true);
+        (model, text)
+    };
+    let (mut clean, text) = open_moving();
+    let mut plain = text.encode(&line.repeat(140)).unwrap();
+    plain.truncate(1025);
+    let expected = observed(&mut clean, &plain, false);
+    assert_eq!(clean.last_metrics["prefill_order"], "layer", "the candidate fell back");
+    assert!(clean.last_metrics.get("prefill_rows_overlap").is_some(), "{:?}", clean.last_metrics.get("prefill_rows_overlap_reason"));
+    drop(clean);
+    for loads in [2u64, 30] {
+        let (mut model, _) = open_moving();
+        straydog_engine::model::fail_layer_bank_after(loads);
+        let failed = model.generate(&plain, 1, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, false, &mut |_| {});
+        straydog_engine::model::fail_layer_bank_after(u64::MAX);
+        let error = failed.expect_err("the pass went on past a failed bank load");
+        eprintln!("{}", serde_json::json!({"case":"failed bank load","after_loads":loads,"error":error,
+            "order":model.last_metrics.get("prefill_order"),"overlap":model.last_metrics.get("prefill_rows_overlap")}));
+        assert!(error.contains("an injected failure"), "{error}");
+        assert!(!error.contains("restoring layer prefill failed"), "{error}");
+        // (as the worker does after a failed request, before it takes another)
+        model.reset().expect("the reset after the failed request");
+        let again = observed(&mut model, &plain, false);
+        assert!(compare(&format!("read again after a failed bank load ({loads} loads in) against a model that never failed"), &expected, &again));
+    }
+}
