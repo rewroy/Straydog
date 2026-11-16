@@ -1317,7 +1317,9 @@ bool prefill_bank_halves(Device& d, size_t layer, size_t bytes) {
 }
 // Points the device's table at a loaded bank, behind its copies on the device's stream.
 static void point_prefill_bank(Device& d, ResidentMoe& plan, void* storage, uint8_t* bank, int use, bool halves) {
+#if !defined(__HIPCC__)
     check(hipStreamWaitEvent(d.stream, d.layer_bank_loaded, 0));
+#endif
     const size_t entry = expert_slot_bytes(plan);
     std::vector<std::pair<size_t, const uint8_t*>> loaded;
     for (size_t expert = 0; expert < plan.experts; ++expert) loaded.emplace_back(expert, bank + expert * entry);
@@ -1446,13 +1448,18 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
     }
     // (the device's stream waits for the copies, not the host: the caller queues the layer's compute behind them at once; the next load, or
     // clearing the bank, waits for them on the host. The trace's copy times are read at its end, so it waits for them there)
+#if defined(__HIPCC__)
+    // (HIP waits for the copies here, as before, with no event between the streams: left to the device's stream, and loaded ahead, a 95K prompt
+    // on an R9700 with 20 of 48 layers locked took 45.5 s where it took 43.1-43.2, the 32K ones the same; waited for here behind an event the
+    // device's stream also waited for, 45.2 s against 43.0-43.2)
+    check(hipStreamSynchronize(d.copy_stream));
+#else
     if (!d.layer_bank_loaded) check(hipEventCreateWithFlags(&d.layer_bank_loaded, hipEventDisableTiming));
     check(hipEventRecord(d.layer_bank_loaded, d.copy_stream));
     d.layer_bank_loading = true;
-#if defined(STRAYDOG_PREFILL_OBSERVER) || defined(__HIPCC__)
-    // (HIP waits for the copies here, as before: left to the device's stream, and loaded ahead, a 95K prompt on an R9700 with 20 of 48 layers
-    // locked took 45.5 s where it took 43.1-43.2, the 32K ones the same)
+#if defined(STRAYDOG_PREFILL_OBSERVER)
     check(hipStreamSynchronize(d.copy_stream));
+#endif
 #endif
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     trace.emit();
