@@ -704,6 +704,13 @@ struct Device {
     // before it reuses the staging and its caller lets that layer's registration go, a layer's compute later, not the load itself.
     hipEvent_t layer_bank_loaded = nullptr;
     bool layer_bank_loading = false;
+    // A bank copied ahead, into the half the computing layer does not use, while that layer computes: the layer, its plan, half and bank,
+    // until the layer's turn points the table at it (commit_prefill_bank). One at a time.
+    ResidentMoe* layer_bank_ahead_plan = nullptr;
+    size_t layer_bank_ahead_layer = 0;
+    int layer_bank_ahead_half = -1;
+    uint8_t* layer_bank_ahead_bank = nullptr;
+    void* layer_bank_ahead_storage = nullptr;
     // A layer-order pass's chunks' expert counts and last routes, copied to the host behind each chunk's routing on the device's stream and
     // observed for the slots in order once they have landed (observe_deferred), so that the host does not wait for each chunk's routing:
     // a ring of page-locked entries, each with its event, and the entries not yet observed, oldest first.

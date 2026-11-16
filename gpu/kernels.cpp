@@ -1155,17 +1155,25 @@ int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
-int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes) {
-    try { load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes)); return 0; }
+int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes, int ahead) {
+    try { load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes), nullptr, nullptr, ahead != 0); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
-                         const uint8_t* const* sources, const uint64_t* source_bytes) {
+                         const uint8_t* const* sources, const uint64_t* source_bytes, int ahead) {
     try {
         if (!sources || !source_bytes) throw std::runtime_error("missing copied layer bank sources");
-        load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes), sources, source_bytes);
+        load_prefill_bank(device(handle), size_t(layer), storage, size_t(bytes), sources, source_bytes, ahead != 0);
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_bank_commit(void* handle, uint64_t layer) {
+    try { commit_prefill_bank(device(handle), size_t(layer)); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+int sd_prefill_bank_halves(void* handle, uint64_t layer, uint64_t bytes) {
+    try { return prefill_bank_halves(device(handle), size_t(layer), size_t(bytes)) ? 1 : 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
 int sd_prefill_bank_clear(void* handle) {
     try { clear_prefill_bank(device(handle)); return 0; }

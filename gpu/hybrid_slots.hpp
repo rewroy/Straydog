@@ -1275,6 +1275,8 @@ void clear_prefill_bank(Device& d) {
     if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
     check(hipStreamSynchronize(d.stream));
     d.layer_bank_loading = false;
+    d.layer_bank_ahead_plan = nullptr;   // (a bank copied ahead and never pointed at: its copies are done, and no table points at it)
+    d.layer_bank_ahead_half = -1;
     // (the pass's last chunks' observations, before anything chooses the slots from them)
     observe_deferred(d, true);
     if (!d.layer_prefill_plan) return;
@@ -1304,8 +1306,31 @@ void release_prefill_bank_behind(Device& d) {
     plan.layer_prefill = false;
     d.layer_prefill_plan = nullptr;
 }
+// Whether a pool of `bytes` holds two of `layer`'s banks, so that one loads while the other's layer computes.
+bool prefill_bank_halves(Device& d, size_t layer, size_t bytes) {
+    const auto decoder = d.decoder.find(layer);
+    if (decoder == d.decoder.end()) throw std::runtime_error("invalid layer prefill bank layer");
+    const auto& plan = *d.resident.at(decoder->second.moe);
+    return plan.experts * expert_slot_bytes(plan) <= ((bytes / 2) & ~size_t(255));
+}
+// Points the device's table at a loaded bank, behind its copies on the device's stream.
+static void point_prefill_bank(Device& d, ResidentMoe& plan, void* storage, uint8_t* bank, int use, bool halves) {
+    check(hipStreamWaitEvent(d.stream, d.layer_bank_loaded, 0));
+    const size_t entry = expert_slot_bytes(plan);
+    std::vector<std::pair<size_t, const uint8_t*>> loaded;
+    for (size_t expert = 0; expert < plan.experts; ++expert) loaded.emplace_back(expert, bank + expert * entry);
+    d.layer_prefill_plan = &plan;
+    d.layer_prefill_storage = storage;
+    hybrid_point_list(d, plan, loaded);
+    if (halves) d.layer_bank_half = use;
+    else check(hipStreamSynchronize(d.stream));
+    plan.layer_prefill = true;
+    d.streamed_experts += plan.experts;
+}
+// `ahead`: the bank goes into the half the computing layer does not use (two halves only), while that layer's compute is still being
+// queued, and the layer's turn points the table at it (commit_prefill_bank): the copies have the rest of that layer's compute to land in.
 void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
-                       const uint8_t* const* sources = nullptr, const uint64_t* source_bytes = nullptr) {
+                       const uint8_t* const* sources = nullptr, const uint64_t* source_bytes = nullptr, bool ahead = false) {
     const auto decoder = d.decoder.find(layer);
     const auto allocation = d.allocations.find(storage);
     if (decoder == d.decoder.end() || allocation == d.allocations.end() || bytes > allocation->second || d.qwen_parts != 1)
@@ -1324,9 +1349,11 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
     // to the device's stream, behind it. One bank: the host waits for the layer before's compute first, as before.
     const size_t half = (bytes / 2) & ~size_t(255);
     const bool halves = required <= half;
+    if (ahead && (!halves || d.layer_bank_ahead_plan))
+        throw std::runtime_error("a layer prefill bank loaded ahead needs a pool of two banks, and one at a time");
     int use = 0;
     if (halves) {
-        release_prefill_bank_behind(d);
+        if (!ahead) release_prefill_bank_behind(d);
         use = d.layer_bank_half < 0 ? 0 : 1 - d.layer_bank_half;
     } else {
         clear_prefill_bank(d);
@@ -1408,21 +1435,33 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
     if (!d.layer_bank_loaded) check(hipEventCreateWithFlags(&d.layer_bank_loaded, hipEventDisableTiming));
     check(hipEventRecord(d.layer_bank_loaded, d.copy_stream));
     d.layer_bank_loading = true;
-    check(hipStreamWaitEvent(d.stream, d.layer_bank_loaded, 0));
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     check(hipStreamSynchronize(d.copy_stream));
-#endif
-    std::vector<std::pair<size_t, const uint8_t*>> loaded;
-    for (size_t expert = 0; expert < plan.experts; ++expert) loaded.emplace_back(expert, bank + expert * entry);
-    d.layer_prefill_plan = &plan;
-    d.layer_prefill_storage = storage;
-    // (behind the copies on the device's stream, which waits for them above)
-    hybrid_point_list(d, plan, loaded);
-    if (halves) d.layer_bank_half = use;
-    else check(hipStreamSynchronize(d.stream));
-    plan.layer_prefill = true;
-    d.streamed_experts += plan.experts;
-#if defined(STRAYDOG_PREFILL_OBSERVER)
     trace.emit();
 #endif
+    if (ahead) {
+        d.layer_bank_ahead_plan = &plan;
+        d.layer_bank_ahead_layer = layer;
+        d.layer_bank_ahead_half = use;
+        d.layer_bank_ahead_bank = bank;
+        d.layer_bank_ahead_storage = storage;
+        return;
+    }
+    point_prefill_bank(d, plan, storage, bank, use, halves);
+}
+// `layer`'s turn: a bank loaded ahead for it takes over from the layer before, whose bank is given up behind its compute, and the table points
+// at it behind its copies. A bank loaded at its turn has been pointed at already.
+void commit_prefill_bank(Device& d, size_t layer) {
+    if (!d.layer_bank_ahead_plan) {
+        const auto decoder = d.decoder.find(layer);
+        if (decoder == d.decoder.end() || d.layer_prefill_plan != d.resident.at(decoder->second.moe).get())
+            throw std::runtime_error("no layer prefill bank loaded for this layer");
+        return;
+    }
+    if (d.layer_bank_ahead_layer != layer) throw std::runtime_error("the layer prefill bank loaded ahead is another layer's");
+    ResidentMoe& plan = *d.layer_bank_ahead_plan;
+    release_prefill_bank_behind(d);
+    d.layer_bank_ahead_plan = nullptr;
+    point_prefill_bank(d, plan, d.layer_bank_ahead_storage, d.layer_bank_ahead_bank, d.layer_bank_ahead_half, true);
+    d.layer_bank_ahead_half = -1;
 }
