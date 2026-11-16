@@ -171,7 +171,25 @@ fn reads_direct(reads: BankReads, unregistered: u64, available: u64) -> bool {
 /// One read ahead left the drive idle while the GPU computed a layer it held registered, and a layer's read began only once the layer
 /// before it had gone up: an RTX 5070 Ti PC (64 GB, UD-IQ2_XS at 9 GiB, 19 of 48 layers registered) read a 32K prompt's 24.4 GB at 1.16 GB/s
 /// on average in its 20.5 s, its drive (7 GB/s class) and CPU far from their limits, the GPU waiting for the next layer for 44% of a pass.
-const READS_AHEAD: usize = 4;
+/// (Three: with the copies page-locked and loaded with no gather, a layer's load is shorter than its read, and a fourth buffer only held
+/// memory.)
+const READS_AHEAD: usize = 3;
+
+/// Page-locks the buffers a layer-order pass takes, on a thread of its own from the model's start, into the model's `pool`: the first long
+/// prompt paid their locking otherwise (an RTX 5070 Ti PC's first 8K request after a short warm-up took 11.28 s, the next 9.95). As many
+/// as a pass takes, each of the largest layer's copy, while the memory available keeps 1 GiB beside them; none without the files' trees.
+pub(crate) fn prepare(weights: &Weights, layers: usize, pool: BankBuffers, ordinal: usize) {
+    let Some(bytes) = (0..layers).filter_map(|layer| Plan::new(weights, layer, false)).map(|plan| plan.bytes).max() else { return };
+    let _ = std::thread::Builder::new().name("straydog-bank-buffers".into()).spawn(move || {
+        let available = crate::host::prefetch_available_bytes();
+        for made in 0..READS_AHEAD as u64 {
+            if (made + 1) * bytes as u64 + (1 << 30) > available { break; }
+            let Ok(pointer) = crate::gpu::host_alloc(ordinal, bytes as u64) else { break };
+            if pointer.is_null() { break; }
+            pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(BankBuffer::Pinned { pointer, len: bytes, ordinal });
+        }
+    });
+}
 
 pub(crate) struct Prefetch {
     plans: Vec<Option<Plan>>,

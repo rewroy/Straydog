@@ -1825,6 +1825,11 @@ impl Model {
         if model.wide_batch_size > model.prefill_batch_size {
             model.group.prefetch_row_staging(model.wide_batch_size as u64)?;
         }
+        // (a partially resident model on one GPU may read a long prompt in layer order: its copies' buffers are page-locked from here)
+        if model.partial && model.group.ordinals().len() == 1 {
+            let layers = 48 + usize::from(model.speculative > 0);
+            crate::layer_bank::prepare(&model.weights, layers, model.bank_buffers.clone(), model.group.ordinals()[0]);
+        }
         Ok(model)
     }
 
