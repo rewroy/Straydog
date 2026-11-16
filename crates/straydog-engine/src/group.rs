@@ -927,6 +927,7 @@ impl Group {
     pub fn commit_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].commit_layer_bank(layer) }
     pub fn layer_bank_halves(&self, layer: usize) -> Result<bool> { self.backends[0].layer_bank_halves(layer) }
     pub fn layer_bank_ahead_ready(&self) -> Result<bool> { self.backends[0].layer_bank_ahead_ready() }
+    pub fn layer_bank_half_free(&self) -> Result<bool> { self.backends[0].layer_bank_half_free() }
     pub fn bank_load_times(&self) -> Result<[u64; 4]> { self.backends[0].bank_load_times() }
     pub fn clear_layer_bank(&mut self) -> Result<()> { self.backends[0].clear_layer_bank() }
     pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }

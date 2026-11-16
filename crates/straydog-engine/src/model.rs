@@ -4625,6 +4625,7 @@ impl Model {
                         }
                         drop(trace_bank);
                         let _trace_compute = crate::layer_trace::Span::new("compute", Some(layer), begin, stop, 0);
+                        let mut loaded_ahead = false;
                         for (chunk, &(first, end)) in chunks.iter().enumerate() {
                             let low = (first - begin) * WIDTH;
                             let high = (end - begin) * WIDTH;
@@ -4665,8 +4666,14 @@ impl Model {
                                     }
                                 }
                             }
-                            if bank_ahead && chunk == LAYER_BANK_AHEAD_AFTER.min(chunks.len() - 1) && layer + 1 < layers {
+                            // (from the layer's fourth chunk on, once the half the next bank takes is free, the layer before it having computed,
+                            // and after its last chunk at the latest: loaded while that layer still computed, its copies waited for it, and its
+                            // gather, through a staging of two parts, for them, 540 ms of each copied layer of a 90,000-token prompt on an RTX
+                            // 5070 Ti PC, its copy kept from the reader until the layer's turn)
+                            if bank_ahead && !loaded_ahead && layer + 1 < layers && chunk >= LAYER_BANK_AHEAD_AFTER.min(chunks.len() - 1)
+                                && (chunk + 1 == chunks.len() || self.group.layer_bank_half_free()?) {
                                 self.load_prefill_bank_copy(layer + 1, layers, &mut bank_reader, true)?;
+                                loaded_ahead = true;
                             }
                             // (the copy the bank loaded ahead was gathered from goes back to the reader once its gather is done, and the reads
                             // go on into it: with one buffer, which a 95K prompt served after an 8K and a 32K one got from the memory left in
