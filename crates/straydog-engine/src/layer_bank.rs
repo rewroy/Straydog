@@ -128,6 +128,8 @@ const READS_AHEAD: usize = 4;
 pub(crate) struct Prefetch {
     plans: Vec<Option<Plan>>,
     reader: Arc<Reader>,
+    buffers: usize,
+    direct: bool,
     /// Buffers no read holds, each of [`Plan::bytes`] of the largest layer.
     free: Vec<Buffer>,
     /// The reads under way, in layer order.
@@ -154,7 +156,14 @@ impl Prefetch {
             match Buffer::try_new(bytes) { Some(buffer) => free.push(buffer), None => break }
         }
         if free.is_empty() { return None; }
-        Some(Self { plans, reader: Reader::shared(), free, pending: std::collections::VecDeque::new(), next: 0, registered })
+        let buffers = free.len();
+        Some(Self { plans, reader: Reader::shared(), free, pending: std::collections::VecDeque::new(), next: 0, registered, buffers, direct })
+    }
+
+    /// The buffers the pass reads ahead into (at most [`READS_AHEAD`], as the memory available allowed), and whether it reads around the page
+    /// cache: for the request's metrics.
+    pub(crate) fn shape(&self) -> (usize, bool) {
+        (self.buffers, self.direct)
     }
 
     /// Reads ahead from `layer` on, as far as the free buffers go: every layer not registered in place now and with a plan, in order
