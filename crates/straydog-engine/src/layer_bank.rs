@@ -31,7 +31,13 @@ impl Plan {
         let roles = ["gate", "up", "down"].map(|role| -> Option<Role> {
             let tensor = weights.tensor(&format!("blk.{layer}.ffn_{role}_exps.weight")).ok()?;
             let verifier = weights.verifier_of(tensor.file)?.clone();
-            let file = storage::reader(files.get(tensor.file)?.1).ok()?;
+            // (STRAYDOG_LAYER_BANK_DIRECT=1: around the page cache, as the experts' own reads are, with their fallback through it where the
+            // working-set quota refuses a direct read; else through it)
+            let opened = files.get(tensor.file)?.1;
+            let file = match bank_reads_direct().then(|| storage::direct(opened)).flatten() {
+                Some(direct) => direct,
+                None => storage::reader(opened).ok()?,
+            };
             let prefix = (tensor.offset % ALIGN as u64) as usize;
             let bytes = usize::try_from(tensor.bytes).ok()?;
             let length = prefix.checked_add(bytes)?.checked_add(ALIGN - 1)? / ALIGN * ALIGN;
@@ -80,6 +86,15 @@ impl Copy {
             &self.buffer.as_slice()[first..first + role.bytes]
         })
     }
+}
+
+/// Whether a layer-order pass reads its banks around the page cache (STRAYDOG_LAYER_BANK_DIRECT=1). Through it, as by default, a host
+/// whose memory keeps the banks the pinned copies leave reads them from memory on the next pass; where it does not keep them (an RTX 5070 Ti
+/// PC with 64 GB, UD-IQ2_XS at 9 GiB: 33 GB off the drive for a 32K read at some 3.4 GB/s), each pass reads the drive again, which direct
+/// reads with deep queues may read faster.
+fn bank_reads_direct() -> bool {
+    static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIRECT.get_or_init(|| std::env::var("STRAYDOG_LAYER_BANK_DIRECT").is_ok_and(|value| value.trim() == "1"))
 }
 
 pub(crate) struct Prefetch {
