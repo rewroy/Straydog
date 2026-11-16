@@ -1274,6 +1274,7 @@ inline bool hybrid_refresh_due(Device& d) {
 void clear_prefill_bank(Device& d) {
     if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
     check(hipStreamSynchronize(d.stream));
+    d.layer_bank_loading = false;
     // (the pass's last chunks' observations, before anything chooses the slots from them)
     observe_deferred(d, true);
     if (!d.layer_prefill_plan) return;
@@ -1311,7 +1312,14 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
         throw std::runtime_error("invalid layer prefill bank storage");
     auto& plan = *d.resident.at(decoder->second.moe);
     const size_t entry = expert_slot_bytes(plan), required = plan.experts * entry;
-    // A pool of two banks' bytes (gpu.rs's begin_layer_prefill, where they leave the rows as many): this layer's copies go into the half the
+    // (the load before's copies have landed before this one fills the staging again, and before its caller lets that layer's registration go:
+    // issued a layer's compute ago, they are done by now, where waiting for them at their own load's end kept the host from queueing the
+    // layer's compute behind them)
+    if (d.layer_bank_loading) {
+        check(hipEventSynchronize(d.layer_bank_loaded));
+        d.layer_bank_loading = false;
+    }
+    // A pool of two banks' (gpu.rs's begin_layer_prefill, where they leave the rows as many): this layer's copies go into the half the
     // layer before did not use, once the compute of the layer before that has ended, while the layer before computes; the table entries go
     // to the device's stream, behind it. One bank: the host waits for the layer before's compute first, as before.
     const size_t half = (bytes / 2) & ~size_t(255);
@@ -1391,18 +1399,24 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
         }
 #if defined(STRAYDOG_PREFILL_OBSERVER)
         const uint64_t drain_started = layer_trace_tick();
-#endif
         check(hipStreamSynchronize(d.copy_stream));
-#if defined(STRAYDOG_PREFILL_OBSERVER)
         trace.wait_ns += layer_trace_tick() - drain_started;
 #endif
     }
+    // (the device's stream waits for the copies, not the host: the caller queues the layer's compute behind them at once; the next load, or
+    // clearing the bank, waits for them on the host. The trace's copy times are read at its end, so it waits for them there)
+    if (!d.layer_bank_loaded) check(hipEventCreateWithFlags(&d.layer_bank_loaded, hipEventDisableTiming));
+    check(hipEventRecord(d.layer_bank_loaded, d.copy_stream));
+    d.layer_bank_loading = true;
+    check(hipStreamWaitEvent(d.stream, d.layer_bank_loaded, 0));
+#if defined(STRAYDOG_PREFILL_OBSERVER)
     check(hipStreamSynchronize(d.copy_stream));
+#endif
     std::vector<std::pair<size_t, const uint8_t*>> loaded;
     for (size_t expert = 0; expert < plan.experts; ++expert) loaded.emplace_back(expert, bank + expert * entry);
     d.layer_prefill_plan = &plan;
     d.layer_prefill_storage = storage;
-    // (the copies have landed: the host waited for the copy stream above, which a later kernel on the device's stream follows anyway)
+    // (behind the copies on the device's stream, which waits for them above)
     hybrid_point_list(d, plan, loaded);
     if (halves) d.layer_bank_half = use;
     else check(hipStreamSynchronize(d.stream));
