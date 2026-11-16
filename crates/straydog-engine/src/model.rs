@@ -630,6 +630,15 @@ fn layer_prefill_rows() -> usize {
 /// [`LAYER_PREFILL_ROWS`], up to the context's limit. Fewer passes read the banks memory does not keep off the drive fewer times; whole
 /// 16,384s keep a pass's batches breaking where they did, so the logits are the same to the bit on any host (at 50,176 rows a 90,000-token
 /// read's were not).
+/// The rows of a pass of `count` whose hidden rows fit in `lockable` page-lockable bytes, in whole [`LAYER_PREFILL_ROWS`] (the pass's
+/// chunks the same, so the logits too): `count` where they all fit, or where not even one such fits (fewer rows a pass would then only
+/// read the banks more often).
+fn layer_prefill_rows_lockable(count: usize, lockable: u64) -> usize {
+    let rows = (lockable / (WIDTH as u64 * 4)) as usize;
+    let fit = rows / LAYER_PREFILL_ROWS * LAYER_PREFILL_ROWS;
+    if rows >= count || fit < LAYER_PREFILL_ROWS { count } else { fit }
+}
+
 fn layer_prefill_rows_for(memory: u64) -> usize {
     let rows = (memory / LAYER_PREFILL_MEMORY_SHARE / (WIDTH as u64 * 4)) as usize / LAYER_PREFILL_ROWS * LAYER_PREFILL_ROWS;
     rows.clamp(LAYER_PREFILL_ROWS, CONTEXT_LIMIT)
@@ -4402,12 +4411,12 @@ impl Model {
         let _trace_total = crate::layer_trace::Span::new("total", None, position, tokens.len(), 0);
         // (the K/V grown to the prompt first: its growth asks the commit that the hidden rows would take, more of it at more rows a pass)
         self.ensure_kv(tokens.len())?;
-        let segment = layer_prefill_rows();
+        let mut segment = layer_prefill_rows();
         let count = (tokens.len() - position).min(segment);
         // (page-aligned: the pass may page-lock the rows to move them beside the compute)
         let Some(mut hidden) = crate::gpu::PageAlignedFloats::zeroed(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
         let bank_bytes = self.layer_bank_bytes()?;
-        let (layer_end, staging) = layer_prefill_split(position, tokens.len(), plan, segment);
+        let (mut layer_end, staging) = layer_prefill_split(position, tokens.len(), plan, segment);
         let preparing = Instant::now();
         let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
         self.group.lend_prefill_head()?;
@@ -4426,12 +4435,32 @@ impl Model {
                 Some(reason) => { self.last_metrics.insert("prefill_rows_host_reason".into(), json!(reason)); }
                 None => { self.last_metrics.insert("prefill_rows_vram".into(), json!(true)); }
             }
+            // (not held whole, and more rows than may be page-locked now: the passes take as many as may, in whole 16,384s, so that they move
+            // beside the compute; the logits are the same to the bit. A 95K prompt's 3.46 GiB of rows met 2.53 GiB lockable on an RTX 5070 Ti PC
+            // with 64 GB after an 8K and a 32K prompt, and went to the GPU and back at each layer apart from the compute, 9.4-10.7 s each way:
+            // 66.0 s where two passes beside the compute take some 42. A layer's compute at such rows is far longer than its bank's load, which a
+            // second pass reads again beside it)
+            if host.is_some() && self.layer_rows_overlap {
+                let narrowed = layer_prefill_rows_lockable(count, crate::host::rows_lockable());
+                if narrowed < count {
+                    let (end, needs_staging) = layer_prefill_split(position, tokens.len(), plan, narrowed);
+                    if !needs_staging || staging {
+                        if let Some(fewer) = crate::gpu::PageAlignedFloats::zeroed(narrowed * WIDTH) {
+                            hidden = fewer;
+                            self.last_metrics.insert("prefill_layer_rows_narrowed_from".into(), json!(segment));
+                            segment = narrowed;
+                            layer_end = end;
+                            self.last_metrics.insert("prefill_layer_rows".into(), json!(segment));
+                        }
+                    }
+                }
+            }
             // (not held whole: on the host, moving beside the compute where it can, the rows page-locked until the segments end)
             let (overlap, locked) = if host.is_none() { (None, 0) } else { self.begin_rows_overlap(&mut hidden, rows)? };
             let rows_in = if host.is_none() { PassRows::Held } else if overlap.is_some() { PassRows::Overlapped } else { PassRows::Host };
             let moved = self.group.prefill_row_transfers().ok();
             let waited = self.group.rows_overlap_times().ok();
-            let done = self.layer_prefill_segments(tokens, position, layer_end, staging, plan, rows as usize, &mut hidden, rows_in,
+            let done = self.layer_prefill_segments(tokens, position, layer_end, segment, staging, plan, rows as usize, &mut hidden, rows_in,
                                                    cancelled, progress);
             // (however the segments ended, the copies are waited for and the pages let go before the rows are freed)
             let ended = overlap.map(crate::gpu::RowsOverlap::finish);
@@ -4490,13 +4519,13 @@ impl Model {
     /// the ordinary way is refused.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    fn layer_prefill_segments(&mut self, tokens: &[u32], position: usize, end: usize, staging: bool, plan: &[(usize, Vec<&'static str>)],
+    fn layer_prefill_segments(&mut self, tokens: &[u32], position: usize, end: usize, segment: usize, staging: bool, plan: &[(usize, Vec<&'static str>)],
                               batch: usize, hidden: &mut [f32], rows_in: PassRows, cancelled: &dyn Fn() -> bool,
                               progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
         let layers = 48 + usize::from(self.speculative > 0);
         let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers, self.registered.clone());
-        for stop in layer_prefill_stops(position, end, &checkpoints, layer_prefill_rows()) {
+        for stop in layer_prefill_stops(position, end, &checkpoints, segment) {
             if cancelled() { return Ok(false); }
             let begin = self.history.len();
             let count = stop - begin;
@@ -7171,6 +7200,19 @@ mod layer_prefill_tests {
         assert_eq!(layer_prefill_rows_for(128 << 30), 196_608);
         assert_eq!(layer_prefill_rows_for(1 << 40), crate::weights::CONTEXT_LIMIT);
         assert_eq!(layer_prefill_rows_named(None, 64 << 30), 98_304);
+    }
+
+    #[test]
+    fn a_pass_narrows_to_the_rows_that_may_be_page_locked() {
+        use super::{layer_prefill_rows_lockable, WIDTH};
+        let row = WIDTH as u64 * 4;
+        // (a 95K prompt's 95,000 rows, 3.46 GiB, with 2.53 GiB lockable: 65,536 rows a pass, two passes)
+        assert_eq!(layer_prefill_rows_lockable(95_000, (2.53 * (1u64 << 30) as f64) as u64), 65_536);
+        assert_eq!(layer_prefill_rows_lockable(95_000, 95_000 * row), 95_000);
+        assert_eq!(layer_prefill_rows_lockable(20_000, 16_384 * row), 16_384);
+        // (not even 16,384 rows: as many a pass as before)
+        assert_eq!(layer_prefill_rows_lockable(95_000, 16_383 * row), 95_000);
+        assert_eq!(layer_prefill_rows_lockable(95_000, 0), 95_000);
     }
 
     /// Decides: a pass of more rows takes a long prompt in fewer passes, each still stopping at a checkpoint: 249,925 tokens in 16 at 16,384,
