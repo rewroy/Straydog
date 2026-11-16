@@ -1682,6 +1682,12 @@ impl Backend {
         check(unsafe { ffi::sd_prefill_bank_commit(self.handle, layer as u64) }).map(drop)
     }
 
+    /// Whether no bank loaded ahead is still being gathered on its thread: its copy may then go back to the reader.
+    pub fn layer_bank_ahead_ready(&self) -> Result<bool> {
+        // SAFETY: a live device.
+        check(unsafe { ffi::sd_prefill_bank_ahead_ready(self.handle) }).map(|ready| ready == 1)
+    }
+
     /// Whether the pool holds two of `layer`'s banks, so that one may load ahead while the other's layer computes.
     pub fn layer_bank_halves(&self, layer: usize) -> Result<bool> {
         let Some((_, bytes)) = self.layer_prefill_pool else { return Ok(false) };
