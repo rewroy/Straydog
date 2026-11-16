@@ -418,10 +418,30 @@ impl Drop for Reader {
 fn run_read(job: &ReadJob, permit: Option<ReadPermit>) -> std::result::Result<(), String> {
     // SAFETY: the target is `len` bytes of a host slot reserved for this read (see HostPointer).
     let target = unsafe { std::slice::from_raw_parts_mut(job.target.0, job.len as usize) };
-    read_fully(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
+    read_expert(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
     drop(permit); // Hashing and proof checks do not consume one of the sixteen data-read admits.
     if let Some((verify, file)) = &job.verifier { verify(*file, job.offset, target)?; }
     Ok(())
+}
+
+/// Fill `target` from `offset` ([`read_fully`]), and where the working-set quota refuses a direct read of it (Windows' error 1453: a process whose working
+/// set has a hard maximum is refused a read whose target's pages it would have to lock beyond it), the rest as a bank's copy is read
+/// ([`crate::banks::read_in_ways`]): in direct pieces of a quarter, then through the page cache, on a handle reopened from this one without
+/// `FILE_FLAG_NO_BUFFERING` ([`storage::reader`]). A refusal had ended the request (an RTX 5070 Ti at 5.5 GiB, a layer-order pass's 0.62 GiB of rows
+/// page-locked beside 21.6 GiB of banks: "expert read at 1358123008: ... (os error 1453)"); an OS that never refuses so reads it whole, as before.
+fn read_expert(file: &File, offset: u64, target: &mut [u8]) -> std::io::Result<()> {
+    read_expert_in_ways(offset, target, storage::working_set_quota, &mut |cached, at, span| {
+        if cached { read_fully(&storage::reader(file)?, at, span) } else { read_fully(file, at, span) }
+    })
+}
+
+/// [`read_expert`]'s ways, with the refusal and the read given (`read`: whether through the page cache, the file's offset, the part of the target).
+fn read_expert_in_ways(offset: u64, target: &mut [u8], refused: fn(&std::io::Error) -> bool,
+                       read: &mut dyn FnMut(bool, u64, &mut [u8]) -> std::io::Result<()>) -> std::io::Result<()> {
+    let bytes = target.len();
+    crate::banks::read_in_ways(true, offset, target, bytes, refused, &mut |way, at, span, len| {
+        read(way == crate::banks::Way::Cached, at, &mut span[..len])
+    })
 }
 
 /// Fill `target` from `offset`, through `storage`'s read; a direct handle reads whole aligned blocks into an aligned target.
@@ -3305,5 +3325,55 @@ mod copied_reader_tests {
             target: buffer.as_mut_slice(), verifier: check }]);
         assert!(result.unwrap_err().contains("deliberate verification refusal"));
         assert_eq!(active.load(Ordering::SeqCst), 0, "a job outlived the borrowed destination");
+    }
+}
+
+#[cfg(test)]
+mod quota_read_tests {
+    use super::read_expert_in_ways;
+    use crate::storage::ALIGN;
+
+    /// Decides: an expert read the working-set quota refuses (1453) is read again in direct pieces, and what a refused piece leaves through the page
+    /// cache, with every byte where it belongs; any other error ends it at once (the request fails as before).
+    #[test]
+    fn a_refused_expert_read_goes_on_in_pieces_and_then_through_the_page_cache() {
+        let refused = |error: &std::io::Error| error.raw_os_error() == Some(1453);
+        let quota = || std::io::Error::from_raw_os_error(1453);
+        let offset = 4 * ALIGN as u64;
+        let bytes = 8 * ALIGN;
+        let source: Vec<u8> = (0..offset as usize + bytes).map(|at| (at * 13 % 251) as u8).collect();
+        let run = |fail: &dyn Fn(usize, bool) -> Option<std::io::Error>| {
+            let mut target = vec![0u8; bytes];
+            let mut calls: Vec<(bool, u64, usize)> = Vec::new();
+            let result = read_expert_in_ways(offset, &mut target, refused, &mut |cached, at, span| {
+                let number = calls.len();
+                calls.push((cached, at, span.len()));
+                if let Some(error) = fail(number, cached) { return Err(error); }
+                span.copy_from_slice(&source[at as usize..at as usize + span.len()]);
+                Ok(())
+            });
+            (result, calls, target)
+        };
+        let whole = &source[offset as usize..];
+        // not refused: one direct read
+        let (result, calls, target) = run(&|_, _| None);
+        assert!(result.is_ok());
+        assert_eq!(calls, [(false, offset, bytes)]);
+        assert_eq!(target, whole);
+        // the whole refused: four direct pieces of a quarter
+        let (result, calls, target) = run(&|number, _| (number == 0).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls.len(), 5);
+        assert!(calls[1..].iter().all(|(cached, _, len)| !cached && *len == 2 * ALIGN));
+        assert_eq!(target, whole);
+        // a piece refused too: the rest through the page cache from where the pieces got to
+        let (result, calls, target) = run(&|number, cached| (!cached && (number == 0 || number == 2)).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls.last(), Some(&(true, offset + 2 * ALIGN as u64, 6 * ALIGN)));
+        assert_eq!(target, whole);
+        // another error: at once, no other way tried
+        let (result, calls, _) = run(&|_, _| Some(std::io::Error::from_raw_os_error(5)));
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(calls.len(), 1);
     }
 }

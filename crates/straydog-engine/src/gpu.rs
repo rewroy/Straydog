@@ -1680,7 +1680,9 @@ impl Backend {
         // SAFETY: a live device.
         let ended = check(unsafe { ffi::sd_rows_overlap_end(self.handle) });
         self.clear_layer_bank()?;
-        ended?;
+        // (the ring and the pool go back even where ending the rows' copies failed, which is said after: clear_layer_bank has waited for the device's
+        // work, the last that read them, and kept they left the restore of the slots and the head without the VRAM they give back, "output.weight
+        // cannot fit", as a pass that failed on an RTX 5070 Ti ended)
         if let Some((storage, _)) = self.layer_rows.take() {
             // SAFETY: the held rows' allocation; clear_layer_bank waited for the device's work, the last that read them.
             check(unsafe { ffi::sd_release(self.handle, storage) })?;
@@ -1696,6 +1698,7 @@ impl Backend {
                 if capacity != self.prefill_capacity { return Err("could not restore layer prefill workspace".into()); }
             }
         }
+        ended?;
         Ok(())
     }
 

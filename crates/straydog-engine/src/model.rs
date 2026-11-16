@@ -234,6 +234,28 @@ fn chooser_started_at(current: &width::Chooser, most: usize, held: bool, saved: 
     (!held && (1..=most).contains(&saved) && !current.decided() && probed == 0).then(|| width::Chooser::new(most, saved))
 }
 
+/// Development: the layer-order bank loads left before one fails ([`fail_layer_bank_after`]); `u64::MAX`, none fails.
+static BANK_LOADS_BEFORE_FAILURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Development (a test of what a pass that fails leaves): the layer-order bank load after `loads` more fails, once, as a read of a layer's
+/// banks refused on Windows by the working-set quota ended one, with the layers before it queued and their rows moving; `u64::MAX` turns it off.
+pub fn fail_layer_bank_after(loads: u64) {
+    BANK_LOADS_BEFORE_FAILURE.store(loads, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether this load is the one [`fail_layer_bank_after`] asked to fail.
+fn injected_bank_failure() -> bool {
+    use std::sync::atomic::Ordering;
+    if BANK_LOADS_BEFORE_FAILURE.load(Ordering::Relaxed) == u64::MAX {
+        return false;
+    }
+    BANK_LOADS_BEFORE_FAILURE.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
+        u64::MAX => None,
+        0 => Some(u64::MAX),
+        left => Some(left - 1),
+    }) == Ok(0)
+}
+
 /// The rows a layer-order batch needs to beat the ordinary path when the banks fit in RAM, on Windows.
 const LAYER_PREFILL_FIT_ROWS: u64 = 512;
 /// The rows it needs where they do not: its MoE takes time inversely with them (a 3.8K follow-up under memory pressure on the RTX 5070 Ti:
@@ -2464,6 +2486,15 @@ impl Model {
         self.memory_watch.allow_quota();
     }
 
+    /// The working set's limit for what is pinned now, at once, once it is kept at all ([`Self::hold_banks`]); before that the locking's own
+    /// limit comes when it ends.
+    fn keep_working_set(&self) {
+        if self.memory_watch.quota_allowed() {
+            let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
+            crate::host::keep_resident(self.weights.host_memory_bytes, pinned, self.banks_bytes, self.in_place_now.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
     /// Page-lock every layer the start planned, here and now, as the worker does behind "ready" (for what is not served: examples and tools).
     pub fn lock_banks_now(&mut self) -> Result<()> {
         let Some(mut job) = self.bank_locks(None) else { return Ok(()) };
@@ -4318,18 +4349,30 @@ impl Model {
         let commit_before = crate::host::commit_left().map(|(_, commit)| commit);
         let refusal = match refusal {
             Some(reason) => reason,
-            None => match self.group.overlap_layer_rows(hidden, batch)? {
-                crate::gpu::RowsOverlapBegin::Begun(guard) => {
-                    if let (Some(before), Some((_, after))) = (commit_before, crate::host::commit_left()) {
-                        self.last_metrics.insert("prefill_rows_lock_commit_bytes".into(), json!(before.saturating_sub(after)));
-                    }
-                    self.pinned_other += bytes;
+            None => {
+                // (the rows count in the working set's limit before they are locked, not at the watcher's next look: locked pages stay in the
+                // working set, and under a limit that left them out the pass's own expert reads were refused by the quota, Windows' error 1453, on
+                // an RTX 5070 Ti at 5.5 GiB with 21.6 GiB of banks locked)
+                self.pinned_other += bytes;
+                self.hold_memory();
+                self.keep_working_set();
+                let begun = self.group.overlap_layer_rows(hidden, batch);
+                if !matches!(begun, Ok(crate::gpu::RowsOverlapBegin::Begun(_))) {
+                    self.pinned_other = self.pinned_other.saturating_sub(bytes);
                     self.hold_memory();
-                    self.last_metrics.insert("prefill_rows_overlap".into(), json!(true));
-                    return Ok((Some(guard), bytes));
+                    self.keep_working_set();
                 }
-                crate::gpu::RowsOverlapBegin::Refused(reason) => reason,
-            },
+                match begun? {
+                    crate::gpu::RowsOverlapBegin::Begun(guard) => {
+                        if let (Some(before), Some((_, after))) = (commit_before, crate::host::commit_left()) {
+                            self.last_metrics.insert("prefill_rows_lock_commit_bytes".into(), json!(before.saturating_sub(after)));
+                        }
+                        self.last_metrics.insert("prefill_rows_overlap".into(), json!(true));
+                        return Ok((Some(guard), bytes));
+                    }
+                    crate::gpu::RowsOverlapBegin::Refused(reason) => reason,
+                }
+            }
         };
         self.last_metrics.insert("prefill_rows_overlap_reason".into(), json!(refusal));
         Ok((None, 0))
@@ -4556,6 +4599,9 @@ impl Model {
     }
 
     fn load_prefill_bank_copy(&mut self, layer: usize, layers: usize, reader: &mut Option<crate::layer_bank::Prefetch>) -> Result<()> {
+        if injected_bank_failure() {
+            return Err(format!("layer {layer}'s bank for a layer-order pass: an injected failure"));
+        }
         let waiting = Instant::now();
         let mut copy = reader.as_mut().map(|reader| reader.take(layer)).transpose()?.flatten();
         self.metric_add("prefill_bank_wait_seconds", waiting.elapsed().as_secs_f64());
