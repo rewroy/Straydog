@@ -26,15 +26,15 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(weights: &Weights, layer: usize) -> Option<Self> {
+    fn new(weights: &Weights, layer: usize, direct: bool) -> Option<Self> {
         let files = weights.files_to_read();
         let roles = ["gate", "up", "down"].map(|role| -> Option<Role> {
             let tensor = weights.tensor(&format!("blk.{layer}.ffn_{role}_exps.weight")).ok()?;
             let verifier = weights.verifier_of(tensor.file)?.clone();
-            // (STRAYDOG_LAYER_BANK_DIRECT=1: around the page cache, as the experts' own reads are, with their fallback through it where the
-            // working-set quota refuses a direct read; else through it)
+            // (`direct`: around the page cache, as the experts' own reads are, with their fallback through it where the working-set quota
+            // refuses a direct read; else through it: [`BankReads`])
             let opened = files.get(tensor.file)?.1;
-            let file = match bank_reads_direct().then(|| storage::direct(opened)).flatten() {
+            let file = match direct.then(|| storage::direct(opened)).flatten() {
                 Some(direct) => direct,
                 None => storage::reader(opened).ok()?,
             };
@@ -88,13 +88,35 @@ impl Copy {
     }
 }
 
-/// Whether a layer-order pass reads its banks around the page cache (STRAYDOG_LAYER_BANK_DIRECT=1). Through it, as by default, a host
-/// whose memory keeps the banks the pinned copies leave reads them from memory on the next pass; where it does not keep them (an RTX 5070 Ti
-/// PC with 64 GB, UD-IQ2_XS at 9 GiB: 33 GB off the drive for a 32K read at some 3.4 GB/s), each pass reads the drive again, which direct
-/// reads with deep queues may read faster.
-fn bank_reads_direct() -> bool {
-    static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DIRECT.get_or_init(|| std::env::var("STRAYDOG_LAYER_BANK_DIRECT").is_ok_and(|value| value.trim() == "1"))
+/// How a layer-order pass reads the banks it does not hold registered (STRAYDOG_LAYER_BANK_DIRECT): through the page cache (`0`, the
+/// default), around it (`1`), or around it only where the memory available could not keep them for the next pass (`auto`). Through it,
+/// a host whose memory keeps the banks reads them from memory on the next pass; where it does not keep them (an RTX 5070 Ti PC with 64 GB,
+/// UD-IQ2_XS at 9 GiB: 33 GB off the drive for a 32K read at some 3.4 GB/s), each pass reads the drive again, which direct reads with deep
+/// queues may read faster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BankReads { Cached, Direct, Auto }
+
+fn bank_reads_named(value: Option<&str>) -> BankReads {
+    match value.map(str::trim) {
+        Some("1") => BankReads::Direct,
+        Some("auto") => BankReads::Auto,
+        _ => BankReads::Cached,
+    }
+}
+
+fn bank_reads() -> BankReads {
+    static READS: std::sync::OnceLock<BankReads> = std::sync::OnceLock::new();
+    *READS.get_or_init(|| bank_reads_named(std::env::var("STRAYDOG_LAYER_BANK_DIRECT").ok().as_deref()))
+}
+
+/// Whether a pass reads around the page cache: `reads`, and for `Auto` whether the `unregistered` bytes it reads again each pass exceed
+/// the memory `available` to keep them.
+fn reads_direct(reads: BankReads, unregistered: u64, available: u64) -> bool {
+    match reads {
+        BankReads::Cached => false,
+        BankReads::Direct => true,
+        BankReads::Auto => unregistered > available,
+    }
 }
 
 pub(crate) struct Prefetch {
@@ -110,7 +132,11 @@ impl Prefetch {
     /// At most one layer's anonymous copy. Under pressure, or without a pinned
     /// tree, retain the existing authenticated mapping path instead.
     pub(crate) fn new(weights: &Weights, layers: usize, registered: Arc<crate::banks::Registered>) -> Option<Self> {
-        let plans: Vec<_> = (0..layers).map(|layer| Plan::new(weights, layer)).collect();
+        // (the bytes of the layers not registered now, which this pass reads from the file: whether to read them around the page cache)
+        let unregistered: u64 = (0..layers).filter(|layer| !registered.is_registered(*layer))
+            .filter_map(|layer| Plan::new(weights, layer, false)).map(|plan| plan.bytes as u64).sum();
+        let direct = reads_direct(bank_reads(), unregistered, crate::host::prefetch_available_bytes());
+        let plans: Vec<_> = (0..layers).map(|layer| Plan::new(weights, layer, direct)).collect();
         let bytes = plans.iter().flatten().map(|plan| plan.bytes).max()?;
         if bytes as u64 + (1 << 30) > crate::host::prefetch_available_bytes() { return None; }
         let buffer = Buffer::try_new(bytes)?;
@@ -157,5 +183,26 @@ impl Prefetch {
 impl Drop for Prefetch {
     fn drop(&mut self) {
         if let Some((_, task)) = self.pending.take() { let _ = task.join(); }
+    }
+}
+
+#[cfg(test)]
+mod bank_reads_tests {
+    use super::{bank_reads_named, reads_direct, BankReads};
+
+    /// Decides: STRAYDOG_LAYER_BANK_DIRECT=1 reads around the page cache, =auto only where the bytes read again each pass exceed the
+    /// memory available to keep them, and anything else (unset included) through it, as before.
+    #[test]
+    fn the_variable_chooses_how_a_pass_reads_its_banks() {
+        assert_eq!(bank_reads_named(None), BankReads::Cached);
+        assert_eq!(bank_reads_named(Some("0")), BankReads::Cached);
+        assert_eq!(bank_reads_named(Some("yes")), BankReads::Cached);
+        assert_eq!(bank_reads_named(Some(" 1 ")), BankReads::Direct);
+        assert_eq!(bank_reads_named(Some("auto")), BankReads::Auto);
+        let gib = 1u64 << 30;
+        assert!(!reads_direct(BankReads::Cached, 40 * gib, gib));
+        assert!(reads_direct(BankReads::Direct, gib, 40 * gib));
+        assert!(reads_direct(BankReads::Auto, 25 * gib, 20 * gib));
+        assert!(!reads_direct(BankReads::Auto, 25 * gib, 30 * gib));
     }
 }
