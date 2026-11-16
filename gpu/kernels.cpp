@@ -1498,7 +1498,7 @@ int sd_rope_rows(void* handle,uint64_t first,uint64_t count,const uint32_t* axes
 int sd_prefill_defer(void* handle,int on) {
     try {
         Device& d=device(handle);
-        if (on && !d.prefill_deferred) check(hipMemsetAsync(d.flags+1,0,4,d.stream));
+        if (on && !d.prefill_deferred) check(hipMemsetAsync(d.flags+prefill_deferred_flag,0,4,d.stream));
         d.prefill_deferred=on!=0;
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
@@ -1508,7 +1508,7 @@ int sd_prefill_settle(void* handle) {
     try {
         Device& d=device(handle);
         unsigned flag=0;
-        download(d,&flag,d.flags+1,4);
+        download(d,&flag,d.flags+prefill_deferred_flag,4);
         check(hipStreamSynchronize(d.helper_stream));
         d.prefill_deferred=false;
         if (d.link.peer) peer_settle(d);
