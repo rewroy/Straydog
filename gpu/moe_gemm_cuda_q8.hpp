@@ -68,36 +68,54 @@ __device__ __forceinline__ void moe_q8_tables(uint8_t* grid, uint2* masks) {
     }
 }
 
-// One unit (32 values from column 32 * unit) of a weight row as eight words of signed bytes, and the F32 factors of its two halves (equal
-// unless the kind has a sub-scale to every 16 values): the values are factor * byte.
+// One unit (32 values from column 32 * unit) of a weight row, in two parts so that a K step's loads are in flight while the step before
+// computes: moe_q8_fetch reads the unit's fields from global memory, moe_q8_decode forms its eight words of signed bytes (with the grid and
+// masks in shared memory) and the F32 factors of its two halves (equal unless the kind has a sub-scale to every 16 values): the values
+// are factor * byte.
 template<int Kind>
-__device__ __forceinline__ void moe_q8_unit(const Matrix& m, uint32_t row, uint32_t unit, const uint8_t* grid, const uint2* masks,
-                                            uint32_t (&words)[8], float& low, float& high) {
+struct MoeQ8Raw {
+    ExpertQ8Unit unit;     // (the IQ kinds)
+    uint32_t codes[4];     // (IQ4_NL, IQ4_XS: the unit's 16 code bytes)
+    float factor;
+};
+template<int Kind>
+__device__ __forceinline__ MoeQ8Raw<Kind> moe_q8_fetch(const Matrix& m, uint32_t row, uint32_t unit) {
+    MoeQ8Raw<Kind> r{};
     if constexpr (Kind == 20 || Kind == 23) {
-        // (IQ4_NL / IQ4_XS: the nonlinear table's sixteen levels by byte permutes, as moe_values16_of reads them)
-        constexpr uint32_t low0 = 0xBFAD9881u, low1 = 0xF6EADDCFu, high0 = 0x26190D01u, high1 = 0x71594535u;
         const uint8_t* codes;
-        float factor;
         if constexpr (Kind == 20) {
             const uint8_t* b = m.data + size_t(row) * m.row_bytes + size_t(unit) * 18;
-            factor = half_at(b);
+            r.factor = half_at(b);
             codes = b + 2;
         } else {
             const uint8_t* b = m.data + size_t(row) * m.row_bytes + size_t(unit / 8) * 136;
             const unsigned group = unit % 8, head = unsigned(b[2]) | (unsigned(b[3]) << 8);
             const int scale = int(((b[4 + group / 2] >> ((group % 2) * 4)) & 15) | (((head >> (2 * group)) & 3) << 4)) - 32;
-            factor = half_at(b) * float(scale);
+            r.factor = half_at(b) * float(scale);
             codes = b + 8 + group * 16;
         }
-        // (bytes 0-15: low nibbles are values 0-15, high nibbles 16-31; two 16-bit loads at a time, the blocks being 2-byte aligned)
+        // (two 16-bit loads a word: the blocks are 2-byte aligned)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            r.codes[i] = uint32_t(reinterpret_cast<const uint16_t*>(codes)[2 * i]) | (uint32_t(reinterpret_cast<const uint16_t*>(codes)[2 * i + 1]) << 16);
+    } else {
+        r.unit = expert_q8_unit<Kind>(m.data, uint32_t(m.rows), uint32_t(m.cols), uint32_t(m.row_bytes), m.layout, row, unit);
+    }
+    return r;
+}
+template<int Kind>
+__device__ __forceinline__ void moe_q8_decode(const MoeQ8Raw<Kind>& r, const uint8_t* grid, const uint2* masks, uint32_t (&words)[8],
+                                              float& low, float& high) {
+    if constexpr (Kind == 20 || Kind == 23) {
+        // (the nonlinear table's sixteen levels by byte permutes, as moe_values16_of reads them: bytes 0-15 hold values 0-15 in their low
+        // nibbles and values 16-31 in their high ones)
+        constexpr uint32_t low0 = 0xBFAD9881u, low1 = 0xF6EADDCFu, high0 = 0x26190D01u, high1 = 0x71594535u;
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const uint32_t pair = uint32_t(reinterpret_cast<const uint16_t*>(codes)[2 * i]) |
-                                  (uint32_t(reinterpret_cast<const uint16_t*>(codes)[2 * i + 1]) << 16);
             uint32_t lo = 0, hi = 0;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const unsigned a = (pair >> (8 * j)) & 15, b = (pair >> (8 * j + 4)) & 15;
+                const unsigned a = (r.codes[i] >> (8 * j)) & 15, b = (r.codes[i] >> (8 * j + 4)) & 15;
                 const uint32_t va = a < 8 ? __byte_perm(low0, low1, a) : __byte_perm(high0, high1, a - 8);
                 const uint32_t vb = b < 8 ? __byte_perm(low0, low1, b) : __byte_perm(high0, high1, b - 8);
                 lo |= (va & 0xffu) << (8 * j);
@@ -106,16 +124,15 @@ __device__ __forceinline__ void moe_q8_unit(const Matrix& m, uint32_t row, uint3
             words[i] = lo;
             words[4 + i] = hi;
         }
-        low = high = factor;
+        low = high = r.factor;
     } else {
-        const ExpertQ8Unit u = expert_q8_unit<Kind>(m.data, uint32_t(m.rows), uint32_t(m.cols), uint32_t(m.row_bytes), m.layout, row, unit);
-        expert_q8_words<Kind>(u, grid, masks, words);
-        const float factor = expert_q8_factor<Kind>(u);
+        expert_q8_words<Kind>(r.unit, grid, masks, words);
+        const float factor = expert_q8_factor<Kind>(r.unit);
         if constexpr (moe_q8_halves(Kind)) {
-            low = factor * float(2 * (u.scale & 15) + 1);
-            high = factor * float(2 * (u.scale >> 4) + 1);
+            low = factor * float(2 * (r.unit.scale & 15) + 1);
+            high = factor * float(2 * (r.unit.scale >> 4) + 1);
         } else {
-            low = high = factor * float(2 * u.scale + 1);
+            low = high = factor * float(2 * r.unit.scale + 1);
         }
     }
 }
@@ -152,14 +169,17 @@ __device__ __forceinline__ void moe_q8_step(const MoeQ8Lds<Kind>& lds, int row0,
             const uint32_t b0 = *reinterpret_cast<const uint32_t*>(wb), b1 = *reinterpret_cast<const uint32_t*>(wb + 16);
             const int c0 = col + 2 * t4, c1 = c0 + 1;
             if constexpr (moe_q8_halves(Kind)) {
-                int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
-                moe_q8_mma16(lo, a0, a1, b0);
-                moe_q8_mma16(hi, a2, a3, b1);
-                const float l0 = lds.ws[c0][unit][0], l1 = lds.ws[c1][unit][0], h0 = lds.ws[c0][unit][1], h1 = lds.ws[c1][unit][1];
-                sums[n][0] += xs0 * (float(lo[0]) * l0 + float(hi[0]) * h0);
-                sums[n][1] += xs0 * (float(lo[1]) * l1 + float(hi[1]) * h1);
-                sums[n][2] += xs1 * (float(lo[2]) * l0 + float(hi[2]) * h0);
-                sums[n][3] += xs1 * (float(lo[3]) * l1 + float(hi[3]) * h1);
+                // (the two halves one after the other, each into the sums: fewer registers live than both dots at once)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    int c[4] = {0, 0, 0, 0};
+                    if (h == 0) moe_q8_mma16(c, a0, a1, b0); else moe_q8_mma16(c, a2, a3, b1);
+                    const float w0 = lds.ws[c0][unit][h], w1 = lds.ws[c1][unit][h];
+                    sums[n][0] += (xs0 * w0) * float(c[0]);
+                    sums[n][1] += (xs0 * w1) * float(c[1]);
+                    sums[n][2] += (xs1 * w0) * float(c[2]);
+                    sums[n][3] += (xs1 * w1) * float(c[3]);
+                }
             } else {
                 int c[4] = {0, 0, 0, 0};
                 moe_q8_mma32(c, a0, a1, a2, a3, b0, b1);
@@ -177,7 +197,7 @@ __device__ __forceinline__ void moe_q8_step(const MoeQ8Lds<Kind>& lds, int row0,
 // 16 (w / 2) and product columns 32 (w % 2): eight tiles, four of gate and four of up. `xq`, `xs`: moe_input_q8's rows; `product`: the
 // routes' INT8 product rows (moe_q8_row_bytes each).
 template<int Kind>
-__global__ void __launch_bounds__(256) moe_gate_up_q8(const MoeGroup* groups, const MoeTile* tiles, const int32_t* positions, size_t steps,
+__global__ void __launch_bounds__(256, 2) moe_gate_up_q8(const MoeGroup* groups, const MoeTile* tiles, const int32_t* positions, size_t steps,
                                                       const int8_t* xq, const float* xs, uint8_t* product, const unsigned* tile_count = nullptr) {
     if (tile_count && blockIdx.y >= *tile_count) return;
     const MoeTile tile = tiles[blockIdx.y];
@@ -200,19 +220,27 @@ __global__ void __launch_bounds__(256) moe_gate_up_q8(const MoeGroup* groups, co
     float sums[8][4] = {};
     const bool rows = tile.first + size_t(wm) * 16 < count;
     __syncthreads();
+    // (a step's activation chunk, its scale and its weight unit are read in the step before, during its products)
+    auto fetch_x = [&](uint32_t k, uint4& a, float& scale) {
+        a = token != SIZE_MAX ? *reinterpret_cast<const uint4*>(xq + token * 2560 + k * 32 + achunk * 16) : uint4{0, 0, 0, 0};
+        scale = token != SIZE_MAX && achunk < 2 ? xs[token * 80 + k + achunk] : 0.0f;
+    };
+    uint4 a;
+    float scale;
+    fetch_x(0, a, scale);
+    MoeQ8Raw<Kind> raw = moe_q8_fetch<Kind>(wmat, wmrow, wunit);
     for (uint32_t k = 0; k < 2560 / 32; k += 2) {
-        uint4 a = {0, 0, 0, 0};
-        if (token != SIZE_MAX) a = *reinterpret_cast<const uint4*>(xq + token * 2560 + k * 32 + achunk * 16);
         *reinterpret_cast<uint4*>(lds.x + arow * moe_q8_stride + achunk * 16) = a;
-        if (achunk < 2) lds.xs[arow][achunk] = token != SIZE_MAX ? xs[token * 80 + k + achunk] : 0.0f;
+        if (achunk < 2) lds.xs[arow][achunk] = scale;
         uint32_t words[8];
         float low, high;
-        moe_q8_unit<Kind>(wmat, wmrow, k + wunit, lds.grid, lds.masks, words, low, high);
+        moe_q8_decode<Kind>(raw, lds.grid, lds.masks, words, low, high);
         uint4* to = reinterpret_cast<uint4*>(lds.w + wrow * moe_q8_stride + wunit * 32);
         to[0] = make_uint4(words[0], words[1], words[2], words[3]);
         to[1] = make_uint4(words[4], words[5], words[6], words[7]);
         lds.ws[wrow][wunit][0] = low; lds.ws[wrow][wunit][1] = high;
         __syncthreads();
+        if (k + 2 < 2560 / 32) { fetch_x(k + 2, a, scale); raw = moe_q8_fetch<Kind>(wmat, wmrow, k + 2 + wunit); }
         // (tiles 0-3: gate's columns 32 wn to 32 wn + 31; tiles 4-7: up's, 64 weight rows on)
         if (rows) moe_q8_step<Kind>(lds, wm * 16, wn * 32, 64 + wn * 32, sums);
         __syncthreads();
@@ -255,7 +283,7 @@ __global__ void __launch_bounds__(256) moe_gate_up_q8(const MoeGroup* groups, co
 // One block: 64 routed rows x 128 output columns (from 128 blockIdx.x) over the 640 product columns. Warp w takes rows 16 (w / 2) and
 // columns 64 (w % 2): eight tiles. The sums go to the routes' output rows as moe_down_mma's do.
 template<int Kind>
-__global__ void __launch_bounds__(256) moe_down_q8(const MoeGroup* groups, const MoeTile* tiles, const int32_t* positions, const uint8_t* product,
+__global__ void __launch_bounds__(256, 2) moe_down_q8(const MoeGroup* groups, const MoeTile* tiles, const int32_t* positions, const uint8_t* product,
                                                    float* outputs, const unsigned* tile_count = nullptr) {
     if (tile_count && blockIdx.y >= *tile_count) return;
     const MoeTile tile = tiles[blockIdx.y];
@@ -272,19 +300,26 @@ __global__ void __launch_bounds__(256) moe_down_q8(const MoeGroup* groups, const
     float sums[8][4] = {};
     const bool rows = tile.first + size_t(wm) * 16 < count;
     __syncthreads();
+    auto fetch_x = [&](uint32_t k, uint4& a, float& scale) {
+        a = source ? *reinterpret_cast<const uint4*>(source + k * 32 + achunk * 16) : uint4{0, 0, 0, 0};
+        scale = source && achunk < 2 ? reinterpret_cast<const float*>(source + 640)[k + achunk] : 0.0f;
+    };
+    uint4 a;
+    float scale;
+    fetch_x(0, a, scale);
+    MoeQ8Raw<Kind> raw = moe_q8_fetch<Kind>(down, n0 + uint32_t(wrow), wunit);
     for (uint32_t k = 0; k < 640 / 32; k += 2) {
-        uint4 a = {0, 0, 0, 0};
-        if (source) a = *reinterpret_cast<const uint4*>(source + k * 32 + achunk * 16);
         *reinterpret_cast<uint4*>(lds.x + arow * moe_q8_stride + achunk * 16) = a;
-        if (achunk < 2) lds.xs[arow][achunk] = source ? reinterpret_cast<const float*>(source + 640)[k + achunk] : 0.0f;
+        if (achunk < 2) lds.xs[arow][achunk] = scale;
         uint32_t words[8];
         float low, high;
-        moe_q8_unit<Kind>(down, n0 + uint32_t(wrow), k + wunit, lds.grid, lds.masks, words, low, high);
+        moe_q8_decode<Kind>(raw, lds.grid, lds.masks, words, low, high);
         uint4* to = reinterpret_cast<uint4*>(lds.w + wrow * moe_q8_stride + wunit * 32);
         to[0] = make_uint4(words[0], words[1], words[2], words[3]);
         to[1] = make_uint4(words[4], words[5], words[6], words[7]);
         lds.ws[wrow][wunit][0] = low; lds.ws[wrow][wunit][1] = high;
         __syncthreads();
+        if (k + 2 < 640 / 32) { fetch_x(k + 2, a, scale); raw = moe_q8_fetch<Kind>(down, n0 + uint32_t(wrow), k + 2 + wunit); }
         if (rows) moe_q8_step<Kind>(lds, wm * 16, wn * 64, wn * 64 + 32, sums);
         __syncthreads();
     }
