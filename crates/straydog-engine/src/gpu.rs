@@ -1657,19 +1657,36 @@ impl Backend {
         Ok(out)
     }
 
-    pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> {
+    /// `ahead`: into the half of the pool the computing layer does not use, pointed at by [`Backend::commit_layer_bank`] at its layer's turn.
+    pub fn load_layer_bank(&mut self, layer: usize, ahead: bool) -> Result<()> {
         let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
         // SAFETY: owned storage retained until clear_layer_bank/finish_layer_prefill, and a registered decoder layer.
-        check(unsafe { ffi::sd_prefill_bank(self.handle, layer as u64, pool, bytes) }).map(drop)
+        check(unsafe { ffi::sd_prefill_bank(self.handle, layer as u64, pool, bytes, c_int::from(ahead)) }).map(drop)
     }
 
-    /// A scoped authenticated host copy; native code settles every staging/H2D read before returning.
-    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3]) -> Result<()> {
+    /// A scoped authenticated host copy, gathered into the staging before this returns (the bank's copies land behind it); `ahead` as
+    /// [`Backend::load_layer_bank`]'s.
+    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3], ahead: bool) -> Result<()> {
         let (pool, bytes) = self.layer_prefill_pool.ok_or("no layer prefill bank pool")?;
         let pointers = sources.map(|source| source.as_ptr());
         let sizes = sources.map(|source| source.len() as u64);
         // SAFETY: all three slices stay alive for this synchronous call, as does the owned pool.
-        check(unsafe { ffi::sd_prefill_bank_from(self.handle, layer as u64, pool, bytes, pointers.as_ptr(), sizes.as_ptr()) }).map(drop)
+        check(unsafe {
+            ffi::sd_prefill_bank_from(self.handle, layer as u64, pool, bytes, pointers.as_ptr(), sizes.as_ptr(), c_int::from(ahead))
+        }).map(drop)
+    }
+
+    /// `layer`'s turn: a bank loaded ahead for it is pointed at, the layer before's given up behind its compute.
+    pub fn commit_layer_bank(&mut self, layer: usize) -> Result<()> {
+        // SAFETY: a live device.
+        check(unsafe { ffi::sd_prefill_bank_commit(self.handle, layer as u64) }).map(drop)
+    }
+
+    /// Whether the pool holds two of `layer`'s banks, so that one may load ahead while the other's layer computes.
+    pub fn layer_bank_halves(&self, layer: usize) -> Result<bool> {
+        let Some((_, bytes)) = self.layer_prefill_pool else { return Ok(false) };
+        // SAFETY: a live device.
+        check(unsafe { ffi::sd_prefill_bank_halves(self.handle, layer as u64, bytes) }).map(|halves| halves == 1)
     }
 
     pub fn clear_layer_bank(&mut self) -> Result<()> {

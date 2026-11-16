@@ -1804,6 +1804,7 @@ unsafe extern "C" {
         layer: u64,
         storage: *mut ::std::os::raw::c_void,
         bytes: u64,
+        ahead: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -1814,6 +1815,20 @@ unsafe extern "C" {
         bytes: u64,
         sources: *const *const u8,
         source_bytes: *const u64,
+        ahead: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_commit(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_halves(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        bytes: u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

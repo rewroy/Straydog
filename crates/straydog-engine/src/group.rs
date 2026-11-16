@@ -920,10 +920,12 @@ impl Group {
         self.backends[0].begin_layer_prefill(bytes, staging)
     }
 
-    pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].load_layer_bank(layer) }
-    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3]) -> Result<()> {
-        self.backends[0].load_layer_bank_from(layer, sources)
+    pub fn load_layer_bank(&mut self, layer: usize, ahead: bool) -> Result<()> { self.backends[0].load_layer_bank(layer, ahead) }
+    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3], ahead: bool) -> Result<()> {
+        self.backends[0].load_layer_bank_from(layer, sources, ahead)
     }
+    pub fn commit_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].commit_layer_bank(layer) }
+    pub fn layer_bank_halves(&self, layer: usize) -> Result<bool> { self.backends[0].layer_bank_halves(layer) }
     pub fn clear_layer_bank(&mut self) -> Result<()> { self.backends[0].clear_layer_bank() }
     pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> { self.backends[0].prefill_rows(layer, rows) }
