@@ -1352,6 +1352,8 @@ pub struct Model {
     pub forced_rows: Option<ForcedRows>,
     /// Inside a pipelined prefill: batches before the last return no rows.
     deferred: bool,
+    /// The last long prefill gave the slot pool back empty ([`Group::end_long_prefill_empty`]): the re-pick before the reply fills it ahead.
+    slots_refill_ahead: bool,
     /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
     mtp_kept: u64,
     /// A draft's vocabulary (DRAFT_ROWS) in use; the tokens past DRAFT_ROWS it holds, and those noted but not yet on the device.
@@ -1628,6 +1630,7 @@ impl Model {
             logits_spare: Vec::new(),
             forced_rows: None,
             deferred: false,
+            slots_refill_ahead: false,
             mtp_kept: 0,
             draft_vocabulary: false,
             draft_extras: HashSet::new(),
@@ -4288,7 +4291,7 @@ impl Model {
         }
         let output = self.prefill_batches(tokens, position, plan, batch, empty_before_prepare, cancelled, progress);
         let restoring = Instant::now();
-        let restored = if long { self.group.end_long_prefill() } else { Ok(()) };
+        let restored = if long { self.end_long_prefill() } else { Ok(()) };
         self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
         match (output, restored) {
             (Err(error), Err(restore)) => Err(format!("{error}; restoring expert slots failed: {restore}")),
@@ -4460,7 +4463,7 @@ impl Model {
         // Always attempt every restoration step. The head must be back before the cache takes the remaining VRAM.
         let bank = self.group.finish_layer_prefill();
         let head = self.with_operands(Model::head_operands, Group::pin);
-        let cache = self.group.end_long_prefill();
+        let cache = self.end_long_prefill();
         self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
         drop(trace_restore);
         let errors: Vec<String> = [bank, head, cache].into_iter().filter_map(Result::err).collect();
@@ -4611,6 +4614,17 @@ impl Model {
             if cancelled() { return Ok(false); }
         }
         Ok(true)
+    }
+
+    /// The end of a long prefill: where the reply's re-pick does not wait for its copies (CUDA, [`prompt_refresh_ahead`]), the slot pool comes
+    /// back empty and that re-pick fills it while the reply begins; elsewhere it is refilled here, waited for, as before.
+    fn end_long_prefill(&mut self) -> Result<()> {
+        if prompt_refresh_ahead() > 0 {
+            self.slots_refill_ahead = true;
+            self.group.end_long_prefill_empty()
+        } else {
+            self.group.end_long_prefill()
+        }
     }
 
     fn load_prefill_bank_copy(&mut self, layer: usize, layers: usize, reader: &mut Option<crate::layer_bank::Prefetch>) -> Result<()> {
@@ -5871,7 +5885,11 @@ impl Model {
         if self.partial {
             // Re-pick cached experts from this prompt's routing before decoding.
             let rebalance = Instant::now();
-            if tokens.len() - reused <= prompt_refresh_ahead() {
+            if std::mem::take(&mut self.slots_refill_ahead) {
+                // (a long prefill gave the pool back empty: its whole refill is asked for and lands while the reply begins)
+                let (slots, _) = self.group.slots()?;
+                self.group.refresh_ahead(slots.max(1))?;
+            } else if tokens.len() - reused <= prompt_refresh_ahead() {
                 // (a short prompt's swaps are asked for and land while the reply begins: the first token does not wait for their copies)
                 self.group.refresh_ahead(2048)?;
             } else {

@@ -1737,7 +1737,14 @@ impl Backend {
         check(unsafe { ffi::sd_prefill_rows(self.handle, layer as u64, rows.as_ptr(), steps as u64) }).map(drop)
     }
 
-    pub fn end_long_prefill(&mut self) -> Result<()> {
+    pub fn end_long_prefill(&mut self) -> Result<()> { self.end_long_prefill_with(true) }
+
+    /// [`Backend::end_long_prefill`] with the slot pool back but empty: the request's re-pick fills it while the reply begins
+    /// ([`Group::refresh_ahead`]), where the refill here waited for every slot's copy before the first token (3.28 of the 16.0 s an RTX 5070
+    /// Ti took to read an 8000-token prompt in layer order, UD-IQ3_XXS at 9 GiB).
+    pub fn end_long_prefill_empty(&mut self) -> Result<()> { self.end_long_prefill_with(false) }
+
+    fn end_long_prefill_with(&mut self, refill: bool) -> Result<()> {
         let Some(capacity) = self.long_prefill else { return Ok(()) };
         if capacity != self.prefill_capacity {
             self.prefill_buffers(capacity)?;
@@ -1747,7 +1754,12 @@ impl Backend {
         }
         // SAFETY: a live handle, between requests.
         check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
-        self.slots_back()?;
+        if refill {
+            self.slots_back()?;
+        } else {
+            let cache = self.slots_that_fit(self.slot_stage, self.slot_margin, self.slot_size)?;
+            self.restore_slots(cache)?;
+        }
         self.long_prefill = None;
         Ok(())
     }

@@ -960,6 +960,20 @@ impl Group {
         failure.map_or(Ok(()), Err)
     }
 
+    /// [`Group::end_long_prefill`] with the slot pools back empty, for [`Group::refresh_ahead`] to fill ([`Backend::end_long_prefill_empty`]).
+    pub fn end_long_prefill_empty(&mut self) -> Result<()> {
+        if self.backends.len() == 2 {
+            return self.on_both(Backend::end_long_prefill_empty, Backend::end_long_prefill_empty);
+        }
+        let mut failure = None;
+        for backend in &mut self.backends {
+            if let Err(error) = backend.end_long_prefill_empty() {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.grow_kv(capacity, valid))
     }
