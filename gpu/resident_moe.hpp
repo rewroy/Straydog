@@ -938,9 +938,16 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
 
     // Host vectors reach the device through the staging arena, so resident experts need no wait
     // here and the caller can queue the next work (the peer's half, the next layer) at once.
-    if (plan.hybrid) check(hipStreamSynchronize(d.stream));
+    // A layer-order pass's layer has every expert in its bank and streams none, prestages none and gives the CPU none: nothing of the host's
+    // is read by the work queued, so the host goes on at once, to the next chunk and to the next layer's bank, which loads while this layer
+    // computes (a pool of two banks, load_prefill_bank). Waiting here had the host behind the GPU at every chunk: an 8000-token prompt on an
+    // RTX 5070 Ti (UD-IQ2_XS, 29 layers copied) kept the GPU waiting at a span's start for 4.33 of 7.80 s with two banks as with one.
+    const bool behind=plan.layer_prefill && missing.empty() && prestaged.empty() && cpu_routes.empty();
+    if (plan.hybrid && !behind) check(hipStreamSynchronize(d.stream));
 #if !defined(__HIPCC__)
-    if (eager) {
+    // (the device's tile list against the plan's needs the stream idle: not checked behind a layer-order pass's layer, whose groups are all
+    // in its bank, as the device's list has them)
+    if (eager && !behind) {
         // (the stream is idle: the device's tile list is read back and must be the one the plan implies, the resident groups' tiles)
         unsigned built=0;
         download(d,&built,built_count,4);
