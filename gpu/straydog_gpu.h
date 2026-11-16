@@ -526,6 +526,8 @@ int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t b
    and its layer's turn points the table at it: sd_prefill_bank_commit. 1 where a pool of `bytes` holds two of `layer`'s banks, 0 where not. */
 int sd_prefill_bank_commit(void* handle, uint64_t layer);
 int sd_prefill_bank_halves(void* handle, uint64_t layer, uint64_t bytes);
+/* 1 where no bank loaded ahead is still being gathered (its copy may be given back), 0 where one is. */
+int sd_prefill_bank_ahead_ready(void* handle);
 int sd_prefill_bank_clear(void* handle);
 /* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
    3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.

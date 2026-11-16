@@ -4667,6 +4667,16 @@ impl Model {
                             if bank_ahead && chunk == LAYER_BANK_AHEAD_AFTER.min(chunks.len() - 1) && layer + 1 < layers {
                                 self.load_prefill_bank_copy(layer + 1, layers, &mut bank_reader, true)?;
                             }
+                            // (the copy the bank loaded ahead was gathered from goes back to the reader once its gather is done, and the reads
+                            // go on into it: with one buffer, which a 95K prompt served after an 8K and a 32K one got from the memory left in
+                            // three of seven requests on an RTX 5070 Ti PC, its next read began only at the layer's turn, and its 25 copied
+                            // layers each came late, 4.4 s in all)
+                            if self.bank_copy_ahead.is_some() && self.group.layer_bank_ahead_ready()? {
+                                if let (Some(reader), Some(copy)) = (bank_reader.as_mut(), self.bank_copy_ahead.take()) {
+                                    reader.recycle(Some(copy));
+                                    if layer + 2 < layers { reader.start(layer + 2); }
+                                }
+                            }
                         }
                     }
                     Ok(())
