@@ -4594,7 +4594,13 @@ impl Model {
                     && (0..layers).map(|layer| self.group.layer_bank_halves(layer)).collect::<Result<Vec<bool>>>()?.into_iter().all(|halves| halves);
                 // (as many chunks' PLE rows ahead as half the row cache keeps, a token's 16 rows each at most: rows read ahead and evicted before
                 // their use are read again one at a time)
-                let ple_ahead = layer_ple_ahead(self.weights.row_table(PLE_TABLE).map_or(0, crate::rows::RowTable::capacity), batch);
+                // (CUDA only: an R9700 with a host's worth of row cache read a 95K prompt 0.8 s slower so, 44.5 s against 43.0-43.7, its rows
+                // all asked for while layer 0 computed; a chunk ahead, as before)
+                let ple_ahead = if cfg!(feature = "cuda") {
+                    layer_ple_ahead(self.weights.row_table(PLE_TABLE).map_or(0, crate::rows::RowTable::capacity), batch)
+                } else {
+                    1
+                };
                 let layers_run = (|| -> Result<()> {
                     if bank_ahead { self.load_prefill_bank_copy(0, layers, &mut bank_reader, true)?; }
                     for layer in 0..48 {
@@ -4626,7 +4632,7 @@ impl Model {
                             // (layer 1's PLE rows are asked for ple_ahead chunks ahead, its first ones while layer 0 computes: read a chunk ahead,
                             // a 90,000-token prompt's 44 chunks waited 13-42 ms each for theirs on an RTX 5070 Ti PC, 1.2 s, a chunk's read taking
                             // twice its compute; two ahead, 1.0 s)
-                            if layer == 0 && chunk < ple_ahead {
+                            if layer == 0 && chunk < ple_ahead && cfg!(feature = "cuda") {
                                 self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
                             }
                             if layer == 1 {
