@@ -617,8 +617,11 @@ const LAYER_PREFILL_MIN: usize = 512;
 /// The chunks of a layer queued before the next layer's bank loads ahead ([`Model::load_prefill_bank_copy`]): the GPU has them to compute while
 /// the host gathers a copied layer (some 50-90 ms on an RTX 5070 Ti PC). A layer of fewer chunks loads the next after its last, as before.
 const LAYER_BANK_AHEAD_AFTER: usize = 3;
-/// The chunks ahead of layer 1's whose PLE rows are asked for (the row cache keeps them: within its gigabyte where memory is scarce).
-const LAYER_PLE_AHEAD: usize = 2;
+/// The chunks of `batch` tokens ahead of layer 1's whose PLE rows are asked for: as many as half a row cache of `capacity` rows keeps, a
+/// token's 16 rows each at most, and at least one (as before; none kept, a prefetch reads nothing).
+fn layer_ple_ahead(capacity: usize, batch: usize) -> usize {
+    (capacity / 2 / (batch.max(1) * 16)).max(1)
+}
 /// The part of the host's memory a pass's hidden rows may take: a 16th, 4 GiB of 64 (98,304 rows; 49,152 of 32). On a 5070 Ti with 64 GB
 /// and a 9 GiB budget, UD-IQ2_XS read 90,000 tokens in 76.1 s at 16,384 rows a pass, 52.7 s at 49,152 and 44.9 s at 98,304 (one pass), the
 /// logits the same to the bit; served there, a new 95K prompt took 50.0 s with Strata 0.2.14 and 53.1 s with a 32nd (two runs each).
@@ -4586,7 +4589,12 @@ impl Model {
                 // layer does not use, and is pointed at at its turn; its copies, and the gather of a copied layer before them, have the rest of the
                 // layer's compute to finish in. A 90,000-token prompt on an RTX 5070 Ti PC queues 44 chunks a layer, of which the host keeps a
                 // few ahead of the GPU: loaded at its turn, a bank's gather and copies left the GPU waiting 50-150 ms at each layer's start, 3.2 s)
-                let bank_ahead = (0..layers).map(|layer| self.group.layer_bank_halves(layer)).collect::<Result<Vec<bool>>>()?.into_iter().all(|halves| halves);
+                // (CUDA only: an R9700 read a 95K prompt 2.3 s slower so, 45.5 s against 43.1-43.2, and a 32K one in the same time)
+                let bank_ahead = cfg!(feature = "cuda")
+                    && (0..layers).map(|layer| self.group.layer_bank_halves(layer)).collect::<Result<Vec<bool>>>()?.into_iter().all(|halves| halves);
+                // (as many chunks' PLE rows ahead as half the row cache keeps, a token's 16 rows each at most: rows read ahead and evicted before
+                // their use are read again one at a time)
+                let ple_ahead = layer_ple_ahead(self.weights.row_table(PLE_TABLE).map_or(0, crate::rows::RowTable::capacity), batch);
                 let layers_run = (|| -> Result<()> {
                     if bank_ahead { self.load_prefill_bank_copy(0, layers, &mut bank_reader, true)?; }
                     for layer in 0..48 {
@@ -4615,14 +4623,15 @@ impl Model {
                                 // (the device stream waits for this chunk's rows to arrive in its slot, which it then copies into the workspace)
                                 PassRows::Overlapped => self.group.rows_overlap_load(layer, chunk as u64, (end - first) as u64)?,
                             }
-                            // (layer 1's PLE rows are asked for LAYER_PLE_AHEAD chunks ahead, its first ones while layer 0 computes: read a chunk
-                            // ahead, a 90,000-token prompt's 44 chunks waited 13-42 ms each for theirs on an RTX 5070 Ti PC, 1.2 s)
-                            if layer == 0 && chunk < LAYER_PLE_AHEAD {
+                            // (layer 1's PLE rows are asked for ple_ahead chunks ahead, its first ones while layer 0 computes: read a chunk ahead,
+                            // a 90,000-token prompt's 44 chunks waited 13-42 ms each for theirs on an RTX 5070 Ti PC, 1.2 s, a chunk's read taking
+                            // twice its compute; two ahead, 1.0 s)
+                            if layer == 0 && chunk < ple_ahead {
                                 self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
                             }
                             if layer == 1 {
                                 let _trace_ple = crate::layer_trace::Span::new("ple", Some(layer), first, end, 0);
-                                if let Some(&(ahead, after)) = chunks.get(chunk + LAYER_PLE_AHEAD) {
+                                if let Some(&(ahead, after)) = chunks.get(chunk + ple_ahead) {
                                     self.prefetch_ple(&tokens[..ahead], &tokens[ahead..after])?;
                                 }
                                 self.prefetch_ple(&tokens[..first], &tokens[first..end])?;
@@ -7262,6 +7271,16 @@ mod layer_prefill_tests {
         assert_eq!(layer_prefill_rows_for(128 << 30), 196_608);
         assert_eq!(layer_prefill_rows_for(1 << 40), crate::weights::CONTEXT_LIMIT);
         assert_eq!(layer_prefill_rows_named(None, 64 << 30), 98_304);
+    }
+
+    #[test]
+    fn layer_ples_are_read_ahead_as_far_as_half_the_row_cache_keeps() {
+        use super::layer_ple_ahead;
+        // (a gigabyte's cache of 2.7 KB rows, some 390,000 of them, and chunks of 2,048 tokens: five chunks ahead)
+        assert_eq!(layer_ple_ahead(390_000, 2048), 5);
+        assert_eq!(layer_ple_ahead(4_000_000, 2048), 61);
+        assert_eq!(layer_ple_ahead(0, 2048), 1);
+        assert_eq!(layer_ple_ahead(10_000, 2048), 1);
     }
 
     #[test]

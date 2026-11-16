@@ -1449,8 +1449,12 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
     if (!d.layer_bank_loaded) check(hipEventCreateWithFlags(&d.layer_bank_loaded, hipEventDisableTiming));
     check(hipEventRecord(d.layer_bank_loaded, d.copy_stream));
     d.layer_bank_loading = true;
-#if defined(STRAYDOG_PREFILL_OBSERVER)
+#if defined(STRAYDOG_PREFILL_OBSERVER) || defined(__HIPCC__)
+    // (HIP waits for the copies here, as before: left to the device's stream, and loaded ahead, a 95K prompt on an R9700 with 20 of 48 layers
+    // locked took 45.5 s where it took 43.1-43.2, the 32K ones the same)
     check(hipStreamSynchronize(d.copy_stream));
+#endif
+#if defined(STRAYDOG_PREFILL_OBSERVER)
     trace.emit();
 #endif
     };
