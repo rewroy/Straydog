@@ -1508,12 +1508,15 @@ impl Backend {
         let (used, budget) = self.budget_memory()?;
         let free = budget.saturating_sub(used) + prefill_workspace_bytes(self.prefill_capacity);
         let Some(capacity) = self.layer_prefill_capacity(bank_bytes, free) else { return Ok(None) };
+        // (a pool of two banks where it leaves the rows as many: the next layer's bank loads while this one computes, where one bank had the
+        // host wait for each layer's compute before the next layer's gather and copies, the GPU idle meanwhile: native load_prefill_bank)
+        let pool_bytes = if self.layer_prefill_capacity(2 * bank_bytes, free) == Some(capacity) { 2 * bank_bytes } else { bank_bytes };
         self.prefill_buffers(capacity)?;
         if self.prefill_capacity < 8 { return Ok(None); }
         let mut pool = std::ptr::null_mut();
         // SAFETY: a live device and out-parameter, with no references published until load_layer_bank.
-        let status = unsafe { ffi::sd_prefill_bank_allocate(self.handle, bank_bytes, &mut pool) };
-        if !pool.is_null() { self.layer_prefill_pool = Some((pool, bank_bytes)); }
+        let status = unsafe { ffi::sd_prefill_bank_allocate(self.handle, pool_bytes, &mut pool) };
+        if !pool.is_null() { self.layer_prefill_pool = Some((pool, pool_bytes)); }
         if check(status)? == 1 { return Ok(None); }
         pointer(pool)?;
         Ok(Some(self.prefill_capacity))

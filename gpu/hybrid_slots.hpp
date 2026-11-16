@@ -1237,16 +1237,44 @@ void clear_prefill_bank(Device& d) {
     plan.layer_prefill = false;
     d.layer_prefill_plan = nullptr;
     d.layer_prefill_storage = nullptr;
+    d.layer_bank_half = -1;
+    d.layer_bank_used[0] = d.layer_bank_used[1] = false;
+}
+// The layer before's bank given up behind its compute, in stream order and without the host waiting for that compute: its experts' table
+// entries emptied after it on the device's stream, and its half of the pool marked free when that compute ends (two halves only).
+void release_prefill_bank_behind(Device& d) {
+    if (!d.layer_prefill_plan) return;
+    auto& plan = *d.layer_prefill_plan;
+    std::vector<std::pair<size_t, const uint8_t*>> absent;
+    for (size_t expert = 0; expert < plan.experts; ++expert) absent.emplace_back(expert, nullptr);
+    hybrid_point_list(d, plan, absent);
+    const int half = d.layer_bank_half;
+    if (!d.layer_bank_free[half]) check(hipEventCreateWithFlags(&d.layer_bank_free[half], hipEventDisableTiming));
+    check(hipEventRecord(d.layer_bank_free[half], d.stream));
+    d.layer_bank_used[half] = true;
+    plan.layer_prefill = false;
+    d.layer_prefill_plan = nullptr;
 }
 void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
                        const uint8_t* const* sources = nullptr, const uint64_t* source_bytes = nullptr) {
-    clear_prefill_bank(d);
     const auto decoder = d.decoder.find(layer);
     const auto allocation = d.allocations.find(storage);
     if (decoder == d.decoder.end() || allocation == d.allocations.end() || bytes > allocation->second || d.qwen_parts != 1)
         throw std::runtime_error("invalid layer prefill bank storage");
     auto& plan = *d.resident.at(decoder->second.moe);
     const size_t entry = expert_slot_bytes(plan), required = plan.experts * entry;
+    // A pool of two banks' bytes (gpu.rs's begin_layer_prefill, where they leave the rows as many): this layer's copies go into the half the
+    // layer before did not use, once the compute of the layer before that has ended, while the layer before computes; the table entries go
+    // to the device's stream, behind it. One bank: the host waits for the layer before's compute first, as before.
+    const size_t half = (bytes / 2) & ~size_t(255);
+    const bool halves = required <= half;
+    int use = 0;
+    if (halves) {
+        release_prefill_bank_behind(d);
+        use = d.layer_bank_half < 0 ? 0 : 1 - d.layer_bank_half;
+    } else {
+        clear_prefill_bank(d);
+    }
     if (!plan.hybrid || required > bytes || d.slots.cache || !d.slots.host || d.slots.stage < 2 || !d.cpu)
         throw std::runtime_error("layer prefill bank needs empty expert cache and staging");
     if (sources) {
@@ -1265,7 +1293,8 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     trace.hint_ns += layer_trace_tick() - hint_started;
 #endif
-    auto* bank = static_cast<uint8_t*>(storage);
+    auto* bank = static_cast<uint8_t*>(storage) + (halves ? size_t(use) * half : 0);
+    if (halves && d.layer_bank_used[use]) check(hipStreamWaitEvent(d.copy_stream, d.layer_bank_free[use], 0));
     if (!sources && plan.mapped[0]) {
         size_t offset = 0;
 #if defined(STRAYDOG_PREFILL_OBSERVER)
@@ -1325,8 +1354,10 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
     for (size_t expert = 0; expert < plan.experts; ++expert) loaded.emplace_back(expert, bank + expert * entry);
     d.layer_prefill_plan = &plan;
     d.layer_prefill_storage = storage;
+    // (the copies have landed: the host waited for the copy stream above, which a later kernel on the device's stream follows anyway)
     hybrid_point_list(d, plan, loaded);
-    check(hipStreamSynchronize(d.stream));
+    if (halves) d.layer_bank_half = use;
+    else check(hipStreamSynchronize(d.stream));
     plan.layer_prefill = true;
     d.streamed_experts += plan.experts;
 #if defined(STRAYDOG_PREFILL_OBSERVER)

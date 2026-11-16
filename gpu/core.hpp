@@ -691,6 +691,11 @@ struct Device {
     bool prefill_deferred = false;
     ResidentMoe* layer_prefill_plan = nullptr;
     void* layer_prefill_storage = nullptr;
+    // A layer-order pass's bank pool in two halves (load_prefill_bank): the half the layer loaded now uses, and for each half the event after the
+    // compute of the layer that last used it, which the next copy into it waits for (and not the compute of the layer between).
+    int layer_bank_half = -1;
+    hipEvent_t layer_bank_free[2] = {nullptr, nullptr};
+    bool layer_bank_used[2] = {false, false};
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     sd_prefill_observer prefill_observer = nullptr;
     void* prefill_observer_context = nullptr;
@@ -945,6 +950,7 @@ struct Device {
         if (slots.host) cleanup(hipHostFree(slots.host));
         if (prestage.event) cleanup(hipEventDestroy(prestage.event));
         if (counts_event) cleanup(hipEventDestroy(counts_event));
+        for (hipEvent_t& event : layer_bank_free) if (event) cleanup(hipEventDestroy(event));
         if (exchange) cleanup(hipHostFree(exchange));
         if (prompt_host && prompt_host_pinned) cleanup(hipHostFree(prompt_host));
         if (prompt_rows) cleanup(hipEventDestroy(prompt_rows));
