@@ -119,18 +119,28 @@ fn reads_direct(reads: BankReads, unregistered: u64, available: u64) -> bool {
     }
 }
 
+/// The layers' reads a pass keeps ahead of the layer it loads at most: each holds one layer's checked copy (some 0.86 GB for UD-IQ2_XS).
+/// One read ahead left the drive idle while the GPU computed a layer it held registered, and a layer's read began only once the layer
+/// before it had gone up: an RTX 5070 Ti PC (64 GB, UD-IQ2_XS at 9 GiB, 19 of 48 layers registered) read a 32K prompt's 24.4 GB at 1.16 GB/s
+/// on average in its 20.5 s, its drive (7 GB/s class) and CPU far from their limits, the GPU waiting for the next layer for 44% of a pass.
+const READS_AHEAD: usize = 4;
+
 pub(crate) struct Prefetch {
     plans: Vec<Option<Plan>>,
     reader: Arc<Reader>,
-    free: Option<Buffer>,
-    pending: Option<(usize, JoinHandle<Result<Copy, String>>)>,
+    /// Buffers no read holds, each of [`Plan::bytes`] of the largest layer.
+    free: Vec<Buffer>,
+    /// The reads under way, in layer order.
+    pending: std::collections::VecDeque<(usize, JoinHandle<Result<Copy, String>>)>,
+    /// The next layer a read ahead may start at.
+    next: usize,
     /// The model's layers registered in place, which are read from the mapping instead.
     registered: Arc<crate::banks::Registered>,
 }
 
 impl Prefetch {
-    /// At most one layer's anonymous copy. Under pressure, or without a pinned
-    /// tree, retain the existing authenticated mapping path instead.
+    /// Up to [`READS_AHEAD`] layers' anonymous copies, each only while the memory available keeps 1 GiB beside them all. Under pressure,
+    /// or without a pinned tree, retain the existing authenticated mapping path instead.
     pub(crate) fn new(weights: &Weights, layers: usize, registered: Arc<crate::banks::Registered>) -> Option<Self> {
         // (the bytes of the layers not registered now, which this pass reads from the file: whether to read them around the page cache)
         let unregistered: u64 = (0..layers).filter(|layer| !registered.is_registered(*layer))
@@ -138,51 +148,74 @@ impl Prefetch {
         let direct = reads_direct(bank_reads(), unregistered, crate::host::prefetch_available_bytes());
         let plans: Vec<_> = (0..layers).map(|layer| Plan::new(weights, layer, direct)).collect();
         let bytes = plans.iter().flatten().map(|plan| plan.bytes).max()?;
-        if bytes as u64 + (1 << 30) > crate::host::prefetch_available_bytes() { return None; }
-        let buffer = Buffer::try_new(bytes)?;
-        Some(Self { plans, reader: Reader::shared(), free: Some(buffer), pending: None, registered })
+        let available = crate::host::prefetch_available_bytes();
+        let mut free = Vec::new();
+        while free.len() < READS_AHEAD && (free.len() as u64 + 1) * bytes as u64 + (1 << 30) <= available {
+            match Buffer::try_new(bytes) { Some(buffer) => free.push(buffer), None => break }
+        }
+        if free.is_empty() { return None; }
+        Some(Self { plans, reader: Reader::shared(), free, pending: std::collections::VecDeque::new(), next: 0, registered })
     }
 
+    /// Reads ahead from `layer` on, as far as the free buffers go: every layer not registered in place now and with a plan, in order
+    /// (a layer whose banks are registered in place is read from the mapping, whose pages its locks keep: not from the file again).
     pub(crate) fn start(&mut self, layer: usize) {
-        // (a layer whose banks are registered in place is read from the mapping, whose pages its locks keep: not from the file again)
-        if self.registered.is_registered(layer) { return; }
-        self.begin(layer);
-    }
-
-    /// Read `layer`'s banks now, registered or not: a layer whose registration was given up after [`Prefetch::start`] passed it by. Its checked
-    /// copy, or None where the layer has no plan (it is loaded as before).
-    pub(crate) fn read_now(&mut self, layer: usize) -> Result<Option<Copy>, String> {
-        self.begin(layer);
-        self.take(layer)
-    }
-
-    fn begin(&mut self, layer: usize) {
-        if self.pending.is_some() { return; }
-        let Some(plan) = self.plans.get(layer).cloned().flatten() else { return };
-        let Some(buffer) = self.free.take() else { return };
-        let reader = self.reader.clone();
-        // A scoped copy owns its destination until the reader has drained every
-        // job; Drop below joins the task on cancellation or any model error.
-        if let Ok(task) = std::thread::Builder::new().name("straydog-layer-bank".into()).spawn(move || plan.read(&reader, buffer)) {
-            self.pending = Some((layer, task));
+        // (a pass's start, `start(0)` with the pass before read through: its reads go from the first layer again)
+        if layer < self.next && self.pending.back().is_none_or(|(at, _)| *at < layer) { self.next = layer; }
+        self.next = self.next.max(layer);
+        while !self.free.is_empty() && self.next < self.plans.len() {
+            let at = self.next;
+            self.next += 1;
+            if self.registered.is_registered(at) || self.plans[at].is_none() { continue; }
+            self.begin(at);
         }
     }
 
-    pub(crate) fn take(&mut self, layer: usize) -> Result<Option<Copy>, String> {
-        let Some((wanted, task)) = self.pending.take() else { return Ok(None) };
-        let copy = task.join().map_err(|_| "a layer bank reader panicked".to_string())??;
-        if wanted != layer { return Err("a copied layer bank arrived out of order".into()); }
+    /// Read `layer`'s banks now, registered or not: a layer whose registration was given up after [`Prefetch::start`] passed it by. Its checked
+    /// copy, or None where no buffer is free or the layer has no plan (it is loaded as before).
+    pub(crate) fn read_now(&mut self, layer: usize) -> Result<Option<Copy>, String> {
+        if self.pending.front().is_some_and(|(at, _)| *at == layer) { return self.take(layer); }
+        if self.free.is_empty() || self.plans.get(layer).cloned().flatten().is_none() { return Ok(None); }
+        let Some(plan) = self.plans[layer].clone() else { return Ok(None) };
+        let buffer = self.free.pop().expect("a free buffer");
+        let copy = plan.read(&self.reader, buffer)?;
         Ok(Some(copy))
     }
 
+    fn begin(&mut self, layer: usize) {
+        let Some(plan) = self.plans.get(layer).cloned().flatten() else { return };
+        let Some(buffer) = self.free.pop() else { return };
+        let reader = self.reader.clone();
+        // A scoped copy owns its destination until the reader has drained every
+        // job; Drop below joins the task on cancellation or any model error.
+        match std::thread::Builder::new().name("straydog-layer-bank".into()).spawn(move || plan.read(&reader, buffer)) {
+            Ok(task) => self.pending.push_back((layer, task)),
+            // (no thread: the buffer went with the closure; the layer is loaded as before)
+            Err(_) => {}
+        }
+    }
+
+    /// `layer`'s checked copy if a read ahead holds it, None if none does (registered when the reads went past it). Reads ahead of layers
+    /// before it, which the pass no longer loads, are joined and their buffers freed.
+    pub(crate) fn take(&mut self, layer: usize) -> Result<Option<Copy>, String> {
+        while let Some((at, _)) = self.pending.front() {
+            if *at > layer { return Ok(None); }
+            let (at, task) = self.pending.pop_front().expect("a read under way");
+            let copy = task.join().map_err(|_| "a layer bank reader panicked".to_string())??;
+            if at == layer { return Ok(Some(copy)); }
+            self.free.push(copy.buffer);
+        }
+        Ok(None)
+    }
+
     pub(crate) fn recycle(&mut self, copy: Option<Copy>) {
-        if let Some(copy) = copy { self.free = Some(copy.buffer); }
+        if let Some(copy) = copy { self.free.push(copy.buffer); }
     }
 }
 
 impl Drop for Prefetch {
     fn drop(&mut self) {
-        if let Some((_, task)) = self.pending.take() { let _ = task.join(); }
+        while let Some((_, task)) = self.pending.pop_front() { let _ = task.join(); }
     }
 }
 
