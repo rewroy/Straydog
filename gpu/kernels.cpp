@@ -3481,6 +3481,8 @@ void* sd_create(int ordinal, uint64_t budget) {
         hipDeviceProp_t prop{}; check(hipGetDeviceProperties(&prop,ordinal));
         value->expert_prefill=prop.major>=7;
         value->mma_f16=prop.major>=8;
+        // (the routed experts of a prompt batch on INT8 operands: STRAYDOG_PROMPT_Q8=0 keeps them FP16)
+        { const char* q8=std::getenv("STRAYDOG_PROMPT_Q8"); value->prompt_q8=prop.major>=8 && !(q8 && q8[0]=='0' && !q8[1]); }
         value->graph_capture=true;
         value->hybrid_prelaunch=prop.major>=7;   // __nanosleep
         // (CUDA 13 no longer says whether kernels have a run-time limit: the shorter wait is the safe one)
