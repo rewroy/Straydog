@@ -334,7 +334,7 @@ fn read_copy(file: &BankFile, offset: u64, target: &mut [u8], bytes: usize) -> s
 
 /// How a read of a copy's bytes goes: past the page cache, or through it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Way {
+pub(crate) enum Way {
     Direct,
     Cached,
 }
@@ -343,7 +343,7 @@ enum Way {
 /// the row tables' reads go ([`crate::rows`]): the whole range direct (`direct`: whether that is possible), then the rest of it in direct pieces of a quarter of
 /// the range if the whole was refused, then what is left once through the page cache if a piece was refused. Only the working-set quota's refusal (`refused`)
 /// is a reason to try the next way: any other error ends the read. Never from the mapping, whose pages the read would bring into the working set.
-fn read_in_ways(direct: bool, offset: u64, target: &mut [u8], bytes: usize, refused: fn(&std::io::Error) -> bool,
+pub(crate) fn read_in_ways(direct: bool, offset: u64, target: &mut [u8], bytes: usize, refused: fn(&std::io::Error) -> bool,
                 read: &mut dyn FnMut(Way, u64, &mut [u8], usize) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut done = 0;
     if direct {

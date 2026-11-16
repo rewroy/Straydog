@@ -426,6 +426,11 @@ impl WorkingSetWatch {
         self.quota.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Whether [`allow_quota`](Self::allow_quota) has come: the working set's limit is kept from then on.
+    pub fn quota_allowed(&self) -> bool {
+        self.quota.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     #[cfg(any(windows, test))]
     fn tick(&self, observe: impl FnOnce(), limit: impl FnOnce()) {
         observe();
