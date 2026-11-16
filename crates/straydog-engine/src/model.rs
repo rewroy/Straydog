@@ -4605,6 +4605,7 @@ impl Model {
                 } else {
                     1
                 };
+                let loads_before = self.group.bank_load_times().ok();
                 let layers_run = (|| -> Result<()> {
                     if bank_ahead { self.load_prefill_bank_copy(0, layers, &mut bank_reader, true)?; }
                     for layer in 0..48 {
@@ -4675,6 +4676,7 @@ impl Model {
                                 if let (Some(reader), Some(copy)) = (bank_reader.as_mut(), self.bank_copy_ahead.take()) {
                                     reader.recycle(Some(copy));
                                     if layer + 2 < layers { reader.start(layer + 2); }
+                                    self.metric_add("prefill_bank_returned_early", 1.0);
                                 }
                             }
                         }
@@ -4683,6 +4685,13 @@ impl Model {
                 })();
                 // (settled whether the layers ran or not: a pass that failed leaves no span deferred, and its own error goes first)
                 let settled = if defer { self.group.prefill_settle() } else { Ok(()) };
+                // (the pass's bank loads, where they ran: their time, their waits for the staging's copies, their gathers)
+                if let (Some(before), Ok(after)) = (loads_before, self.group.bank_load_times()) {
+                    self.metric_add("prefill_bank_loads", after[0].saturating_sub(before[0]) as f64);
+                    self.metric_add("prefill_bank_load_seconds", after[1].saturating_sub(before[1]) as f64 / 1e9);
+                    self.metric_add("prefill_bank_staging_wait_seconds", after[2].saturating_sub(before[2]) as f64 / 1e9);
+                    self.metric_add("prefill_bank_gather_seconds", after[3].saturating_sub(before[3]) as f64 / 1e9);
+                }
                 layers_run?;
                 settled?;
                 match rows_in {
@@ -4804,6 +4813,7 @@ impl Model {
             reader.recycle(Some(copy));
             // (the next read goes into it now: the load ahead started what reads it could, with this buffer still held)
             reader.start(layer + 1);
+            self.metric_add("prefill_bank_returned_at_turn", 1.0);
         }
         Ok(())
     }

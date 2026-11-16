@@ -1383,6 +1383,10 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
     const uint8_t* const own[3] = {c0, c1, c2};
     const uint8_t* const* sources = from_copies ? own : nullptr;
     (void)layer; (void)required; (void)use;
+    const auto load_started = std::chrono::steady_clock::now();
+    const auto since = [](std::chrono::steady_clock::time_point from) {
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+    };
     std::vector<size_t> experts(plan.experts);
     for (size_t i = 0; i < experts.size(); ++i) experts[i] = i;
 #if defined(STRAYDOG_PREFILL_OBSERVER)
@@ -1416,7 +1420,11 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 #if defined(STRAYDOG_PREFILL_OBSERVER)
             const uint64_t wait_started = layer_trace_tick();
 #endif
-            if (chunk >= 2) check(hipEventSynchronize(events.loaded[buffer]));
+            if (chunk >= 2) {
+                const auto staged = std::chrono::steady_clock::now();
+                check(hipEventSynchronize(events.loaded[buffer]));
+                d.bank_staging_wait_ns += since(staged);
+            }
 #if defined(STRAYDOG_PREFILL_OBSERVER)
             trace.wait_ns += layer_trace_tick() - wait_started;
 #endif
@@ -1426,7 +1434,9 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 #if defined(STRAYDOG_PREFILL_OBSERVER)
             const uint64_t gather_started = layer_trace_tick();
 #endif
+            const auto gathering = std::chrono::steady_clock::now();
             hybrid_gather(d, plan, experts.data() + first, count, targets.data(), sources);
+            d.bank_gather_ns += since(gathering);
 #if defined(STRAYDOG_PREFILL_OBSERVER)
             trace.gather_ns += layer_trace_tick() - gather_started;
             trace.before_copy(buffer);
@@ -1464,6 +1474,8 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 #if defined(STRAYDOG_PREFILL_OBSERVER)
     trace.emit();
 #endif
+    d.bank_loads += 1;
+    d.bank_load_ns += since(load_started);
     };
 #if !defined(STRAYDOG_PREFILL_OBSERVER)
     if (ahead) {

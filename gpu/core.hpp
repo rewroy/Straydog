@@ -706,6 +706,9 @@ struct Device {
     bool layer_bank_loading = false;
     // A bank copied ahead, into the half the computing layer does not use, while that layer computes: the layer, its plan, half and bank,
     // until the layer's turn points the table at it (commit_prefill_bank). One at a time.
+    // A layer-order pass's bank loads, counted where they run (the loader's thread too): loads, and in ns their time, their waits for the
+    // staging's copies before a gather, and their gathers (sd_prefill_bank_times).
+    std::atomic<uint64_t> bank_loads{0}, bank_load_ns{0}, bank_staging_wait_ns{0}, bank_gather_ns{0};
     ResidentMoe* layer_bank_ahead_plan = nullptr;
     size_t layer_bank_ahead_layer = 0;
     int layer_bank_ahead_half = -1;

@@ -528,6 +528,9 @@ int sd_prefill_bank_commit(void* handle, uint64_t layer);
 int sd_prefill_bank_halves(void* handle, uint64_t layer, uint64_t bytes);
 /* 1 where no bank loaded ahead is still being gathered (its copy may be given back), 0 where one is. */
 int sd_prefill_bank_ahead_ready(void* handle);
+/* A layer-order pass's bank loads since the device began: out[0] loads, then in ns their time, their waits for the staging's copies and
+   their gathers. */
+int sd_prefill_bank_times(void* handle, uint64_t* out);
 int sd_prefill_bank_clear(void* handle);
 /* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
    3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.
