@@ -175,6 +175,7 @@ unsigned resident_lanes(const std::vector<Matrix>& weights,size_t role,const flo
     return first==second ? first : 0;
 }
 #include "resident_expert_q8.hpp"
+#include "moe_gemm_cuda_q8.hpp"
 // shared_done: the shared expert's gate and up are in `output` already (moe_tokens_experts' router launch).
 void resident_expert_launch(Device& d,const ResidentMoe& plan,const MoeGroup* groups,const int32_t* selected,
                             bool down,const float* input,float* output,
@@ -629,6 +630,16 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     // FP16 product uses routes*1280 bytes, then the converted token inputs use steps*5120. Both fit before outputs (routes*7680 bytes from scratch).
     auto* product=reinterpret_cast<__half*>(scratch);
     auto* half_input=product+routes*640;
+    // (the routed experts on INT8 operands, moe_gemm_cuda_q8.hpp: the token rows' INT8 values and scales after the FP16 inputs, steps*2880 bytes
+    // more; the products' INT8 rows in the FP16 product rows' bytes)
+    auto* q8_input=reinterpret_cast<int8_t*>(half_input+steps*2560);
+    auto* q8_scales=reinterpret_cast<float*>(q8_input+steps*2560);
+    bool q8_ready=false;
+    auto q8_inputs=[&]() {
+        if (!d.prompt_q8 || q8_ready) return;
+        moe_input_q8<<<unsigned((steps*80+7)/8),256,0,d.stream>>>(steps,input,q8_input,q8_scales);
+        q8_ready=true;
+    };
     // (the tile lists: the device's from 0, the shared expert's first and the routed experts' after it, the host's from host_base)
     const size_t routed_most=(steps*10+moe_block_m-1)/moe_block_m+experts;
     const size_t shared_tiles=eager ? (steps+moe_block_m-1)/moe_block_m : 0;
@@ -655,7 +666,23 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         // Each format with a compiled decode has its own kernel (moe_cuda_mode): a switch on the kind for every
         // sixteen weights made the generic kernel's prefill about ten times the RDNA4 kernels' a routed row.
         const int gate_kind=plan.weights[group*3].kind, up_kind=plan.weights[group*3+1].kind;
-        const int gate_mode=gate_kind==up_kind ? moe_cuda_gate_mode(gate_kind) : 0, down_mode=moe_cuda_mode(plan.weights[group*3+2].kind);
+        const int down_kind=plan.weights[group*3+2].kind;
+        if (d.prompt_q8 && group==0 && gate_kind==up_kind && moe_q8_gate_kind(gate_kind) && moe_q8_down_kind(down_kind)) {
+            q8_inputs();
+            auto* rows=reinterpret_cast<uint8_t*>(product);
+            const dim3 gate_tiles(10,unsigned(finish-start)), down_tiles(20,unsigned(finish-start));
+            #define SD_Q8_GATE(kind) case kind: moe_gate_up_q8<kind><<<gate_tiles,256,0,d.stream>>>(groups,list+start,positions,steps,q8_input,q8_scales,rows,built); break;
+            #define SD_Q8_DOWN(kind) case kind: moe_down_q8<kind><<<down_tiles,256,0,d.stream>>>(groups,list+start,positions,rows,outputs,built); break;
+            switch (gate_kind) { SD_Q8_GATE(16) SD_Q8_GATE(17) SD_Q8_GATE(18) SD_Q8_GATE(21) SD_Q8_GATE(22) }
+            phase(d,phase_gate);
+            switch (down_kind) { SD_Q8_DOWN(16) SD_Q8_DOWN(17) SD_Q8_DOWN(18) SD_Q8_DOWN(20) SD_Q8_DOWN(21) SD_Q8_DOWN(22) SD_Q8_DOWN(23) }
+            phase(d,phase_down);
+            #undef SD_Q8_DOWN
+            #undef SD_Q8_GATE
+            check(hipGetLastError());
+            return;
+        }
+        const int gate_mode=gate_kind==up_kind ? moe_cuda_gate_mode(gate_kind) : 0, down_mode=moe_cuda_mode(down_kind);
         const int gate_only=moe_cuda_gate_mode(gate_kind), up_only=moe_cuda_gate_mode(up_kind);
         const dim3 gate_generic(10,unsigned(finish-start)), down_generic(20,unsigned(finish-start));
         // (the staging kernel only for the formats that have it, and only where a group can be native: any other launch is the one kernel)
