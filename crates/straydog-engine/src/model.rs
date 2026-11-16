@@ -1354,6 +1354,8 @@ pub struct Model {
     deferred: bool,
     /// The last long prefill gave the slot pool back empty ([`Group::end_long_prefill_empty`]): the re-pick before the reply fills it ahead.
     slots_refill_ahead: bool,
+    /// The layer-order passes' copy buffers, kept between passes (page-locked once: [`crate::layer_bank::BankBuffers`]).
+    bank_buffers: crate::layer_bank::BankBuffers,
     /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
     mtp_kept: u64,
     /// A draft's vocabulary (DRAFT_ROWS) in use; the tokens past DRAFT_ROWS it holds, and those noted but not yet on the device.
@@ -1631,6 +1633,7 @@ impl Model {
             forced_rows: None,
             deferred: false,
             slots_refill_ahead: false,
+            bank_buffers: Default::default(),
             mtp_kept: 0,
             draft_vocabulary: false,
             draft_extras: HashSet::new(),
@@ -4495,7 +4498,8 @@ impl Model {
                               progress: &mut dyn FnMut(usize, usize)) -> Result<bool> {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
         let layers = 48 + usize::from(self.speculative > 0);
-        let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers, self.registered.clone());
+        let ordinal = self.group.ordinals().first().copied().unwrap_or(0);
+        let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers, self.registered.clone(), self.bank_buffers.clone(), ordinal);
         for stop in layer_prefill_stops(position, end, &checkpoints, layer_prefill_rows()) {
             if cancelled() { return Ok(false); }
             let begin = self.history.len();
@@ -4657,7 +4661,7 @@ impl Model {
         }
         drop(held);
         if let Some(copy) = &copy {
-            self.group.load_layer_bank_from(layer, copy.sources())?;
+            self.group.load_layer_bank_from(layer, copy.sources(), copy.pinned())?;
             self.metric_add("prefill_bank_copied_layers", 1.0);
         }
         if let Some(reader) = reader {
