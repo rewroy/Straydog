@@ -1363,6 +1363,8 @@ pub struct Model {
     deferred: bool,
     /// The last long prefill gave the slot pool back empty ([`Group::end_long_prefill_empty`]): the re-pick before the reply fills it ahead.
     slots_refill_ahead: bool,
+    /// The registrations a layer-order pass's bank loads read from, held until their copies are known to have landed ([`Model::load_prefill_bank_copy`]).
+    bank_held: Vec<crate::banks::RegisteredRead>,
     /// Rows of the last batch the MTP layer's device kept (0: none, see `mtp_prompt_kept`).
     mtp_kept: u64,
     /// A draft's vocabulary (DRAFT_ROWS) in use; the tokens past DRAFT_ROWS it holds, and those noted but not yet on the device.
@@ -1640,6 +1642,7 @@ impl Model {
             forced_rows: None,
             deferred: false,
             slots_refill_ahead: false,
+            bank_held: Vec::new(),
             mtp_kept: 0,
             draft_vocabulary: false,
             draft_extras: HashSet::new(),
@@ -4491,6 +4494,8 @@ impl Model {
         let trace_restore = crate::layer_trace::Span::new("restore", None, position, tokens.len(), 0);
         // Always attempt every restoration step. The head must be back before the cache takes the remaining VRAM.
         let bank = self.group.finish_layer_prefill();
+        // (the bank's clearing waited for every copy: the registrations the last loads read from go)
+        self.bank_held.clear();
         let head = self.with_operands(Model::head_operands, Group::pin);
         let cache = self.end_long_prefill();
         self.metric_add("prefill_restore_seconds", restoring.elapsed().as_secs_f64());
@@ -4675,32 +4680,40 @@ impl Model {
         let waiting = Instant::now();
         let mut copy = reader.as_mut().map(|reader| reader.take(layer)).transpose()?.flatten();
         self.metric_add("prefill_bank_wait_seconds", waiting.elapsed().as_secs_f64());
-        // (a layer registered in place: the read holds the registration until the load's copies are done, which it waits for)
+        // (a layer registered in place: the read holds the registration until the load's copies are done: the next load waits for them, or the
+        // bank's clearing at the pass's end, so the hold goes then, in `bank_held`)
         let held = if copy.is_none() { self.registered.read(layer) } else { None };
-        match bank_source(copy.is_some(), held.is_some(), reader.is_some()) {
-            BankSource::Copy => {}
-            // (the mapping's pages, which its locks keep checked, not the file's again)
-            BankSource::Registered => {
-                self.metric_add("prefill_bank_registered_layers", 1.0);
-                self.group.load_layer_bank(layer)?;
-            }
-            // (passed by while it was registered, and given up since: its pages are no longer kept checked, so a checked copy now)
-            BankSource::ReadNow => {
-                let reading = Instant::now();
-                copy = reader.as_mut().map(|reader| reader.read_now(layer)).transpose()?.flatten();
-                self.metric_add("prefill_bank_wait_seconds", reading.elapsed().as_secs_f64());
-                self.metric_add("prefill_bank_read_late_layers", 1.0);
-                if copy.is_none() {
+        let loaded = (|| -> Result<()> {
+            match bank_source(copy.is_some(), held.is_some(), reader.is_some()) {
+                BankSource::Copy => {}
+                // (the mapping's pages, which its locks keep checked, not the file's again)
+                BankSource::Registered => {
+                    self.metric_add("prefill_bank_registered_layers", 1.0);
                     self.group.load_layer_bank(layer)?;
                 }
+                // (passed by while it was registered, and given up since: its pages are no longer kept checked, so a checked copy now)
+                BankSource::ReadNow => {
+                    let reading = Instant::now();
+                    copy = reader.as_mut().map(|reader| reader.read_now(layer)).transpose()?.flatten();
+                    self.metric_add("prefill_bank_wait_seconds", reading.elapsed().as_secs_f64());
+                    self.metric_add("prefill_bank_read_late_layers", 1.0);
+                    if copy.is_none() {
+                        self.group.load_layer_bank(layer)?;
+                    }
+                }
+                BankSource::Mapping => self.group.load_layer_bank(layer)?,
             }
-            BankSource::Mapping => self.group.load_layer_bank(layer)?,
-        }
-        drop(held);
-        if let Some(copy) = &copy {
-            self.group.load_layer_bank_from(layer, copy.sources())?;
-            self.metric_add("prefill_bank_copied_layers", 1.0);
-        }
+            if let Some(copy) = &copy {
+                self.group.load_layer_bank_from(layer, copy.sources())?;
+                self.metric_add("prefill_bank_copied_layers", 1.0);
+            }
+            Ok(())
+        })();
+        // (a load that went through waited for the copies of the one before: the holds before it go; a failed one may not have, and they stay
+        // until the pass's end, where the bank's clearing waits for every copy)
+        if loaded.is_ok() { self.bank_held.clear(); }
+        self.bank_held.extend(held);
+        loaded?;
         if let Some(reader) = reader {
             // The GPU now owns the entire bank: the same host buffer can receive the
             // next layer while this layer computes, without keeping two host copies.

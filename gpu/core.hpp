@@ -700,6 +700,10 @@ struct Device {
     int layer_bank_half = -1;
     hipEvent_t layer_bank_free[2] = {nullptr, nullptr};
     bool layer_bank_used[2] = {false, false};
+    // The last bank load's copies (recorded on the copy stream, which the device's stream waits for): the next load waits for them on the host,
+    // before it reuses the staging and its caller lets that layer's registration go, a layer's compute later, not the load itself.
+    hipEvent_t layer_bank_loaded = nullptr;
+    bool layer_bank_loading = false;
     // A layer-order pass's chunks' expert counts and last routes, copied to the host behind each chunk's routing on the device's stream and
     // observed for the slots in order once they have landed (observe_deferred), so that the host does not wait for each chunk's routing:
     // a ring of page-locked entries, each with its event, and the entries not yet observed, oldest first.
@@ -963,6 +967,7 @@ struct Device {
         if (prestage.event) cleanup(hipEventDestroy(prestage.event));
         if (counts_event) cleanup(hipEventDestroy(counts_event));
         for (hipEvent_t& event : layer_bank_free) if (event) cleanup(hipEventDestroy(event));
+        if (layer_bank_loaded) cleanup(hipEventDestroy(layer_bank_loaded));
         for (hipEvent_t& event : deferred_events) if (event) cleanup(hipEventDestroy(event));
         if (deferred_host) cleanup(hipHostFree(deferred_host));
         if (exchange) cleanup(hipHostFree(exchange));
