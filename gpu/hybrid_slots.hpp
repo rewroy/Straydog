@@ -1256,7 +1256,7 @@ void release_prefill_bank_behind(Device& d) {
     d.layer_prefill_plan = nullptr;
 }
 void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
-                       const uint8_t* const* sources = nullptr, const uint64_t* source_bytes = nullptr, bool pinned_sources = false) {
+                       const uint8_t* const* sources = nullptr, const uint64_t* source_bytes = nullptr) {
     const auto decoder = d.decoder.find(layer);
     const auto allocation = d.allocations.find(storage);
     if (decoder == d.decoder.end() || allocation == d.allocations.end() || bytes > allocation->second || d.qwen_parts != 1)
@@ -1295,17 +1295,13 @@ void load_prefill_bank(Device& d, size_t layer, void* storage, size_t bytes,
 #endif
     auto* bank = static_cast<uint8_t*>(storage) + (halves ? size_t(use) * half : 0);
     if (halves && d.layer_bank_used[use]) check(hipStreamWaitEvent(d.copy_stream, d.layer_bank_free[use], 0));
-    // (the model's mapping registered in place, or copies in page-locked memory the device reads in place: each role's experts straight into
-    // the bank's entries by the copy engine, a strided copy a role, with no gather through the staging. An RTX 5070 Ti PC's gather and copies
-    // of a copied layer's 0.86 GB took 85 ms a layer against some 25 ms of its compute for an 8000-token prompt)
-    const uint8_t* const* direct = sources && pinned_sources ? sources : (!sources && plan.mapped[0] ? plan.host : nullptr);
-    if (direct) {
+    if (!sources && plan.mapped[0]) {
         size_t offset = 0;
 #if defined(STRAYDOG_PREFILL_OBSERVER)
         trace.before_copy(0);
 #endif
         for (size_t role = 0; role < 3; ++role) {
-            check(hipMemcpy2DAsync(bank + offset, entry, direct[role], plan.host_bytes[role], plan.host_bytes[role], plan.experts,
+            check(hipMemcpy2DAsync(bank + offset, entry, plan.host[role], plan.host_bytes[role], plan.host_bytes[role], plan.experts,
                                    hipMemcpyHostToDevice, d.copy_stream));
             offset += plan.host_bytes[role];
         }
