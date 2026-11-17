@@ -624,7 +624,7 @@ fn layer_ple_ahead(capacity: usize, batch: usize) -> usize {
 }
 /// The part of the host's memory a pass's hidden rows may take: a 16th, 4 GiB of 64 (98,304 rows; 49,152 of 32). On a 5070 Ti with 64 GB
 /// and a 9 GiB budget, UD-IQ2_XS read 90,000 tokens in 76.1 s at 16,384 rows a pass, 52.7 s at 49,152 and 44.9 s at 98,304 (one pass), the
-/// logits the same to the bit; served there, a new 95K prompt took 50.0 s with Strata 0.2.14 and 53.1 s with a 32nd (two runs each).
+/// logits the same to the bit; served there, a new 95K prompt took 53.1 s with a 32nd, in two passes (two runs).
 const LAYER_PREFILL_MEMORY_SHARE: u64 = 16;
 
 /// The rows a layer-order pass takes: [`layer_prefill_rows_for`] this host's memory, or STRAYDOG_LAYER_PREFILL_ROWS when the process
