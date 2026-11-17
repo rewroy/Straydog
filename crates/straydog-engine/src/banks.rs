@@ -864,31 +864,48 @@ impl BankLocks {
     /// # Safety
     /// As [`BankLocks::lock_next`].
     unsafe fn register_turn(&self, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
-        let mut locked = 0;
         let started = std::time::Instant::now();
-        for bank in &banks {
-            // SAFETY: the caller's.
-            if let Err(error) = (self.registrar.lock)(self.ordinal, unsafe { bank.range() }) {
-                Self::release(&self.registrar, &banks[..locked]);
-                return Err(Stop::Refused { layer, error });
+        let (registrar, ordinal) = (self.registrar, self.ordinal);
+        // SAFETY: the caller's.
+        let ranges: [&[u8]; 3] = [0, 1, 2].map(|role| unsafe { banks[role].range() });
+        // A bank is registered on one thread and checked on many: the next bank is registered while this one is checked (on two RTX 3090,
+        // 46.9 GiB, the registering took 27.7 s of a 53.4 s locking and the checks 22.5, one after the other). Locked, a bank's pages stay as they
+        // are: with the shards' verity trees, check them (they may have been read again since loading verified their chunks).
+        (registrar.lock)(ordinal, ranges[0]).map_err(|error| Stop::Refused { layer, error })?;
+        let mut locked = 1;
+        let mut registering = 0.0;
+        let outcome = std::thread::scope(|scope| {
+            for role in 0..3 {
+                let next = (role + 1 < 3).then(|| scope.spawn(move || {
+                    let began = std::time::Instant::now();
+                    ((registrar.lock)(ordinal, ranges[role + 1]), began.elapsed().as_secs_f64())
+                }));
+                // SAFETY: the caller's, and the bank is locked.
+                let checked = unsafe { banks[role].verify(priority) };
+                let registered = next.map(|next| next.join().unwrap_or_else(|_| (Err("a bank's registration panicked".to_string()), 0.0)));
+                if let Some((Ok(()), seconds)) = &registered {
+                    locked += 1;
+                    registering += seconds;
+                }
+                if let Err(error) = checked {
+                    return Err(Stop::Unverified { layer, error });
+                }
+                if let Some((Err(error), _)) = registered {
+                    return Err(Stop::Refused { layer, error });
+                }
             }
-            locked += 1;
+            Ok(())
+        });
+        if let Err(stop) = outcome {
+            Self::release(&self.registrar, &banks[..locked]);
+            return Err(stop);
         }
-        let registered = started.elapsed().as_secs_f64();
-        // Locked, the banks' pages stay as they are now: with the shards' verity trees, check them (they may have been read again since
-        // loading verified their chunks).
-        for bank in &banks {
-            // SAFETY: the caller's, and the bank is locked above.
-            if let Err(error) = unsafe { bank.verify(priority) } {
-                Self::release(&self.registrar, &banks);
-                return Err(Stop::Unverified { layer, error });
-            }
-        }
+        let registered = registering;
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
         // (as the copy mode's line: where a layer's turn goes, registering its pages or checking them)
         if std::env::var_os("DS41_PROFILE").is_some() {
-            eprintln!("Straydog host banks register: layer {layer}, {:.2} GiB, register {registered:.3} s, verification {:.3} s, {} threads",
-                      bytes as f64 / (1u64 << 30) as f64, started.elapsed().as_secs_f64() - registered,
+            eprintln!("Straydog host banks register: layer {layer}, {:.2} GiB, turn {:.3} s, the later banks' registering beside the checks {registered:.3} s, {} threads",
+                      bytes as f64 / (1u64 << 30) as f64, started.elapsed().as_secs_f64(),
                       check_threads(priority, std::thread::available_parallelism().map_or(8, |count| count.get())));
         }
         self.registered.mark(layer);
@@ -1705,6 +1722,34 @@ mod tests {
         assert_eq!(refusal.blocks_more(0, 0), None, "a layer was taken before it");
         drop((first, locks));
         assert_eq!(memory.live(), 0);
+        fixture.finish();
+    }
+
+    /// Decides: a register turn registers a layer's next bank beside the check of the one before, and a check that fails gives up every bank
+    /// registered so far, the one registered beside it among them (a byte changed in the first bank: the second was registered meanwhile).
+    #[test]
+    fn a_failed_check_gives_up_the_bank_registered_beside_it() {
+        static RECORD: Mutex<Vec<(&str, usize, usize)>> = Mutex::new(Vec::new());
+        fn lock(_: usize, range: &[u8]) -> Result<(), String> {
+            RECORD.lock().unwrap().push(("lock", range.as_ptr() as usize, range.len()));
+            Ok(())
+        }
+        fn unlock(range: &[u8]) {
+            RECORD.lock().unwrap().push(("unlock", range.as_ptr() as usize, range.len()));
+        }
+        let fixture = Fixture::new("register-tampered", Some(SPANS[0].0 as usize + 10));
+        let base = fixture.map().as_ptr() as usize;
+        let ranges: Vec<(usize, usize)> = SPANS.iter().map(|&(offset, bytes)| (base + offset as usize, bytes as usize)).collect();
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true))], 0, 1 << 30).registering_with(Registrar { lock, unlock });
+        // SAFETY: the fixture keeps the mapping alive.
+        let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("the first bank does not match its tree");
+        assert!(matches!(stop, Stop::Unverified { layer: 7, .. }), "{stop:?}");
+        let record = RECORD.lock().unwrap().clone();
+        assert_eq!(record.iter().filter(|entry| entry.0 == "lock").map(|entry| (entry.1, entry.2)).collect::<Vec<_>>(), ranges[..2].to_vec(),
+                   "the first two banks registered, the third not begun");
+        assert_eq!(record.iter().filter(|entry| entry.0 == "unlock").map(|entry| (entry.1, entry.2)).collect::<Vec<_>>(), ranges[..2].to_vec(),
+                   "both given up");
+        drop(locks);
         fixture.finish();
     }
 
