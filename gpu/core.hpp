@@ -327,7 +327,15 @@ struct ExpertSlots {
     std::vector<std::pair<ResidentMoe*,int32_t>> owner;
     std::vector<size_t> pending;   // decode swaps still loading on the copy stream
     // Opt-in cache allocations are independent; base then owns only the fixed stage.
-    bool retained_requested=[]() { const char* v=std::getenv("STRAYDOG_KV_CACHE_RETAIN"); return v && std::strcmp(v,"1")==0; }();
+    // (gpu.rs's kv_cache_retention_requested: on CUDA unless STRAYDOG_KV_CACHE_RETAIN=0, on HIP only with =1)
+    bool retained_requested=[]() {
+        const char* v=std::getenv("STRAYDOG_KV_CACHE_RETAIN");
+#if defined(__HIPCC__)
+        return v && std::strcmp(v,"1")==0;
+#else
+        return !(v && std::strcmp(v,"0")==0);
+#endif
+    }();
     bool segmented=false, retained_disabled=false, retained_oom=false;
     bool restore_cap_live=false;
     size_t restore_cap=0;

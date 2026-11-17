@@ -84,9 +84,35 @@ fn top_pairs(row: &[f32], top: usize) -> Vec<(f32, u32)> {
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// The development-only retained expert-cache allocator is selected before placement.
+/// Whether the expert slots keep what they hold across a growth of the K/V (the pool in chunks, gpu/core.hpp's `retained_requested` reads the
+/// same), selected before placement: on a CUDA build unless STRAYDOG_KV_CACHE_RETAIN=0, on a HIP build only with =1. Two RTX 3090 (IQ3_S,
+/// context 262144, served) grew the K/V for a 95,204-token prompt in 1.60 s with it where they took 3.36 s without, the 19 scenarios of the
+/// fixed benchmark as fast (98.9 and 98.7 s) with no error; one RTX 5070 Ti had grown it in 0.12-0.27 s where it took 1.04-1.55 s.
 pub fn kv_cache_retention_requested() -> bool {
-    std::env::var("STRAYDOG_KV_CACHE_RETAIN").is_ok_and(|value| value == "1")
+    kv_cache_retention_named(cfg!(feature = "cuda"), std::env::var("STRAYDOG_KV_CACHE_RETAIN").ok().as_deref())
+}
+
+fn kv_cache_retention_named(cuda: bool, value: Option<&str>) -> bool {
+    match value {
+        Some("1") => true,
+        Some("0") => false,
+        _ => cuda,
+    }
+}
+
+#[cfg(test)]
+mod kv_cache_retention_tests {
+    /// Decides: the K/V growth keeps the expert slots by default on CUDA and not on HIP, and the switch's 0 and 1 name it either way, as the
+    /// native side reads it (gpu/core.hpp).
+    #[test]
+    fn retention_is_on_for_cuda_unless_named_off_and_off_for_hip_unless_named_on() {
+        assert!(super::kv_cache_retention_named(true, None));
+        assert!(super::kv_cache_retention_named(true, Some("2")));
+        assert!(!super::kv_cache_retention_named(true, Some("0")));
+        assert!(!super::kv_cache_retention_named(false, None));
+        assert!(!super::kv_cache_retention_named(false, Some("2")));
+        assert!(super::kv_cache_retention_named(false, Some("1")));
+    }
 }
 
 /// Cumulative native retained-growth counters, in the order of `sd_expert_slots_retain_stats`.
