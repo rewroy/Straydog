@@ -124,6 +124,8 @@ fn reads_direct(reads: BankReads, unregistered: u64, available: u64) -> bool {
 /// before it had gone up: an RTX 5070 Ti PC (64 GB, UD-IQ2_XS at 9 GiB, 19 of 48 layers registered) read a 32K prompt's 24.4 GB at 1.16 GB/s
 /// on average in its 20.5 s, its drive (7 GB/s class) and CPU far from their limits, the GPU waiting for the next layer for 44% of a pass.
 const READS_AHEAD: usize = 4;
+/// The memory the first two copies keep beside them ([`Prefetch::new`]; more copies keep a GiB).
+pub(crate) const FIRST_COPIES_MARGIN: u64 = 1 << 28;
 
 pub(crate) struct Prefetch {
     plans: Vec<Option<Plan>>,
@@ -159,7 +161,7 @@ impl Prefetch {
         // (two buffers keep a quarter of a GiB beside them, the rest a GiB: with one, a layer's read begins only once the copy before it has
         // gone up, and a 90,000-token prompt on an RTX 5070 Ti PC took 39.1 s where it took 36.8 with two; a 95K prompt served after an 8K
         // and a 32K one got one in three of seven requests, 6 GiB free after them)
-        let margin = |buffers: usize| if buffers < 2 { 1u64 << 28 } else { 1u64 << 30 };
+        let margin = |buffers: usize| if buffers < 2 { FIRST_COPIES_MARGIN } else { 1u64 << 30 };
         while free.len() < most && (free.len() as u64 + 1) * bytes as u64 + margin(free.len()) <= available {
             match Buffer::try_new(bytes) { Some(buffer) => free.push(buffer), None => break }
         }
