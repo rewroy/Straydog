@@ -64,6 +64,8 @@ struct Handle(mpsc::Sender<Job>);
 impl Served for Handle {
     fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
            started: Instant) -> Result<Value, Failure> {
+        // (as the resident worker's: a background check behind "ready" takes a quarter of the cores while a request runs)
+        let _running = straydog_engine::banks::RequestRunning::begin();
         let (reply, result) = mpsc::channel();
         let job = Job::Run { body: body.clone(), id: id.to_string(), output: output.clone(), cancel: cancel.clone(), started,
                              text: text.clone(), reply };

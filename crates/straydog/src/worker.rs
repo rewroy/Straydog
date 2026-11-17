@@ -224,6 +224,8 @@ impl Served for Engine {
            started: Instant) -> Result<Value, Failure> {
         self.vram_ready().map_err(|message| Failure { message: format!("{message}. Restart the worker before retrying."), fatal: true })?;
         self.requests += 1;
+        // (while it runs, the locking behind "ready" checks its banks on a quarter of the cores, not all of them)
+        let _running = straydog_engine::banks::RequestRunning::begin();
         self.more_vram(false, "request").map_err(|message| engine_failed(message, "adjusting the GPU memory budget"))?;
         let result = run(self, text, output, id, body, cancel, started);
         #[cfg(windows)]
