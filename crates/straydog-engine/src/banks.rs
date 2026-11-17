@@ -1100,6 +1100,30 @@ pub fn layers_within(sizes: &[u64], budget: u64) -> Vec<usize> {
     layers
 }
 
+/// The unlocked layers (`layers`, with their banks' bytes, in the order wanted) whose banks a read back takes within `budget` bytes: in order,
+/// as long as the next one fits. A layer that does not fit ends the list, so that the likeliest go first and whole.
+pub fn read_back_plan(layers: &[(usize, u64)], budget: u64) -> Vec<usize> {
+    let mut left = budget;
+    let mut planned = Vec::new();
+    for &(layer, bytes) in layers {
+        if bytes > left {
+            break;
+        }
+        left -= bytes;
+        planned.push(layer);
+    }
+    planned
+}
+
+/// How long a read back waits after reading `bytes` in `took` so that it reads at no more than `rate` bytes a second on average: the drive
+/// is shared with the reply's own faults.
+pub fn read_back_pause(bytes: u64, took: std::time::Duration, rate: u64) -> std::time::Duration {
+    if rate == 0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_secs_f64(bytes as f64 / rate as f64).saturating_sub(took)
+}
+
 /// `layers` in the order they are locked: with an earlier run's counts, the layers whose experts the host ran most routes of first (locking
 /// a layer lets the GPU take some of its absent routes from the CPU, so those are where it saves most); layers with as many routes keep the
 /// order they were given, and without counts all do.
@@ -1110,6 +1134,22 @@ pub fn order_by_host_routes(layers: &mut [usize], host_routes: impl Fn(usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides: a read back takes whole layers in the order given while each fits what is left of its budget, and stops at the first that does
+    /// not; it waits after each so that its reads average the rate given, and not at all when its read was already that slow.
+    #[test]
+    fn a_read_back_takes_whole_layers_in_order_within_its_budget_and_its_rate() {
+        const GIB: u64 = 1 << 30;
+        let layers = [(30, GIB), (12, GIB), (40, 2 * GIB), (7, GIB)];
+        assert_eq!(read_back_plan(&layers, 5 * GIB), vec![30, 12, 40, 7]);
+        assert_eq!(read_back_plan(&layers, 3 * GIB), vec![30, 12], "40's two GiB do not fit the one left, and 7 waits behind it");
+        assert_eq!(read_back_plan(&layers, GIB - 1), Vec::<usize>::new());
+        assert_eq!(read_back_plan(&[], 5 * GIB), Vec::<usize>::new());
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(read_back_pause(2 * GIB, second / 4, GIB), 2 * second - second / 4);
+        assert_eq!(read_back_pause(GIB, 3 * second, GIB), std::time::Duration::ZERO);
+        assert_eq!(read_back_pause(GIB, second / 2, 0), std::time::Duration::ZERO);
+    }
 
     /// Decides: the check behind "ready" has at most a quarter of the cores and at least one while a request runs, and every core between
     /// requests, as the load's check and a locking nothing runs beside always have; the count follows the requests as they begin and end.
