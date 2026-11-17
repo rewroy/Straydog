@@ -17,7 +17,7 @@
 constexpr size_t moe_q8_row_bytes = 1280;   // a route's product row: 640 INT8 values, then its 20 F32 scales
 // The kinds the INT8 kernels decode: the IQ formats of resident_expert_q8.hpp, and IQ4_NL and IQ4_XS for down.
 __host__ __device__ constexpr bool moe_q8_gate_kind(int kind) { return kind == 16 || kind == 17 || kind == 18 || kind == 21 || kind == 22; }
-__host__ __device__ constexpr bool moe_q8_down_kind(int kind) { return moe_q8_gate_kind(kind) || kind == 20 || kind == 23; }
+__host__ __device__ constexpr bool moe_q8_down_kind(int kind) { return moe_q8_gate_kind(kind) || kind == 20 || kind == 23 || kind == 42; }
 __host__ __device__ constexpr bool moe_q8_halves(int kind) { return kind == 17 || kind == 22; }   // a sub-scale to every 16 values
 
 // The token rows as INT8 units: row r's 2560 values at q + r * 2560, its 80 scales at s + r * 80. A warp a unit, a lane a value.
@@ -91,8 +91,9 @@ __device__ __forceinline__ MoeQ8Source moe_q8_source(const Matrix& m, uint32_t r
 // A unit's fields as read. IQ kinds: h[0] the block's scale, then each 32-bit field as two 16-bit halves (low, high; in the SoA layout the
 // whole word and a zero), then the 16-bit words holding its bytes (high bits, sub-scales; in the SoA layout the byte itself). IQ4_NL: the
 // scale, then the 16 code bytes as eight halves. IQ4_XS: the scale, the high scale bits, the unit's low scale byte, its eight halves of codes.
+// Kind 42 (a half scale to 64 values, their 2-bit codes four to a byte): the scale, then the unit's 8 code bytes as four halves.
 __host__ __device__ constexpr int moe_q8_raw_words(int kind) {
-    return kind == 16 ? 5 : kind == 17 ? 6 : kind == 20 || kind == 21 ? 9 : kind == 23 ? 11 : 7;
+    return kind == 16 || kind == 42 ? 5 : kind == 17 ? 6 : kind == 20 || kind == 21 ? 9 : kind == 23 ? 11 : 7;
 }
 template<int Kind>
 struct MoeQ8Raw {
@@ -101,7 +102,13 @@ struct MoeQ8Raw {
 template<int Kind>
 __device__ __forceinline__ MoeQ8Raw<Kind> moe_q8_fetch(const MoeQ8Source& s, uint32_t row, uint32_t unit) {
     MoeQ8Raw<Kind> r{};
-    if constexpr (Kind == 20) {
+    if constexpr (Kind == 42) {
+        // (a unit is half of an 18-byte block: the block's scale, then its 64 codes, the unit's 32 in 8 bytes)
+        const uint16_t* b = reinterpret_cast<const uint16_t*>(s.at + size_t(unit / 2) * 18);
+        r.h[0] = b[0];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) r.h[1 + i] = b[1 + (unit % 2) * 4 + i];
+    } else if constexpr (Kind == 20) {
         const uint16_t* b = reinterpret_cast<const uint16_t*>(s.at + size_t(unit) * 18);
         #pragma unroll
         for (int i = 0; i < 9; ++i) r.h[i] = b[i];
@@ -190,7 +197,15 @@ __device__ __forceinline__ ExpertQ8Unit moe_q8_join(const MoeQ8Raw<Kind>& r, boo
 template<int Kind>
 __device__ __forceinline__ void moe_q8_decode(const MoeQ8Raw<Kind>& r, bool soa, uint32_t unit, const uint8_t* grid, const uint2* masks,
                                               uint32_t (&words)[8], float& low, float& high) {
-    if constexpr (Kind == 20 || Kind == 23) {
+    if constexpr (Kind == 42) {
+        // (byte i holds values 4i to 4i + 3, two bits each from the low end; a value is its code - 1: -1, 0, 1 or 2)
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t x = (r.h[1 + i / 2] >> (8 * (i % 2))) & 255;
+            words[i] = __vsub4((x | (x << 6) | (x << 12) | (x << 18)) & 0x03030303u, 0x01010101u);
+        }
+        low = high = gemv_half(r.h[0]);
+    } else if constexpr (Kind == 20 || Kind == 23) {
         uint32_t codes[4];
         float factor;
         if constexpr (Kind == 20) {

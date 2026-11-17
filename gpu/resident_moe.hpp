@@ -675,7 +675,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
             #define SD_Q8_DOWN(kind) case kind: moe_down_q8<kind><<<down_tiles,256,0,d.stream>>>(groups,list+start,positions,rows,outputs,built); break;
             switch (gate_kind) { SD_Q8_GATE(16) SD_Q8_GATE(17) SD_Q8_GATE(18) SD_Q8_GATE(21) SD_Q8_GATE(22) }
             phase(d,phase_gate);
-            switch (down_kind) { SD_Q8_DOWN(16) SD_Q8_DOWN(17) SD_Q8_DOWN(18) SD_Q8_DOWN(20) SD_Q8_DOWN(21) SD_Q8_DOWN(22) SD_Q8_DOWN(23) }
+            switch (down_kind) { SD_Q8_DOWN(16) SD_Q8_DOWN(17) SD_Q8_DOWN(18) SD_Q8_DOWN(20) SD_Q8_DOWN(21) SD_Q8_DOWN(22) SD_Q8_DOWN(23) SD_Q8_DOWN(42) }
             phase(d,phase_down);
             #undef SD_Q8_DOWN
             #undef SD_Q8_GATE
