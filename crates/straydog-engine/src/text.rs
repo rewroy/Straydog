@@ -28,6 +28,11 @@ const MEMO_FROM: usize = 4096;
 /// served with, DeepSeek-V4.1's 1,048,576 tokens, with room for others. A segment longer than this is not kept: at 1 << 19 a
 /// 932,410-token conversation was encoded again each turn, 0.9 s of a 1.55 s wait for its first token.
 const MEMO_TOKENS: usize = 1 << 22;
+/// A segment of at least this many bytes is encoded in pieces side by side ([`Text::encode_long`]), each about [`SPLIT_PIECE`] bytes: a prompt
+/// of 95,204 tokens took 0.86 s to encode on two RTX 3090's slow host (EPYC 7543, 20 shared vCPUs) and one of 242,361 took 2.1 s, in one thread,
+/// before any of it was read.
+const SPLIT_FROM: usize = 1 << 16;
+const SPLIT_PIECE: usize = 1 << 15;
 
 /// Encoded segments by the SHA-256 of their text, and the order they came in. A conversation's next request renders its earlier messages
 /// again, and their segments come back the same: only the new ones need encoding (a 250K-token conversation took 0.30 to 0.34 s to encode
@@ -39,6 +44,37 @@ struct Memo {
     tokens: usize,
 }
 
+/// Where to cut `text` into pieces of at least `piece` bytes: just after a newline that an ASCII letter follows (a char boundary), with the
+/// start and the end.
+fn line_cuts(text: &str, piece: usize) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let (mut cuts, mut at) = (vec![0], piece.max(1));
+    while at < bytes.len() {
+        let Some(found) = bytes[at - 1..].windows(2).position(|pair| pair[0] == b'\n' && pair[1].is_ascii_alphabetic()) else { break };
+        let cut = at + found;
+        cuts.push(cut);
+        at = cut + piece.max(1);
+    }
+    cuts.push(bytes.len());
+    cuts
+}
+
+/// Whether `tokenizer` encodes texts cut at [`line_cuts`] as their pieces, on probes with what lies at such a cut: punctuation, spaces and
+/// tabs before the newline, blank lines, digits and words after it, CJK.
+fn splits_at_lines(tokenizer: &Tokenizer) -> bool {
+    const PROBES: [&str; 3] = [
+        "The cat sat.\nThen it left, 12345 times!\n\nAnother line  \n\tindented\nEnd of it\r\nCarriage\nx",
+        "fn main() {\n    let a = 1;\n}\nfoo(bar);\n// comment\nlet b = \"q\";\nreturn\n\n\nz",
+        "日本語の行です。\nEnglish after it\n123\nabc def\n'quoted'\ns\n-- dash\nlast",
+    ];
+    PROBES.iter().all(|probe| {
+        let whole = Text::encode_with(tokenizer, probe);
+        let cuts = line_cuts(probe, 1);
+        let pieces: Result<Vec<Vec<u32>>, _> = cuts.windows(2).map(|cut| Text::encode_with(tokenizer, &probe[cut[0]..cut[1]])).collect();
+        cuts.len() > 4 && matches!((whole, pieces), (Ok(whole), Ok(pieces)) if whole == pieces.concat())
+    })
+}
+
 pub struct Text {
     tokenizer: Tokenizer,
     /// The same without its added tokens: a defused one's text as any other text.
@@ -48,6 +84,9 @@ pub struct Text {
     /// [`Text::token_bytes`], built on first use.
     bytes: std::sync::OnceLock<std::sync::Arc<crate::constraint::TokenBytes>>,
     memo: std::sync::Mutex<Memo>,
+    /// Whether a text cut where a line ends and the next begins with an ASCII letter encodes as its two pieces do, as the pre-tokenizers of
+    /// Qwen3.8 and DeepSeek-V4.1 make it (a newline run ends a piece there, and a word begins at its letter): checked on probes at load.
+    lines: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +117,8 @@ impl Text {
             let compile = |pattern: String| regex::Regex::new(&pattern).map_err(|exc| TextError(exc.to_string()));
             Some((compile(alternatives.clone())?, compile(format!("^(?:{alternatives})"))?))
         };
-        Ok(Text { tokenizer, plain, added, bytes: std::sync::OnceLock::new(), memo: Default::default() })
+        let lines = splits_at_lines(&tokenizer);
+        Ok(Text { tokenizer, plain, added, bytes: std::sync::OnceLock::new(), memo: Default::default(), lines })
     }
 
     /// `text`, a message's own, with each added token's text in it marked [`DEFUSED`]: only the
@@ -192,7 +232,7 @@ impl Text {
             ids.extend_from_slice(&kept);
             return Ok(());
         }
-        let encoded: std::sync::Arc<[u32]> = Self::encode_with(&self.tokenizer, segment)?.into();
+        let encoded: std::sync::Arc<[u32]> = self.encode_long(segment)?.into();
         ids.extend_from_slice(&encoded);
         let mut memo = self.memo.lock().unwrap();
         if encoded.len() <= MEMO_TOKENS && memo.segments.insert(key, encoded.clone()).is_none() {
@@ -204,6 +244,19 @@ impl Text {
             }
         }
         Ok(())
+    }
+
+    /// A long segment's ids: where the tokenizer splits at lines ([`Text::lines`]), its pieces cut there ([`line_cuts`]) are encoded side by side
+    /// and joined, the same ids as the segment's in one call; else in one call.
+    fn encode_long(&self, segment: &str) -> Result<Vec<u32>, TextError> {
+        if !self.lines || segment.len() < SPLIT_FROM {
+            return Self::encode_with(&self.tokenizer, segment);
+        }
+        use rayon::prelude::*;
+        let cuts = line_cuts(segment, SPLIT_PIECE);
+        let pieces: Vec<&str> = cuts.windows(2).map(|cut| &segment[cut[0]..cut[1]]).collect();
+        let encoded = pieces.par_iter().map(|piece| Self::encode_with(&self.tokenizer, piece)).collect::<Result<Vec<_>, _>>()?;
+        Ok(encoded.concat())
     }
 
     fn encode_with(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>, TextError> {
@@ -319,7 +372,30 @@ impl Detokenizer<'_> {
 
 #[cfg(test)]
 mod memo_tests {
-    use super::{Text, MEMO_FROM};
+    use super::{Text, MEMO_FROM, SPLIT_FROM};
+
+    /// Decides: a long segment encoded in pieces cut at lines, side by side, has the ids of the whole segment encoded at once, and the probes
+    /// at load find that the real Qwen3.8 tokenizer allows the cuts (skipped where its file is not on the machine). The text: this repository's
+    /// documents and this file's source three times over, over a megabyte with code, tables, Japanese and blank lines.
+    #[test]
+    fn a_long_segment_in_pieces_has_the_ids_of_the_whole() {
+        let path = std::env::var("STRAYDOG_TOKENIZER_JSON")
+            .unwrap_or_else(|_| "/server/gguf-models/Qwen3.8-Flash-Next-GGUF/UD-IQ2_XS/tokenizer.json".into());
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let text = Text::new(&bytes).unwrap();
+        assert!(text.lines, "the probes found the cuts change the ids");
+        let documents = [include_str!("../../../README.md"), include_str!("../../../docs/DESIGN.md"), include_str!("text.rs")];
+        let segment = documents.concat().repeat(3);
+        assert!(segment.len() > 8 * SPLIT_FROM);
+        let whole = Text::encode_with(&text.tokenizer, &segment).unwrap();
+        assert_eq!(text.encode_long(&segment).unwrap(), whole);
+        // (and one copy cut at every seam the rule allows, each piece alone: every kind of line end and line start the documents have)
+        let copy = documents.concat();
+        let cuts = super::line_cuts(&copy, 1);
+        assert!(cuts.len() > 200, "{} cuts", cuts.len());
+        let pieces: Vec<u32> = cuts.windows(2).flat_map(|cut| Text::encode_with(&text.tokenizer, &copy[cut[0]..cut[1]]).unwrap()).collect();
+        assert_eq!(pieces, Text::encode_with(&text.tokenizer, &copy).unwrap());
+    }
 
     /// Decides: a rendered conversation's ids are the same with the kept segments as without, the first time and when its earlier
     /// messages come back with a new one (the real Qwen3.8 tokenizer; skipped where its file is not on the machine).
