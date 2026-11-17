@@ -510,6 +510,44 @@ async fn suppress_reaches_the_worker_only_when_given() {
     assert_eq!(pyjson::dumps(&asking), pyjson::dumps(&absent).strip_suffix('}').unwrap().to_string() + r#", "suppress": "not_cp932_han"}"#);
 }
 
+/// `straydog.reasoning` false asks one reply with no reasoning in a conversation that thinks: the worker's request is the thinking
+/// one with `"reasoning": false` after it (its prompt is not another mode's), and the answer is read as words from its first.
+/// Only where the template closes a reasoning by its own token (DSML, which says so in `/props`); elsewhere, and when not asked, the
+/// request is the request it always was.
+#[tokio::test]
+async fn a_reply_asked_with_no_reasoning_keeps_the_thinking_request() {
+    let sent = |markup: Markup, fields: serde_json::Value| async move {
+        let mock = Mock::new(vec![Script::Events(vec![delta("Written."), done("stop")])]);
+        let app = router(mock.clone(), ApiConfig { markup, ..config() });
+        let (status, body) = fetch(app, chat(ask(fields).to_string())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (mock.requests()[0].clone(), body["choices"][0]["message"].clone())
+    };
+    let (plain, thought) = sent(Markup::Dsml, json!({"seed": 1})).await;
+    assert_eq!(plain.get("thinking"), Some(&pyjson::Value::Bool(true)));
+    assert_eq!((thought["reasoning_content"].as_str(), thought["content"].as_str()), (Some("Written."), Some("")), "a thinking reply that never closed its reasoning");
+    let (asking, written) = sent(Markup::Dsml, json!({"seed": 1, "straydog": {"reasoning": false}})).await;
+    assert_eq!(pyjson::dumps(&asking), pyjson::dumps(&plain).strip_suffix('}').unwrap().to_string() + r#", "reasoning": false}"#);
+    assert_eq!((written.get("reasoning_content").and_then(|reasoning| reasoning.as_str()), written["content"].as_str()), (None, Some("Written.")));
+    for fields in [json!({"seed": 1, "straydog": {"reasoning": true}}), json!({"seed": 1, "straydog": {"reasoning": null}})] {
+        assert_eq!(pyjson::dumps(&sent(Markup::Dsml, fields).await.0), pyjson::dumps(&plain));
+    }
+    // (a request that does not think has no reasoning to leave out)
+    let chat_mode = json!({"seed": 1, "chat_template_kwargs": {"enable_thinking": false}});
+    let mut both = chat_mode.clone();
+    both["straydog"] = json!({"reasoning": false});
+    assert_eq!(pyjson::dumps(&sent(Markup::Dsml, both).await.0), pyjson::dumps(&sent(Markup::Dsml, chat_mode).await.0));
+    let (qwen, _) = sent(Markup::Qwen, json!({"seed": 1, "reasoning_effort": "medium"})).await;
+    let (qwen_asking, _) = sent(Markup::Qwen, json!({"seed": 1, "reasoning_effort": "medium", "straydog": {"reasoning": false}})).await;
+    assert_eq!(pyjson::dumps(&qwen_asking), pyjson::dumps(&qwen));
+    let mock = Mock::new(vec![]);
+    mock.set_state(EngineState::Ready { context: 65536, speculative: 0, processing: false, placement: json!({}) });
+    let (_, props) = fetch(router(mock.clone(), ApiConfig { markup: Markup::Dsml, ..config() }), get("/props")).await;
+    assert_eq!(props["reasoning_off"], true);
+    let (status, body) = fetch(router(mock, ApiConfig { markup: Markup::Dsml, ..config() }), chat(ask(json!({"straydog": {"reasoning": 0}})).to_string())).await;
+    assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some("straydog.reasoning must be a boolean")));
+}
+
 /// A client's X-Request-Id reaches the worker request as its `request_id`, for the server's log: printable ASCII but the space
 /// and at most 64 of it, nothing at all when none is left, and a request without one is the request it always was.
 #[tokio::test]
@@ -713,8 +751,9 @@ async fn invalid_requests_are_refused() {
         (ask(json!({"stop": ["a", 1]})), "stop must be a string or a list of at most 16 strings"),
         (ask(json!({"stop": seventeen})), "stop must be a string or a list of at most 16 strings"),
         (ask(json!({"straydog": {"checkpoint": "no"}})), "straydog.checkpoint must be a boolean"),
-        (ask(json!({"straydog": {"cache": false}})), "the straydog object supports checkpoint"),
-        (ask(json!({"straydog": true})), "the straydog object supports checkpoint"),
+        (ask(json!({"straydog": {"tool_writing": "yes"}})), "straydog.tool_writing must be a boolean"),
+        (ask(json!({"straydog": {"cache": false}})), "the straydog object supports checkpoint, tool_writing and reasoning"),
+        (ask(json!({"straydog": true})), "the straydog object supports checkpoint, tool_writing and reasoning"),
         (ask(json!({"stream": "yes"})), "stream must be a boolean"),
         (ask(json!({"stream_options": true})), "stream_options must be an object"),
         (ask(json!({"stream_options": {"include_usage": 1}})), "stream_options.include_usage must be a boolean"),
@@ -802,7 +841,8 @@ async fn health_and_models_follow_the_engine() {
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
     assert_eq!(models, json!({"object": "list", "data": [{
         "id": "Qwen3.8-Flash-Next-IQ3_S", "object": "model", "created": 1_760_000_000, "owned_by": "straydog",
-        "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false, "vision": false, "suppress": ["not_cp932_han"]}}]}));
+        "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false, "vision": false, "suppress": ["not_cp932_han"],
+                 "tool_writing": true, "reasoning_off": false}}]}));
     for path in ["/props", "/slots"] {
         assert_eq!(fetch(app(&mock), get(path)).await, refused(503, "unavailable_error", "Loading model"), "{path}");
     }
@@ -812,7 +852,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(fetch(app(&mock), get("/health")).await, (StatusCode::OK, json!({"status": "ok"})));
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
     assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true, "vision": false, "suppress": ["not_cp932_han"],
-                                                 "placement": {"resident": true, "host_kv": false}}));
+                                                 "tool_writing": true, "reasoning_off": false, "placement": {"resident": true, "host_kv": false}}));
     // llama-server's endpoints, where its clients read the context.
     let slot = json!({"id": 0, "n_ctx": 131072, "speculative": true, "is_processing": true,
                       "params": {"n_predict": -1, "seed": 0, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
@@ -821,7 +861,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(props, json!({"default_generation_settings": slot, "total_slots": 1,
                              "model_alias": "Qwen3.8-Flash-Next-IQ3_S", "modalities": {"vision": false, "audio": false},
-                             "suppress": ["not_cp932_han"],
+                             "suppress": ["not_cp932_han"], "tool_writing": true, "reasoning_off": false,
                              "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false}));
     assert_eq!(fetch(app(&mock), get("/slots")).await, (StatusCode::OK, json!([slot])));
 
@@ -968,4 +1008,158 @@ async fn a_dsml_model_gets_its_own_levels_card_and_tool_calls() {
     let (_, props) = fetch(app(), get("/props")).await;
     assert_eq!((props["default_generation_settings"]["params"]["top_k"].as_u64(), props["default_generation_settings"]["params"]["top_p"].as_f64()),
                (Some(0), Some(1.0)));
+}
+
+/// A streamed body with what the server draws at random (the ids) and the clock (`created`) replaced.
+fn normalized(body: &str) -> String {
+    fn after(text: &str, marker: &str, keep: impl Fn(char) -> bool, with: &str) -> String {
+        let (mut out, mut rest) = (String::new(), text);
+        while let Some(at) = rest.find(marker) {
+            let end = at + marker.len();
+            out.push_str(&rest[..end]);
+            let tail = &rest[end..];
+            out.push_str(with);
+            rest = &tail[tail.find(|c| !keep(c)).unwrap_or(tail.len())..];
+        }
+        out.push_str(rest);
+        out
+    }
+    let body = after(body, "chatcmpl-", |c| c.is_ascii_hexdigit(), "ID");
+    let body = after(&body, "call_", |c| c.is_ascii_hexdigit(), "ID");
+    after(&body, "\"created\":", |c| c.is_ascii_digit(), "0")
+}
+
+/// The whole body of a streamed request, normalized.
+async fn streamed_body(events: Vec<Value>, fields: Value) -> String {
+    let mock = Mock::new(vec![Script::Events(events)]);
+    let mut body = ask(fields);
+    body["stream"] = true.into();
+    let (status, kind, text) = send(app(&mock), chat(body.to_string())).await;
+    assert_eq!((status, kind.as_str()), (StatusCode::OK, "text/event-stream"));
+    normalized(&text)
+}
+
+fn tool_calling_events() -> Vec<Value> {
+    vec![
+        progress(512, 1024),
+        delta("Let me check"),
+        delta(" the file.\n</th"),
+        delta("ink>\n\nReading it"),
+        delta(" now.\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n"),
+        delta("<parameter=limit>\n50\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/"),
+        delta("lib \"two\".rs\nline\n</param"),
+        delta("eter>\n</function>\n</tool_call>"),
+        done("stop"),
+    ]
+}
+
+/// A request that does not ask for the calls as they are written streams what it always has: the whole body, byte for byte (the
+/// ids and the clock aside), as the server streamed it before the option existed (`tests/golden/`).
+#[tokio::test]
+async fn a_request_that_does_not_ask_streams_what_it_always_has() {
+    let usage = streamed_body(tool_calling_events(), json!({"tools": read_file(), "stream_options": {"include_usage": true}})).await;
+    assert_eq!(usage, include_str!("golden/tool_calls_usage.sse").replace("\r\n", "\n"));
+    let plain = streamed_body(tool_calling_events(), json!({"tools": read_file()})).await;
+    assert_eq!(plain, include_str!("golden/tool_calls.sse").replace("\r\n", "\n"));
+    assert!(!plain.contains("straydog_tool_writing"));
+    // (asking for nothing is not asking)
+    for straydog in [json!({}), json!({"tool_writing": false}), json!({"tool_writing": null}), json!({"checkpoint": true})] {
+        let body = streamed_body(tool_calling_events(), json!({"tools": read_file(), "straydog": straydog})).await;
+        assert_eq!(body, plain);
+    }
+}
+
+/// A streaming client with tools that asks gets the pieces of a call being written in a field of its own, and the same stream
+/// beside them: the calls it ends with are the ones it gets without asking.
+#[tokio::test]
+async fn a_client_that_asks_gets_the_calls_as_they_are_written() {
+    let run = |straydog: Value| async move {
+        let mock = Mock::new(vec![Script::Events(tool_calling_events())]);
+        let mut fields = json!({"tools": read_file()});
+        if !straydog.is_null() {
+            fields["straydog"] = straydog;
+        }
+        let (status, events) = stream(&mock, ask(fields)).await;
+        assert_eq!(status, StatusCode::OK);
+        (events, mock.requests())
+    };
+    let ((asking, asked_request), (plain, plain_request)) = (run(json!({"tool_writing": true})).await, run(Value::Null).await);
+    // the worker never hears of it
+    assert_eq!(pyjson::dumps(&asked_request[0]), pyjson::dumps(&plain_request[0]));
+
+    // the chunks that carry pieces, in order: before the calls themselves
+    let mut asked = deltas(&asking);
+    // (a chunk as it is written: the name of the call alone, then what its arguments are so far)
+    let example = asked.iter().find(|delta| delta.get("straydog_tool_writing").is_some()).unwrap();
+    assert_eq!(example, &json!({"straydog_tool_writing": [{"index": 0, "name": "read_file", "arguments": ""},
+                                                          {"index": 0, "arguments": r#"{"path": "src/main.rs"#}]}));
+    let (mut shown, mut at) = (Vec::new(), Vec::new());
+    for (position, delta) in asked.iter_mut().enumerate() {
+        if let Some(pieces) = delta.as_object_mut().and_then(|fields| fields.remove("straydog_tool_writing")) {
+            shown.push(pieces);
+            at.push(position);
+        }
+    }
+    let name = |index: u64| json!({"index": index, "name": "read_file", "arguments": ""});
+    assert_eq!(shown, [
+        json!([name(0), {"index": 0, "arguments": r#"{"path": "src/main.rs"#}]),
+        json!([{"index": 0, "arguments": r#"", "limit": 50}"#}, name(1), {"index": 1, "arguments": r#"{"path": "src/"#}]),
+        json!([{"index": 1, "arguments": r#"lib \"two\".rs\nline"#}]),
+        json!([{"index": 1, "arguments": r#""}"#}]),
+    ]);
+    let calls_at = asked.iter().position(|delta| delta.get("tool_calls").is_some()).unwrap();
+    assert!(at.iter().all(|position| *position < calls_at), "the pieces come before the calls");
+
+    // what is left is the stream without the option: the same chunks, but those that held only pieces
+    let mut without = deltas(&plain);
+    let mut kept: Vec<Value> = asked.iter().enumerate().filter(|(position, delta)| !(at.contains(position) && **delta == json!({}))).map(|(_, d)| d.clone()).collect();
+    for list in [&mut kept, &mut without] {
+        for delta in list.iter_mut() {
+            if let Some(calls) = delta.get_mut("tool_calls") {
+                fix_ids(calls);
+            }
+        }
+    }
+    assert_eq!(kept, without);
+    // the pieces, joined, are what the calls end with
+    let ended: Vec<String> = without.iter().filter_map(|delta| delta.get("tool_calls")).flat_map(|calls| calls.as_array().unwrap())
+        .map(|call| call["function"]["arguments"].as_str().unwrap().to_string()).collect();
+    let joined = |index: u64| -> String {
+        shown.iter().flat_map(|pieces| pieces.as_array().unwrap()).filter(|piece| piece["index"] == index)
+            .map(|piece| piece["arguments"].as_str().unwrap()).collect()
+    };
+    assert_eq!(ended, [joined(0), joined(1)]);
+    assert_eq!(ended[1], r#"{"path": "src/lib \"two\".rs\nline"}"#);
+    // and the finish is the same
+    let finish = |events: &[Sse]| chunks(events).last().map(|chunk| chunk["choices"][0]["finish_reason"].clone());
+    assert_eq!((finish(&asking), finish(&plain)), (Some(json!("tool_calls")), Some(json!("tool_calls"))));
+}
+
+/// Pieces are for a stream with tools: a client that asks otherwise gets the answer it would get without asking.
+#[tokio::test]
+async fn the_option_is_ignored_without_a_stream_or_tools() {
+    let events = || vec![delta("Reading.\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>"), done("stop")];
+    let no_think = json!({"chat_template_kwargs": {"enable_thinking": false}});
+    let with = |extra: Value| {
+        let mut fields = json!({"tools": read_file(), "chat_template_kwargs": no_think["chat_template_kwargs"]});
+        for (key, value) in extra.as_object().unwrap() {
+            fields[key] = value.clone();
+        }
+        ask(fields)
+    };
+    let (status, mut plain) = complete(&Mock::new(vec![Script::Events(events())]), with(json!({}))).await;
+    let (asking_status, mut asking) = complete(&Mock::new(vec![Script::Events(events())]), with(json!({"straydog": {"tool_writing": true}}))).await;
+    assert_eq!((status, asking_status), (StatusCode::OK, StatusCode::OK));
+    for body in [&mut plain, &mut asking] {
+        fix_ids(&mut body["choices"][0]["message"]["tool_calls"]);
+        body["id"] = "id".into();
+        body["created"] = 0.into();
+    }
+    assert_eq!(asking, plain);
+    assert_eq!(asking["choices"][0]["finish_reason"], "tool_calls");
+    assert!(!asking.to_string().contains("straydog_tool_writing"));
+    // (streamed, with no tools: the markup is text)
+    let body = streamed_body(events(), json!({"straydog": {"tool_writing": true}, "chat_template_kwargs": no_think["chat_template_kwargs"]})).await;
+    assert!(!body.contains("straydog_tool_writing"));
+    assert_eq!(body, streamed_body(events(), no_think).await);
 }

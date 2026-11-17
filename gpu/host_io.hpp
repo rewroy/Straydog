@@ -1,3 +1,4 @@
+#include "host_io_common.hpp"
 // Transfers of caller memory. Rust vectors, std::vector storage and the stack are
 // pageable: an asynchronous copy from or to them makes the runtime pin those pages
 // for the call, and ROCm can reuse such a pin after the pages were unmapped and
@@ -160,12 +161,13 @@ std::string budget_exceeded(const Device& value, uint64_t bytes) {
     const double mib = 1 << 20;
     char text[160];
     std::snprintf(text, sizeof text, "Straydog VRAM budget exceeded (%.1f MiB asked, %.1f MiB of %.1f MiB left)", bytes / mib,
-                  value.used < value.budget ? (value.budget - value.used) / mib : 0.0, value.budget / mib);
+                  budget_available(value) / mib, value.budget / mib);
     return text;
 }
 // A tracked allocation within the budget; only its tail padding is zeroed.
 void* allocate(Device& value, uint64_t bytes) {
-    if (!bytes || bytes > value.budget - value.used || allocation_tail > value.budget - value.used - bytes)
+    const size_t available=budget_available(value);
+    if (!bytes || bytes > available || allocation_tail > available - bytes)
         throw std::runtime_error(budget_exceeded(value, bytes));
     void* pointer = nullptr;
     check(hipMalloc(&pointer, size_t(bytes) + allocation_tail));

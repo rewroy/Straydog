@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 use straydog_engine::arch::deepseek41::serve::{place, Model, CHECKPOINT_BYTES};
-use straydog_engine::arch::served::Settings;
+use straydog_engine::arch::served::{Engines as _, Settings};
 use straydog_engine::group::SplitMode;
 use straydog_engine::chat::ChatTemplate;
 use straydog_engine::pyjson;
@@ -163,4 +163,111 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     assert_eq!(retried.tokens[..5], clean.tokens[..5], "the tokens sent before the void");
     eprintln!("after a void pass: {} of {} tokens as the uninterrupted run's", retried.tokens.iter().zip(&clean.tokens).take_while(|(a, b)| a == b).count(),
               clean.tokens.len());
+
+    // A long reply is marked as it grows. A client that keeps it only in part (a file it cut at a line's end to have the
+    // model go on, a reply its person stopped) sends a prompt that leaves the held sequence before its end: the request goes
+    // on from the last mark the part kept reaches, where it read the reply again from the checkpoint before it.
+    model.forget();
+    let long = render(&format!("[{}]", user("Write a long and detailed essay about the sea in winter, of at least two thousand words.")));
+    let written = go(&mut model, &long, 1300);
+    let marks = model.last_metrics["marks"].as_u64().unwrap();
+    let marked: Vec<usize> = model.last_metrics["marked_tokens"].as_array().unwrap().iter().map(|at| at.as_u64().unwrap() as usize).collect();
+    eprintln!("a reply of {} tokens: {marks} marks, {:.1} ms each, kept at {marked:?} of {}", written.tokens.len(),
+              1e3 * model.last_metrics["mark_seconds"].as_f64().unwrap() / marks.max(1) as f64, long.len() + written.tokens.len());
+    assert!(marks >= 2 && marked.len() == 2 && marked[0] > long.len(), "the reply was long enough to be marked twice: {} tokens", written.tokens.len());
+    let tail = text.encode("\n\nGo on from there.").unwrap();
+    // (the part kept ends 40 tokens past a mark: past the last, and between the two, where the last is of no use)
+    let part = |mark: usize| -> Vec<u32> { long.iter().chain(&written.tokens[..mark - long.len() + 40]).chain(&tail).copied().collect() };
+    assert!(marked[1] - long.len() + 48 < written.tokens.len() && marked[0] + 40 < marked[1], "the parts kept end before the reply and the last mark");
+    let next = part(marked[1]);
+    let stepped = go(&mut model, &next, 8);
+    let stepped_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(model.last_metrics["resumed_from"], "step");
+    assert_eq!(stepped.cached, Some(marked[1] as u64), "from the last mark");
+    model.forget();
+    let again = go(&mut model, &long, 1300);
+    assert_eq!(again.tokens, written.tokens, "the reply written again");
+    let earlier = go(&mut model, &part(marked[0]), 8);
+    assert_eq!(model.last_metrics["resumed_from"], "step");
+    assert_eq!(earlier.cached, Some(marked[0] as u64), "from the mark before the last");
+    // Without the marks the same request starts where the reply's generation prompt began; its first token is the same.
+    model.forget();
+    go(&mut model, &long, 1300);
+    model.forget_marks();
+    let turned = go(&mut model, &next, 8);
+    let turned_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(model.last_metrics["resumed_from"], "turn");
+    assert!(turned.cached.is_some_and(|cached| (cached as usize) < long.len()), "from before the reply: {:?}", turned.cached);
+    let top = |logits: &[f32]| logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(token, _)| token);
+    let widest = stepped_logits.iter().zip(&turned_logits).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    eprintln!("from the mark and from the turn: the largest logit difference {widest}, {} of {} tokens the same",
+              stepped.tokens.iter().zip(&turned.tokens).take_while(|(a, b)| a == b).count(), turned.tokens.len());
+    assert_eq!(top(&stepped_logits), top(&turned_logits), "the first token");
+
+    // Back at a mark the engines are where they were when it was taken: the same pass then gives the same logits, bit for
+    // bit, after a pass of one token and after batches that wrote over the whole window and began new groups; at the last
+    // mark and at the one before it, which leaves the last behind.
+    model.forget();
+    go(&mut model, &other, 8);
+    let at = model.held().len();
+    let probe = &written.tokens[..3];
+    let batch = &written.tokens[3..303];
+    assert!(model.engines.mark(None).unwrap());
+    let one = model.engines.forward(&probe[..1]).unwrap();
+    model.engines.forward(batch).unwrap();
+    assert!(model.engines.mark(None).unwrap());
+    let far = model.engines.forward(&probe[..1]).unwrap();
+    model.engines.forward(batch).unwrap();
+    assert!(model.engines.mark(Some(at + 301)).unwrap());
+    assert!(far == model.engines.forward(&probe[..1]).unwrap(), "a pass of one token from the last mark");
+    assert!(model.engines.mark(Some(at)).unwrap());
+    assert!(one == model.engines.forward(&probe[..1]).unwrap(), "a pass of one token from the mark before it");
+    assert!(!model.engines.mark(Some(at + 301)).unwrap(), "the mark the sequence went back past");
+    assert!(model.engines.mark(Some(at)).unwrap());
+    let rows = model.engines.verify(probe).unwrap();
+    model.engines.rewind(2).unwrap();
+    model.engines.forward(batch).unwrap();
+    assert!(model.engines.mark(Some(at)).unwrap());
+    assert!(rows == model.engines.verify(probe).unwrap(), "a verify pass from the mark");
+    model.engines.rewind(1).unwrap();
+    model.forget();
+    // (another sequence has left the mark)
+    go(&mut model, &first, 8);
+    assert!(!model.engines.mark(Some(at)).unwrap());
+
+    // A client that writes its folder and the date into its system prompt sends a system prompt that ends otherwise at every new
+    // conversation: none extends another's root. The second such prompt is checkpointed where it parts from the first (its
+    // stem), and the third starts from there, with the first token of a model that reads it whole.
+    let ending = |folder: &str| -> Vec<u32> {
+        let system = format!("{{\"role\": \"system\", \"content\": {}}}",
+                             serde_json::to_string(&format!("{document}\n\nWorking folder: /work/{folder}\nToday is a day in November.")).unwrap());
+        render(&format!("[{system}, {}]", user("What is this project?")))
+    };
+    let (one, two, three) = (ending("alpha-run"), ending("bravo-run"), ending("charlie-run"));
+    let shared = one.iter().zip(&two).take_while(|(a, b)| a == b).count();
+    assert!(shared > 2000 && shared < one.len() - 8, "the system prompts part near their end: {shared} of {}", one.len());
+    model.forget();
+    go(&mut model, &one, 8);
+    let second = go(&mut model, &two, 8);
+    assert_eq!(second.cached, Some(0), "the second ending extends nothing yet");
+    let from_stem = go(&mut model, &three, 8);
+    let from_stem_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(model.last_metrics["resumed_from"], "root");
+    assert!(from_stem.cached.is_some_and(|cached| (cached as usize) < shared && (cached as usize) + 64 > shared), "from the stem: {:?} of {shared} shared", from_stem.cached);
+    model.forget();
+    let whole = go(&mut model, &three, 8);
+    let whole_logits = model.prompt_logits.clone().unwrap();
+    assert_eq!(whole.cached, Some(0));
+    let widest = from_stem_logits.iter().zip(&whole_logits).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    eprintln!("from the stem ({:?} of {} tokens) and read whole: the largest logit difference {widest}, {} of {} tokens the same", from_stem.cached, three.len(),
+              from_stem.tokens.iter().zip(&whole.tokens).take_while(|(a, b)| a == b).count(), whole.tokens.len());
+    assert_eq!(top(&from_stem_logits), top(&whole_logits), "the first token from the stem");
+
+    // The ids of a reply are kept where its text comes back (Text::reach): all of them spell the text they decode to,
+    // whether or not the tokenizer splits that text as the model wrote it.
+    let ids: Vec<u32> = long.iter().chain(&written.tokens).copied().collect();
+    let spelled = text.decode(&ids).unwrap();
+    assert_eq!(text.reach(&ids, &spelled), (ids.len(), spelled.len()));
+    let encoded = text.encode(&spelled).unwrap();
+    eprintln!("the reply's text encoded again: the same ids for {} of {}", encoded.iter().zip(&ids).take_while(|(a, b)| a == b).count(), ids.len());
 }

@@ -84,6 +84,9 @@ const NEUTRAL: [(&str, &str); 10] = [
     ("modalities", r#"["text"]"#),
 ];
 
+/// What the `straydog` object of a request may hold.
+const EXTENSION: &str = "the straydog object supports checkpoint, tool_writing and reasoning";
+
 /// Features the engine does not have: a request may only leave them out.
 const UNSUPPORTED: [&str; 4] = ["functions", "function_call", "audio", "prediction"];
 
@@ -101,6 +104,8 @@ pub(crate) struct Shape {
     pub stops: Vec<String>,
     pub stream: bool,
     pub include_usage: bool,
+    /// The stream also carries the pieces of the tool calls being written (`straydog.tool_writing`, for a stream with tools).
+    pub tool_writing: bool,
 }
 
 /// The worker request for an OpenAI chat completion request, and the shape of its answer.
@@ -244,7 +249,7 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
         }
         Some(_) => return Err(ApiError::invalid("stop must be a string or a list of at most 16 strings")),
     };
-    let mut checkpoint = true;
+    let (mut checkpoint, mut tool_writing, mut reasoning) = (true, false, true);
     match given(payload, "straydog") {
         None => {}
         Some(Value::Object(extension)) => {
@@ -253,11 +258,17 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
                     ("checkpoint", Value::Bool(flag)) => checkpoint = *flag,
                     ("checkpoint", Value::Null) => {}
                     ("checkpoint", _) => return Err(ApiError::invalid("straydog.checkpoint must be a boolean")),
-                    _ => return Err(ApiError::invalid("the straydog object supports checkpoint")),
+                    ("tool_writing", Value::Bool(flag)) => tool_writing = *flag,
+                    ("tool_writing", Value::Null) => {}
+                    ("tool_writing", _) => return Err(ApiError::invalid("straydog.tool_writing must be a boolean")),
+                    ("reasoning", Value::Bool(flag)) => reasoning = *flag,
+                    ("reasoning", Value::Null) => {}
+                    ("reasoning", _) => return Err(ApiError::invalid("straydog.reasoning must be a boolean")),
+                    _ => return Err(ApiError::invalid(EXTENSION)),
                 }
             }
         }
-        Some(_) => return Err(ApiError::invalid("the straydog object supports checkpoint")),
+        Some(_) => return Err(ApiError::invalid(EXTENSION)),
     }
     let stream = match given(payload, "stream") {
         None => false,
@@ -310,7 +321,17 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
     if let Some(kind) = suppress {
         fields.push(("suppress".into(), kind));
     }
-    Ok((Value::Object(fields), Shape { thinking, markup, tools, stops, stream, include_usage }))
+    // `straydog.reasoning` false: this one reply is written with no reasoning, in a conversation that thinks. The prompt stays the
+    // thinking one's (its head says the effort: asked with another effort or with none, the whole conversation is read again), and
+    // the reply begins where its reasoning ends, as the template writes a reply back that had none. Only where the template closes
+    // a reasoning by its own token (DSML); elsewhere the reply reasons as asked.
+    let unreasoned = thinking && !reasoning && markup == Markup::Dsml;
+    if unreasoned {
+        fields.push(("reasoning".into(), Value::Bool(false)));
+    }
+    // (only a stream with tools has calls being written to tell)
+    let tool_writing = tool_writing && stream && tools.is_some();
+    Ok((Value::Object(fields), Shape { thinking: thinking && !unreasoned, markup, tools, stops, stream, include_usage, tool_writing }))
 }
 
 /// What the worker holds the answer to ([`straydog_engine::constraint`]), as its request's

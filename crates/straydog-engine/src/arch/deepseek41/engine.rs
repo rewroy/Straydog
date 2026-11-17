@@ -125,7 +125,7 @@ pub struct Settings {
     /// Bytes of host tier (page-locked memory) for experts VRAM evicts, per device.
     pub host_expert_bytes: u64,
     pub scratch_bytes: u64,
-    /// FP16 operands (F32 sums and output) for the products of a pass of at least 32 rows: the
+    /// FP16 operands (F32 sums and output) for the products of a pass of at least [`HALF_ROWS`] rows: the
     /// shared/routed FFN GEMMs, and through the devices' GEMM policy every other projection over
     /// its rows (attention, index, router, Engram). Fewer rows stay F32; up to four rows GEMV.
     pub half_gemm: bool,
@@ -450,6 +450,14 @@ pub struct Beside<'e> {
 pub const OWN_ROWS: usize = 64;
 /// The least rows a product takes GEMM for (the devices' default).
 const GEMM_MIN_BATCH: u64 = 8;
+
+/// The fewest rows of a prompt pass whose products take FP16 operands (with `--gemm fp16`). A pass of fewer rows (the short one
+/// before a reply's generation prompt, a short message) takes F32 and the routed GEMVs of a few rows, which cost a row about what a
+/// decode pass costs. At 32, a request that added 9 to 32 tokens to a held conversation waited longer for its pass than one that
+/// added 36 to 88 (two R9700, UD-IQ1_M, `--vram 30`): 12 tokens 358-403 ms, 20 tokens 534-562, 28 tokens 651-682, 32 tokens 728,
+/// against 233-324 ms for 36 to 88. At 8 the same requests take 144-155, 189-200, 201-237 and 252 ms, and a new conversation of 36
+/// tokens 328 ms where it took 401.
+const HALF_ROWS: usize = 8;
 /// A wave's group and tile lists for the grouped WMMA kernels (32 experts' groups and their 64-row
 /// tiles of up to a pass's routes take ~11 KB).
 const SLOT_TABLE_BYTES: u64 = 64 << 10;
@@ -827,14 +835,14 @@ impl Shard {
         let initialized = started.elapsed().as_secs_f64();
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         // (a prompt pass's attention weights expanded once a layer, not a batch: ATTENTION_ROWS)
-        if settings.half_gemm && settings.rows >= 32 {
+        if settings.half_gemm && settings.rows >= HALF_ROWS {
             gpu.keep_expansions(std::env::var("DS41_EXPANSIONS").map_or(EXPANSIONS, |value| if value == "0" { 0 } else { EXPANSIONS }))?;
         }
         // The normal four-token warm takes GEMV; move BLAS's lazy setup ahead of requests. Initialize both policies: batches below 32 still use F32.
         // Synthetic zero matrices touch no model, expert store or sequence state. Release
         // them before the long-lived buffers/cache are allocated (no residency change).
         let mut gemm_warm = [0.0; 2];
-        if settings.half_gemm && settings.rows >= 32 {
+        if settings.half_gemm && settings.rows >= HALF_ROWS {
             let warming = std::time::Instant::now();
             let weights = gpu.buffer(256 * 256 * 4)?;
             let input = gpu.buffer(32 * 256 * 4)?;
@@ -1661,6 +1669,19 @@ impl<'a, T: Tensors> Engine<'a, T> {
     /// served checkpoint copied them before the first token, ~0.2 s at 110K tokens and 2-4 s when
     /// the host had to find the pages).
     pub fn snapshot_into(&mut self, snapshot: &mut Snapshot) -> Result<()> {
+        self.copy_state(snapshot, true)
+    }
+
+    /// [`Engine::snapshot_into`] without the compressed rows and index keys, not even room for them: a mark that only the
+    /// sequence it was taken of goes back to, in place ([`Engine::rewind_to`], while it still [extends](Engine::extends)
+    /// it). What it copies is the window's rows and the tails, so that one can be taken every few hundred tokens of a reply;
+    /// [`Engine::restore`] is not for it.
+    pub fn mark_into(&mut self, snapshot: &mut Snapshot) -> Result<()> {
+        self.copy_state(snapshot, false)
+    }
+
+    /// The state a snapshot holds at once: with `whole`, room for the compressed rows and index keys too, left pending.
+    fn copy_state(&mut self, snapshot: &mut Snapshot, whole: bool) -> Result<()> {
         let (window, dim, index_dim, ring, position) = (self.hp.window, self.hp.head_dim, self.hp.index_dim, self.ring, self.position);
         let shard = &mut self.shards[0];
         let first = position.saturating_sub(window);
@@ -1678,8 +1699,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let groups = self.sources[&layer].groups;
             // (the compressed rows and index keys as they are, BF16 pairs in F32 words; the dims are even)
             let [rows, keys, tail_kv, tail_gate] = kept;
-            fit_room(rows, groups * dim / 2);
-            fit_room(keys, groups * index_dim / 2);
+            fit_room(rows, if whole { groups * dim / 2 } else { 0 });
+            fit_room(keys, if whole { groups * index_dim / 2 } else { 0 });
             for (buffer, values) in [(&buffers.tail_kv, tail_kv), (&buffers.tail_gate, tail_gate)] {
                 fit(values, dim);
                 shard.gpu.read_buffer(buffer, 0, values)?;
@@ -2087,7 +2108,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // A prompt pass's projections take FP16 operands as its FFN's do: in F32, its attention's
         // alone held each device ~6 of a 10.7K-token prompt's 36 s (F32 GEMMs and their weights
         // expanded to F32, every 256 rows).
-        let half = self.settings.half_gemm && n >= 32;
+        let half = self.settings.half_gemm && n >= HALF_ROWS;
         if self.half_policy != Some(half) {
             for shard in &self.shards {
                 shard.gpu.configure_gemm(GEMM_MIN_BATCH, half)?;
@@ -3129,7 +3150,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         let (rows, split) = (n - first, self.shards.len() > 1);
         // Small prompts keep F32 after the half path regressed served cold TTFT.
         // Each routed GEMV still keeps its <=4 rule inside the linear op.
-        let half_gemm = self.settings.half_gemm && rows >= 32;
+        let half_gemm = self.settings.half_gemm && rows >= HALF_ROWS;
         let capacity = self.settings.rows.max(self.settings.batch);
         // The routes (alike on every device), grouped by expert, in waves of at most the stores'
         // limit of experts and as many routes as a pass has rows.

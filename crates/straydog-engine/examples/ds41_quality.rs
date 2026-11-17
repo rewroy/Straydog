@@ -315,6 +315,12 @@ fn main() -> Result<(), String> {
         args.drain(at..at + 2);
         value
     });
+    // --probation A,B,...: the expert stores' probation depth (thousandths of a class's slots) of each --verify round, to compare depths in one process
+    let probations: Vec<usize> = args.iter().position(|arg| arg == "--probation").map_or(Vec::new(), |at| {
+        let value = args[at + 1].split(',').map(|depth| depth.parse().unwrap()).collect();
+        args.drain(at..at + 2);
+        value
+    });
     let accept_all = args.iter().position(|arg| arg == "--accept-all").map(|at| args.remove(at)).is_some();
     let dspark_dir = args.iter().position(|arg| arg == "--dspark").map(|at| {
         let value = args[at + 1].clone();
@@ -428,6 +434,10 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     for (run, &verify) in widths.iter().enumerate() {
+        if let Some(&depth) = probations.get(run) {
+            straydog_engine::experts::set_probation(depth);
+            println!("probation {depth}");
+        }
         let (mut all, mut decode_tokens, mut decode_passes, mut decode_seconds) = (Vec::new(), 0, 0, 0.0);
         let mut run_hash = 0xcbf2_9ce4_8422_2325u64;
         // per block size, over the prompts: rounds, tokens matched as a prefix, rounds whose prefix

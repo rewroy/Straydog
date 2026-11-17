@@ -449,6 +449,11 @@ impl RowTable {
         Ok(out)
     }
 
+    /// The rows the cache holds at once (0 where it holds none, and a prefetch reads nothing ahead).
+    pub fn capacity(&self) -> usize {
+        self.table.cache.lock().unwrap().owner.len()
+    }
+
     /// (rows asked for, rows read from the file, 4 KiB blocks of them not in the page cache)
     /// since the table opened.
     pub fn counts(&self) -> (u64, u64, u64) {

@@ -583,7 +583,20 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         // (where the pass's rows were: held in VRAM, or on the host and why)
         let held = match (timings["prefill_rows_vram"] == true, timings["prefill_rows_host_reason"].as_str()) {
             (true, _) => ", rows held in VRAM".to_string(),
-            (false, Some(reason)) => format!(", rows on the host ({reason})"),
+            (false, Some(reason)) => {
+                // (on the host: moving beside the compute, with what the compute still waited for, or why not)
+                let beside = if timings["prefill_rows_overlap"] == true {
+                    // (what page-locking the rows took of the commit, where it is known: whether Windows charges rows charged when they were allocated)
+                    let charged = number("prefill_rows_lock_commit_bytes").map_or_else(String::new, |bytes| format!("; the lock took {:.2} GiB of commit", bytes / (1u64 << 30) as f64));
+                    match (number("prefill_rows_overlap_stream_wait_seconds"), number("prefill_rows_overlap_host_wait_seconds")) {
+                        (Some(rows), Some(last)) => format!(", copied beside the compute (it waited {rows:.1} s for rows to come up and {last:.1} s for the last to go down{charged})"),
+                        _ => format!(", copied beside the compute{}", if charged.is_empty() { String::new() } else { format!(" ({})", &charged[2..]) }),
+                    }
+                } else {
+                    timings["prefill_rows_overlap_reason"].as_str().map_or_else(String::new, |why| format!(", not copied beside the compute ({why})"))
+                };
+                format!(", rows on the host ({reason}){beside}")
+            }
             _ => String::new(),
         };
         format!("; prefill layers first,{passes} {} rows a batch{held}{moved}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
@@ -2045,6 +2058,15 @@ mod tests {
         let host = request_summary(&event(json!({"prefill_layer_passes": 2, "prefill_layer_rows": 131072,
                                                  "prefill_rows_host_reason": "5.00 GiB of rows, 3.50 GiB of VRAM free"})), None);
         assert!(host.contains("2048 rows a batch, rows on the host (5.00 GiB of rows, 3.50 GiB of VRAM free)"), "{host}");
+        // (and moving beside the compute, or why it did not)
+        let beside = request_summary(&event(json!({"prefill_layer_passes": 3, "prefill_layer_rows": 16384, "prefill_rows_host_reason": "0.62 GiB of rows, 0.49 GiB of VRAM free",
+                                                   "prefill_rows_overlap": true, "prefill_rows_overlap_stream_wait_seconds": 0.42,
+                                                   "prefill_rows_overlap_host_wait_seconds": 0.07, "prefill_rows_up_bytes": 96.6e9,
+                                                   "prefill_rows_up_seconds": 5.9, "prefill_rows_down_bytes": 96.6e9, "prefill_rows_down_seconds": 6.6})), None);
+        assert!(beside.contains("rows on the host (0.62 GiB of rows, 0.49 GiB of VRAM free), copied beside the compute (it waited 0.4 s for rows to come up and 0.1 s for the last to go down), hidden rows up 96.6 GB in 5.9 s and down 96.6 GB in 6.6 s"), "{beside}");
+        let not = request_summary(&event(json!({"prefill_layer_passes": 3, "prefill_layer_rows": 16384, "prefill_rows_host_reason": "0.62 GiB of rows, 0.49 GiB of VRAM free",
+                                                "prefill_rows_overlap_reason": "STRAYDOG_LAYER_ROWS_OVERLAP=0"})), None);
+        assert!(not.contains("rows on the host (0.62 GiB of rows, 0.49 GiB of VRAM free), not copied beside the compute (STRAYDOG_LAYER_ROWS_OVERLAP=0)"), "{not}");
         let without = request_summary(&event(json!({})), None);
         assert!(without.contains("; prefill layers first, 2048 rows a batch"), "{without}");
     }

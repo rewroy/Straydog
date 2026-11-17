@@ -30,6 +30,8 @@ int sd_device_pci(int ordinal, int* domain, int* bus, int* device);
 void* sd_create(int ordinal, uint64_t budget);
 void sd_destroy(void* handle);
 int sd_memory(void* handle, uint64_t* used, uint64_t* budget);
+// Budget admission includes the live allocator reserve; sd_memory remains requested bytes.
+int sd_memory_effective(void* handle, uint64_t* used, uint64_t* budget);
 /* Raise the budget while serving (GPU memory freed by other programs since the start, under `auto`); never below what is allocated. */
 int sd_set_budget(void* handle, uint64_t budget);
 
@@ -515,11 +517,23 @@ int sd_decode_span(void* handle, uint64_t begin, uint64_t end, uint64_t position
 /* Temporarily bind one layer's routed banks to an owned allocation. Requires an empty expert cache; clear before releasing storage. */
 /* 1 when memory was refused (no allocation), 0 when allocated. */
 int sd_prefill_bank_allocate(void* handle, uint64_t bytes, void** storage);
-int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes);
-/* Three authenticated host copies, kept alive until return (all H2D reads have settled).
+int sd_prefill_bank(void* handle, uint64_t layer, void* storage, uint64_t bytes, int ahead);
+/* Three authenticated host copies, kept alive until return (gathered into the staging by then; the bank's copies land behind it).
    The decoder's ordinary host pointers are unchanged. source_bytes holds each whole bank's size. */
 int sd_prefill_bank_from(void* handle, uint64_t layer, void* storage, uint64_t bytes,
-                         const uint8_t* const* sources, const uint64_t* source_bytes);
+                         const uint8_t* const* sources, const uint64_t* source_bytes, int ahead);
+/* A bank loaded `ahead` (sd_prefill_bank, sd_prefill_bank_from) goes into the half of a pool of two banks that the computing layer does not use,
+   and its layer's turn points the table at it: sd_prefill_bank_commit. 1 where a pool of `bytes` holds two of `layer`'s banks, 0 where not. */
+int sd_prefill_bank_commit(void* handle, uint64_t layer);
+int sd_prefill_bank_halves(void* handle, uint64_t layer, uint64_t bytes);
+/* 1 where no bank loaded ahead is still being gathered (its copy may be given back), 0 where one is. */
+int sd_prefill_bank_ahead_ready(void* handle);
+/* 1 where the half of the pool a bank loaded ahead would take is free now (the compute of the layer that used it last has ended), 0 where
+   not yet: a load ahead's copies would wait for it, and its gather behind them. */
+int sd_prefill_bank_half_free(void* handle);
+/* A layer-order pass's bank loads since the device began: out[0] loads, then in ns their time, their waits for the staging's copies and
+   their gathers. */
+int sd_prefill_bank_times(void* handle, uint64_t* out);
 int sd_prefill_bank_clear(void* handle);
 /* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
    3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.
@@ -535,6 +549,22 @@ int sd_layer_rows_get(void* handle, void* storage, uint64_t first, float* rows, 
 int sd_prefill_rows_held(void* handle, uint64_t layer, void* storage, uint64_t first, uint64_t steps);
 int sd_prefill_span_held(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, void* storage, uint64_t first);
 int sd_prefill_span(void* handle, uint64_t begin, uint64_t end, uint64_t position, uint64_t steps, const float* input, float* output, uint64_t output_rows, double* timings);
+/* Layer order's hidden rows kept on the host and moved beside the compute (gpu/kernels.cpp, RowsOverlap in gpu/core.hpp). `storage` is an
+   allocation of sd_prefill_bank_allocate of one or two slots of `slot_rows` rows (a ring standing for the rows a pass would hold in VRAM);
+   begin page-locks the pass's `host_rows` rows at `host` until end: 1 where they could not be (nothing has changed; sd_error says why).
+   Per layer and chunk c (rows of the pass from `row`, `steps` of them): up queues the chunk's rows into slot c % 2 on a copy stream of its own,
+   load waits for them on the device stream and copies them into the layer's workspace, span runs the layer on them (sd_prefill_span_held's
+   work) and queues the slot out to the host on a second copy stream. The calls come in that order, and each waits only on events. wait: every
+   copy has landed and the host's rows are the last layer's (the next pass starts clean); end: whatever the pass's end, waits for the copies and
+   unlocks the host rows (nothing where none moves). times: nanoseconds the device stream waited for rows to come up, nanoseconds the host
+   waited in wait (the copies' own times and bytes are in sd_prefill_row_transfers). */
+int sd_rows_overlap_begin(void* handle, void* storage, uint64_t slot_rows, float* host, uint64_t host_rows);
+int sd_rows_overlap_up(void* handle, uint64_t chunk, uint64_t row, uint64_t steps);
+int sd_rows_overlap_load(void* handle, uint64_t layer, uint64_t chunk, uint64_t steps);
+int sd_rows_overlap_span(void* handle, uint64_t layer, uint64_t chunk, uint64_t row, uint64_t position, uint64_t steps);
+int sd_rows_overlap_wait(void* handle);
+int sd_rows_overlap_end(void* handle);
+int sd_rows_overlap_times(void* handle, uint64_t* out);
 /* Qwen3.8's layers split across two linked GPUs (gpu/qwen_parts.hpp, sd_link_sums): this device's parts (1 or 2), before any
    layer or K/V state is registered on it; then each layer's part (0 or 1 of two), registered as sd_decoder_layer registers a
    whole layer, with the part's operands and states. */
@@ -653,6 +683,29 @@ int sd_expert_slots(void* handle, uint64_t cache, uint64_t stage, uint64_t slot_
 /* A K/V growth takes the VRAM of the expert slots for its longer indexers (release) and gives back what is left (restore, `cache` slots). */
 int sd_expert_slots_release(void* handle);
 int sd_expert_slots_restore(void* handle, uint64_t cache);
+// Replacement pool prediction, excluding the existing pool. Includes a missing CPU
+// partial buffer automatically; extra is an additional, independently allocated workspace.
+// Returned cache is the nominal largest-slot count, not the carved group capacity.
+int sd_expert_slots_plan(void* handle, uint64_t cache_cap, uint64_t stage, uint64_t slot_bytes,
+                         uint64_t margin, uint64_t extra, uint64_t* cache, uint64_t* nominal, uint64_t* reserve);
+// 16 words: raw used, budget, reserve, charged live count, peak reserve, chunk bytes,
+// pool nominal/reserve/count, KV nominal/reserve/count, CPU partial nominal/reserve/count,
+// flags (requested, segmented, disabled). General allocations incur no new reserve.
+int sd_expert_slots_accounting(void* handle, uint64_t* out, uint64_t count);
+// Opt-in KV growth: 0 with *retained=0 requests the legacy allocation path;
+// negative returns preserve real GPU/copy/synchronization errors.
+int sd_expert_slots_retain_prepare(void* handle, const uint64_t* ordered_layers, uint64_t count,
+                                   uint64_t capacity, uint64_t margin, int* retained);
+int sd_expert_slots_retain_finish(void* handle, int* retained);
+int sd_expert_slots_retain_oom(void* handle);
+// Cumulative counters: attempts, successes, fallbacks, in-place experts,
+// D2D experts/bytes, new H2D experts/bytes, temporary evictions,
+// temporary H2D experts/bytes, freed bytes, pack launches, chunk allocations,
+// chunk frees, temporary eviction bytes. Exactly 16 uint64_t words.
+int sd_expert_slots_retain_stats(void* handle, uint64_t* out, uint64_t count);
+// Eight words per occupied slot: layer, expert, group, slot, device address,
+// payload bytes, layout bitmask, FNV-1a byte hash. Null out queries row count.
+int sd_expert_slots_residency(void* handle, uint64_t* out, uint64_t rows_capacity, uint64_t* rows);
 int sd_hybrid_attach_cpu(void* handle, void* engine);
 int sd_hybrid_drain(void* handle);
 int sd_hybrid_rebalance(void* handle, uint64_t max_swaps);

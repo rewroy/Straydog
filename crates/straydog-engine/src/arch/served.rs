@@ -173,6 +173,13 @@ pub trait Engines {
     fn whole_checkpoints(&self) -> bool {
         false
     }
+    /// Save a mark of the sequence state where it is, in the place of the oldest of the [`MARKS`] kept (None), or go back to
+    /// the mark taken when the sequence was this long: whether one is now held, or the sequence is back at it. A mark is
+    /// light (no copy of what a longer sequence only adds to) and is good only while the held sequence extends it; engines
+    /// that keep none say so.
+    fn mark(&mut self, _back_to: Option<usize>) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Whether checkpoint `slot` still holds its state (whole checkpoints may give theirs up to
     /// a budget).
     fn holds(&self, _slot: usize) -> bool {
@@ -325,8 +332,65 @@ fn evicted(checkpoints: &[Checkpoint], history: &[u32]) -> usize {
         .unwrap_or(0)
 }
 
+/// The conversation roots kept as roots: the last two system prompts' states. With one, a second client's request (a team's test, a
+/// helper with its own system prompt) made the first client's root an ordinary checkpoint, which the first client's next conversation
+/// then gave up as an earlier turn of its own (see [`evicted`]), so the conversation after that read its whole system prompt again:
+/// on two R9700 with DeepSeek-V4.1 two clients taking turns, each with a 5.8K-token system prompt and a new question, waited 3.4 to
+/// 3.5 s for the first token of every other new conversation, and 0.3 to 0.5 s where the root was still there.
+const ROOTS: usize = 2;
+
+/// The roots that become ordinary checkpoints when a root of `history` is saved: the oldest, so that [`ROOTS`] stay with the new one
+/// (which may be one of them saved again).
+fn demoted(checkpoints: &[Checkpoint], history: &[u32]) -> Vec<usize> {
+    let others: Vec<usize> = checkpoints.iter().enumerate().filter(|(_, checkpoint)| checkpoint.root && checkpoint.tokens != history)
+        .map(|(index, _)| index).collect();
+    others[..(others.len() + 1).saturating_sub(ROOTS)].to_vec()
+}
+
+/// A root a conversation starts from becomes the latest root (the last in the order): the roots kept are the last ones used,
+/// so a stem that every new conversation starts from stays while the roots of the conversations' own system prompts come and go.
+/// Where the checkpoint now is.
+fn refreshed(checkpoints: &mut Vec<Checkpoint>, index: usize) -> usize {
+    if !checkpoints[index].root {
+        return index;
+    }
+    let root = checkpoints.remove(index);
+    checkpoints.push(root);
+    checkpoints.len() - 1
+}
+
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
+
+/// A stem is worth a checkpoint where it is this much longer than what the request resumed from.
+const STEM_GAIN: usize = 1024;
+/// How far before the place two system prompts part their stem ends: the tokens just before it can be split otherwise by what
+/// follows them (the first letters of a folder's name, the first digits of a date).
+const STEM_BACK: usize = 16;
+
+/// Where the system prompt of a new conversation is checkpointed before its end: at its stem, the beginning it shares with a
+/// system prompt the engines read before, when its end is another (a client that writes the folder, the date or its files
+/// into its system prompt). Such a prompt extends no root, and was read from its first token each time: two agent tools read
+/// their 5.5K- and 7K-token system prompts again at every new conversation (3.8 s on two R9700 with DeepSeek-V4.1), where a
+/// client whose system prompt stays the same waits 0.5 s from its root. The next conversation starts from the stem.
+/// `agreed`: how far the prompt agrees with what was held or checkpointed; `fed`: where the request resumed; `root`: where its
+/// system prompt ends.
+fn stem(agreed: usize, fed: usize, root: usize) -> Option<usize> {
+    let stem = agreed.min(root).saturating_sub(STEM_BACK);
+    (agreed < root && stem >= ROOT_MINIMUM && stem >= fed + STEM_GAIN).then_some(stem)
+}
+
+/// The tokens of a reply between two marks of its sequence ([`Engines::mark`]). A client that keeps a long reply only in
+/// part (it stopped a file being written at a line's end and has the model go on, or its person pressed stop) sends a prompt
+/// that leaves the held sequence a few tokens before its end: the next request then goes on from the last mark, where it
+/// read the whole reply again from the checkpoint before it.
+const MARK_EVERY: usize = 512;
+
+/// The marks kept, the last ones taken. The last mark alone is of no use to a prompt that leaves the reply before it: a reply
+/// stopped a few tokens after a mark and kept to its last whole line (one request in three of a first measurement, where the
+/// mark was 4 tokens past the part kept) went back to the checkpoint before the reply all the same. The one before it is then
+/// at most [`MARK_EVERY`] tokens further back.
+pub const MARKS: usize = 2;
 
 /// A placed model serving requests one at a time.
 pub struct Session<E: Engines> {
@@ -348,6 +412,9 @@ pub struct Session<E: Engines> {
     /// Saved states, oldest first: the last ("turn") where the last prompt's reply began, the
     /// earlier ones ("prior") where earlier prompts' did, and the last root ("root").
     checkpoints: Vec<Checkpoint>,
+    /// The held sequence's lengths where the engines' marks of it were taken ([`Engines::mark`]), oldest first, while it still
+    /// extends them.
+    marks: Vec<usize>,
     /// The last request's prompt tokens that agreed with what was held or checkpointed (more than
     /// it reused when it changed what came before).
     agreed: usize,
@@ -408,6 +475,11 @@ struct Decoded {
     accepted: usize,
     engine_drafted: usize,
     engine_accepted: usize,
+    /// The sequence's lengths at the last marks taken ([`MARK_EVERY`], [`MARKS`] of them), the marks taken and the seconds
+    /// they took.
+    marked: Vec<usize>,
+    marks: usize,
+    mark_seconds: f64,
 }
 
 /// How a drafter is to choose its tokens for a request with this sampling: drawn from its own distribution when
@@ -467,6 +539,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
     }
     let mut policy = Policy::new(rows);
     let mut done = Decoded::default();
+    let mut mark_at = history.len() + MARK_EVERY;
     let mut next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
     loop {
         if cancelled() || end.contains(&next) {
@@ -519,6 +592,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             let logits = engines.forward(&[next])?;
             history.push(next);
             (done.passes, done.fed) = (done.passes + 1, done.fed + 1);
+            mark(engines, history, &mut mark_at, &mut done)?;
             next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
             continue;
         }
@@ -566,9 +640,29 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         if stop {
             break;
         }
+        mark(engines, history, &mut mark_at, &mut done)?;
         next = token;
     }
     Ok(done)
+}
+
+/// Between two passes of a reply: a mark of the sequence where it has grown [`MARK_EVERY`] tokens past the last (or past the
+/// prompt), if the engines keep marks.
+fn mark<E: Engines>(engines: &mut E, history: &[u32], mark_at: &mut usize, done: &mut Decoded) -> Result<(), String> {
+    if history.len() < *mark_at {
+        return Ok(());
+    }
+    *mark_at = history.len() + MARK_EVERY;
+    let started = Instant::now();
+    if engines.mark(None)? {
+        if done.marked.len() == MARKS {
+            done.marked.remove(0);
+        }
+        done.marked.push(history.len());
+        done.marks += 1;
+        done.mark_seconds += started.elapsed().as_secs_f64();
+    }
+    Ok(())
 }
 
 impl<E: Engines> Session<E> {
@@ -576,7 +670,7 @@ impl<E: Engines> Session<E> {
         Session {
             engines: placed.engines, files: placed.files, vocabulary: placed.vocabulary,
             context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, turn_start: placed.turn_start,
-            root_end: placed.root_end, checkpoints: Vec::new(), agreed: 0, card: placed.card,
+            root_end: placed.root_end, checkpoints: Vec::new(), marks: Vec::new(), agreed: 0, card: placed.card,
             placement: placed.placement, state_bytes: placed.state_bytes, load_seconds: placed.load_seconds,
             last_metrics: Map::new(), prompt_logits: None, warmth: Warm::new(placed.layers, placed.experts),
         }
@@ -599,6 +693,17 @@ impl<E: Engines> Session<E> {
         self.checkpoints.clear();
     }
 
+    /// The tokens the engines hold, in order: the last request's prompt and what its reply fed.
+    pub fn held(&self) -> &[u32] {
+        &self.history
+    }
+
+    /// Tests only: forget the mark of the last long reply, as engines that keep none have none.
+    #[doc(hidden)]
+    pub fn forget_marks(&mut self) {
+        self.marks.clear();
+    }
+
     /// The model's metadata, authenticated.
     pub fn header(&self) -> &straydog_gguf::ModelHeader {
         &self.files.header
@@ -612,6 +717,7 @@ impl<E: Engines> Session<E> {
     /// Forget the sequence (warm experts stay).
     pub fn reset(&mut self) {
         self.history.clear();
+        self.marks.clear();
         self.engines.reset();
     }
 
@@ -706,7 +812,17 @@ impl<E: Engines> Session<E> {
         // (the seconds the checkpoints took: copies of the whole state, made before the first token)
         let mut checkpoint_seconds = 0.0;
         if let Some(root) = self.root_mark(tokens, reused) {
-            if self.feed(&tokens[reused..root], cancelled, &mut |done| progress(done, total))?.is_none() {
+            // (the beginning this system prompt shares with one read before, where it ends otherwise: a root of its own)
+            if let Some(stem) = stem(agreed, fed, root) {
+                if self.feed(&tokens[fed..stem], cancelled, &mut |done| progress(done, total))?.is_none() {
+                    return Ok(());
+                }
+                let saving = Instant::now();
+                self.save_checkpoint(true)?;
+                checkpoint_seconds += saving.elapsed().as_secs_f64();
+                fed = stem;
+            }
+            if self.feed(&tokens[fed..root], cancelled, &mut |done| progress(done, total))?.is_none() {
                 return Ok(());
             }
             let saving = Instant::now();
@@ -766,6 +882,10 @@ impl<E: Engines> Session<E> {
             }
         };
         let decode_seconds = decoding.elapsed().as_secs_f64();
+        // (the engines keep the last marks taken, this reply's after an earlier one's)
+        self.marks.extend(&decoded.marked);
+        let surplus = self.marks.len().saturating_sub(MARKS);
+        self.marks.drain(..surplus);
         let emitted = decoded.emitted;
         let steps = emitted.saturating_sub(1);
         // (with DS41_PROFILE: the decode's phases, in milliseconds a token)
@@ -793,6 +913,7 @@ impl<E: Engines> Session<E> {
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
             "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
             "decode_profile": decode_profile,
+            "marks": decoded.marks, "mark_seconds": decoded.mark_seconds, "marked_tokens": decoded.marked,
         })
         .as_object()
         .unwrap()
@@ -825,11 +946,32 @@ impl<E: Engines> Session<E> {
         let best = self.checkpoints.iter().enumerate()
             .filter(|(_, checkpoint)| (whole || checkpoint.tokens.len() <= common) && checkpoint.tokens.len() <= limit
                     && tokens.starts_with(&checkpoint.tokens) && self.engines.holds(checkpoint.slot))
-            .max_by_key(|(_, checkpoint)| checkpoint.tokens.len());
-        let Some((index, checkpoint)) = best else {
+            .max_by_key(|(_, checkpoint)| checkpoint.tokens.len())
+            .map(|(index, _)| index);
+        // The last mark of the reply the held sequence ends with that the prompt keeps the sequence as far as, where no
+        // checkpoint reaches further: the sequence goes back to it in place.
+        let reach = best.map_or(0, |index| self.checkpoints[index].tokens.len());
+        while let Some(mark) = self.marks.iter().rev().copied().find(|&mark| mark > reach && mark <= common) {
+            match self.engines.mark(Some(mark)) {
+                Ok(true) => {
+                    // (a mark above it is of what the sequence has left)
+                    self.marks.retain(|&kept| kept <= mark);
+                    self.history.truncate(mark);
+                    return Ok((mark, "step"));
+                }
+                Ok(false) => self.marks.retain(|&kept| kept != mark),
+                Err(error) => {
+                    self.reset();
+                    return Err(error);
+                }
+            }
+        }
+        let Some(index) = best else {
             self.reset();
             return Ok((0, "none"));
         };
+        let index = refreshed(&mut self.checkpoints, index);
+        let checkpoint = &self.checkpoints[index];
         let kind = if checkpoint.root {
             "root"
         } else if self.checkpoints[index + 1..].iter().all(|later| later.root) {
@@ -842,6 +984,8 @@ impl<E: Engines> Session<E> {
             self.reset();
             return Err(error);
         }
+        // (the marks were above where the sequence now is, or of another sequence)
+        self.marks.clear();
         self.history = saved;
         Ok((self.history.len(), kind))
     }
@@ -871,7 +1015,9 @@ impl<E: Engines> Session<E> {
         let engines = &self.engines;
         self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
         if root {
-            self.checkpoints.iter_mut().for_each(|checkpoint| checkpoint.root = false);
+            for index in demoted(&self.checkpoints, &self.history) {
+                self.checkpoints[index].root = false;
+            }
         }
         if let Some(index) = self.checkpoints.iter().position(|checkpoint| checkpoint.tokens == self.history) {
             let mut same = self.checkpoints.remove(index);
@@ -888,7 +1034,8 @@ impl<E: Engines> Session<E> {
             self.engines.checkpoint(slot, true)?;
             self.checkpoints.push(Checkpoint { slot, tokens: self.history.clone(), root });
         }
-        let kept = self.checkpoints.iter().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
+        // (the root a budget gives up last: the latest conversation's)
+        let kept = self.checkpoints.iter().rev().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
         self.engines.keep_checkpoint(kept);
         Ok(())
     }
@@ -955,6 +1102,9 @@ mod tests {
         draws: Vec<Option<Draw>>,
         verified: Vec<Vec<u32>>,
         rewinds: Vec<usize>,
+        /// Whether it keeps marks, and the lengths of what it held at each one saved.
+        keeps_marks: bool,
+        marks: Vec<usize>,
     }
 
     impl Toy {
@@ -1026,6 +1176,52 @@ mod tests {
             self.held.truncate(from + keep);
             Ok(())
         }
+        fn mark(&mut self, back_to: Option<usize>) -> Result<bool, String> {
+            if !self.keeps_marks {
+                return Ok(false);
+            }
+            let Some(at) = back_to else {
+                // (between passes: nothing of a verify pass is still to be taken back)
+                assert!(self.verified_from.is_none());
+                self.marks.push(self.held.len());
+                return Ok(true);
+            };
+            // (the last MARKS taken are kept)
+            let kept = &self.marks[self.marks.len().saturating_sub(MARKS)..];
+            if !kept.contains(&at) || at > self.held.len() {
+                return Ok(false);
+            }
+            self.held.truncate(at);
+            self.marks.retain(|&mark| mark <= at);
+            Ok(true)
+        }
+    }
+
+    /// Decides: a long reply is marked every [`MARK_EVERY`] tokens of its sequence, between passes and with what the session
+    /// holds, whatever the passes' widths; engines that keep no marks are asked and nothing is recorded.
+    #[test]
+    fn a_long_reply_is_marked_as_it_grows() {
+        for rows in [1, 4] {
+            let mut toy = Toy { vocabulary: 8, rows, keeps_marks: true, ..Toy::default() };
+            let mut history = PROMPT.to_vec();
+            let logits = toy.forward(&PROMPT).unwrap();
+            let max_new = 3 * MARK_EVERY + 40;
+            let done = decode(&mut toy, &mut history, logits, 8, &[], max_new, &Sampling::GREEDY, 1, &|| false, &mut |_| {}, None).unwrap();
+            assert_eq!(done.marks, 3, "rows {rows}: {:?}", toy.marks);
+            assert_eq!(done.marked, toy.marks[1..], "the last two");
+            let mut last = PROMPT.len();
+            for &at in &toy.marks {
+                assert!(at >= last + MARK_EVERY && at < last + MARK_EVERY + rows, "rows {rows}: {:?}", toy.marks);
+                last = at;
+            }
+            // (the first is no longer kept; back at the one before the last, the engines hold the sequence that far)
+            assert!(!toy.mark(Some(toy.marks[0])).unwrap());
+            let before = toy.marks[1];
+            assert!(toy.mark(Some(before)).unwrap());
+            assert_eq!(toy.held, history[..before]);
+        }
+        let (_, done) = run(4, &PROMPT, &[], 2 * MARK_EVERY + 40, &Sampling::GREEDY, 1);
+        assert_eq!((done.marks, done.marked), (0, Vec::new()));
     }
 
     /// Decides: a helper conversation between two requests of another (a sub-agent's, with its own system prompt) gives up
@@ -1057,6 +1253,53 @@ mod tests {
         let alone = vec![checkpoint(0, &[1], true), checkpoint(1, &[1, 2], false), checkpoint(2, &[1, 2, 3], false)];
         assert_eq!(evicted(&alone, &[1, 2, 3, 4]), 1);
         assert_eq!(evicted(&[checkpoint(0, &[1], true)], &[1, 2]), 0);
+    }
+
+    /// Decides: two clients with their own system prompts taking turns each keep their root, so a new conversation of either starts
+    /// from it; a third system prompt makes the oldest root an ordinary checkpoint, and a root saved again demotes none.
+    /// Decides: a system prompt that shares its beginning with one read before and ends otherwise is checkpointed at that
+    /// beginning, a little before the place the two part; not one that is new, nor one that is the same to its end, nor one whose
+    /// beginning the request already resumed from, nor a short beginning. And the stem a conversation starts from stays a root
+    /// while each conversation's own root replaces the one before.
+    #[test]
+    fn a_system_prompt_with_another_end_is_checkpointed_at_its_stem_which_stays() {
+        // (agreed, fed, root)
+        assert_eq!(stem(5000, 0, 5400), Some(5000 - STEM_BACK), "the same for 5,000 tokens of 5,400");
+        assert_eq!(stem(0, 0, 5400), None, "a new system prompt");
+        assert_eq!(stem(5400, 0, 5400), None, "the same system prompt: its root is the checkpoint");
+        assert_eq!(stem(7000, 0, 5400), None, "the same conversation further on");
+        assert_eq!(stem(5010, 4984, 5400), None, "resumed from the stem already");
+        assert_eq!(stem(1030, 0, 5400), None, "too short to be worth a checkpoint");
+        assert_eq!(stem(3000, 1500, 5400), Some(3000 - STEM_BACK), "longer than what it resumed from by enough");
+        let checkpoint = |slot: usize, tokens: &[u32], root: bool| Checkpoint { slot, tokens: tokens.to_vec(), root };
+        // a stem, the first conversation's root and its turn; the second conversation starts from the stem
+        let mut held = vec![checkpoint(0, &[1, 1], true), checkpoint(1, &[1, 1, 5], true), checkpoint(2, &[1, 1, 5, 9], false)];
+        let at = refreshed(&mut held, 0);
+        assert_eq!((at, held[at].slot), (2, 0));
+        // its own root is saved: the first conversation's root is the one that stops being a root, the stem stays
+        let own = [1u32, 1, 6];
+        let demote = demoted(&held, &own);
+        assert_eq!(demote.iter().map(|&index| held[index].slot).collect::<Vec<_>>(), [1]);
+        // (a turn's checkpoint resumed from stays where it is)
+        assert_eq!(refreshed(&mut held, 1), 1);
+    }
+
+    #[test]
+    fn the_last_two_conversation_roots_stay_roots() {
+        let checkpoint = |slot: usize, tokens: &[u32], root: bool| Checkpoint { slot, tokens: tokens.to_vec(), root };
+        let (first, second, third) = ([1u32, 1], [2u32, 2], [3u32, 3]);
+        // one root and a turn of its conversation: a second client's root demotes nothing
+        let mut held = vec![checkpoint(0, &first, true), checkpoint(1, &[1, 1, 5], false)];
+        assert!(demoted(&held, &second).is_empty());
+        held.push(checkpoint(2, &second, true));
+        // the first client's next conversation saves a turn with every slot taken: its own earlier turn goes, neither root
+        held.push(checkpoint(3, &[2, 2, 6], false));
+        let given_up = evicted(&held, &[1, 1, 7]);
+        assert_eq!(held[given_up].tokens, [1, 1, 5]);
+        // the first root saved again (a prompt that reached it from nothing) demotes none
+        assert!(demoted(&held, &first).is_empty());
+        // a third system prompt: the oldest root becomes an ordinary checkpoint
+        assert_eq!(demoted(&held, &third), [0]);
     }
 
     /// A cancel is seen before every pass, the first too: a prompt's next stretch (after a
@@ -1224,7 +1467,7 @@ mod tests {
         assert_eq!(toy.verified, [vec![plain[0], plain[1], wrong, 7], plain[2..6].to_vec(), plain[6..8].to_vec()]);
         assert_eq!(toy.rewinds, [2, 4, 1]); // Rejection, all accepted, final emitted token stays unfed.
         assert_eq!(done, Decoded { emitted: 8, fed: 10, passes: 3, drafted: 7, accepted: 4,
-            engine_drafted: 7, engine_accepted: 4 });
+            engine_drafted: 7, engine_accepted: 4, ..Decoded::default() });
     }
 
     #[test]

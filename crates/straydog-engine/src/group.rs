@@ -920,10 +920,15 @@ impl Group {
         self.backends[0].begin_layer_prefill(bytes, staging)
     }
 
-    pub fn load_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].load_layer_bank(layer) }
-    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3]) -> Result<()> {
-        self.backends[0].load_layer_bank_from(layer, sources)
+    pub fn load_layer_bank(&mut self, layer: usize, ahead: bool) -> Result<()> { self.backends[0].load_layer_bank(layer, ahead) }
+    pub(crate) fn load_layer_bank_from(&mut self, layer: usize, sources: [&[u8]; 3], ahead: bool) -> Result<()> {
+        self.backends[0].load_layer_bank_from(layer, sources, ahead)
     }
+    pub fn commit_layer_bank(&mut self, layer: usize) -> Result<()> { self.backends[0].commit_layer_bank(layer) }
+    pub fn layer_bank_halves(&self, layer: usize) -> Result<bool> { self.backends[0].layer_bank_halves(layer) }
+    pub fn layer_bank_ahead_ready(&self) -> Result<bool> { self.backends[0].layer_bank_ahead_ready() }
+    pub fn layer_bank_half_free(&self) -> Result<bool> { self.backends[0].layer_bank_half_free() }
+    pub fn bank_load_times(&self) -> Result<[u64; 4]> { self.backends[0].bank_load_times() }
     pub fn clear_layer_bank(&mut self) -> Result<()> { self.backends[0].clear_layer_bank() }
     pub fn finish_layer_prefill(&mut self) -> Result<()> { self.backends[0].finish_layer_prefill() }
     pub fn prefill_rows(&mut self, layer: usize, rows: &[f32]) -> Result<()> { self.backends[0].prefill_rows(layer, rows) }
@@ -935,6 +940,17 @@ impl Group {
     pub fn prefill_span_held(&mut self, layer: usize, first: u64, position: u64, steps: u64) -> Result<()> {
         self.backends[0].prefill_span_held(layer, first, position, steps)
     }
+    /// A pass's hidden rows on the host, moving to and from a ring in VRAM beside the compute ([`Backend::overlap_layer_rows`]).
+    pub fn overlap_layer_rows(&mut self, host: &mut [f32], batch: u64) -> Result<crate::gpu::RowsOverlapBegin> {
+        self.backends[0].overlap_layer_rows(host, batch)
+    }
+    pub fn rows_overlap_up(&mut self, chunk: u64, row: u64, steps: u64) -> Result<()> { self.backends[0].rows_overlap_up(chunk, row, steps) }
+    pub fn rows_overlap_load(&mut self, layer: usize, chunk: u64, steps: u64) -> Result<()> { self.backends[0].rows_overlap_load(layer, chunk, steps) }
+    pub fn rows_overlap_span(&mut self, layer: usize, chunk: u64, row: u64, position: u64, steps: u64) -> Result<()> {
+        self.backends[0].rows_overlap_span(layer, chunk, row, position, steps)
+    }
+    pub fn rows_overlap_wait(&mut self) -> Result<()> { self.backends[0].rows_overlap_wait() }
+    pub fn rows_overlap_times(&self) -> Result<[u64; 2]> { self.backends[0].rows_overlap_times() }
 
     pub fn end_long_prefill(&mut self) -> Result<()> {
         if self.backends.len() == 2 {
@@ -949,8 +965,33 @@ impl Group {
         failure.map_or(Ok(()), Err)
     }
 
+    /// [`Group::end_long_prefill`] with the slot pools back empty, for [`Group::refresh_ahead`] to fill ([`Backend::end_long_prefill_empty`]).
+    pub fn end_long_prefill_empty(&mut self) -> Result<()> {
+        if self.backends.len() == 2 {
+            return self.on_both(Backend::end_long_prefill_empty, Backend::end_long_prefill_empty);
+        }
+        let mut failure = None;
+        for backend in &mut self.backends {
+            if let Err(error) = backend.end_long_prefill_empty() {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub fn grow_kv(&mut self, capacity: u64, valid: u64) -> Result<()> {
         self.backends.iter_mut().try_for_each(|backend| backend.grow_kv(capacity, valid))
+    }
+
+    /// Sum each device's cumulative counters for retained expert-cache growth.
+    pub fn kv_cache_retain_stats(&self) -> Result<[u64; 16]> {
+        let mut total = [0u64; 16];
+        for backend in &self.backends {
+            for (sum, value) in total.iter_mut().zip(backend.kv_cache_retain_stats()?) {
+                *sum = sum.saturating_add(value);
+            }
+        }
+        Ok(total)
     }
 
     /// Each device's K/V stage grown into the VRAM its placement left (see [`Backend::grow_kv_stage`]).

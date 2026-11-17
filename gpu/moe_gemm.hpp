@@ -8,15 +8,7 @@
 // FP16 GEMM mode. Gate and up share each tile so SiLU(gate)*up is formed before
 // leaving the block.
 #if defined(__HIPCC__)
-typedef _Float16 moe_half2 __attribute__((ext_vector_type(2)));
-typedef _Float16 moe_half8 __attribute__((ext_vector_type(8)));
-typedef float moe_float8 __attribute__((ext_vector_type(8)));
-typedef uint32_t moe_word4 __attribute__((ext_vector_type(4)));
-// Blocks of 110, 98, 82, 18 or 34 bytes start at any even address; RDNA4 loads them unaligned.
-typedef uint32_t moe_word_u __attribute__((aligned(2)));
-typedef uint2 moe_word2_u __attribute__((aligned(2)));
-typedef moe_word4 moe_word4_u __attribute__((aligned(2)));
-typedef moe_word4 moe_word4_b __attribute__((aligned(1)));   // MXFP4: 17-byte blocks at any byte
+// (the vector types moe_half8, moe_float8, moe_word4 and their unaligned forms are in core.hpp: the attention kernels of kernels.cpp use them too)
 constexpr int moe_block_k = 64, moe_lds_k = moe_block_k + 8, moe_block_m = 64;
 
 __device__ __forceinline__ uint32_t moe_pack(float a, float b) {
