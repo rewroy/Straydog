@@ -237,12 +237,14 @@ __device__ __forceinline__ void moe_q8_decode(const MoeQ8Raw<Kind>& r, bool soa,
 
 // Shared memory of a gate/up or down block: the INT8 activations of 64 rows and two units (64 values, padded to 80 bytes a row so that a
 // warp's fragment loads fall in 32 banks), the 128 weight rows' two units likewise, their scales, and the kind's grid and masks.
+// The activations in two stages: a step's are copied by cp.async during the step before, straight to shared memory, so that they take no
+// registers while in flight (the IQ2_S gate/up kernel is at its 128 and spilled with them there).
 constexpr int moe_q8_m = 64, moe_q8_stride = 80;
 template<int Kind>
 struct MoeQ8Lds {
-    uint8_t x[moe_q8_m * moe_q8_stride];
+    uint8_t x[2][moe_q8_m * moe_q8_stride];
     uint8_t w[128 * moe_q8_stride];
-    float xs[moe_q8_m][2];
+    float xs[2][moe_q8_m][2];
     float ws[128][2][2];   // (row, unit, half)
     uint8_t grid[moe_q8_gate_kind(Kind) ? expert_q8_grid_bytes(Kind) : 16];
     uint2 masks[moe_q8_gate_kind(Kind) ? expert_q8_masks(Kind) : 1];
@@ -251,15 +253,15 @@ struct MoeQ8Lds {
 // A warp's share of a K step of two units: its 16 rows against its eight tiles of eight weight rows (tiles 0-3 from row `col_a` of the
 // block's 128, tiles 4-7 from `col_b`), each unit's INT32 dots scaled into the F32 sums.
 template<int Kind>
-__device__ __forceinline__ void moe_q8_step(const MoeQ8Lds<Kind>& lds, int row0, int col_a, int col_b, float (&sums)[8][4]) {
+__device__ __forceinline__ void moe_q8_step(const MoeQ8Lds<Kind>& lds, int stage, int row0, int col_a, int col_b, float (&sums)[8][4]) {
     const int lane = threadIdx.x % 32, g = lane / 4, t4 = lane % 4;
-    #pragma unroll
+    #pragma unroll 1   // (the two units in turn: unrolled, the IQ2_S kernel spilled at its 128 registers)
     for (int unit = 0; unit < 2; ++unit) {
-        const uint8_t* xa = lds.x + (row0 + g) * moe_q8_stride + unit * 32 + t4 * 4;
+        const uint8_t* xa = lds.x[stage] + (row0 + g) * moe_q8_stride + unit * 32 + t4 * 4;
         const uint8_t* xb = xa + 8 * moe_q8_stride;
         const uint32_t a0 = *reinterpret_cast<const uint32_t*>(xa), a1 = *reinterpret_cast<const uint32_t*>(xb);
         const uint32_t a2 = *reinterpret_cast<const uint32_t*>(xa + 16), a3 = *reinterpret_cast<const uint32_t*>(xb + 16);
-        const float xs0 = lds.xs[row0 + g][unit], xs1 = lds.xs[row0 + g + 8][unit];
+        const float xs0 = lds.xs[stage][row0 + g][unit], xs1 = lds.xs[stage][row0 + g + 8][unit];
         #pragma unroll
         for (int n = 0; n < 8; ++n) {
             const int col = n < 4 ? col_a + 8 * n : col_b + 8 * (n - 4);
@@ -291,6 +293,16 @@ __device__ __forceinline__ void moe_q8_step(const MoeQ8Lds<Kind>& lds, int row0,
     }
 }
 
+// Four bytes to shared memory by cp.async, or zero where `src` is null (`fallback` is any valid address); committed with moe_copy_commit.
+__device__ __forceinline__ void moe_q8_copy4(void* dst, const void* src, const void* fallback) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned address = unsigned(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(address), "l"(src ? src : fallback), "r"(src ? 4 : 0) : "memory");
+#else
+    *reinterpret_cast<uint32_t*>(dst) = src ? *reinterpret_cast<const uint32_t*>(src) : 0u;
+#endif
+}
+
 // One block: 64 routed rows x 64 gate/up product columns (128 weight rows: 64 of gate, then the same 64 of up). Warp w takes rows
 // 16 (w / 2) and product columns 32 (w % 2): eight tiles, four of gate and four of up. `xq`, `xs`: moe_input_q8's rows; `product`: the
 // routes' INT8 product rows (moe_q8_row_bytes each).
@@ -318,18 +330,18 @@ __global__ void __launch_bounds__(256, 2) moe_gate_up_q8(const MoeGroup* groups,
     float sums[8][4] = {};
     const bool rows = tile.first + size_t(wm) * 16 < count;
     __syncthreads();
-    // (a step's activation chunk, its scale and its weight unit are read in the step before, during its products)
-    auto fetch_x = [&](uint32_t k, uint4& a, float& scale) {
-        a = token != SIZE_MAX ? *reinterpret_cast<const uint4*>(xq + token * 2560 + k * 32 + achunk * 16) : uint4{0, 0, 0, 0};
-        scale = token != SIZE_MAX && achunk < 2 ? xs[token * 80 + k + achunk] : 0.0f;
+    // (a step's activation chunk and its scale are copied in the step before, to the other stage; its weight unit is read then too)
+    const int8_t* xrow = token != SIZE_MAX ? xq + token * 2560 + achunk * 16 : nullptr;
+    const float* srow = token != SIZE_MAX && achunk < 2 ? xs + token * 80 + achunk : nullptr;
+    auto copy_x = [&](uint32_t k, int stage) {
+        moe_copy16(lds.x[stage] + arow * moe_q8_stride + achunk * 16, xrow ? xrow + k * 32 : xq, xrow ? 16u : 0u);
+        if (achunk < 2) moe_q8_copy4(&lds.xs[stage][arow][achunk], srow ? srow + k : nullptr, xs);
+        moe_copy_commit();
     };
-    uint4 a;
-    float scale;
-    fetch_x(0, a, scale);
+    copy_x(0, 0);
     MoeQ8Raw<Kind> raw = moe_q8_fetch<Kind>(wsrc, wmrow, wunit);
     for (uint32_t k = 0; k < 2560 / 32; k += 2) {
-        *reinterpret_cast<uint4*>(lds.x + arow * moe_q8_stride + achunk * 16) = a;
-        if (achunk < 2) lds.xs[arow][achunk] = scale;
+        const int stage = (k / 2) % 2;
         uint32_t words[8];
         float low, high;
         moe_q8_decode<Kind>(raw, wsrc.soa, k + wunit, lds.grid, lds.masks, words, low, high);
@@ -337,10 +349,11 @@ __global__ void __launch_bounds__(256, 2) moe_gate_up_q8(const MoeGroup* groups,
         to[0] = make_uint4(words[0], words[1], words[2], words[3]);
         to[1] = make_uint4(words[4], words[5], words[6], words[7]);
         lds.ws[wrow][wunit][0] = low; lds.ws[wrow][wunit][1] = high;
+        moe_copy_wait();
         __syncthreads();
-        if (k + 2 < 2560 / 32) { fetch_x(k + 2, a, scale); raw = moe_q8_fetch<Kind>(wsrc, wmrow, k + 2 + wunit); }
+        if (k + 2 < 2560 / 32) { copy_x(k + 2, stage ^ 1); raw = moe_q8_fetch<Kind>(wsrc, wmrow, k + 2 + wunit); }
         // (tiles 0-3: gate's columns 32 wn to 32 wn + 31; tiles 4-7: up's, 64 weight rows on)
-        if (rows) moe_q8_step<Kind>(lds, wm * 16, wn * 32, 64 + wn * 32, sums);
+        if (rows) moe_q8_step<Kind>(lds, stage, wm * 16, wn * 32, 64 + wn * 32, sums);
         __syncthreads();
     }
     if (tile.first + size_t(wm) * 16 >= count) return;
@@ -399,17 +412,16 @@ __global__ void __launch_bounds__(256, 2) moe_down_q8(const MoeGroup* groups, co
     float sums[8][4] = {};
     const bool rows = tile.first + size_t(wm) * 16 < count;
     __syncthreads();
-    auto fetch_x = [&](uint32_t k, uint4& a, float& scale) {
-        a = source ? *reinterpret_cast<const uint4*>(source + k * 32 + achunk * 16) : uint4{0, 0, 0, 0};
-        scale = source && achunk < 2 ? reinterpret_cast<const float*>(source + 640)[k + achunk] : 0.0f;
+    auto copy_x = [&](uint32_t k, int stage) {
+        moe_copy16(lds.x[stage] + arow * moe_q8_stride + achunk * 16, source ? source + k * 32 + achunk * 16 : product, source ? 16u : 0u);
+        if (achunk < 2)
+            moe_q8_copy4(&lds.xs[stage][arow][achunk], source ? reinterpret_cast<const float*>(source + 640) + k + achunk : nullptr, product);
+        moe_copy_commit();
     };
-    uint4 a;
-    float scale;
-    fetch_x(0, a, scale);
+    copy_x(0, 0);
     MoeQ8Raw<Kind> raw = moe_q8_fetch<Kind>(wsrc, wmrow, wunit);
     for (uint32_t k = 0; k < 640 / 32; k += 2) {
-        *reinterpret_cast<uint4*>(lds.x + arow * moe_q8_stride + achunk * 16) = a;
-        if (achunk < 2) lds.xs[arow][achunk] = scale;
+        const int stage = (k / 2) % 2;
         uint32_t words[8];
         float low, high;
         moe_q8_decode<Kind>(raw, wsrc.soa, k + wunit, lds.grid, lds.masks, words, low, high);
@@ -417,9 +429,10 @@ __global__ void __launch_bounds__(256, 2) moe_down_q8(const MoeGroup* groups, co
         to[0] = make_uint4(words[0], words[1], words[2], words[3]);
         to[1] = make_uint4(words[4], words[5], words[6], words[7]);
         lds.ws[wrow][wunit][0] = low; lds.ws[wrow][wunit][1] = high;
+        moe_copy_wait();
         __syncthreads();
-        if (k + 2 < 640 / 32) { fetch_x(k + 2, a, scale); raw = moe_q8_fetch<Kind>(wsrc, wmrow, k + 2 + wunit); }
-        if (rows) moe_q8_step<Kind>(lds, wm * 16, wn * 64, wn * 64 + 32, sums);
+        if (k + 2 < 640 / 32) { copy_x(k + 2, stage ^ 1); raw = moe_q8_fetch<Kind>(wsrc, wmrow, k + 2 + wunit); }
+        if (rows) moe_q8_step<Kind>(lds, stage, wm * 16, wn * 64, wn * 64 + 32, sums);
         __syncthreads();
     }
     if (!rows) return;
