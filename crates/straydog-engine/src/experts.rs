@@ -424,13 +424,14 @@ fn run_read(job: &ReadJob, permit: Option<ReadPermit>) -> std::result::Result<()
     Ok(())
 }
 
-/// Fill `target` from `offset` ([`read_fully`]), and where the working-set quota refuses a direct read of it (Windows' error 1453: a process whose working
-/// set has a hard maximum is refused a read whose target's pages it would have to lock beyond it), the rest as a bank's copy is read
+/// Fill `target` from `offset` ([`read_fully`]), and where Windows refuses a direct read of it for its pages ([`storage::refused_for_pages`]: a process
+/// whose working set has a hard maximum is refused a read whose target's pages it would have to lock beyond it), the rest as a bank's copy is read
 /// ([`crate::banks::read_in_ways`]): in direct pieces of a quarter, then through the page cache, on a handle reopened from this one without
 /// `FILE_FLAG_NO_BUFFERING` ([`storage::reader`]). A refusal had ended the request (an RTX 5070 Ti at 5.5 GiB, a layer-order pass's 0.62 GiB of rows
-/// page-locked beside 21.6 GiB of banks: "expert read at 1358123008: ... (os error 1453)"); an OS that never refuses so reads it whole, as before.
+/// page-locked beside 21.6 GiB of banks: "expert read at 1358123008: ... (os error 1453)"; at 20.4 GiB of banks the same read was refused with
+/// os error 1117); an OS that never refuses so reads it whole, as before.
 fn read_expert(file: &File, offset: u64, target: &mut [u8]) -> std::io::Result<()> {
-    read_expert_in_ways(offset, target, storage::working_set_quota, &mut |cached, at, span| {
+    read_expert_in_ways(offset, target, storage::refused_for_pages, &mut |cached, at, span| {
         if cached { read_fully(&storage::reader(file)?, at, span) } else { read_fully(file, at, span) }
     })
 }

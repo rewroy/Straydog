@@ -326,7 +326,7 @@ impl Banks {
 /// the allocation is aligned for it, else through the page cache ([`read_in_ways`]).
 fn read_copy(file: &BankFile, offset: u64, target: &mut [u8], bytes: usize) -> std::io::Result<()> {
     let direct = file.direct.as_ref().filter(|_| offset.is_multiple_of(ALIGN as u64) && (target.as_ptr() as usize).is_multiple_of(ALIGN));
-    read_in_ways(direct.is_some(), offset, target, bytes, storage::working_set_quota, &mut |way, at, span, len| match (way, direct) {
+    read_in_ways(direct.is_some(), offset, target, bytes, storage::refused_for_pages, &mut |way, at, span, len| match (way, direct) {
         (Way::Direct, Some(direct)) => storage::read_direct_into(direct, at, span, len),
         _ => storage::read_at(&file.cached, at, &mut span[..len]),
     })
