@@ -1448,6 +1448,10 @@ pub struct Model {
     kv_ahead: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What the engine has given back to requests since it started, in order.
     pub gave_back: Vec<GaveBack>,
+    /// The layers layer-order passes gave back for their commit ([`Model::make_pass_room`]) and not locked again yet, and the commit the last
+    /// pass found with all of them locked: [`Model::more_bank_locks`] locks them again behind the request within it.
+    pass_given: Vec<usize>,
+    pass_floor: u64,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
@@ -1692,6 +1696,8 @@ impl Model {
             lock_halt: Default::default(),
             kv_ahead: Default::default(),
             gave_back: Vec::new(),
+            pass_given: Vec::new(),
+            pass_floor: 0,
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
@@ -2405,6 +2411,10 @@ impl Model {
             // (the memory has grown by a layer's banks since, or nothing was refused: a refusal that comes later is told as its own)
             None => self.refusal_told = false,
         }
+        // (what a layer-order pass gave back comes back first, by its own measure: the plan below keeps far more free than a pass leaves)
+        if let Some(job) = self.pass_relock() {
+            return Some(job);
+        }
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
             .collect::<Result<Vec<_>>>().ok()?;
@@ -2478,6 +2488,7 @@ impl Model {
             }
         }
         self.lock_pending.retain(|pending| *pending != layer);
+        self.pass_given.retain(|given| *given != layer);
         self.locked_layers.push(layer);
         self.count_in_place();
         let before = self.assist_mapped;
@@ -4389,13 +4400,58 @@ impl Model {
     fn make_pass_room(&mut self, rows: usize, bank_bytes: u64) -> Result<()> {
         let copies = 2 * bank_bytes + crate::layer_bank::FIRST_COPIES_MARGIN;
         let Some((wanted, left)) = crate::host::pass_commit(rows as u64 * WIDTH as u64 * 4, copies) else { return Ok(()) };
+        // (what the commit would be with every layer the passes gave back locked again: what they go back within after this pass; measured
+        // anew at each pass, so that what other programs took meanwhile is theirs)
+        if !self.pass_given.is_empty() || left < wanted {
+            let out = self.pass_given.iter().map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
+                .sum::<Result<u64>>()?;
+            self.pass_floor = left.saturating_sub(out);
+        }
         if left >= wanted {
             return Ok(());
         }
         if let Some(gave) = self.give_back(wanted, &format!("a layer-order pass of {rows} rows"))? {
             self.last_metrics.insert("prefill_pass_gave_back_layers".into(), json!(gave.layers.len()));
+            self.pass_given.extend(gave.layers.iter().copied());
         }
         Ok(())
+    }
+
+    /// Behind a request: the layers layer-order passes gave back ([`Model::make_pass_room`]) locked again, as many as leave the commit at least
+    /// where the last pass found it with them all locked ([`crate::banks::relock_within`]). The pass's rows and copies are let go by then, so
+    /// what it gave back is there again; what other programs took meanwhile is not taken back. None where there is nothing to lock again or no
+    /// room for one layer: the next request's end asks again. Served on an RTX 5070 Ti PC with 64 GB (UD-IQ2_XS, --vram 9, 22 layers locked at
+    /// the start), new conversations of 32K, 32K, 99K, 95K, 32K and 32K tokens gave back 2, 1, 5, 7, 2 and 2 layers and had 1, 1, 6, 7, 2 and 2
+    /// locked again 0.2-1.2 s after each request, 22 locked at the end; without this they stayed given back, 16 locked after the 95K.
+    fn pass_relock(&mut self) -> Option<BankLocks> {
+        if self.pass_given.is_empty() {
+            return None;
+        }
+        let (_, left) = crate::host::commit_left()?;
+        let given = self.pass_given.iter().filter(|layer| !self.lock_pending.contains(layer))
+            .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| (layer, banks.iter().map(|bank| bank.len() as u64).sum::<u64>())))
+            .collect::<Result<Vec<_>>>().ok()?;
+        let layers = crate::banks::relock_within(&given, left, self.pass_floor);
+        if layers.is_empty() {
+            return None;
+        }
+        let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+        let bytes = given.iter().filter(|(layer, _)| layers.contains(layer)).map(|(_, bytes)| bytes).sum::<u64>();
+        eprintln!("Straydog host banks: {} of the {} layers layer-order passes gave back are locked again behind the requests, {}, with {} of the commit \
+                   left ({} where the last pass began, with them all locked); {} locked already", layers.len(), given.len(), gib(bytes), gib(left),
+                  gib(self.pass_floor), self.locked_layers.len());
+        // (a give-back's halt was for the plan it stopped)
+        self.lock_halt = Default::default();
+        let job = match self.lock_job(&layers) {
+            Ok(job) => job,
+            Err(error) => {
+                eprintln!("WARN Straydog host banks: the layers a pass gave back are not locked again ({error})");
+                return None;
+            }
+        };
+        self.lock_pending = layers;
+        self.locking = true;
+        Some(job)
     }
 
     /// A layer-order pass's hidden rows (`hidden`) are on the host, not held in VRAM whole: move them beside the compute, to and from a ring of two
