@@ -63,7 +63,8 @@ The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm
 (`libcublas.so.13` and `libcublasLt.so.13`, in `/usr/local/cuda/lib64` or `/usr/local/cuda-13/lib64`
 or wherever `ldconfig` lists them, as NVIDIA's packages install them) on Linux with NVIDIA GPUs, the
 NVIDIA driver and `cublas64_13.dll` (next to the executable or from the CUDA Toolkit) on Windows.
-Linux also needs bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
+Linux also needs bubblewrap. The released Linux executables are built on Ubuntu 24.04 and need glibc 2.39 or
+later; on an older system, build from source as above. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
 
 ## Run
 
