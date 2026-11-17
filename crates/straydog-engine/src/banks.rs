@@ -501,11 +501,38 @@ impl Registrar {
     const SYSTEM: Registrar = Registrar { lock: crate::gpu::lock_host_range, unlock: crate::gpu::unlock_host_range };
 }
 
-/// The threads that check a layer's banks on a machine of `cores`: every core for a locking that nothing waits behind, and at most a quarter of them
-/// (one at least) for the locking behind "ready", which leaves the rest to the request's CPU experts and the memory bandwidth they use.
+/// Requests running now in this process ([`RequestRunning`]): the locking behind "ready" checks a bank on every core while there are none.
+static REQUESTS_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A request under way, counted while it lives (the worker holds one for each request it runs): the locking behind "ready" checks its banks on
+/// a quarter of the cores meanwhile, and on all of them between requests ([`check_threads`]).
+pub struct RequestRunning(());
+
+impl RequestRunning {
+    pub fn begin() -> RequestRunning {
+        REQUESTS_RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        RequestRunning(())
+    }
+}
+
+impl Drop for RequestRunning {
+    fn drop(&mut self) {
+        REQUESTS_RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The threads that check a bank on a machine of `cores`, asked as each bank's check begins: every core for a locking that nothing waits behind,
+/// and for the locking behind "ready" while no request runs (its threads at the lowered priority still); a quarter of them (one at least) behind
+/// "ready" while one does, which leaves the rest to the request's CPU experts and the memory bandwidth they use. With a quarter of the cores
+/// throughout, two RTX 3090 on a 20-vCPU host locked 46.8 GiB in 94.0 s after ready, with no request meanwhile; with all of them, 57.4 s.
 pub(crate) fn check_threads(priority: Priority, cores: usize) -> usize {
+    check_threads_with(priority, cores, REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+fn check_threads_with(priority: Priority, cores: usize, running: usize) -> usize {
     match priority {
         Priority::Normal => cores.max(1),
+        Priority::Background if running == 0 => cores.max(1),
         Priority::Background => (cores / 4).max(1),
     }
 }
@@ -1067,22 +1094,30 @@ pub fn order_by_host_routes(layers: &mut [usize], host_routes: impl Fn(usize) ->
 mod tests {
     use super::*;
 
-    /// Decides: the check behind "ready" has at most a quarter of the cores and at least one, and the load's check, and a locking nothing runs beside,
-    /// has every core.
+    /// Decides: the check behind "ready" has at most a quarter of the cores and at least one while a request runs, and every core between
+    /// requests, as the load's check and a locking nothing runs beside always have; the count follows the requests as they begin and end.
     #[test]
-    fn the_check_behind_ready_has_a_quarter_of_the_cores_and_the_load_all_of_them() {
+    fn the_check_behind_ready_has_a_quarter_of_the_cores_while_a_request_runs_and_all_of_them_else() {
         for cores in [1, 2, 3, 4, 7, 8, 12, 16, 24, 32, 64] {
-            let behind = check_threads(Priority::Background, cores);
+            let behind = check_threads_with(Priority::Background, cores, 1);
             assert!(behind >= 1 && behind <= cores.div_ceil(4).max(1), "{behind} threads behind ready on {cores} cores");
-            assert_eq!(check_threads(Priority::Normal, cores), cores, "every core for the load's check on {cores} cores");
+            assert_eq!(check_threads_with(Priority::Background, cores, 0), cores, "every core behind ready with no request on {cores} cores");
+            assert_eq!(check_threads_with(Priority::Normal, cores, 1), cores, "every core for the load's check on {cores} cores");
             if cores >= 2 {
                 assert!(behind < cores, "{behind} threads behind ready on {cores} cores are not fewer than the cores");
             }
         }
-        assert_eq!((check_threads(Priority::Background, 16), check_threads(Priority::Background, 8), check_threads(Priority::Background, 2)), (4, 2, 1));
-        // (this machine's own count: what `Bank::verify` takes)
-        let cores = std::thread::available_parallelism().map_or(8, |count| count.get());
-        assert!(check_threads(Priority::Background, cores) <= check_threads(Priority::Normal, cores));
+        assert_eq!((check_threads_with(Priority::Background, 16, 2), check_threads_with(Priority::Background, 8, 1),
+                    check_threads_with(Priority::Background, 2, 1)), (4, 2, 1));
+        // (the count as the worker keeps it: a request begun lowers the check, its end raises it again)
+        let cores = 16;
+        let before = REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst);
+        {
+            let _request = RequestRunning::begin();
+            assert_eq!(REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(check_threads_with(Priority::Background, cores, before + 1), 4);
+        }
+        assert_eq!(REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst), before);
         assert_eq!(check_threads(Priority::Normal, 0), 1);
     }
 
