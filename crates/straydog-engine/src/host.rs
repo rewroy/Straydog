@@ -231,6 +231,28 @@ fn read_ahead_room_of(available: u64, commit: Option<u64>) -> u64 {
 /// and 0.72 GiB reading through the mapping with none.
 const READ_AHEAD_COMMIT_KEPT: u64 = 1 << 30;
 
+/// What a layer-order pass asks of the commit before its first batch, where the system charges an allocation to it as it is made (Windows),
+/// and the commit left now; None elsewhere. The pass takes, in this order, its rows (`rows_bytes`), their page lock (which charged 0.18 GiB
+/// of 3.43 GiB of rows on an RTX 5070 Ti PC with 64 GB, and is counted at most, a [`ROWS_LOCK_COMMIT_SHARE`]th), and its read-ahead copies
+/// (`copies_bytes`: those the caller wants room for, with their margin), which leave [`READ_AHEAD_COMMIT_KEPT`]. The memory it takes on the
+/// GPU is not counted: it is what the expert slots it lets go had taken (a 90,000-token pass gave back 0.65 GiB more than it took).
+pub fn pass_commit(rows_bytes: u64, copies_bytes: u64) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        commit_left().map(|(_, left)| (pass_commit_of(rows_bytes, copies_bytes), left))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (rows_bytes, copies_bytes);
+        None
+    }
+}
+
+#[cfg(any(windows, test))]
+fn pass_commit_of(rows_bytes: u64, copies_bytes: u64) -> u64 {
+    rows_bytes + rows_bytes / ROWS_LOCK_COMMIT_SHARE + copies_bytes + READ_AHEAD_COMMIT_KEPT
+}
+
 /// The memory a page-locked allocation can have now: where the system charges page-locked memory to the commit (Windows) the commit left, else
 /// (and elsewhere) the physical memory available. None where the system does not say. The physical memory that unlocked pages still hold in a
 /// working set is not counted as available until the system takes it back, which is why the commit is the figure there: it is given back at once.
@@ -835,6 +857,15 @@ mod prefetch_tests {
         assert_eq!(super::read_ahead_room_of(3 * GIB, Some(20 * GIB)), 3 * GIB);
         assert_eq!(super::read_ahead_room_of(21 * GIB, Some(GIB / 2)), 0);
         assert_eq!(super::read_ahead_room_of(21 * GIB, None), 21 * GIB);
+    }
+    /// Decides: a layer-order pass asks the commit for its rows, an eighth of them for their lock, the copies asked for and the GiB the
+    /// read-ahead leaves: the 90,000-token pass's 3.43 GiB of rows with two copies of 1.04 GiB and their quarter-GiB margin, some 7.2 GiB.
+    #[test]
+    fn a_pass_asks_the_commit_for_its_rows_their_lock_and_its_copies() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::pass_commit_of(8 * GIB, 2 * GIB), 8 * GIB + GIB + 2 * GIB + GIB);
+        let wanted = super::pass_commit_of(90_000 * 10_240 * 4, 2 * 1_114_112_000 + (1 << 28));
+        assert!((7 * GIB..7 * GIB + GIB / 4).contains(&wanted), "{wanted}");
     }
     /// Decides: a hint on the ranges of a mapped file (a bank's experts, joined or apart, one that is not a whole page, and none at all) is taken and
     /// changes nothing of what the mapping reads.

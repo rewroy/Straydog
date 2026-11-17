@@ -4374,6 +4374,30 @@ impl Model {
         Ok(bank_bytes)
     }
 
+    /// Room in the commit for a layer-order pass of `rows` rows whose largest layer's banks are `bank_bytes`, before it takes any of it (Windows,
+    /// which charges an allocation to the commit as it is made; elsewhere nothing to do): the rows, their lock and two read-ahead copies
+    /// ([`crate::host::pass_commit`]). The start's plan leaves the commit the margin it keeps for the rest of the system, and a long pass took
+    /// nearly all of it: where the commit left lacks what the pass asks, locked layers are given back for it ([`Model::give_back`]) as for a K/V
+    /// growth, and the worker locks them again behind a request as the memory available allows ([`Model::more_bank_locks`], whose room
+    /// is the physical memory's: served on that PC with 6.9 GiB available after the request, it had not within two minutes); the request's
+    /// own reply decodes with them unlocked, which cost nothing that showed (99K tokens served: 20.8 tok/s with 4 layers given back, 19.5
+    /// with 1, the replies after 34-38 either way). On an RTX 5070 Ti PC with 64 GB (UD-IQ2_XS, --vram 9, a 90,000-token prompt), with 22
+    /// and 23 layers locked the pass asked for 7.2 GiB with 4.2 and 4.0 left, gave 4 layers back (3.5 and 3.8 GiB), took two copies and kept
+    /// 2.59 and 2.13 GiB of the commit at the least (33.6 and 34.6 s), where with only the read-ahead's room ([`crate::host::read_ahead_room`])
+    /// it kept 0.76 with 22, and before that 0.26 with 22 and ran out with 23; with the 19 the start planned it gave none back and kept 2.22
+    /// (35.2 s); the logits the same in all three.
+    fn make_pass_room(&mut self, rows: usize, bank_bytes: u64) -> Result<()> {
+        let copies = 2 * bank_bytes + crate::layer_bank::FIRST_COPIES_MARGIN;
+        let Some((wanted, left)) = crate::host::pass_commit(rows as u64 * WIDTH as u64 * 4, copies) else { return Ok(()) };
+        if left >= wanted {
+            return Ok(());
+        }
+        if let Some(gave) = self.give_back(wanted, &format!("a layer-order pass of {rows} rows"))? {
+            self.last_metrics.insert("prefill_pass_gave_back_layers".into(), json!(gave.layers.len()));
+        }
+        Ok(())
+    }
+
     /// A layer-order pass's hidden rows (`hidden`) are on the host, not held in VRAM whole: move them beside the compute, to and from a ring of two
     /// chunk slots of `batch` rows in VRAM ([`crate::gpu::Backend::overlap_layer_rows`]), if STRAYDOG_LAYER_ROWS_OVERLAP allows, the page-locked rows
     /// are within what [`crate::host::rows_lockable`] leaves, and the ring fits in the VRAM beside what layer order holds. The guard (None where the rows
@@ -4427,9 +4451,10 @@ impl Model {
         self.ensure_kv(tokens.len())?;
         let mut segment = layer_prefill_rows();
         let count = (tokens.len() - position).min(segment);
+        let bank_bytes = self.layer_bank_bytes()?;
+        self.make_pass_room(count, bank_bytes)?;
         // (page-aligned: the pass may page-lock the rows to move them beside the compute)
         let Some(mut hidden) = crate::gpu::PageAlignedFloats::zeroed(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
-        let bank_bytes = self.layer_bank_bytes()?;
         let (mut layer_end, staging) = layer_prefill_split(position, tokens.len(), plan, segment);
         let preparing = Instant::now();
         let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
