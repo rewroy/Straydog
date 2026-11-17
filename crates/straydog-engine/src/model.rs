@@ -614,6 +614,12 @@ struct AssistScript {
 /// STRAYDOG_LAYER_PREFILL_ROWS sets it, to measure ([`layer_prefill_rows`]).
 const LAYER_PREFILL_ROWS: usize = 16384;
 const LAYER_PREFILL_MIN: usize = 512;
+/// The most a read back of the unlocked layers' banks reads a second ([`Model::read_back_banks`]), beside a reply's own faults: those read some
+/// 0.35 GB a second from the drive (7 GB/s class) of an RTX 5070 Ti PC while a reply after a 99K prompt decoded at 20.9 tok/s.
+const READ_BACK_RATE: u64 = 2 << 30;
+/// How long a read back waits for the memory it plans with: right after a layer-order pass its rows and read-ahead copies are still being let
+/// go (on an RTX 5070 Ti PC with 64 GB, 9-13 GiB available once they were, less than the 7.7 GiB kept free beside the first layer before).
+const READ_BACK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// The chunks of a layer queued before the next layer's bank loads ahead ([`Model::load_prefill_bank_copy`]): the GPU has them to compute while
 /// the host gathers a copied layer (some 50-90 ms on an RTX 5070 Ti PC). A layer of fewer chunks loads the next after its last, as before.
 const LAYER_BANK_AHEAD_AFTER: usize = 3;
@@ -1452,6 +1458,8 @@ pub struct Model {
     /// pass found with all of them locked: [`Model::more_bank_locks`] locks them again behind the request within it.
     pass_given: Vec<usize>,
     pass_floor: u64,
+    /// Counts the layer-order passes and the read backs of the banks begun: a read back ([`Model::read_back_banks`]) stops when either begins.
+    read_back_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
@@ -1698,6 +1706,7 @@ impl Model {
             gave_back: Vec::new(),
             pass_given: Vec::new(),
             pass_floor: 0,
+            read_back_generation: Default::default(),
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
@@ -2520,6 +2529,8 @@ impl Model {
             self.bank_failure = failure;
         }
         self.hold_banks();
+        // (the layers left unlocked are read into memory behind the requests, before their faults would read them one at a time)
+        self.read_back_banks("after the locking");
     }
 
     /// Count the bytes of the banks page-locked in place (the locked layers that are not held as copies) for the working set's limit.
@@ -4385,6 +4396,79 @@ impl Model {
         Ok(bank_bytes)
     }
 
+    /// The banks of the layers that are not page-locked read back whole into memory, layer by layer, on a thread of its own at the background's
+    /// CPU and I/O priority ([`crate::host::prefetch`]): after a layer-order pass (`when` says which, for the log), which reads them around the
+    /// page cache and leaves nothing of them in memory, and after the banks' locking at a start, which leaves the rest to the first requests'
+    /// faults. Either way a reply's first tokens otherwise read their CPU experts from the drive one fault at a time: on an RTX 5070 Ti PC, a 99K
+    /// prompt read first after a start replied at 20.9 tok/s where the same reply decodes at 37.7 once the pages are in memory, its first 64
+    /// tokens touching some 125 experts of each such layer, spread over every rank of their scores (so no ranking of experts picks them: the
+    /// layer goes whole); and a 2K chat turn, the first after a start, replied at 22.0 tok/s with 7.35 GB read from the drive, the same turn
+    /// later at 32.9-36.4 with 0.8-0.9 GB. The layers the host ran most routes of go first (this run's counts; without any, in order), as many
+    /// whole layers as the memory available keeps [`crate::host::left_free`] beside, planned once [`READ_BACK_WAIT`] at most has let a pass's
+    /// memory go, at [`READ_BACK_RATE`] at most. The next layer-order pass stops it.
+    fn read_back_banks(&mut self, when: &'static str) {
+        if !self.partial {
+            return;
+        }
+        let counts = self.route_counts().ok().filter(|routes| routes.total() > 0);
+        let mut layers: Vec<usize> = (0..48).filter(|layer| !self.locked_layers.contains(layer)).collect();
+        if let Some(counts) = &counts {
+            crate::banks::order_by_host_routes(&mut layers, |layer| counts.host_routes(layer));
+        }
+        let mut banks = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let Ok(three) = Self::host_banks(&self.weights, layer) else { continue };
+            let ranges: Vec<(usize, usize)> = three.iter().filter(|bank| !bank.is_empty()).map(|bank| (bank.as_ptr() as usize, bank.len())).collect();
+            banks.push((layer, ranges.iter().map(|&(_, length)| length as u64).sum::<u64>(), ranges));
+        }
+        if banks.is_empty() {
+            return;
+        }
+        let kept = crate::host::left_free(self.weights.host_memory_bytes);
+        let ordered = if counts.is_some() { ", the most host routes first" } else { "" };
+        // (an earlier read back stops: this one plans from what memory holds now)
+        let generation = self.read_back_generation.clone();
+        let mine = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        // (the mapping outlives the thread's reads: the weights stay mapped while the model lives, and a read of a range let go only fails)
+        let spawned = std::thread::Builder::new().name("bank read back".into()).spawn(move || {
+            // (the CPU and the drive at the background's priority, the pages read at the normal memory priority: they wait in memory for the
+            // reply's faults)
+            let _lowered = crate::host::Lowered::begin_reading(crate::host::Priority::Background);
+            let started = Instant::now();
+            let sizes: Vec<(usize, u64)> = banks.iter().map(|(layer, bytes, _)| (*layer, *bytes)).collect();
+            let mut available = crate::host::prefetch_available_bytes();
+            while available.saturating_sub(kept) < sizes[0].1 && started.elapsed() < READ_BACK_WAIT
+                && generation.load(std::sync::atomic::Ordering::SeqCst) == mine {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                available = crate::host::prefetch_available_bytes();
+            }
+            let planned = crate::banks::read_back_plan(&sizes, available.saturating_sub(kept)).len();
+            let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+            let bytes: u64 = sizes[..planned].iter().map(|(_, bytes)| bytes).sum();
+            eprintln!("Straydog host banks: {planned} of {} unlocked layers to be read back {when}, {} ({} available after {:.1} s, {} kept free){ordered}",
+                      sizes.len(), gib(bytes), gib(available), started.elapsed().as_secs_f64(), gib(kept));
+            let (mut layers, mut read) = (0usize, 0u64);
+            for (_, bytes, ranges) in &banks[..planned] {
+                if generation.load(std::sync::atomic::Ordering::SeqCst) != mine {
+                    break;
+                }
+                let asked = Instant::now();
+                if crate::host::prefetch(ranges).is_err() {
+                    break;
+                }
+                layers += 1;
+                read += bytes;
+                std::thread::sleep(crate::banks::read_back_pause(*bytes, asked.elapsed(), READ_BACK_RATE));
+            }
+            if planned > 0 {
+                eprintln!("Straydog host banks: read back {when}: {layers} layers, {} in {:.1} s", gib(read), started.elapsed().as_secs_f64());
+            }
+        });
+        if let Err(error) = spawned {
+            eprintln!("WARN Straydog cannot read back the unlocked layers' banks {when}: {error}");
+        }
+    }
+
     /// Room in the commit for a layer-order pass of `rows` rows whose largest layer's banks are `bank_bytes`, before it takes any of it (Windows,
     /// which charges an allocation to the commit as it is made; elsewhere nothing to do): the rows, their lock and two read-ahead copies
     /// ([`crate::host::pass_commit`]). The start's plan leaves the commit the margin it keeps for the rest of the system, and a long pass took
@@ -4503,6 +4587,8 @@ impl Model {
                          cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
         if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
         let _trace_total = crate::layer_trace::Span::new("total", None, position, tokens.len(), 0);
+        // (a read back of the banks after an earlier pass stops: this pass reads them itself)
+        self.read_back_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // (the K/V grown to the prompt first: its growth asks the commit that the hidden rows would take, more of it at more rows a pass)
         self.ensure_kv(tokens.len())?;
         let mut segment = layer_prefill_rows();
@@ -4605,8 +4691,12 @@ impl Model {
         match output? {
             None => Ok(LayerPrefill::Fallback),
             Some(false) => Ok(LayerPrefill::Cancelled),
-            Some(true) if layer_end < tokens.len() => Ok(LayerPrefill::Continue(layer_end)),
             Some(true) => {
+                // (the pass is over whether the prompt ends with it or a short last segment follows the ordinary way, as a 99K one's does)
+                self.read_back_banks("behind the reply");
+                if layer_end < tokens.len() {
+                    return Ok(LayerPrefill::Continue(layer_end));
+                }
                 let row = self.final_hidden.clone().ok_or("layer prefill returned no final hidden row")?;
                 self.head_logits(&row, false).map(LayerPrefill::Ready)
             }
