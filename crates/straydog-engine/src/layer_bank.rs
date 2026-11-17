@@ -141,7 +141,8 @@ pub(crate) struct Prefetch {
 }
 
 impl Prefetch {
-    /// Up to [`READS_AHEAD`] layers' anonymous copies, each only while the memory available keeps a GiB beside them all (the first two, a quarter of one). Under pressure,
+    /// Up to [`READS_AHEAD`] layers' anonymous copies, each only while the memory available (and on Windows the commit left: `read_ahead_room`)
+    /// keeps a GiB beside them all (the first two, a quarter of one). Under pressure,
     /// or without a pinned tree, retain the existing authenticated mapping path instead.
     pub(crate) fn new(weights: &Weights, layers: usize, registered: Arc<crate::banks::Registered>) -> Option<Self> {
         // (the bytes of the layers not registered now, which this pass reads from the file: whether to read them around the page cache)
@@ -150,7 +151,7 @@ impl Prefetch {
         let direct = reads_direct(bank_reads(), unregistered, crate::host::prefetch_available_bytes());
         let plans: Vec<_> = (0..layers).map(|layer| Plan::new(weights, layer, direct)).collect();
         let bytes = plans.iter().flatten().map(|plan| plan.bytes).max()?;
-        let available = crate::host::prefetch_available_bytes();
+        let available = crate::host::read_ahead_room();
         let mut free = Vec::new();
         // (development: STRAYDOG_LAYER_BANK_BUFFERS=N reads ahead into N buffers at most, to see a pass the memory left one or two)
         let most = std::env::var("STRAYDOG_LAYER_BANK_BUFFERS").ok().and_then(|value| value.trim().parse::<usize>().ok())

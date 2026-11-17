@@ -212,6 +212,25 @@ pub fn prefetch_available_bytes() -> u64 {
     physical
 }
 
+/// The memory a pass's read-ahead copies of the layers' banks may take now: what is available ([`prefetch_available_bytes`]), and where the
+/// system charges an allocation to the commit as it is made (Windows) no more than the commit left less [`READ_AHEAD_COMMIT_KEPT`] (what the
+/// pass goes on taking after its copies, and the rest of the system), the buffers' own margin then kept besides. On an RTX 5070 Ti PC with 64 GB
+/// (UD-IQ2_XS, --vram 9, a 90,000-token prompt, 22 layers' banks page-locked: 17.8 GiB) the pass took, in this order, its rows (3.44 GiB of
+/// commit), their lock (0.18) and four copies of 1.04 GiB (4.16), and the commit left came down from 7.58 GiB to 0.45, 0.26 at the least: with
+/// a layer more locked, or other programs holding more, the first batch failed for want of memory (out of memory at the next GPU call).
+/// With the room, the same PC with 19 layers locked (15.0 GiB) took two copies and kept 2.12 GiB at the least (35.12 s, where the build before
+/// took 36.2 with 21 and 22 layers); with 22 layers forced, 1.48 GiB left before the copies, it took none (the pass then reads through the
+/// mapping) and kept 0.76 GiB at the least (35.05 s), where the build before took four and ran out.
+pub fn read_ahead_room() -> u64 {
+    read_ahead_room_of(prefetch_available_bytes(), commit_left().map(|(_, commit)| commit))
+}
+fn read_ahead_room_of(available: u64, commit: Option<u64>) -> u64 {
+    commit.map_or(available, |commit| available.min(commit.saturating_sub(READ_AHEAD_COMMIT_KEPT)))
+}
+/// The commit a pass's read-ahead leaves, whatever its buffers' margin: after its copies the same PC's pass took 0.19-0.24 GiB more of it,
+/// and 0.72 GiB reading through the mapping with none.
+const READ_AHEAD_COMMIT_KEPT: u64 = 1 << 30;
+
 /// The memory a page-locked allocation can have now: where the system charges page-locked memory to the commit (Windows) the commit left, else
 /// (and elsewhere) the physical memory available. None where the system does not say. The physical memory that unlocked pages still hold in a
 /// working set is not counted as available until the system takes it back, which is why the commit is the figure there: it is given back at once.
@@ -807,6 +826,16 @@ mod priority_tests {
 
 #[cfg(test)]
 mod prefetch_tests {
+    /// Decides: the read-ahead's room is the commit left less a GiB where that is smaller than the physical memory available (the PC's
+    /// first batch above), and the physical memory elsewhere.
+    #[test]
+    fn the_read_ahead_takes_no_more_than_the_commit_left() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::read_ahead_room_of(21 * GIB, Some(4 * GIB)), 3 * GIB);
+        assert_eq!(super::read_ahead_room_of(3 * GIB, Some(20 * GIB)), 3 * GIB);
+        assert_eq!(super::read_ahead_room_of(21 * GIB, Some(GIB / 2)), 0);
+        assert_eq!(super::read_ahead_room_of(21 * GIB, None), 21 * GIB);
+    }
     /// Decides: a hint on the ranges of a mapped file (a bank's experts, joined or apart, one that is not a whole page, and none at all) is taken and
     /// changes nothing of what the mapping reads.
     #[test]
