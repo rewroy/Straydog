@@ -838,6 +838,7 @@ impl BankLocks {
     /// As [`BankLocks::lock_next`].
     unsafe fn register_turn(&self, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
         let mut locked = 0;
+        let started = std::time::Instant::now();
         for bank in &banks {
             // SAFETY: the caller's.
             if let Err(error) = (self.registrar.lock)(self.ordinal, unsafe { bank.range() }) {
@@ -846,6 +847,7 @@ impl BankLocks {
             }
             locked += 1;
         }
+        let registered = started.elapsed().as_secs_f64();
         // Locked, the banks' pages stay as they are now: with the shards' verity trees, check them (they may have been read again since
         // loading verified their chunks).
         for bank in &banks {
@@ -856,6 +858,12 @@ impl BankLocks {
             }
         }
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
+        // (as the copy mode's line: where a layer's turn goes, registering its pages or checking them)
+        if std::env::var_os("DS41_PROFILE").is_some() {
+            eprintln!("Straydog host banks register: layer {layer}, {:.2} GiB, register {registered:.3} s, verification {:.3} s, {} threads",
+                      bytes as f64 / (1u64 << 30) as f64, started.elapsed().as_secs_f64() - registered,
+                      check_threads(priority, std::thread::available_parallelism().map_or(8, |count| count.get())));
+        }
         self.registered.mark(layer);
         Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar), registered: Some(self.registered.clone()) })
     }
