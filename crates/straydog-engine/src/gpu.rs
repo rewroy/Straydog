@@ -85,33 +85,27 @@ fn top_pairs(row: &[f32], top: usize) -> Vec<(f32, u32)> {
 pub type Result<T> = std::result::Result<T, String>;
 
 /// Whether the expert slots keep what they hold across a growth of the K/V (the pool in chunks, gpu/core.hpp's `retained_requested` reads the
-/// same), selected before placement: on a CUDA build unless STRAYDOG_KV_CACHE_RETAIN=0, on a HIP build only with =1. Two RTX 3090 (IQ3_S,
+/// same), selected before placement: unless STRAYDOG_KV_CACHE_RETAIN=0. Two RTX 3090 (IQ3_S,
 /// context 262144, served) grew the K/V for a 95,204-token prompt in 1.60 s with it where they took 3.36 s without, the 19 scenarios of the
-/// fixed benchmark as fast (98.9 and 98.7 s) with no error; one RTX 5070 Ti had grown it in 0.12-0.27 s where it took 1.04-1.55 s.
+/// fixed benchmark as fast (98.9 and 98.7 s) with no error; one RTX 5070 Ti had grown it in 0.12-0.27 s where it took 1.04-1.55 s, and one
+/// R9700 in 0.11 s where it took 1.5-1.8 s, its GPU tests passing with it (kv_cache_retain_gpu, kv_growth_vram_gpu, behind_gpu, giveback_gpu).
 pub fn kv_cache_retention_requested() -> bool {
-    kv_cache_retention_named(cfg!(feature = "cuda"), std::env::var("STRAYDOG_KV_CACHE_RETAIN").ok().as_deref())
+    kv_cache_retention_named(std::env::var("STRAYDOG_KV_CACHE_RETAIN").ok().as_deref())
 }
 
-fn kv_cache_retention_named(cuda: bool, value: Option<&str>) -> bool {
-    match value {
-        Some("1") => true,
-        Some("0") => false,
-        _ => cuda,
-    }
+fn kv_cache_retention_named(value: Option<&str>) -> bool {
+    value != Some("0")
 }
 
 #[cfg(test)]
 mod kv_cache_retention_tests {
-    /// Decides: the K/V growth keeps the expert slots by default on CUDA and not on HIP, and the switch's 0 and 1 name it either way, as the
-    /// native side reads it (gpu/core.hpp).
+    /// Decides: the K/V growth keeps the expert slots by default, and the switch's 0 turns it off, as the native side reads it (gpu/core.hpp).
     #[test]
-    fn retention_is_on_for_cuda_unless_named_off_and_off_for_hip_unless_named_on() {
-        assert!(super::kv_cache_retention_named(true, None));
-        assert!(super::kv_cache_retention_named(true, Some("2")));
-        assert!(!super::kv_cache_retention_named(true, Some("0")));
-        assert!(!super::kv_cache_retention_named(false, None));
-        assert!(!super::kv_cache_retention_named(false, Some("2")));
-        assert!(super::kv_cache_retention_named(false, Some("1")));
+    fn retention_is_on_unless_named_off() {
+        assert!(super::kv_cache_retention_named(None));
+        assert!(super::kv_cache_retention_named(Some("1")));
+        assert!(super::kv_cache_retention_named(Some("2")));
+        assert!(!super::kv_cache_retention_named(Some("0")));
     }
 }
 
