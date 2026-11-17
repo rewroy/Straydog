@@ -921,6 +921,21 @@ pub fn locking_room(available: u64, layer_bytes: u64, margin: u64, kv_ahead: u64
     }
 }
 
+/// The layers layer-order passes gave back (`given`, with their bytes, in the order given) to lock again with `left` bytes of commit left now:
+/// those in order whose locks leave at least `floor`, what the last pass found with them all locked. A layer that does not fit ends the list.
+pub fn relock_within(given: &[(usize, u64)], left: u64, floor: u64) -> Vec<usize> {
+    let mut room = left.saturating_sub(floor);
+    let mut layers = Vec::new();
+    for &(layer, bytes) in given {
+        if bytes > room {
+            break;
+        }
+        room -= bytes;
+        layers.push(layer);
+    }
+    layers
+}
+
 /// How many of the locked layers a K/V growth (or another request's allocation) that is `shortfall` bytes short of memory takes back, newest first:
 /// `locked` is the layers in the order they were locked, with their bytes. As many of the newest as their bytes cover the shortfall, and at least one
 /// where any is locked (the allocation was refused: whatever the system says is available did not give it).
@@ -1141,6 +1156,21 @@ mod tests {
         // (the layers it names are the last of the list: the caller takes them from the end)
         let count = give_back_count(&locked, 2 * GIB + 1);
         assert_eq!(locked[locked.len() - count..].iter().map(|layer| layer.0).collect::<Vec<_>>(), vec![42, 43, 44]);
+    }
+
+    /// Decides: the layers passes gave back are locked again in the order given while their locks leave the commit where the last pass found it
+    /// with them all locked; one that does not fit ends it, and with the commit at or under that mark none is.
+    #[test]
+    fn layers_a_pass_gave_back_are_locked_again_within_the_commit_it_found() {
+        const GIB: u64 = 1 << 30;
+        let given = [(27, GIB), (28, GIB), (29, 2 * GIB)];
+        // (the pass found 5 GiB with them all locked: 9 GiB now is room for all four GiB of them)
+        assert_eq!(relock_within(&given, 9 * GIB, 5 * GIB), vec![27, 28, 29]);
+        assert_eq!(relock_within(&given, 8 * GIB, 5 * GIB), vec![27, 28], "29's two GiB would leave less than the pass found");
+        assert_eq!(relock_within(&given, 7 * GIB - 1, 5 * GIB), vec![27]);
+        assert_eq!(relock_within(&given, 5 * GIB, 5 * GIB), Vec::<usize>::new(), "other programs took what the pass let go");
+        assert_eq!(relock_within(&given, 4 * GIB, 5 * GIB), Vec::<usize>::new());
+        assert_eq!(relock_within(&[], 9 * GIB, 5 * GIB), Vec::<usize>::new());
     }
 
     /// Decides: the line a give-back leaves says the layers (newest first), their bytes, what asked, how much and what was available, and what stays.
