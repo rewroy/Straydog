@@ -321,9 +321,29 @@ impl<E: Engines> Loaded<E> {
         // (a message's own text never writes the template's tokens: see Text::defuse)
         let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
         let prompt = self.template.render_with(messages, &tools, &variables).map_err(|exc| refused(exc.0))?;
+        // A reply asked with no reasoning in a conversation that thinks (`"reasoning": false`): the prompt as it is, its reasoning
+        // closed where it opens. That is how the template writes back a reply that had none, so the next request goes on from it.
+        const THINK_OPEN: &str = "<think>";
+        let unreasoned = thinking && matches!(body.get("reasoning"), Some(Py::Bool(false)));
+        let prompt = if unreasoned && prompt.ends_with(THINK_OPEN) { prompt + THINK_CLOSE } else { prompt };
+        let thinking = thinking && !unreasoned;
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         let images: Vec<images::Image> = images.iter().map(|bytes| images::prepare(bytes)).collect::<Result<_, _>>().map_err(refused)?;
-        let (ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
+        let (mut ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
+        // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
+        // encoded again can be split otherwise, and the engines then read the reply again from the first such place.
+        if images.is_empty() {
+            let held = self.model.held();
+            let shared = ids.iter().zip(held).take_while(|(new, old)| new == old).count();
+            if shared < held.len() && shared < ids.len() {
+                let (count, at) = text.reach(held, &prompt);
+                if count > shared {
+                    let mut kept = held[..count].to_vec();
+                    kept.extend(text.encode(&prompt[at..]).map_err(Failure::from)?);
+                    ids = kept;
+                }
+            }
+        }
         let encode_seconds = started.elapsed().as_secs_f64();
         let image_started = Instant::now();
         let rows = self.image_rows(&images, &spans)?;

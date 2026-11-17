@@ -64,6 +64,13 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_memory_effective(
+        handle: *mut ::std::os::raw::c_void,
+        used: *mut u64,
+        budget: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_set_budget(handle: *mut ::std::os::raw::c_void, budget: u64)
         -> ::std::os::raw::c_int;
 }
@@ -1797,6 +1804,7 @@ unsafe extern "C" {
         layer: u64,
         storage: *mut ::std::os::raw::c_void,
         bytes: u64,
+        ahead: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -1807,6 +1815,34 @@ unsafe extern "C" {
         bytes: u64,
         sources: *const *const u8,
         source_bytes: *const u64,
+        ahead: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_commit(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_halves(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_ahead_ready(
+        handle: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_half_free(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_prefill_bank_times(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -1893,6 +1929,53 @@ unsafe extern "C" {
         output: *mut f32,
         output_rows: u64,
         timings: *mut f64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_begin(
+        handle: *mut ::std::os::raw::c_void,
+        storage: *mut ::std::os::raw::c_void,
+        slot_rows: u64,
+        host: *mut f32,
+        host_rows: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_up(
+        handle: *mut ::std::os::raw::c_void,
+        chunk: u64,
+        row: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_load(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        chunk: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_span(
+        handle: *mut ::std::os::raw::c_void,
+        layer: u64,
+        chunk: u64,
+        row: u64,
+        position: u64,
+        steps: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_wait(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_end(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_rows_overlap_times(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -2402,6 +2485,61 @@ unsafe extern "C" {
     pub fn sd_expert_slots_restore(
         handle: *mut ::std::os::raw::c_void,
         cache: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_plan(
+        handle: *mut ::std::os::raw::c_void,
+        cache_cap: u64,
+        stage: u64,
+        slot_bytes: u64,
+        margin: u64,
+        extra: u64,
+        cache: *mut u64,
+        nominal: *mut u64,
+        reserve: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_accounting(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_prepare(
+        handle: *mut ::std::os::raw::c_void,
+        ordered_layers: *const u64,
+        count: u64,
+        capacity: u64,
+        margin: u64,
+        retained: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_finish(
+        handle: *mut ::std::os::raw::c_void,
+        retained: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_oom(handle: *mut ::std::os::raw::c_void)
+        -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_retain_stats(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expert_slots_residency(
+        handle: *mut ::std::os::raw::c_void,
+        out: *mut u64,
+        rows_capacity: u64,
+        rows: *mut u64,
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {

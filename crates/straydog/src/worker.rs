@@ -1869,7 +1869,20 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let prompt = if images.is_empty() { engine.template.render(messages, &tools, thinking, effort) } else { engine.template.render_parts(messages, &tools, thinking, effort) }
         .map_err(|exc| refused(exc.0))?;
     let (ids, prepared, spans) = if images.is_empty() {
-        (text.encode(&prompt).map_err(Failure::from)?, Vec::new(), Vec::new())
+        // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
+        // encoded again can be split otherwise, and the model then read the reply again from the first such place.
+        let mut ids = text.encode(&prompt).map_err(Failure::from)?;
+        let held = engine.model.held();
+        let shared = ids.iter().zip(held).take_while(|(new, old)| new == old).count();
+        if shared < held.len() && shared < ids.len() {
+            let (count, at) = text.reach(held, &prompt);
+            if count > shared {
+                let mut kept = held[..count].to_vec();
+                kept.extend(text.encode(&prompt[at..]).map_err(Failure::from)?);
+                ids = kept;
+            }
+        }
+        (ids, Vec::new(), Vec::new())
     } else {
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         let prepared: Vec<images::QwenImage> = images.iter().map(|bytes| images::prepare_qwen(bytes)).collect::<Result<_, _>>().map_err(refused)?;

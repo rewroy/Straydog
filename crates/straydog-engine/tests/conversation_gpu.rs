@@ -33,9 +33,14 @@ const IM_START: u32 = 248045;
 
 /// A model of the bundle, placed in 5.5 GiB with the K/V in host memory, and its tokenizer.
 fn open(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>) -> (Model, Text) {
+    open_with(root, drafter, true)
+}
+
+/// [`open`] with the prompt's products in FP16 (`half`, as served) or in F32.
+fn open_with(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>, half: bool) -> (Model, Text) {
     let budget = (5.5 * (1u64 << 30) as f64) as u64;
     let mut group = Group::new(&[0], &[budget], SplitMode::Experts).unwrap();
-    group.configure_gemm(2, true).unwrap();
+    group.configure_gemm(2, half).unwrap();
     let bundle = straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, "UD-IQ1_S").unwrap();
     let drafter = drafter.map(PathBuf::from);
     let weights = Weights::open(&PathBuf::from(root), bundle, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
@@ -48,6 +53,19 @@ fn open(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>) -> (Model, Te
     assert!(model.host_kv, "its K/V must be in host memory");
     // (the prompt's experts all stream: the fresh models compared begin alike)
     model.prompt_share(false).unwrap();
+    (model, text)
+}
+
+/// A bundle whole in the VRAM of the GPUs named (30 GiB each), with the MTP drafter, and its tokenizer.
+fn open_full(root: &std::ffi::OsStr, drafter: &std::ffi::OsStr, half: bool, quantization: &str, devices: &[usize]) -> (Model, Text) {
+    let mut group = Group::new(devices, &vec![30 << 30; devices.len()], SplitMode::Experts).unwrap();
+    group.configure_gemm(2, half).unwrap();
+    let bundle = straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quantization).unwrap();
+    let weights = Weights::open(&PathBuf::from(root), bundle, Some(&PathBuf::from(drafter)), straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+    let text = Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap();
+    let settings = Settings { context: 131072, state_budget_bytes: 8 << 30, prefill_batch_size: 2048, speculative: 3, cpu_threads: 0, row_cache_bytes: None };
+    let model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+    assert!(!model.partial, "the model must be fully resident at these budgets");
     (model, text)
 }
 
@@ -182,6 +200,213 @@ fn kept_conversation(drafter: Option<&std::ffi::OsStr>, root_dir: &std::ffi::OsS
     }
     assert!(!std::env::var("STRAYDOG_PROMPT_CPU").is_ok_and(|value| value == "0") || same_bits,
             "with every expert beyond the slots streamed, the two agree to the bit: they differ by {worst:.2e}");
+}
+
+/// A long reply is marked as it grows (the recurrent state, every 512 tokens, at a multiple of four). A client that keeps it only in part
+/// (a file it cut at a line's end to have the model go on, a reply its person stopped) sends a prompt that leaves the held sequence before
+/// its end: the request goes on from the last mark the part reaches (the mark before the last, where the part ends between the two), where
+/// it read the whole reply again. Its first token is the one a model that reads the whole request chooses.
+fn kept_part(drafter: Option<&std::ffi::OsStr>, root_dir: &std::ffi::OsStr) {
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut model, text) = open(root_dir, drafter);
+    let prompt = text.encode("<|im_start|>user\nWrite a long and detailed essay about the sea in winter, of at least two thousand words.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+    let tail = text.encode("<|im_end|>\n<|im_start|>user\nGo on from there.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+    let top = |logits: &[f32]| logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(token, _)| token);
+    // (the part kept ends 40 tokens past the last mark, then 8 tokens before it: after the mark before the last)
+    for (past, kind) in [(40isize, "mark"), (-8, "mark_before")] {
+        model.reset().unwrap();
+        let mut written = Vec::new();
+        model.generate(&prompt, 1300, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| written.push(token)).unwrap();
+        let marks = model.last_metrics.get("marks").and_then(|marks| marks.as_u64()).unwrap_or(0);
+        let marked: Vec<usize> = model.last_metrics.get("marked_tokens").and_then(|marked| marked.as_array()).map(|marked| marked.iter().map(|at| at.as_u64().unwrap() as usize).collect())
+            .unwrap_or_default();
+        eprintln!("a reply of {} tokens: {marks} marks at {marked:?}, {:.1} ms each", written.len(),
+                  1e3 * model.last_metrics.get("mark_seconds").and_then(|seconds| seconds.as_f64()).unwrap_or(0.0) / marks.max(1) as f64);
+        assert!(marked.len() >= 2 && marked.iter().all(|at| at % 4 == 0), "the reply was long enough to be marked twice: {} tokens", written.len());
+        let (last, before) = (marked[marked.len() - 1], marked[marked.len() - 2]);
+        let kept = (last as isize + past) as usize - prompt.len();
+        assert!(kept + 8 < written.len() && last - before >= 512, "the part kept ends before the reply does");
+        let next: Vec<u32> = prompt.iter().chain(&written[..kept]).chain(&tail).copied().collect();
+        let stepped = first_logits(&mut model, &next);
+        let expected = if kind == "mark" { last } else { before };
+        assert_eq!((model.last_metrics["resumed_from"].as_str(), model.last_metrics["cached_tokens"].as_u64()), (Some(kind), Some(expected as u64)));
+        // The same request read whole, and (with no marks) from the place the reply began.
+        model.reset().unwrap();
+        let whole = first_logits(&mut model, &next);
+        assert_eq!(model.last_metrics["cached_tokens"].as_u64(), Some(0));
+        eprintln!("from the {kind} and read whole: relative difference {:.4}", relative_difference(&stepped, &whole));
+        assert_eq!(top(&stepped), top(&whole), "the first token from the {kind}");
+    }
+    // A model that takes no marks reads the reply again from where it began.
+    model.set_reply_marks(false);
+    model.reset().unwrap();
+    let mut written = Vec::new();
+    model.generate(&prompt, 700, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| written.push(token)).unwrap();
+    assert!(model.last_metrics.get("marks").is_none() && written.len() > 600);
+    let next: Vec<u32> = prompt.iter().chain(&written[..600]).chain(&tail).copied().collect();
+    first_logits(&mut model, &next);
+    assert!(model.last_metrics["cached_tokens"].as_u64().is_some_and(|cached| (cached as usize) <= prompt.len()), "{:?}", model.last_metrics["resumed_from"]);
+}
+
+fn log_softmax(logits: &[f32]) -> Vec<f64> {
+    let top = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum: f64 = logits.iter().map(|&value| (value as f64 - top).exp()).sum();
+    logits.iter().map(|&value| value as f64 - top - sum.ln()).collect()
+}
+
+/// KL(p || q) of two rows of logits.
+fn kl(p: &[f32], q: &[f32]) -> f64 {
+    let (p, q) = (log_softmax(p), log_softmax(q));
+    p.iter().zip(&q).map(|(&a, &b)| a.exp() * (a - b)).sum()
+}
+
+fn best(logits: &[f32]) -> usize {
+    logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0
+}
+
+/// What the decode path makes of a reply against what the prompt path makes of the same tokens: a reply of 512 greedy tokens is
+/// decoded again as known rows (passes of 1, 3 and 2 rows, their logits kept), and at every 32nd token the prompt and the reply
+/// so far are read as a prompt by a fresh sequence. The same with F32 products (the reference). Printed: the next token's
+/// distribution after the same tokens, decode against the F32 prompt read, beside the FP16 prompt read against it (the form long
+/// prompts already have), and how often each chooses the reference's token. The model as a 6 GiB card places it: the decode's
+/// routes run on the CPU where the slots hold no expert, the prompt's stream to the GPU.
+///
+/// STRAYDOG_DECODE_ACCURACY names the run ("fp16" or "f32") and STRAYDOG_DECODE_ACCURACY_DIR the folder its logits are kept in:
+/// one run a process, as each locks the model's banks in host memory; the run that finds both compares.
+#[test]
+fn the_decode_path_is_as_near_the_f32_prompt_read_as_the_fp16_prompt_read() {
+    let (Some(root_dir), Some(drafter)) = (common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory"),
+                                           common::model_env("STRAYDOG_DRAFTER", "the MTP drafter's directory")) else { return };
+    let (Ok(mode), Ok(dir)) = (std::env::var("STRAYDOG_DECODE_ACCURACY"), std::env::var("STRAYDOG_DECODE_ACCURACY_DIR")) else {
+        eprintln!("skipped: STRAYDOG_DECODE_ACCURACY (fp16 or f32) and STRAYDOG_DECODE_ACCURACY_DIR are not set");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    const REPLY: usize = 512;
+    const EVERY: usize = 32;
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    {
+        let half = match mode.as_str() {
+            "fp16" => true,
+            "f32" => false,
+            other => panic!("STRAYDOG_DECODE_ACCURACY is {other}, not fp16 or f32"),
+        };
+        // (STRAYDOG_DECODE_ACCURACY_PLACE=full: the model whole in the VRAM of two GPUs, as served there, with STRAYDOG_MODEL its
+        // UD-IQ3_XXS bundle; else as a 6 GiB card places UD-IQ1_S)
+        // (the F32 reference of the small placement is read by two GPUs that hold the model whole: F32 products fit neither 5.5 GiB nor one card)
+        let (mut model, text) = if std::env::var("STRAYDOG_DECODE_ACCURACY_PLACE").is_ok_and(|place| place == "full") { open_full(&root_dir, &drafter, half, "UD-IQ3_XXS", &[0, 1]) }
+                                else if half { open_with(&root_dir, Some(&drafter), half) } else { open_full(&root_dir, &drafter, half, "UD-IQ1_S", &[0, 1]) };
+        let prompt = text.encode("<|im_start|>user\nWrite a long and detailed essay about the sea in winter, of at least two thousand words.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+        // (the reply: the fp16 run's greedy tokens, which the f32 run takes from its file so that both read the same tokens)
+        let reply_file = dir.join("reply.bin");
+        let reply: Vec<u32> = match std::fs::read(&reply_file) {
+            Ok(bytes) => bytes.chunks_exact(4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).collect(),
+            Err(_) => {
+                let mut reply = Vec::new();
+                model.generate(&prompt, REPLY, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| reply.push(token)).unwrap();
+                assert_eq!(reply.len(), REPLY, "a long reply");
+                std::fs::write(&reply_file, reply.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+                reply
+            }
+        };
+        let bytes = |rows: &[f32]| -> Vec<u8> { rows.iter().flat_map(|value| value.to_le_bytes()).collect() };
+        // The prompt path: after the reply's first k tokens, k = 32, 64, ...
+        let mut read = Vec::new();
+        for k in (EVERY..REPLY).step_by(EVERY) {
+            model.reset().unwrap();
+            let whole: Vec<u32> = prompt.iter().chain(&reply[..k]).copied().collect();
+            read.extend(first_logits(&mut model, &whole));
+        }
+        std::fs::write(dir.join(format!("{mode}-read.bin")), bytes(&read)).unwrap();
+        // The decode path, where the run's own greedy tokens are the reply (the fp16 run): the same tokens as known rows.
+        if half {
+            model.reset().unwrap();
+            model.forced_rows = Some(straydog_engine::model::ForcedRows { tokens: reply.clone(), widths: vec![1, 3, 2], read_logits: true, keep_logits: true,
+                                                                         teacher: true, ..Default::default() });
+            let mut again = Vec::new();
+            model.generate(&prompt, REPLY, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| again.push(token)).unwrap();
+            let forced = model.forced_rows.take().unwrap();
+            assert_eq!(again, reply, "the known rows are the reply");
+            assert_eq!(forced.rejected, 0);
+            let vocabulary = forced.kept_logits.len() / (REPLY - 1);
+            // (row i is the logits after the reply's token i: the rows after tokens 31, 63, ... are after its first 32, 64, ... tokens)
+            let decoded: Vec<f32> = (EVERY..REPLY).step_by(EVERY).flat_map(|k| forced.kept_logits[(k - 1) * vocabulary..k * vocabulary].to_vec()).collect();
+            std::fs::write(dir.join("fp16-decode.bin"), bytes(&decoded)).unwrap();
+        }
+    }
+    let rows = |name: &str| -> Option<Vec<Vec<f32>>> {
+        let values: Vec<f32> = std::fs::read(dir.join(name)).ok()?.chunks_exact(4).map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect();
+        let points = (EVERY..REPLY).step_by(EVERY).count();
+        Some(values.chunks_exact(values.len() / points).map(<[f32]>::to_vec).collect())
+    };
+    let (Some(exact), Some(read), Some(decoded)) = (rows("f32-read.bin"), rows("fp16-read.bin"), rows("fp16-decode.bin")) else {
+        eprintln!("the other run's logits are not there yet: nothing compared");
+        return;
+    };
+    for (name, other) in [("the FP16 prompt read", &read), ("the decode path", &decoded)] {
+        let kls: Vec<f64> = exact.iter().zip(other).map(|(exact, other)| kl(exact, other)).collect();
+        let same = exact.iter().zip(other).filter(|(exact, other)| best(exact) == best(other)).count();
+        let gap = exact.iter().zip(other).map(|(exact, other)| exact[best(exact)] - exact[best(other)]).fold(0f32, f32::max);
+        eprintln!("{name} against the F32 prompt read: KL mean {:.3e}, worst {:.3e}, by place {:?}; the same next token at {same} of {}; its choice at most {gap:.3} below",
+                  kls.iter().sum::<f64>() / kls.len() as f64, kls.iter().copied().fold(0f64, f64::max), kls.iter().map(|kl| format!("{kl:.1e}")).collect::<Vec<_>>(), kls.len());
+    }
+    let between: Vec<f64> = read.iter().zip(&decoded).map(|(read, decoded)| kl(read, decoded)).collect();
+    eprintln!("the decode path against the FP16 prompt read: KL mean {:.3e}, worst {:.3e}", between.iter().sum::<f64>() / between.len() as f64,
+              between.iter().copied().fold(0f64, f64::max));
+}
+
+/// A client that writes its folder into its system prompt sends a system prompt that ends otherwise at every new conversation:
+/// none extends another's root. The second such prompt is checkpointed where it parts from the first (its stem, a root of its
+/// own), every later one starts from there, and a new conversation with the same system prompt starts from that prompt's own root.
+#[test]
+fn a_system_prompt_with_another_end_starts_from_its_stem() {
+    let Some(root_dir) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    let _gpus = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut model, text) = open(&root_dir, None);
+    let document: String = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/DESIGN.md")).unwrap().chars().take(14000).collect();
+    let prompt = |folder: &str, question: &str| -> Vec<u32> {
+        text.encode(&format!("<|im_start|>system\n{document}\n\nWorking folder: /work/{folder}\nToday is a day in November.<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n")).unwrap()
+    };
+    let (one, two, three, four) = (prompt("alpha-run", "What is this project?"), prompt("bravo-run", "What is this project?"),
+                                   prompt("charlie-run", "What is this project?"), prompt("delta-run", "What is this project?"));
+    let shared = one.iter().zip(&two).take_while(|(a, b)| a == b).count();
+    assert!(shared > 2200 && shared + 8 < one.len(), "the system prompts part near their end: {shared} of {}", one.len());
+    let top = |logits: &[f32]| logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(token, _)| token);
+    first_logits(&mut model, &one);
+    first_logits(&mut model, &two);
+    assert_eq!(model.last_metrics["cached_tokens"].as_u64(), Some(0), "the second ending extends nothing yet");
+    for later in [&three, &four] {
+        let from_stem = first_logits(&mut model, later);
+        let cached = model.last_metrics["cached_tokens"].as_u64().unwrap() as usize;
+        eprintln!("resumed from {:?} at {cached} of {} ({shared} shared)", model.last_metrics["resumed_from"], later.len());
+        assert!(matches!(model.last_metrics["resumed_from"].as_str(), Some("root") | Some("root_before")), "{:?}", model.last_metrics["resumed_from"]);
+        assert!(cached % 4 == 0 && cached < shared && cached + 64 > shared, "from the stem: {cached} of {shared} shared");
+        if std::ptr::eq(later, &four) {
+            // (the same prompt read whole chooses the same first token)
+            model.reset().unwrap();
+            let whole = first_logits(&mut model, later);
+            eprintln!("from the stem and read whole: relative difference {:.4}", relative_difference(&from_stem, &whole));
+            assert_eq!(top(&from_stem), top(&whole), "the first token from the stem");
+        }
+    }
+    // (a new conversation with the last system prompt itself starts from that prompt's own root, past the stem)
+    let same = prompt("delta-run", "Name its main parts.");
+    first_logits(&mut model, &same);
+    let cached = model.last_metrics["cached_tokens"].as_u64().unwrap() as usize;
+    assert!(cached > shared && cached + 64 > reply_place(&same) - 32, "from its own root: {cached} ({shared} shared, {:?})", model.last_metrics["resumed_from"]);
+}
+
+#[test]
+fn a_reply_kept_in_part_goes_on_from_its_mark() {
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    kept_part(None, &root);
+}
+
+#[test]
+fn a_reply_kept_in_part_goes_on_from_its_mark_with_the_mtp_layers_too() {
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    let Some(drafter) = common::model_env("STRAYDOG_DRAFTER", "the MTP drafter's directory") else { return };
+    kept_part(Some(&drafter), &root);
 }
 
 #[test]

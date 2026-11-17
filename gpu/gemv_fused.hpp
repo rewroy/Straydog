@@ -7,7 +7,7 @@
 // that hides behind the other blocks', and the norm's launch is saved. Included in the GPU TU
 // after gemv.hpp and ops.hpp.
 
-namespace {
+namespace sdgpu {
 
 // One row's norm and rope (op_norm_rope_row) for a block of its own beside a GEMV's.
 struct NormRopeJob {
@@ -291,9 +291,9 @@ void fused_matrices(Device& value, const sd_linear* items, size_t count, const f
     for (size_t i = 0; i < count; ++i) matrices[i].output_offset = size_t(items[i].output - output);
 }
 
-} // namespace
+} // namespace sdgpu
 
-namespace {
+namespace sdgpu {
 // The side job of sd_op_norm_linears_rope, checked as sd_op_norm_rope checks one row.
 NormRopeJob norm_rope_job(Device& value, const sd_norm_rope& side) {
     if (!side.width || side.width > (uint64_t(1) << 24) || side.rope_dims % 2 || side.rope_dims > side.width ||
@@ -363,9 +363,9 @@ void norm_linears(Device& value, const float* x, const float* weight, uint64_t w
     if (side.publish) attention_turns_mark_ready(value, 1, side.pairs);
     check(hipGetLastError());
 }
-} // namespace
+} // namespace sdgpu
 
-namespace {
+namespace sdgpu {
 // sd_op_linears_norm_rope: the linears in gemv()'s launch, its last block forming the norm and the
 // side job, where gemv() takes gemv_fixed_kind; else the three ops apart, in order.
 void linears_norm(Device& value, const sd_linear* items, uint64_t count, const float* x, const float* weight, uint64_t width,
@@ -417,7 +417,7 @@ void linears_norm(Device& value, const sd_linear* items, uint64_t count, const f
     if (side.publish) attention_turns_mark_ready(value, 1, side.pairs);
     check(hipGetLastError());
 }
-} // namespace
+} // namespace sdgpu
 
 int sd_op_linears_norm_rope(void* handle, const sd_linear* items, uint64_t count, const float* x, const float* weight, uint64_t width,
                             float eps, float* normed, const sd_norm_rope* side) {
@@ -442,7 +442,7 @@ int sd_op_norm_linears_rope(void* handle, const float* x, const float* weight, u
     SD_OP_END
 }
 
-namespace {
+namespace sdgpu {
 // sd_op_swiglu_linear, and with route_logits sd_op_route's softmax routes of that row (256 experts,
 // normalized) in the same launch (else after it).
 void swiglu_linear(Device& value, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up,
@@ -480,7 +480,7 @@ void swiglu_linear(Device& value, const void* weights, int kind, uint64_t rows, 
     if (route_logits) op_route_softmax256_kernel<<<1, 32, 0, value.stream>>>(route_logits, size_t(route_k), 1, route_ids, route_weights);
     check(hipGetLastError());
 }
-} // namespace
+} // namespace sdgpu
 
 int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate,
                         const float* up, const float* scale, float* hidden, float* out) {

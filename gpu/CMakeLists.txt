@@ -1,22 +1,25 @@
 cmake_minimum_required(VERSION 3.24)
 project(straydog_gpu LANGUAGES CXX)
 
+# The device code is compiled as several translation units, so that an edit recompiles one of them and the units compile side by side: kernels.cpp
+# (the rest and the extern "C" API) and the units that hold the kernels of gemv.hpp (gemv_a.cu, gemv_b.cu). Each is compiled as the backend's language.
+set(STRAYDOG_GPU_UNITS kernels.cpp gemv_a.cu gemv_b.cu moe.cu)
 set(STRAYDOG_BACKEND "HIP" CACHE STRING "HIP or CUDA")
 set_property(CACHE STRAYDOG_BACKEND PROPERTY STRINGS HIP CUDA)
 if(STRAYDOG_BACKEND STREQUAL "HIP")
   enable_language(HIP)
   find_package(hip REQUIRED CONFIG)
   find_package(hipblas REQUIRED CONFIG)
-  set_source_files_properties(kernels.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${STRAYDOG_GPU_UNITS} PROPERTIES LANGUAGE HIP)
 elseif(STRAYDOG_BACKEND STREQUAL "CUDA")
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
-  set_source_files_properties(kernels.cpp PROPERTIES LANGUAGE CUDA)
+  set_source_files_properties(${STRAYDOG_GPU_UNITS} PROPERTIES LANGUAGE CUDA)
 else()
   message(FATAL_ERROR "STRAYDOG_BACKEND must be HIP or CUDA")
 endif()
 # Static, linked into the straydog executable.
-add_library(straydog_gpu STATIC kernels.cpp cpu_experts.cpp)
+add_library(straydog_gpu STATIC ${STRAYDOG_GPU_UNITS} cpu_experts.cpp)
 set_target_properties(straydog_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 option(STRAYDOG_PREFILL_OBSERVER "Compile synchronous prefill phase observations for validation" OFF)
 if(STRAYDOG_PREFILL_OBSERVER)
@@ -31,6 +34,13 @@ else()
   target_link_libraries(straydog_gpu PRIVATE CUDA::cublas)
   # Device code calls constexpr std::min/std::max, as HIP allows.
   target_compile_options(straydog_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  # kernels.cpp is one translation unit, compiled once for each architecture in CMAKE_CUDA_ARCHITECTURES, and nvcc compiles those
+  # one after another unless told otherwise. --threads 0 compiles them side by side, a thread each. nvcc's own times for 0.1.12's
+  # kernels.cpp and the four default architectures: 15 minutes of cicc and ptxas in all, 4 minutes on the clock side by side.
+  target_compile_options(straydog_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--threads=0>)
+  # fatbinary compresses a unit's machine code only when it judges that worth it, and leaves some of the smaller units' code as it is:
+  # with sm_120 alone the executable's device code took 15.0 MB as one unit and 27.3 MB as four. Compress every image.
+  target_compile_options(straydog_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
 endif()
 # Drafter quantization must produce the pinned bytes on every compiler.
 set_source_files_properties(cpu_experts.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")
@@ -49,12 +59,12 @@ endif()
 
 option(STRAYDOG_GPU_TESTS "Build the standalone GPU kernel regressions (HIP, RDNA4)" OFF)
 if(STRAYDOG_GPU_TESTS AND STRAYDOG_BACKEND STREQUAL "HIP")
-  add_executable(straydog_qsa_interval_test tests/qsa_interval_test.cpp cpu_experts.cpp)
+  add_executable(straydog_qsa_interval_test tests/qsa_interval_test.cpp cpu_experts.cpp gemv_a.cu gemv_b.cu moe.cu)
   set_source_files_properties(tests/qsa_interval_test.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(straydog_qsa_interval_test PRIVATE hip::host roc::hipblas Threads::Threads)
   target_compile_options(straydog_qsa_interval_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-mllvm -amdgpu-scalarize-global-loads=false>")
   set_target_properties(straydog_qsa_interval_test PROPERTIES HIP_STANDARD 17)
-  add_executable(straydog_hc_fused_test tests/hc_fused_test.cpp cpu_experts.cpp)
+  add_executable(straydog_hc_fused_test tests/hc_fused_test.cpp cpu_experts.cpp gemv_a.cu gemv_b.cu moe.cu)
   set_source_files_properties(tests/hc_fused_test.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(straydog_hc_fused_test PRIVATE hip::host roc::hipblas Threads::Threads)
   target_compile_options(straydog_hc_fused_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-mllvm -amdgpu-scalarize-global-loads=false>")

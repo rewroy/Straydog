@@ -349,7 +349,8 @@ conversation has met.
 There is no `-ngl`. Placement measures what fits, in this order:
 
 1. **Full residency.** Every weight in VRAM, the K/V too (Qwen3.8: at the prefill batch derived, 4096 from 48 GiB of
-   budgets, then at 2048; a batch given is not narrowed to keep the K/V in VRAM).
+   budgets, or given; it is not narrowed to keep the K/V in VRAM: on two R9700s the K/V in host memory at 4096 read a
+   95K prompt 12% faster than the K/V in VRAM at 2048 and decoded after it as fast).
 2. **Host K/V,** then a smaller prefill batch (Qwen3.8), with the MTP drafter, then without.
    The first choice that fits is taken; when it is not the first, the placement notes what the first
    would have needed, and with partial residency what full residency would (`resident_placement`),
@@ -402,7 +403,16 @@ IQ2_XXS with DSpark, 2026-10-28):
 - Predicting the next layer's experts (`DS41_PREDICT`, off) reaches 30% of the misses only by
   uploading 4-5 times the experts actually missed.
 - Computing misses on the CPU did not pay either.
-- So the store is plain LRU, and capacity is the lever: 10% more slots cut misses by 16%.
+- A newly filled expert goes in a tenth of a class's slots from the cold end of the LRU order and
+  is promoted by a later pass's use (`STRAYDOG_EXPERT_PROBATION`, thousandths, 100): on a served
+  trace of UD-IQ1_M (two R9700, `--vram 30`, 3.2 M accesses, 2026-11-15) 13% fewer misses than LRU,
+  a decode pass 36.96 to 35.61 ms; Belady's optimum there is 58.8% fewer.
+- The router's ranking below its choices does not foretell the next pass well enough to keep those
+  experts: of a row's experts ranked 7th-10th, 9.0% are acquired at that layer in the next pass,
+  against 28.8% of those it chose (0.98% of any other). Moving them up the order costs 2.6-13% more
+  misses; moving them to the warm end of the probation alone saves 1.6% (served trace with the
+  scores, 2026-11-16).
+- So capacity is the lever: 10% more slots cut misses by 16%.
 
 ## 6. Generation
 
@@ -427,6 +437,19 @@ The engine holds one sequence.
     window's rows and the incomplete groups' tails go back, since a later position never writes a
     complete group's compressed row or index key. Its copy may go on later; the copies of
     checkpoints above it are made first.
+  - A system prompt that shares its beginning with one read before and ends otherwise (a client that writes the folder,
+    the date or a list of its files into it) is checkpointed at that beginning too, 16 tokens before the place the two part:
+    its stem, a root of its own. Such prompts extend no root, and each new conversation read its system prompt from the first
+    token. The next one starts from the stem. A root a conversation starts from becomes the latest of the two roots kept, so
+    the stem stays while each conversation's own root replaces the one before. Qwen3.8 does the same with its root and the
+    root before it.
+  - A long reply is marked as it grows: every 512 tokens, between two passes, the window's rows and the tails are
+    copied (2 ms; no compressed row or index key), and the last two marks are kept. A client that keeps a reply only
+    in part (an agent app that cuts a file being written at a line's end and has the model go on, a person who stops
+    a reply) sends a prompt that leaves the held sequence a few tokens before its end; the sequence cannot go back by
+    a few tokens, so the request goes back in place to the last mark the prompt reaches (`resumed_from` is `step`)
+    and reads at most some 500 tokens again, where it read the whole reply again from the checkpoint before it
+    (6,327 tokens in 3.2 s after a reply stopped at 24,000 characters; 517 tokens in 1.05 s from the mark).
   - The checkpoints take at most 2 GiB of host memory, or room for two at the full context when that is
     more: a checkpoint is ~0.85 GB at 262144 tokens and ~3.4 GB at 1048576, so a 1048576-token context
     gets ~6.3 GiB. A checkpoint over the budget is not saved.
@@ -447,6 +470,13 @@ The engine holds one sequence.
     request line), 0.20 s now, the bytes the same (every part compared with the runtime's copy).
   - So a one-off request with another prefix (a title, a summary, a subagent) does not cost the
     conversation it interrupted its whole prompt again.
+- **Qwen3.8** marks a long reply as DeepSeek-V4.1 does, for the same prompts: the recurrent state (a page-locked
+  slot, as a checkpoint's) where the reply stands, every 512 tokens at the next position that is a multiple of four,
+  the last two kept (`resumed_from` is `mark` or `mark_before`). The K/V below a mark is the held sequence's. A
+  pipelined reply (two GPUs, partially resident) is not marked: its passes overlap.
+- A reply sent back keeps the ids the model wrote it in, as far as the bytes they spell are the prompt's
+  (`Text::reach`): the same text encoded again can be split otherwise, and the request then left the held sequence
+  at the first such place.
 - A request may mark itself one-off (`"straydog": {"checkpoint": false}`) so it saves no
   checkpoint.
 
@@ -823,8 +853,11 @@ and a 102.2 GiB host tier (12,629 experts' worth, of 15,360).
   1 + (layers − 1 − k) × (window − 1) rows, plus the K/V of the window − 1 rows before them. The
   kv source still compresses every row. This is exact; `DS41_FULL_DECODER` computes every row,
   for comparisons.
-- **Products in prompt passes of 32 rows or more** use FP16 operands; smaller passes use F32
-  (README, Numerics).
+- **Products in prompt passes of 8 rows or more** use FP16 operands; smaller passes use F32
+  (README, Numerics). The limit was 32 rows until a request that added 9 to 32 tokens to a held conversation (a short
+  tool result, a short message) was found to wait longer than one that added 36 to 88: in F32 a row of such a pass cost
+  about what a decode pass costs (12 tokens 358-403 ms, 28 tokens 651-682 ms, against 233-324 ms for 36 to 88; at 8 rows
+  144-155 and 201-237 ms; two R9700, UD-IQ1_M).
 - **What a long pass's kernels share.** The attention's output kernel splits a row into dim / 64
   blocks: a kernel before them forms each row's softmax weights and denominators once, in place. The
   HC step takes 16 rows a block, each thread holding its column's mixing weights, and forms its 26
@@ -1826,6 +1859,29 @@ with a model of its own reads no file it was not given.
   - `max_tokens` / `max_completion_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
     `presence_penalty`, `seed`, `stop`;
   - `suppress`: `not_cp932_han` (§6), listed in `/props` and `/v1/models`' `meta`;
+  - `straydog.reasoning` (boolean): `false` asks this one reply with no reasoning in a conversation that thinks. The prompt
+    is the thinking one's as it stands, with the reasoning the template opens after `<｜Assistant｜>` closed at once, which is
+    how the template writes back a reply that had none: the request goes on from what the engine holds, and so does the next
+    one, sent with the reply's `reasoning_content` empty or left out. (Asked with another `reasoning_effort` or without
+    thinking, a DeepSeek-V4.1 conversation is read again from its first token: its template says the effort at the head of
+    the prompt.) Only DeepSeek-V4.1 takes it, listed as `reasoning_off: true` in `/props` and `/v1/models`' `meta`; a model
+    listed `false` reasons as the request's effort says, and a request that does not think has nothing to leave out;
+  - `straydog.tool_writing` (boolean; `checkpoint` is the third key of the `straydog` object): on a streamed request with
+    tools, the chunks also carry the calls as the model writes them. The server holds a call's markup back and sends the call
+    whole at the end, so a client would otherwise see nothing for the minutes a file takes to write. It is listed as
+    `tool_writing: true` in `/props` and `/v1/models`' `meta` (a server without it refuses the key with a 400). The final
+    `tool_calls` are the same with or without it; a request that does not ask streams what it always did.
+    - A chunk's `delta` may hold `straydog_tool_writing`, a list of `{"index": i, "name": "<tool>", "arguments": "<piece>"}`
+      in the order the calls are written. A call's first piece has its `name` and empty `arguments`, as soon as the
+      `<function=NAME>` is whole; the next pieces have `arguments` only. `index` counts the blocks of the markup, which is
+      the final call's place unless a block the final reading drops (a slip) came before it.
+    - A call's pieces, joined, are what the markup read so far makes of its arguments JSON in the final form (key order,
+      separators and string escaping as `tool_calls` writes it): all of it when the markup is well formed, otherwise a
+      partial string that need not be JSON. They are display data: a repair, a dropped block or markup released as text
+      changes nothing in them, and nothing in the answer. Only `tool_calls` is authoritative.
+    - A string parameter's text is sent as it arrives, held back only where it could still be the close (and the one newline
+      the template writes before it); any other parameter, with its key, once its close is seen. A call written as a block
+      of JSON (`<tool_call>{...}`) sends no pieces. DeepSeek-V4.1's DSML calls are sent the same way.
   - `reasoning_effort` (`none` to `xhigh`) and `chat_template_kwargs`;
   - `stream_options.include_usage`.
 

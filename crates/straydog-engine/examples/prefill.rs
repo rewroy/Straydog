@@ -5,6 +5,7 @@
 //!     [--pause SECONDS] [--trace-batches] [--sampled] [--drafts N] [--chat] [--force-rows W,W,... --force-tokens FILE [--force-logits] [--force-reject N]] [--copy-drafts N]
 //!
 //! Without --batch the batch is derived from the budgets as the server derives it (and a placement may narrow it); --batch N asks for N, which is kept.
+//! The bundle's verity trees (MODEL/.straydog), where it has them, are opened as the server opens them.
 //!
 //! The text is this repository's design document and engine sources (or FILE), repeated; each prompt
 //! starts with its own line, so no prompt reuses another's state. TOKENS 0 only loads, "+N"
@@ -81,7 +82,13 @@ fn main() -> Result<(), String> {
     let mut group = Group::new(&devices, &vec![budget; devices.len()], split)?;
     group.configure_gemm(gemm_min_batch, half_gemm)?;
     let root = PathBuf::from(model);
-    let weights = Weights::open(&root, straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quant)?, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
+    let mut weights = Weights::open(&root, straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quant)?, drafter.as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {})?;
+    // (the bundle's verity trees, where it has them, are opened as the server opens them: what is read again is checked, and a layer-order
+    // pass reads its banks ahead from the files as served)
+    let trees = root.join(".straydog");
+    if trees.is_dir() {
+        weights.open_trees(&trees)?;
+    }
     let open_seconds = started.elapsed().as_secs_f64();
     let settings = Settings { context: context.parse().unwrap(), state_budget_bytes: 14 << 30, prefill_batch_size: batch.unwrap_or(straydog_engine::model::DERIVED_BATCH),
                               speculative: if drafter.is_some() { drafts.unwrap_or(3).clamp(1, straydog_engine::model::MAX_DRAFTS) } else { 0 }, cpu_threads: 0,
@@ -108,8 +115,10 @@ fn main() -> Result<(), String> {
         Some(file) => std::fs::read_to_string(file).map_err(|exc| exc.to_string())?,
         None => {
             let mut corpus = std::fs::read_to_string(source.join("docs/DESIGN.md")).map_err(|exc| exc.to_string())?;
+            // (the sources alone: the folder also holds tables that are no text)
             let mut files: Vec<PathBuf> = std::fs::read_dir(source.join("crates/straydog-engine/src"))
-                .map_err(|exc| exc.to_string())?.flatten().map(|entry| entry.path()).filter(|path| path.is_file()).collect();
+                .map_err(|exc| exc.to_string())?.flatten().map(|entry| entry.path())
+                .filter(|path| path.is_file() && path.extension().is_some_and(|extension| extension == "rs")).collect();
             files.sort();
             for file in files {
                 corpus += &std::fs::read_to_string(file).map_err(|exc| exc.to_string())?;
@@ -239,8 +248,8 @@ fn main() -> Result<(), String> {
         println!("  K/V {} positions, {} expert slots, growth {} s, slots by growth {}", model.kv_positions(), model.slot_counts().0,
                  model.last_metrics.get("kv_growth_seconds").map_or("none".to_string(), |seconds| seconds.to_string()),
                  model.last_metrics.get("kv_growth_slots").map_or("none".to_string(), |slots| slots.to_string()));
-        println!("  batches: {} of up to {} rows", model.last_metrics["prefill_batches"].as_u64().unwrap_or(0),
-                 model.last_metrics["prefill_batch_rows"].as_u64().unwrap_or(0));
+        println!("  batches: {} of up to {} rows", model.last_metrics.get("prefill_batches").and_then(|count| count.as_u64()).unwrap_or(0),
+                 model.last_metrics.get("prefill_batch_rows").and_then(|rows| rows.as_u64()).unwrap_or(0));
         println!("prefill {length} tokens ({reused} reused): {seconds:.3} s ({:.0} tok/s), request {:.3} s, logits {}", (length - reused as usize) as f64 / seconds,
                  started.elapsed().as_secs_f64(), &digest[..16.min(digest.len())]);
         if let Some(now) = model.weights.row_counts("per_layer_token_embd.weight") {

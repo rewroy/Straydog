@@ -426,6 +426,11 @@ impl WorkingSetWatch {
         self.quota.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Whether [`allow_quota`](Self::allow_quota) has come: the working set's limit is kept from then on.
+    pub fn quota_allowed(&self) -> bool {
+        self.quota.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     #[cfg(any(windows, test))]
     fn tick(&self, observe: impl FnOnce(), limit: impl FnOnce()) {
         observe();
@@ -470,6 +475,34 @@ const COMMIT_AFTER_LOCKS: u64 = 1 << 30;
 #[cfg(any(windows, test))]
 fn lockable_of(available: u64, commit: u64, vram_room: u64, memory: u64) -> u64 {
     within_free(u64::MAX, 0, available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS + vram_room)), memory)
+}
+
+/// Bytes of rows the process holds already (allocated, so charged to the commit, and written by each pass whether they are locked or not) that may
+/// be page-locked given the `available` physical memory and the `commit` left: what keeps [`COMMIT_AFTER_LOCKS`] of the commit, the lock
+/// charging at most a [`ROWS_LOCK_COMMIT_SHARE`]th of them to it once more. Not less what is kept free for the rest of the system ([`left_free`]),
+/// as the banks' locks are: the rows take that memory through the pass in any case. Asked as the banks are, they were asked for it twice: at
+/// --vram 5.5 on an RTX 5070 Ti with 62 GiB, a pass's 0.62 GiB of rows met "0.00 GiB lockable" with 6.4 GiB available, and moved the round trip
+/// they could have moved beside the compute.
+#[cfg(any(windows, test))]
+fn rows_lockable_of(available: u64, commit: u64) -> u64 {
+    available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS).saturating_mul(ROWS_LOCK_COMMIT_SHARE))
+}
+
+/// What locking rows already allocated charges to the commit, at most: a share of them. An RTX 5070 Ti PC with 64 GB (Windows 11): 3.46 GiB of
+/// a 95K prompt's rows took 0.08-0.37 GiB of it in fourteen requests, 1.88 GiB 0.11-0.23, 3-11% (prefill_rows_lock_commit_bytes). Taken as
+/// all of them, a pass of those rows met 3.13-3.46 GiB lockable with 6.4 GiB available, and was narrowed to two passes, 2-4 s slower.
+#[cfg(any(windows, test))]
+const ROWS_LOCK_COMMIT_SHARE: u64 = 8;
+
+/// Bytes of rows already held that may be page-locked now ([`rows_lockable_of`]; no bound off Windows).
+pub fn rows_lockable() -> u64 {
+    #[cfg(windows)]
+    {
+        let (available, commit) = windows_available();
+        return rows_lockable_of(available, commit);
+    }
+    #[cfg(not(windows))]
+    u64::MAX
 }
 
 /// Bytes of the expert banks that may be page-locked now (no bound off Windows).
@@ -815,6 +848,14 @@ mod tests {
         // Commit bounds the locks where physical memory does not: 34 GiB of commit left, 46 of memory, 4 of VRAM to come.
         assert_eq!(super::lockable_of(46 * GIB, 34 * GIB, 4 * GIB, 62 * GIB), 29 * GIB - 62 * GIB / 8);
         assert_eq!(super::lockable_of(46 * GIB, 3 * GIB, 0, 62 * GIB), 0);
+        // Rows held already are not asked for the memory kept free again: with 6 GiB available and 7 of commit left the banks may lock nothing more,
+        // the rows what keeps a GiB of the commit; and with half a GiB of commit left, nothing.
+        assert_eq!(super::lockable_of(6 * GIB, 7 * GIB, 0, 62 * GIB), 0);
+        assert_eq!(super::rows_lockable_of(6 * GIB, 7 * GIB), 6 * GIB);
+        assert_eq!(super::rows_lockable_of(46 * GIB, GIB / 2), 0);
+        assert_eq!(super::rows_lockable_of(GIB / 2, 30 * GIB), GIB / 2);
+        // (6 GiB available and 1.5 GiB of commit left: the lock charges at most an eighth of the rows, so 4 GiB of them)
+        assert_eq!(super::rows_lockable_of(6 * GIB, GIB + GIB / 2), 4 * GIB);
     }
 
     /// Decides: the working set's share is what it was while the process's own memory fits it, and is never under the banks locked in place and that

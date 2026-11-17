@@ -418,10 +418,30 @@ impl Drop for Reader {
 fn run_read(job: &ReadJob, permit: Option<ReadPermit>) -> std::result::Result<(), String> {
     // SAFETY: the target is `len` bytes of a host slot reserved for this read (see HostPointer).
     let target = unsafe { std::slice::from_raw_parts_mut(job.target.0, job.len as usize) };
-    read_fully(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
+    read_expert(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
     drop(permit); // Hashing and proof checks do not consume one of the sixteen data-read admits.
     if let Some((verify, file)) = &job.verifier { verify(*file, job.offset, target)?; }
     Ok(())
+}
+
+/// Fill `target` from `offset` ([`read_fully`]), and where the working-set quota refuses a direct read of it (Windows' error 1453: a process whose working
+/// set has a hard maximum is refused a read whose target's pages it would have to lock beyond it), the rest as a bank's copy is read
+/// ([`crate::banks::read_in_ways`]): in direct pieces of a quarter, then through the page cache, on a handle reopened from this one without
+/// `FILE_FLAG_NO_BUFFERING` ([`storage::reader`]). A refusal had ended the request (an RTX 5070 Ti at 5.5 GiB, a layer-order pass's 0.62 GiB of rows
+/// page-locked beside 21.6 GiB of banks: "expert read at 1358123008: ... (os error 1453)"); an OS that never refuses so reads it whole, as before.
+fn read_expert(file: &File, offset: u64, target: &mut [u8]) -> std::io::Result<()> {
+    read_expert_in_ways(offset, target, storage::working_set_quota, &mut |cached, at, span| {
+        if cached { read_fully(&storage::reader(file)?, at, span) } else { read_fully(file, at, span) }
+    })
+}
+
+/// [`read_expert`]'s ways, with the refusal and the read given (`read`: whether through the page cache, the file's offset, the part of the target).
+fn read_expert_in_ways(offset: u64, target: &mut [u8], refused: fn(&std::io::Error) -> bool,
+                       read: &mut dyn FnMut(bool, u64, &mut [u8]) -> std::io::Result<()>) -> std::io::Result<()> {
+    let bytes = target.len();
+    crate::banks::read_in_ways(true, offset, target, bytes, refused, &mut |way, at, span, len| {
+        read(way == crate::banks::Way::Cached, at, &mut span[..len])
+    })
 }
 
 /// Fill `target` from `offset`, through `storage`'s read; a direct handle reads whole aligned blocks into an aligned target.
@@ -823,6 +843,9 @@ struct VramSlot {
     warmed: bool,
     /// Acquired or requested since the last release: not evicted before it.
     held: bool,
+    /// Filled and not yet released by the pass that took it: at that release it takes a place near the cold end of the LRU order
+    /// ([`DeviceExperts::settle_touches`]).
+    fresh: bool,
     /// Filled while a prefill streams its experts through ([`DeviceExperts::set_streaming`]): the
     /// host tier keeps its copy, and the release empties the slot without a write-back.
     streamed: bool,
@@ -875,6 +898,31 @@ struct Class {
     /// Those of `host_lru` whose expert a VRAM slot holds too: its eviction writes nothing back,
     /// and a host slot needed comes from here first (the tier then still holds what it alone holds).
     copies: BTreeSet<(u64, usize)>,
+    /// Copies to give up first, the best last ([`DeviceExperts::spare_copy`]), and the count of VRAM
+    /// changes from which they may be looked for again.
+    spare: Vec<usize>,
+    spare_at: u64,
+}
+
+/// How deep from the cold end of a class's LRU order a newly filled expert goes in, in thousandths of the class's slots (0: as just
+/// used; see `DeviceExperts::settle_touches`): `STRAYDOG_EXPERT_PROBATION`, 100 where it is not set, or what [`set_probation`] set.
+static PROBATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn probation() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    match PROBATION.load(Relaxed) {
+        usize::MAX => {
+            let depth = std::env::var("STRAYDOG_EXPERT_PROBATION").ok().and_then(|value| value.parse().ok()).map_or(100, |value: usize| value.min(1000));
+            PROBATION.store(depth, Relaxed);
+            depth
+        }
+        depth => depth,
+    }
+}
+
+/// Development: the probation's depth from here on, for a comparison of depths in one process (ds41_quality --probation).
+pub fn set_probation(thousandths: usize) {
+    PROBATION.store(thousandths.min(1000), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Counters since creation.
@@ -950,6 +998,11 @@ pub struct DeviceExperts {
     /// The clock when that pass took its first layer (a prompt of several passes takes layer 0 again).
     pass_clock: u64,
     heads_first: bool,
+    /// A host slot needed takes the copy of an expert that stays in VRAM before the oldest copy
+    /// ([`spare_copy`](Self::spare_copy)).
+    spare_copies: bool,
+    /// This store's own probation depth ([`set_probation`](Self::set_probation)); None: the process's ([`probation`]).
+    probation: Option<usize>,
     tails: Vec<Tail>,
     /// The experts a begun request still fills, and the read chunk it fills them with
     /// ([`request_begin`](Self::request_begin)).
@@ -1086,14 +1139,14 @@ impl DeviceExperts {
             let pinner = Pinner::new(arenas, per_arena * host_bytes as usize, allocated.clone());
             let first = all_slots.len();
             all_slots.extend((0..count).map(|_| VramSlot {
-                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false, held: false, streamed: false, class: index,
+                key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false, held: false, fresh: false, streamed: false, class: index,
                 place: None,
                 taken_back: false,
             }));
             classes.push(Class {
                 vram_bytes, host_bytes, vram: gpu.buffer(vram_bytes * count as u64)?, first, count, free: (first..first + count).collect(),
                 lru: BTreeSet::new(), reserve, host_capacity, per_arena, arenas: Vec::new(), pinner: Some(pinner), hosts: 0,
-                host_free: VecDeque::new(), host_lru: BTreeSet::new(), copies: BTreeSet::new(),
+                host_free: VecDeque::new(), host_lru: BTreeSet::new(), copies: BTreeSet::new(), spare: Vec::new(), spare_at: 0,
             });
         }
         let (done_tx, done_rx) = channel();
@@ -1103,6 +1156,8 @@ impl DeviceExperts {
             stream_layer: 0,
             pass_clock: 0,
             heads_first: std::env::var("DS41_HEADS_FIRST").map_or(true, |value| value != "0"),
+            spare_copies: std::env::var("STRAYDOG_EXPERT_COPIES").map_or(true, |value| value != "oldest"),
+            probation: None,
             tails: Vec::new(),
             unfilled: VecDeque::new(),
             unfilled_chunk: CHUNK,
@@ -1560,6 +1615,7 @@ impl DeviceExperts {
                 }
                 let slot = self.fill(gpu, key, false, chunk)?;
                 self.slots[slot].speculative = true;
+                self.slots[slot].fresh = false;
                 self.slots[slot].warmed = !guess;
                 self.speculative.entry(layer as u32).or_default().push(slot);
                 self.counts.prefetched += u64::from(guess);
@@ -1583,6 +1639,7 @@ impl DeviceExperts {
         for &slot in &released {
             self.slots[slot].guards[0] = Some(mark);
             self.slots[slot].held = false;
+            self.slots[slot].fresh = false;
         }
         self.requested.clear();
         // A streamed expert's slot comes free for the prefill's next wave; the host tier holds
@@ -1629,7 +1686,7 @@ impl DeviceExperts {
             let slot = self.slots.len();
             self.slots.push(VramSlot {
                 key: None, ready: None, ready_first: None, guards: [None; 2], waiting: None, used: 0, speculative: false, warmed: false,
-                held: false, streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
+                held: false, fresh: false, streamed: false, class, place: Some(region.slice(start, bytes)), taken_back: false,
             });
             self.classes[class].free.push_back(slot);
             self.lent.push(LentSlot { slot, region: number, offset: start, out: false });
@@ -1724,8 +1781,32 @@ impl DeviceExperts {
 
     /// Mark `slot` just used (its place in the LRU order).
     /// The LRU order as [`hold`](Self::hold)s since the last call would have left it.
+    ///
+    /// An expert filled for the pass that now releases it (`fresh`) does not take the place of one just used: it goes in at the
+    /// probation's depth from the cold end (`probation` of the class's slots in a thousand), and takes the place of one just used
+    /// only when a later pass uses it again. A route's expert that no later token wants is then given up before the experts that
+    /// passes keep coming back to, which plain LRU order let it push out. On the accesses of a DeepSeek-V4.1 server answering the fixed
+    /// scenarios (two R9700, UD-IQ1_M, 3.2 million accesses of 14,789 experts in about 5,900 slots a GPU), a simulation of the orders
+    /// gives 13.0% fewer misses for a tenth of the slots than plain LRU's 6.19% of accesses (a twentieth 11.4%, a fifth 10.5%, a half
+    /// 4.1%; 2Q and ARC with their histories 0.5% to 1.8%; least use count among the coldest more misses; the optimum 58.8% fewer).
+    /// Which experts are computed does not change, nor a logit. `STRAYDOG_EXPERT_PROBATION=0` keeps plain LRU order.
     fn settle_touches(&mut self) {
-        for (slot, used) in std::mem::take(&mut self.touched) {
+        let probation = self.probation.unwrap_or_else(probation);
+        let mut depth: Vec<Option<Option<u64>>> = vec![None; self.classes.len()];
+        for (slot, mut used) in std::mem::take(&mut self.touched) {
+            let class = self.slots[slot].class;
+            // (every hold of a fresh slot in this pass: a request's fill holds it, and the acquire after it again)
+            if self.slots[slot].fresh && probation > 0 && self.slots[slot].key.is_some() {
+                // (the stamp of the slot at the probation's depth, found once a class a release: the fresh ones of a pass share it)
+                let stamp = *depth[class].get_or_insert_with(|| {
+                    let lru = &self.classes[class].lru;
+                    let at = lru.len() * probation / 1000;
+                    if at == 0 { None } else { lru.iter().nth(at).map(|&(stamp, _)| stamp) }
+                });
+                if let Some(stamp) = stamp {
+                    used = used.min(stamp);
+                }
+            }
             let entry = &mut self.slots[slot];
             let lru = &mut self.classes[entry.class].lru;
             if entry.key.is_some() {
@@ -1767,6 +1848,7 @@ impl DeviceExperts {
         self.vram_changes += 1;
         entry.speculative = false;
         entry.warmed = false;
+        entry.fresh = false;
         let class = &mut self.classes[entry.class];
         class.lru.remove(&(entry.used, slot));
         class.free.push_back(slot);
@@ -1793,6 +1875,7 @@ impl DeviceExperts {
         self.map.insert(key, slot);
         self.slots[slot].key = Some(key);
         self.slots[slot].streamed = self.streaming;
+        self.slots[slot].fresh = !self.streaming;
         self.classes[class].lru.insert((self.slots[slot].used, slot));
         self.touch(slot);
         let stream = if urgent { Stream::Upload } else { Stream::LaterUpload };
@@ -2244,6 +2327,12 @@ impl DeviceExperts {
         Ok(slot)
     }
 
+    /// This store's probation depth in thousandths of a class's slots, whatever the process's is (0: plain LRU order; see
+    /// [`settle_touches`](Self::settle_touches)).
+    pub fn set_probation(&mut self, thousandths: usize) {
+        self.probation = Some(thousandths.min(1000));
+    }
+
     fn victim(&self, class: usize) -> Result<usize> {
         self.classes[class].lru.iter().map(|&(_, slot)| slot)
             .find(|&slot| self.slots[slot].waiting.is_none() && !self.slots[slot].held)
@@ -2346,7 +2435,8 @@ impl DeviceExperts {
             // The least recently used expert's slot (its copies long done), before an emptied slot
             // whose upload is still running.
             // (while streaming, not the copy of an expert a streamed slot holds, and next an expert of a layer the pass has done: see evict)
-            let copy = self.classes[class].copies.iter().map(|&(_, host)| host).find(|&host| !self.streaming || !self.streamed_copy(host));
+            let spare = if self.spare_copies && !self.streaming { self.spare_copy(class) } else { None };
+            let copy = spare.or_else(|| self.classes[class].copies.iter().map(|&(_, host)| host).find(|&host| !self.streaming || !self.streamed_copy(host)));
             let done = if copy.is_none() && self.streaming { self.done_layer_host(gpu, class)? } else { None };
             let candidate = copy.or(done)
                 .or_else(|| self.classes[class].host_lru.iter().map(|&(_, host)| host).next())
@@ -2389,6 +2479,42 @@ impl DeviceExperts {
                 }
             }
             return Ok(host);
+        }
+    }
+
+    /// The copy to give up for a host slot outside a prefill's streaming: that of an expert likely to stay in VRAM. An expert whose
+    /// copy is gone is written back when it leaves VRAM, and that write-back takes another copy in turn, so the experts in VRAM with
+    /// no copy stay as many whichever copies go: taken oldest first, the lack moved among the experts that come and go, and six
+    /// in ten of a DeepSeek-V4.1 decode pass's fills on two R9700s wrote an expert back. The copies given up first are those of the
+    /// experts used in the more recent half and by the most passes ([`uses`](Self::uses)): an eighth of them a look, and the next
+    /// look after `SPARE_GAP` more changes to what VRAM holds. Which experts each tier holds does not change by it.
+    fn spare_copy(&mut self, class: usize) -> Option<usize> {
+        const SPARE_GAP: u64 = 256;
+        loop {
+            while let Some(host) = self.classes[class].spare.pop() {
+                let entry = &self.host[host];
+                if entry.key.is_some() && self.classes[class].copies.contains(&(entry.used, host)) {
+                    return Some(host);
+                }
+            }
+            if self.vram_changes < self.classes[class].spare_at {
+                return None;
+            }
+            self.classes[class].spare_at = self.vram_changes + SPARE_GAP;
+            let mut found: Vec<(u64, u32, usize)> = self.classes[class].copies.iter().filter_map(|&(_, host)| {
+                let key = self.host[host].key?;
+                let slot = *self.map.get(&key)?;
+                Some((self.slots[slot].used, self.uses.get(&key).copied().unwrap_or(0), host))
+            }).collect();
+            if found.len() < 8 {
+                return None;
+            }
+            let half = found.len() / 2;
+            found.select_nth_unstable(half);
+            let mut recent: Vec<(u32, u64, usize)> = found[half..].iter().map(|&(used, uses, host)| (uses, used, host)).collect();
+            recent.sort_unstable();
+            let keep = (found.len() / 8).max(1).min(recent.len());
+            self.classes[class].spare = recent[recent.len() - keep..].iter().map(|&(_, _, host)| host).collect();
         }
     }
 
@@ -2858,6 +2984,7 @@ impl DeviceExperts {
         }
         self.settled = false;
         let slot = self.fill(gpu, (layer as u32, expert as u32), false, CHUNK)?;
+        self.slots[slot].fresh = false;
         let (_, mark) = self.slots[slot].ready.ok_or("a promoted expert has no upload")?;
         Ok(Some((self.slot_buffer(slot).base() as u64, mark)))
     }
@@ -3198,5 +3325,55 @@ mod copied_reader_tests {
             target: buffer.as_mut_slice(), verifier: check }]);
         assert!(result.unwrap_err().contains("deliberate verification refusal"));
         assert_eq!(active.load(Ordering::SeqCst), 0, "a job outlived the borrowed destination");
+    }
+}
+
+#[cfg(test)]
+mod quota_read_tests {
+    use super::read_expert_in_ways;
+    use crate::storage::ALIGN;
+
+    /// Decides: an expert read the working-set quota refuses (1453) is read again in direct pieces, and what a refused piece leaves through the page
+    /// cache, with every byte where it belongs; any other error ends it at once (the request fails as before).
+    #[test]
+    fn a_refused_expert_read_goes_on_in_pieces_and_then_through_the_page_cache() {
+        let refused = |error: &std::io::Error| error.raw_os_error() == Some(1453);
+        let quota = || std::io::Error::from_raw_os_error(1453);
+        let offset = 4 * ALIGN as u64;
+        let bytes = 8 * ALIGN;
+        let source: Vec<u8> = (0..offset as usize + bytes).map(|at| (at * 13 % 251) as u8).collect();
+        let run = |fail: &dyn Fn(usize, bool) -> Option<std::io::Error>| {
+            let mut target = vec![0u8; bytes];
+            let mut calls: Vec<(bool, u64, usize)> = Vec::new();
+            let result = read_expert_in_ways(offset, &mut target, refused, &mut |cached, at, span| {
+                let number = calls.len();
+                calls.push((cached, at, span.len()));
+                if let Some(error) = fail(number, cached) { return Err(error); }
+                span.copy_from_slice(&source[at as usize..at as usize + span.len()]);
+                Ok(())
+            });
+            (result, calls, target)
+        };
+        let whole = &source[offset as usize..];
+        // not refused: one direct read
+        let (result, calls, target) = run(&|_, _| None);
+        assert!(result.is_ok());
+        assert_eq!(calls, [(false, offset, bytes)]);
+        assert_eq!(target, whole);
+        // the whole refused: four direct pieces of a quarter
+        let (result, calls, target) = run(&|number, _| (number == 0).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls.len(), 5);
+        assert!(calls[1..].iter().all(|(cached, _, len)| !cached && *len == 2 * ALIGN));
+        assert_eq!(target, whole);
+        // a piece refused too: the rest through the page cache from where the pieces got to
+        let (result, calls, target) = run(&|number, cached| (!cached && (number == 0 || number == 2)).then(quota));
+        assert!(result.is_ok());
+        assert_eq!(calls.last(), Some(&(true, offset + 2 * ALIGN as u64, 6 * ALIGN)));
+        assert_eq!(target, whole);
+        // another error: at once, no other way tried
+        let (result, calls, _) = run(&|_, _| Some(std::io::Error::from_raw_os_error(5)));
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(calls.len(), 1);
     }
 }

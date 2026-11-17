@@ -1,5 +1,5 @@
 // DSpark feature injection, using the existing Q8 GEMV/GEMM, RMS and RoPE ops.
-namespace {
+namespace sdgpu {
 // One block owns each ring row, so repeated positions (including N > 128) have a
 // deterministic last writer. Other ring rows retain their previous contents.
 __global__ void dspark_ring_last(const float* rotated, const int32_t* positions, size_t rows, float* ring) {

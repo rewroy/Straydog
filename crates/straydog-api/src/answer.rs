@@ -15,7 +15,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Map, Value};
-use straydog_engine::reply::{Markup, ReasoningSplitter, StopMatcher, ToolCall, ToolCallSplitter};
+use straydog_engine::reply::{Markup, ReasoningSplitter, StopMatcher, ToolCall, ToolCallSplitter, ToolPiece};
 
 use crate::request::Shape;
 use crate::{ApiError, Generation};
@@ -33,7 +33,10 @@ pub(crate) async fn respond(generation: Generation, shape: Shape, model: &str) -
             Markup::Dsml => ReasoningSplitter::with_markup(shape.thinking, shape.markup).ending_by_token(),
             Markup::Qwen => ReasoningSplitter::with_markup(shape.thinking, shape.markup),
         },
-        tools: ToolCallSplitter::with_markup(shape.tools.as_ref(), shape.markup),
+        tools: {
+            let tools = ToolCallSplitter::with_markup(shape.tools.as_ref(), shape.markup);
+            if shape.tool_writing { tools.writing() } else { tools }
+        },
         calls: Vec::new(),
     };
     let mut completion = Completion { generation, reply };
@@ -62,6 +65,9 @@ pub(crate) async fn respond(generation: Generation, shape: Shape, model: &str) -
 enum Delta {
     Reasoning(String),
     Content(String),
+    /// Pieces of the tool calls being written, for a client that asked (`straydog.tool_writing`): display data beside the calls,
+    /// which come whole in [`Delta::Calls`] once the text has ended.
+    Writing(Vec<ToolPiece>),
     Calls(Vec<ToolCall>),
 }
 
@@ -89,6 +95,10 @@ impl Reply {
         }
         if !content.is_empty() {
             deltas.push(Delta::Content(content));
+        }
+        let writing = self.tools.take_pieces();
+        if !writing.is_empty() {
+            deltas.push(Delta::Writing(writing));
         }
         deltas
     }
@@ -231,7 +241,7 @@ impl Completion {
                 match delta {
                     Delta::Reasoning(text) => reasoning += &text,
                     Delta::Content(text) => content += &text,
-                    Delta::Calls(_) => {}
+                    Delta::Writing(_) | Delta::Calls(_) => {}
                 }
             }
             let Some(end) = end else { continue };
@@ -325,6 +335,7 @@ impl Chunks {
         match delta {
             Some(Delta::Reasoning(text)) => fields.insert("reasoning_content".into(), text.as_str().into()),
             Some(Delta::Content(text)) => fields.insert("content".into(), text.as_str().into()),
+            Some(Delta::Writing(pieces)) => fields.insert(WRITING.into(), pieces.iter().map(piece).collect()),
             Some(Delta::Calls(calls)) => {
                 fields.insert("tool_calls".into(), calls.iter().map(|call| tool_call(call, true)).collect())
             }
@@ -342,6 +353,21 @@ impl Chunks {
         }
         Event::default().data(Value::Object(chunk).to_string())
     }
+}
+
+/// The field of a streamed delta that carries the pieces of the tool calls being written (docs/DESIGN.md §10).
+const WRITING: &str = "straydog_tool_writing";
+
+/// A piece of a call being written: its index, its name on the call's first piece (which has no arguments), and the next part of
+/// the arguments JSON.
+fn piece(piece: &ToolPiece) -> Value {
+    let mut fields = Map::new();
+    fields.insert("index".into(), piece.index.into());
+    if let Some(name) = &piece.name {
+        fields.insert("name".into(), name.clone().into());
+    }
+    fields.insert("arguments".into(), piece.arguments.clone().into());
+    Value::Object(fields)
 }
 
 /// A tool call as OpenAI writes it; a streamed one also carries its index.
