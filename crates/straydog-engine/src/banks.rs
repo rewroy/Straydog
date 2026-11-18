@@ -1086,6 +1086,31 @@ pub fn pieces_of(layers: &[(usize, [(usize, u64); 3])], limit: u64) -> Vec<Piece
     pieces
 }
 
+/// What [`visible_lock_cap`] leaves of the host memory the GPUs see beside the banks and the sequence state: the K/V's growth holds its old
+/// and new planes at once for a moment, and a layer-order pass page-locks its rows.
+pub const VISIBLE_KEPT: u64 = 2 << 30;
+
+/// The most bank bytes to page-lock on Windows, given what DXGI says the process may reserve of the GPU's system memory group (`reservable`:
+/// the NON_LOCAL group's AvailableForReservation, the least of the GPUs') and the page-locked sequence state (`pinned_state`: the host K/V at
+/// the context's length and the checkpoints): what is left of it less [`VISIBLE_KEPT`]; no bound where Windows gives no such figure. Page-locked
+/// memory is charged to that group 1 to 1. On an RTX 5070 Ti PC with 62 GiB (22.54 GiB reservable, 2.6 GiB of state, UD-IQ2_XS at --vram 5.5
+/// and 9, -c 131072), a 99K prompt was read with 17.8 GiB of banks locked (at --vram 9) and with 19.7 GiB (the expert slots not kept across
+/// the K/V's growth); with 21.4 GiB, with 19.7 GiB and the slots kept, and with 23.0 GiB (at --vram 9), the GPU's work failed as out of memory
+/// with VRAM and the commit to spare, and the GPU faulted. The decode's speed hardly depends on the layers locked there (25 layers or none at
+/// --vram 5.5: the same tokens a second).
+pub fn visible_lock_cap(reservable: Option<u64>, pinned_state: u64) -> u64 {
+    reservable.map_or(u64::MAX, |reservable| reservable.saturating_sub(pinned_state).saturating_sub(VISIBLE_KEPT))
+}
+
+/// The layers of `planned` (in their order) that fit `room` together, stopping at the first that does not.
+pub fn layers_fitting(planned: &[usize], sizes: impl Fn(usize) -> u64, room: u64) -> Vec<usize> {
+    let mut taken = 0u64;
+    planned.iter().copied().take_while(|&layer| {
+        taken = taken.saturating_add(sizes(layer));
+        taken <= room
+    }).collect()
+}
+
 /// The layers to page-lock: whole layers from the last, as many as `budget` holds. Reading went through the last layers most recently, so
 /// they are the likeliest to be cached.
 pub fn layers_within(sizes: &[u64], budget: u64) -> Vec<usize> {
@@ -1134,6 +1159,29 @@ pub fn order_by_host_routes(layers: &mut [usize], host_routes: impl Fn(usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides: the banks' lock leaves the GPUs' view of host memory the sequence state and VISIBLE_KEPT, so that the 62 GiB PC's 22.54 GiB
+    /// reservable with 2.6 GiB of state leaves 17.96 GiB to the banks: UD-IQ2_XS's last 22 layers (17.8 GiB, as a 99K prompt was read with)
+    /// and not 25 (20.4 GiB); 21 of layers of its average size. No figure, no bound; and the layers given back come back only as far as the
+    /// room holds them.
+    #[test]
+    fn the_lock_leaves_the_gpus_view_of_host_memory_the_sequence_state_and_a_margin() {
+        const GIB: u64 = 1 << 30;
+        let gib = |value: f64| (value * GIB as f64) as u64;
+        // (UD-IQ2_XS: 39.4 GiB of banks over 48 layers, 0.82 GiB a layer on average)
+        let sizes = vec![gib(39.4 / 48.0); 48];
+        let cap = visible_lock_cap(Some(gib(22.54)), gib(2.58));
+        assert_eq!(cap, gib(22.54) - gib(2.58) - VISIBLE_KEPT);
+        let layers = layers_within(&sizes, cap);
+        assert_eq!(layers.len(), 21, "21 layers of {:.2} GiB fit {:.2} GiB", 39.4 / 48.0, cap as f64 / GIB as f64);
+        assert!(layers_within(&sizes, cap).iter().map(|&layer| sizes[layer]).sum::<u64>() <= cap);
+        assert_eq!(visible_lock_cap(None, gib(2.58)), u64::MAX);
+        assert_eq!(visible_lock_cap(Some(gib(3.0)), gib(2.58)), 0, "less than the state and the margin: nothing");
+        let given = [27, 28, 29];
+        assert_eq!(layers_fitting(&given, |_| 2 * GIB, 5 * GIB), vec![27, 28]);
+        assert_eq!(layers_fitting(&given, |_| 2 * GIB, GIB), Vec::<usize>::new());
+        assert_eq!(layers_fitting(&given, |_| 2 * GIB, u64::MAX), vec![27, 28, 29]);
+    }
 
     /// Decides: a read back takes whole layers in the order given while each fits what is left of its budget, and stops at the first that does
     /// not; it waits after each so that its reads average the rate given, and not at all when its read was already that slow.

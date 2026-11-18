@@ -1458,6 +1458,9 @@ pub struct Model {
     /// pass found with all of them locked: [`Model::more_bank_locks`] locks them again behind the request within it.
     pass_given: Vec<usize>,
     pass_floor: u64,
+    /// The most bank bytes page-locked at once on Windows, for the GPUs' view of host memory ([`crate::banks::visible_lock_cap`]), as the start
+    /// planned it; u64::MAX elsewhere. Every later lock keeps within it.
+    visible_cap: u64,
     /// Counts the layer-order passes and the read backs of the banks begun: a read back ([`Model::read_back_banks`]) stops when either begins.
     read_back_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The group's counters when the request began (a request's partial residency counts).
@@ -1706,6 +1709,7 @@ impl Model {
             gave_back: Vec::new(),
             pass_given: Vec::new(),
             pass_floor: 0,
+            visible_cap: u64::MAX,
             read_back_generation: Default::default(),
             hybrid_counts: Value::Null,
             ple_counts: (0, 0, 0),
@@ -2431,7 +2435,8 @@ impl Model {
         let locked = self.locked_layers.iter().map(|&layer| sizes[layer]).sum::<u64>();
         let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
         let by_memory = lock_budget(memory, sizes.iter().sum(), pinned).saturating_sub(locked);
-        let mut budget = by_memory.min(crate::host::lockable(memory, 0));
+        // (and within the GPUs' view of host memory the start planned for: banks::visible_lock_cap)
+        let mut budget = by_memory.min(crate::host::lockable(memory, 0)).min(self.visible_cap.saturating_sub(locked));
         let mut left: Vec<usize> = (0..48).rev().filter(|layer| sizes[*layer] > 0 && !self.locked_layers.contains(layer)).collect();
         self.refresh_kv_ahead();
         let (margin, kv_ahead) = (crate::host::left_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
@@ -2651,7 +2656,15 @@ impl Model {
         let vram_room = vram_budget.saturating_sub(vram_used);
         let (by_memory, by_free) = (lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state),
                                     crate::host::lockable(self.weights.host_memory_bytes, vram_room));
-        let budget = by_memory.min(by_free);
+        // (Windows: what the GPUs may see of host memory beside the sequence state, the least of the GPUs')
+        let reservable = if cfg!(windows) {
+            self.group.ordinals().into_iter().filter_map(crate::gpu::host_visible).map(|(_, _, reservable)| reservable).min()
+        } else {
+            None
+        };
+        let by_visible = crate::banks::visible_lock_cap(reservable, pinned_state);
+        self.visible_cap = by_visible;
+        let budget = by_memory.min(by_free).min(by_visible);
         // Whole layers from the last: reading went through those most recently, so they are the likeliest to be cached.
         let layers = crate::banks::layers_within(&sizes, budget);
         // What the start planned and why it planned no more, for a log that says where the CPU's experts are read from.
@@ -2662,6 +2675,9 @@ impl Model {
         let commit = crate::host::commit_left();
         let why = if layers.len() == 48 {
             "none left".to_string()
+        } else if by_visible < by_memory.min(by_free) {
+            format!("the GPUs' view of host memory allows {} (banks::visible_lock_cap: {} reservable less {} of sequence state and {} kept)",
+                    gib(by_visible), gib(reservable.unwrap_or(0)), gib(pinned_state), gib(crate::banks::VISIBLE_KEPT))
         } else if by_memory <= by_free {
             format!("the lock budget of {} was used", gib(by_memory))
         } else if commit.is_some_and(|(available, commit)| commit < available) {
@@ -2682,8 +2698,8 @@ impl Model {
             eprintln!("Straydog host banks: {copy_why}, so each layer's banks are page-locked as one verified copy in portable host memory, not in the model's mapping");
         }
         eprintln!("Straydog host banks: {} of 48 layers planned to be page-locked behind ready, {} of {}; no more planned because {why}; lock_budget {}, \
-                   lockable {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
-                  gib(by_memory), gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
+                   lockable {}, visible {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
+                  gib(by_memory), gib(by_free), gib(by_visible), gib(self.weights.host_memory_bytes), gib(vram_room));
         self.banks_bytes = banks_total;
         self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
@@ -4516,6 +4532,12 @@ impl Model {
             .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| (layer, banks.iter().map(|bank| bank.len() as u64).sum::<u64>())))
             .collect::<Result<Vec<_>>>().ok()?;
         let layers = crate::banks::relock_within(&given, left, self.pass_floor);
+        // (no more than the GPUs' view of host memory the start planned for leaves beside the layers locked now: banks::visible_lock_cap)
+        let size = |layer: usize| given.iter().find(|(given, _)| *given == layer).map_or(0, |(_, bytes)| *bytes);
+        let locked = self.locked_layers.iter()
+            .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()).unwrap_or(0))
+            .sum::<u64>();
+        let layers = crate::banks::layers_fitting(&layers, size, self.visible_cap.saturating_sub(locked));
         if layers.is_empty() {
             return None;
         }
