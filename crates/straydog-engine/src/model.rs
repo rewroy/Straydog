@@ -4560,6 +4560,12 @@ impl Model {
         Some(job)
     }
 
+    /// Bytes of a layer-order pass's rows that may be page-locked now: what the memory and the commit leave ([`crate::host::rows_lockable`]), and on
+    /// Windows no more than the banks' lock left of the GPUs' view of host memory ([`crate::banks::rows_visible_room`]).
+    fn rows_lockable(&self) -> u64 {
+        crate::host::rows_lockable().min(crate::banks::rows_visible_room(self.visible_cap))
+    }
+
     /// A layer-order pass's hidden rows (`hidden`) are on the host, not held in VRAM whole: move them beside the compute, to and from a ring of two
     /// chunk slots of `batch` rows in VRAM ([`crate::gpu::Backend::overlap_layer_rows`]), if STRAYDOG_LAYER_ROWS_OVERLAP allows, the page-locked rows
     /// are within what [`crate::host::rows_lockable`] leaves, and the ring fits in the VRAM beside what layer order holds. The guard (None where the rows
@@ -4571,7 +4577,7 @@ impl Model {
         let refusal = if !self.layer_rows_overlap {
             Some("STRAYDOG_LAYER_ROWS_OVERLAP=0".to_string())
         } else {
-            crate::gpu::rows_lock_refusal(bytes, crate::host::rows_lockable())
+            crate::gpu::rows_lock_refusal(bytes, self.rows_lockable())
         };
         let commit_before = crate::host::commit_left().map(|(_, commit)| commit);
         let refusal = match refusal {
@@ -4644,7 +4650,7 @@ impl Model {
             // 66.0 s where two passes beside the compute take some 42. A layer's compute at such rows is far longer than its bank's load, which a
             // second pass reads again beside it)
             if host.is_some() && self.layer_rows_overlap {
-                let narrowed = layer_prefill_rows_lockable(count, crate::host::rows_lockable());
+                let narrowed = layer_prefill_rows_lockable(count, self.rows_lockable());
                 if narrowed < count {
                     let (end, needs_staging) = layer_prefill_split(position, tokens.len(), plan, narrowed);
                     if !needs_staging || staging {
@@ -7531,6 +7537,22 @@ mod layer_prefill_tests {
         // (not even 16,384 rows: as many a pass as before)
         assert_eq!(layer_prefill_rows_lockable(95_000, 16_383 * row), 95_000);
         assert_eq!(layer_prefill_rows_lockable(95_000, 0), 95_000);
+    }
+
+    /// Decides: with the banks' lock under the GPUs' view of host memory (Windows), a 99K prompt's pass takes the rows whose page-locks fit
+    /// what the lock left (VISIBLE_KEPT): 49,152 rows (1.9 GiB) a pass where one pass of 98,304 page-locked 3.75 GiB; with no cap, as before.
+    #[test]
+    fn a_pass_s_page_locked_rows_fit_what_the_banks_left_of_the_gpus_view() {
+        use super::{layer_prefill_rows_lockable, WIDTH};
+        use crate::banks::{rows_visible_room, visible_lock_cap, VISIBLE_KEPT};
+        let row = WIDTH as u64 * 4;
+        let cap = visible_lock_cap(Some(22 << 30), 2 << 30);
+        assert_eq!(rows_visible_room(cap), VISIBLE_KEPT);
+        let rows = layer_prefill_rows_lockable(98_304, rows_visible_room(cap));
+        assert_eq!(rows, 49_152);
+        assert!(rows as u64 * row <= VISIBLE_KEPT);
+        assert_eq!(rows_visible_room(visible_lock_cap(None, 2 << 30)), u64::MAX);
+        assert_eq!(layer_prefill_rows_lockable(98_304, rows_visible_room(u64::MAX)), 98_304);
     }
 
     /// Decides: a pass of more rows takes a long prompt in fewer passes, each still stopping at a checkpoint: 249,925 tokens in 16 at 16,384,
