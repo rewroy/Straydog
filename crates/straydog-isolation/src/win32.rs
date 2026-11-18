@@ -523,8 +523,13 @@ pub fn launch(command: &[OsString], sid: &Sid, working_directory: Option<&Path>)
     // Only the variables the system, the loader and the CUDA runtime read pass from this
     // environment, which holds whatever the server's had.
     let variables = std::env::vars_os().map(|(name, value)| (units(&name), units(&value))).collect();
-    let temp = profile_folder(sid).map(|folder| units(folder.join("Temp").as_os_str()));
-    let environment = environment_block(variables, temp);
+    let folder = profile_folder(sid);
+    let temp = folder.as_ref().map(|folder| units(folder.join("Temp").as_os_str()));
+    // The CUDA driver's compute cache (the kernels it builds for this GPU), in the AppContainer's folder: its default, under the
+    // user's APPDATA, is closed to the AppContainer, so every start built cuBLAS's kernels again, 4.6 s at the first FP16 GEMM on
+    // an RTX 5070 Ti against 0.15 s from the cache.
+    let cuda_cache = folder.map(|folder| units(folder.join("NVIDIA").join("ComputeCache").as_os_str()));
+    let environment = environment_block(variables, temp, cuda_cache);
     let job = Job::new()?; // kill on close: the worker never outlives the launcher
 
     let mut attributes = AttributeList::new(3)?;
