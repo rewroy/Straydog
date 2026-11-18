@@ -25,7 +25,7 @@ use crate::{check_exposable, resolve, Exposure, LAUNCHER_SUBCOMMAND, LAUNCHER_WA
 /// The AppContainer profile the worker runs as. It persists, and so do its grants.
 pub const PROFILE_NAME: &str = "Straydog.Worker";
 
-/// The variables the worker inherits (Windows ignores the case of names), TEMP and TMP aside:
+/// The variables the worker inherits (Windows ignores the case of names), TEMP, TMP and CUDA_CACHE_PATH aside:
 /// what the system, the loader and the CUDA runtime read, and the profile paths. Creating an
 /// AppContainer process points LOCALAPPDATA and the user profile at the container's own
 /// folders, and fails with ERROR_ENVVAR_NOT_FOUND (203) when they are absent. Nothing else
@@ -406,9 +406,9 @@ pub fn command_line(args: &[Vec<u16>]) -> Vec<u16> {
 }
 
 /// The worker's Unicode environment block: of `variables` only those `WORKER_VARIABLES` and
-/// [`crate::ENGINE_VARIABLES`] names, then TEMP and TMP set to `temp` when given, as `NAME=value` strings sorted by name
-/// without regard to case (as Windows keeps them), each NUL-terminated, then a final NUL.
-pub fn environment_block(variables: Vec<(Vec<u16>, Vec<u16>)>, temp: Option<Vec<u16>>) -> Vec<u16> {
+/// [`crate::ENGINE_VARIABLES`] names, then TEMP and TMP set to `temp` and CUDA_CACHE_PATH to `cuda_cache` when given, as
+/// `NAME=value` strings sorted by name without regard to case (as Windows keeps them), each NUL-terminated, then a final NUL.
+pub fn environment_block(variables: Vec<(Vec<u16>, Vec<u16>)>, temp: Option<Vec<u16>>, cuda_cache: Option<Vec<u16>>) -> Vec<u16> {
     let upper = |name: &[u16]| -> Vec<u16> {
         name.iter()
             .map(|&unit| if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) { unit - 32 } else { unit })
@@ -417,8 +417,9 @@ pub fn environment_block(variables: Vec<(Vec<u16>, Vec<u16>)>, temp: Option<Vec<
     let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
     let allowed: Vec<Vec<u16>> = WORKER_VARIABLES.iter().chain(&crate::ENGINE_VARIABLES).map(|name| upper(&wide(name))).collect();
     let temp = temp.into_iter().flat_map(|temp| [(wide("TEMP"), temp.clone()), (wide("TMP"), temp)]);
+    let cuda_cache = cuda_cache.into_iter().map(|cache| (wide("CUDA_CACHE_PATH"), cache));
     let mut sorted = BTreeMap::new();
-    for (name, value) in variables.into_iter().filter(|(name, _)| allowed.contains(&upper(name))).chain(temp) {
+    for (name, value) in variables.into_iter().filter(|(name, _)| allowed.contains(&upper(name))).chain(temp).chain(cuda_cache) {
         sorted.insert(upper(&name), (name, value));
     }
     let mut block = Vec::new();
@@ -786,12 +787,16 @@ mod tests {
                 pair("GITHUB_TOKEN", "t"),
                 pair("LOCALAPPDATA", r"C:\Users\u\AppData\Local"),
                 pair("=C:", r"C:\"),
+                pair("CUDA_CACHE_PATH", r"C:\Users\u\AppData\Roaming\NVIDIA\ComputeCache"),
             ],
             Some(wide(r"C:\container\Temp")),
+            Some(wide(r"C:\container\NVIDIA\ComputeCache")),
         );
         let text = String::from_utf16(&block).unwrap();
-        // LOCALAPPDATA stays: creating the AppContainer process repoints it (and fails without it).
+        // LOCALAPPDATA stays: creating the AppContainer process repoints it (and fails without it). CUDA_CACHE_PATH is the
+        // AppContainer's own, whatever the server's environment named.
         let expected = [
+            r"CUDA_CACHE_PATH=C:\container\NVIDIA\ComputeCache",
             r"cuda_path=C:\CUDA",
             r"LOCALAPPDATA=C:\Users\u\AppData\Local",
             r"Path=C:\bin",
@@ -802,8 +807,8 @@ mod tests {
             "",
         ];
         assert_eq!(text, expected.join("\0"));
-        // Without the AppContainer's folder there is no TEMP: the user's own is not writable from it anyway.
-        assert_eq!(environment_block(vec![pair("TEMP", r"C:\t")], None), vec![0, 0]);
+        // Without the AppContainer's folder there is no TEMP nor CUDA cache: the user's own are not writable from it anyway.
+        assert_eq!(environment_block(vec![pair("TEMP", r"C:\t"), pair("CUDA_CACHE_PATH", r"C:\c")], None, None), vec![0, 0]);
     }
 
     #[test]
