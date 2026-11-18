@@ -3259,8 +3259,9 @@ struct DxgiMemoryInfo {
     DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
 };
 
-// Match CUDA's adapter and physical node before asking for this process's LOCAL budget.
-static DxgiMemoryInfo dxgi_memory_info(const hipDeviceProp_t& prop) {
+// Match CUDA's adapter and physical node before asking for this process's budget of `group`: LOCAL (VRAM) unless named, or NON_LOCAL
+// (system memory the GPU reaches, where page-locked host memory is charged 1 to 1).
+static DxgiMemoryInfo dxgi_memory_info(const hipDeviceProp_t& prop, DXGI_MEMORY_SEGMENT_GROUP group = DXGI_MEMORY_SEGMENT_GROUP_LOCAL) {
     DxgiMemoryInfo result;
     if (prop.tccDriver) { result.reason = "tcc"; return result; }
     const unsigned mask = prop.luidDeviceNodeMask;
@@ -3291,7 +3292,7 @@ static DxgiMemoryInfo dxgi_memory_info(const hipDeviceProp_t& prop) {
             result.status = adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter3));
             result.reason = "adapter3";
             if (SUCCEEDED(result.status)) {
-                result.status = adapter3->QueryVideoMemoryInfo(result.node, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &result.memory);
+                result.status = adapter3->QueryVideoMemoryInfo(result.node, group, &result.memory);
                 result.reason = SUCCEEDED(result.status) ? "ok" : "query_memory";
                 adapter3->Release();
             }
@@ -3411,6 +3412,27 @@ int sd_device_headroom(int ordinal, int64_t* bytes, int* process_budget) {
         }
 #endif
         return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// The system memory the GPU reaches, as Windows gives it to this process (DXGI's NON_LOCAL segment group): what the process's page-locked
+// host memory takes of it now, the budget and what may be reserved. 1 where Windows says, 0 where there is no such figure (another system,
+// a TCC driver, HIP), -1 on an error.
+int sd_host_visible(int ordinal, uint64_t* usage, uint64_t* budget, uint64_t* reservable) {
+    try {
+        if (!usage || !budget || !reservable) throw std::runtime_error("invalid host visible memory buffers");
+        *usage = 0; *budget = 0; *reservable = 0;
+#if defined(_WIN32) && !defined(__HIPCC__)
+        hipDeviceProp_t prop{};
+        check(hipGetDeviceProperties(&prop, ordinal));
+        const DxgiMemoryInfo dxgi = dxgi_memory_info(prop, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL);
+        if (FAILED(dxgi.status)) return 0;
+        *usage = dxgi.memory.CurrentUsage; *budget = dxgi.memory.Budget; *reservable = dxgi.memory.AvailableForReservation;
+        return 1;
+#else
+        (void)ordinal;
+        return 0;
+#endif
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
