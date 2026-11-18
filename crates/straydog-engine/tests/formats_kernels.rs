@@ -92,7 +92,7 @@ fn generated_block(kind: u32, random: &mut Random) -> Vec<u8> {
 }
 
 /// The CPU expert engine's formats.
-const CPU_KINDS: [u32; 12] = [8, 10, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39];
+const CPU_KINDS: [u32; 13] = [6, 8, 10, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39];
 
 fn load_tables() {
     straydog_engine::gpu::load_iq_tables().unwrap();
