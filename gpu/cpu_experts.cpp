@@ -567,7 +567,7 @@ CpuFormat cpu_format(int kind) {
         case 19: return {256, 50, decode_iq1_s, decode_iq1_s, SD_ROWS(19)};
         case 10: return {256, 84, decode_q2_k, decode_q2_k, SD_ROWS(10)};
         case 39: return {32, 17, decode_mxfp4, decode_mxfp4, SD_ROWS(39)};
-        case 6: return {32, 22, decode_q5_0, decode_q5_0, nullptr};
+        case 6: return {32, 22, decode_q5_0, decode_q5_0, SD_ROWS(6)};
     }
     #undef SD_WIDE
     #undef SD_ROWS

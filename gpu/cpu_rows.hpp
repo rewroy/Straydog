@@ -171,6 +171,12 @@ template<> struct Block<10> {   // Q2_K: group c's scale byte is c; its codes as
     float scale(unsigned c) const { return d * float(b[c] & 15); }
     float offset(unsigned c) const { return minimum * float(b[c] >> 4); }
 };
+template<> struct Block<6> {    // Q5_0: value i of 32 is d * ((its nibble | bit i of the high word << 4) - 16), as decode_q5_0
+    static constexpr size_t values = 32, bytes = 22;
+    static constexpr int grid = -4;
+    const uint8_t* b; float d; uint32_t high;
+    void load(const uint8_t* block) { b = block; d = half_at(block); std::memcpy(&high, block + 2, 4); }
+};
 template<> struct Block<39> {   // MXFP4: doubled E2M1 values times 2^(e - 128)
     static constexpr size_t values = 32, bytes = 17;
     static constexpr int grid = -3;
@@ -220,6 +226,15 @@ inline __m512 values16(const Block<kind>& block, unsigned c, const float* table)
         const __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c))));
         const __m512i codes = _mm512_and_si512(_mm512_srli_epi32(bytes, unsigned(block.shift(c))), _mm512_set1_epi32(15));
         return _mm512_mul_ps(_mm512_permutexvar_ps(codes, fp4), _mm512_set1_ps(block.d));
+    } else if constexpr (B::grid == -4) {
+        // (chunk c: the low nibbles of the sixteen code bytes, or their high ones, and bits 16c .. 16c + 15 of the high word)
+        const __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 6)));
+        const __m512i low = _mm512_and_si512(_mm512_srli_epi32(bytes, 4 * c), _mm512_set1_epi32(15));
+        const __m512i bit = _mm512_and_si512(_mm512_srlv_epi32(_mm512_set1_epi32(int(block.high >> (16 * c))),
+                                                               _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)),
+                                             _mm512_set1_epi32(1));
+        const __m512i q = _mm512_sub_epi32(_mm512_or_si512(low, _mm512_slli_epi32(bit, 4)), _mm512_set1_epi32(16));
+        return _mm512_mul_ps(_mm512_set1_ps(block.d), _mm512_cvtepi32_ps(q));
     } else {
         const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 2 + 16 * c));
         return _mm512_mul_ps(_mm512_set1_ps(block.d), _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q)));
@@ -626,6 +641,18 @@ inline Halves values8x2(const Block<kind>& block, unsigned c, const float* table
     } else if constexpr (B::grid == -3) {
         const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.codes(c)));
         return {nonlinear8(bytes, block.shift(c), block.d, true), nonlinear8(_mm_srli_si128(bytes, 8), block.shift(c), block.d, true)};
+    } else if constexpr (B::grid == -4) {
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 6));
+        const __m256i shift = _mm256_set1_epi32(4 * int(c)), fifteen = _mm256_set1_epi32(15), one = _mm256_set1_epi32(1);
+        const __m256i lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), sixteen = _mm256_set1_epi32(16);
+        const uint32_t high = block.high >> (16 * c);
+        const __m256 d = _mm256_set1_ps(block.d);
+        const __m256i low_codes = _mm256_and_si256(_mm256_srlv_epi32(_mm256_cvtepu8_epi32(bytes), shift), fifteen);
+        const __m256i high_codes = _mm256_and_si256(_mm256_srlv_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(bytes, 8)), shift), fifteen);
+        const __m256i low_bits = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(int(high)), lanes), one);
+        const __m256i high_bits = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(int(high >> 8)), lanes), one);
+        return {_mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_or_si256(low_codes, _mm256_slli_epi32(low_bits, 4)), sixteen))),
+                _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_or_si256(high_codes, _mm256_slli_epi32(high_bits, 4)), sixteen)))};
     } else {
         const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block.b + 2 + 16 * c));
         const __m256 d = _mm256_set1_ps(block.d);
