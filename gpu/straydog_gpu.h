@@ -23,6 +23,9 @@ int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_byte
 int sd_device_memory_diagnostic(int ordinal, int ready);
 /* Signed bytes until the process's memory budget; process_budget is 1 for DXGI, 0 for reported free. */
 int sd_device_headroom(int ordinal, int64_t* bytes, int* process_budget);
+/* Windows (CUDA): the GPU's system memory group (DXGI NON_LOCAL) as this process has it: the page-locked bytes it holds, the budget and what
+   may be reserved; 1 when Windows reports them, 0 where there is no such figure, negative on failure. */
+int sd_host_visible(int ordinal, uint64_t* usage, uint64_t* budget, uint64_t* reservable);
 /* CUDA: 1 if cudaHostRegisterReadOnly is supported on this device, 0 if not; negative on query failure. */
 int sd_host_register_read_only_supported(int ordinal);
 /* Where the device sits on the PCI bus: domain, bus and device numbers (function 0). */
