@@ -4308,8 +4308,10 @@ impl Model {
         if self.wide_batch_size > batch && tokens.len() - position >= WIDE_READ_TOKENS && self.images.is_empty() && self.warm_stop.is_none() {
             batch = self.wide_batch_size;
         }
-        // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
-        let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
+        // (a batch that rests narrow widens as soon as a read takes more than one of it, besides the last token's own: putting the slots back
+        // costs less than a second batch's streaming. One R9700 at --vram 5.5, 256-row batches, Qwen3.8 UD-IQ2_XS: a 390-token read 1.29 ->
+        // 0.96 s, two batches for three, 9.3K experts streamed for 13.6K; reads of one batch kept theirs, which borrowing slowed by 0.06 s)
+        let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size + 2) };
         let long = self.partial && tokens.len() - position >= threshold;
         let eligible = long && self.layer_prefill && self.group.backends.len() == 1 && self.images.is_empty() && self.warm_stop.is_none();
         let layer_order = eligible && {
