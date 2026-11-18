@@ -5,8 +5,9 @@
 //! refused it, says why after the worker's own reason; closing the
 //! runtime returns only once every process of the worker's tree has exited, the one outside
 //! its process group too (as a sandbox's is); a request too large for the worker is refused alone;
-//! a client that leaves during a long prefill pass costs nothing but the pass, and only a worker
-//! that does not end a cancelled generation in time fails the runtime.
+//! a client that leaves during a long prefill pass costs nothing but the pass; a worker that fails a
+//! request (an error it calls fatal, a cancelled generation it does not end in time) is started again,
+//! the next request served by the new one, and only one that keeps failing fails the runtime.
 //! No GPU or model.
 //!
 //! cargo test -p straydog --features hip --test runtime_controls
@@ -75,6 +76,31 @@ fn stand_in(marker: &Path) {
     }
 }
 
+/// A worker that fails each chat with an error it calls fatal and then waits to be ended; with MARKER, only the first launch's first chat
+/// (it writes MARKER), a launch that finds MARKER answering every chat.
+fn fatal(marker: Option<&Path>) {
+    let healthy = marker.is_some_and(Path::exists);
+    ready();
+    for line in std::io::stdin().lock().lines() {
+        let frame: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if frame["command"].as_str() != Some("chat") {
+            continue;
+        }
+        let id = frame["id"].as_str().unwrap().to_string();
+        if healthy {
+            println!("{}", serde_json::json!({"id": id, "event": "delta", "content": "x"}));
+            println!("{}", serde_json::json!({"id": id, "event": "done", "finish_reason": "stop",
+                                              "usage": {"prompt_tokens": 1, "completion_tokens": 1}}));
+        } else {
+            if let Some(marker) = marker {
+                std::fs::write(marker, "failed").unwrap();
+            }
+            println!("{}", serde_json::json!({"id": id, "event": "error", "message": "Straydog GPU: out of memory (a stand-in)", "fatal": true}));
+        }
+        std::io::stdout().flush().unwrap();
+    }
+}
+
 fn ready() {
     println!("{}", serde_json::json!({"event": "ready", "protocol": 1, "engine": "Straydog", "context": CONTEXT,
                                       "model": straydog_engine::bundle::MODEL, "provider": straydog_engine::bundle::ISTA, "quantization": QUANT}));
@@ -100,7 +126,11 @@ fn in_a_pass() {
 }
 
 /// A worker that never answers a chat.
-fn hung() {
+/// A worker that never answers a chat nor ends a cancelled one; with PID_FILE, its process id written there first.
+fn hung(pid_file: Option<&Path>) {
+    if let Some(pid_file) = pid_file {
+        std::fs::write(pid_file, std::process::id().to_string()).unwrap();
+    }
     ready();
     for line in std::io::stdin().lock().lines() {
         if line.unwrap().contains("shutdown") {
@@ -149,7 +179,8 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("stand-in") => return stand_in(Path::new(&args[2])),
         Some("in-a-pass") => return in_a_pass(),
-        Some("hung") => return hung(),
+        Some("hung") => return hung(args.get(2).map(Path::new)),
+        Some("fatal") => return fatal(args.get(2).map(Path::new)),
         // As a worker that finds its GPUs' memory held fails: its reason on stderr, status 1.
         Some("fails") => {
             eprintln!("Straydog VRAM budget is unavailable");
@@ -259,16 +290,67 @@ fn main() {
         println!("runtime_controls: a client that left during a pass of {PASS:?} cost the pass alone, {:.1} s", started.elapsed().as_secs_f64());
         engine.close().await;
 
-        // A worker that does not end a cancelled generation in time fails the runtime.
+        // A worker that does not end a cancelled generation in time is started again; the runtime serves on.
         let patience = Duration::from_secs(1);
-        let engine = wait_ready(Runtime::start_with_cancel_patience(&settings, (std::env::current_exe().unwrap(), vec!["hung".into()]), patience)).await;
+        let pid_file = scratch.join("hung-pid");
+        let engine = wait_ready(Runtime::start_with_cancel_patience(&settings, (std::env::current_exe().unwrap(),
+                                                                               vec!["hung".into(), PathBuf::from(&pid_file).into_os_string()]),
+                                                                  patience)).await;
+        let first = std::fs::read_to_string(&pid_file).unwrap();
         let left = engine.generate(hi()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(left);
+        let started = Instant::now();
+        while std::fs::read_to_string(&pid_file).unwrap_or_default() == first {
+            assert!(started.elapsed() < Duration::from_secs(10), "a hung worker was not started again");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let engine = wait_ready(engine).await;
+        assert!(tokio::time::timeout(Duration::from_millis(200), engine.failed()).await.is_err(), "a hung worker failed the runtime");
+        println!("runtime_controls: a hung worker was started again in {:.1} s", started.elapsed().as_secs_f64());
+        engine.close().await;
+
+        // A worker that fails a request with an error it calls fatal: the request is told the worker starts again, and the next
+        // request is served by the new one.
+        let marker = scratch.join("fatal-once");
+        let engine = wait_ready(Runtime::start(&settings, (std::env::current_exe().unwrap(),
+                                                           vec!["fatal".into(), PathBuf::from(&marker).into_os_string()]))).await;
+        let mut failed = engine.generate(hi()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), failed.events.next()).await.unwrap().unwrap();
+        assert_eq!((event["event"].as_str(), event["fatal"].as_bool()), (Some("error"), Some(true)), "{event}");
+        let told = event["message"].as_str().unwrap_or("");
+        assert!(told.contains("out of memory (a stand-in)") && told.contains("starting its worker again"), "{told}");
+        let restarted = Instant::now();
+        let mut next = engine.generate(hi()).await.unwrap();
+        let mut answered = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(20), next.events.next()).await.unwrap() {
+            match event["event"].as_str() {
+                Some("delta") => answered = true,
+                Some("done") => break,
+                other => panic!("unexpected event {other:?}: {event}"),
+            }
+        }
+        assert!(answered, "the request after the failure was not answered");
+        assert!(matches!(engine.state(), EngineState::Ready { .. }), "{:?}", engine.state());
+        println!("runtime_controls: a worker that failed a request was started again; the next request answered {:.1} s later",
+                 restarted.elapsed().as_secs_f64());
+        engine.close().await;
+
+        // One that keeps failing: three restarts, then the fourth failure fails the runtime (with the reason, told to restart the server).
+        let engine = wait_ready(Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["fatal".into()]))).await;
+        for attempt in 0..4 {
+            let mut failed = engine.generate(hi()).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(20), failed.events.next()).await.unwrap().unwrap();
+            assert_eq!(event["event"].as_str(), Some("error"), "attempt {attempt}: {event}");
+            let told = event["message"].as_str().unwrap_or("");
+            let next = if attempt < 3 { "starting its worker again" } else { "restart the server" };
+            assert!(told.contains(next), "attempt {attempt}: {told}");
+        }
         let message = tokio::time::timeout(Duration::from_secs(10), engine.failed()).await
-            .expect("a hung worker did not fail the runtime");
-        assert!(message.contains("did not acknowledge cancellation"), "{message}");
+            .expect("a worker that kept failing did not fail the runtime");
+        assert!(message.contains("out of memory (a stand-in)") && message.ends_with("restart the server"), "{message}");
         assert!(matches!(engine.state(), EngineState::Failed(_)));
+        println!("runtime_controls: a worker that kept failing was started again three times, then failed the runtime");
         engine.close().await;
 
         // A worker that fails to start: the runtime fails with its reason, at once.

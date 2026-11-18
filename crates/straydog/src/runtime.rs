@@ -1027,6 +1027,7 @@ impl Runtime {
             prefix: Cache::new(settings),
             keeper: Keeper::new(settings),
             saves: Mutex::new(Vec::new()),
+            restarts: Mutex::new(Vec::new()),
         };
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
@@ -1095,6 +1096,23 @@ struct Driver {
     keeper: Keeper,
     /// The saves under way, each on a thread of its own: the server waits for them before it ends.
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// When the worker was started again after it failed ([`RESTARTS`] within [`RESTART_WINDOW`] at the most).
+    restarts: Mutex<Vec<Instant>>,
+}
+
+/// A worker that failed (an error it called fatal, its exit, a cancelled generation it did not end) is started again, the request it
+/// failed for told so and those queued served by the new one, up to this many times within [`RESTART_WINDOW`]; one more failure ends
+/// the runtime as before. A GPU's memory or context that the failure left unusable is the old process's: the new one starts clean. On an
+/// RTX 5070 Ti PC at --vram 5.5 the first 99K prompt after a start failed out of memory and the server stopped until it was restarted by
+/// hand, where the same prompt read in the next process.
+const RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(600);
+
+/// How serving ended: the runtime closed (whether the warm-up state changed since it was last saved), or the worker failed (why, and
+/// the worker ended).
+enum Served {
+    Closed(bool),
+    Failed(String),
 }
 
 /// The name of the file that keeps a bundle's warm-up state, in the data directory's `warm`. The key hashes the bundle's pinned shards. A bundle read on
@@ -1136,34 +1154,60 @@ impl Driver {
 
     async fn run(self, prepare: Prepare, mut jobs: mpsc::UnboundedReceiver<Job>,
                  mut controls: mpsc::UnboundedReceiver<Control>) {
-        let launched = match self.prepare(prepare).await {
-            Ok(command) => self.launch(command).await,
+        let command = self.prepare(prepare).await;
+        let mut launched = match &command {
+            Ok(command) => self.launch(command.clone()).await,
             Err(message) => Err((format!("Straydog failed to start ({message}); see the server log and restart the server"),
                                  Vec::new())),
         };
-        let holders = match launched {
-            Ok(mut process) => {
-                let warming = self.restore_warm_state(&mut process).await;
-                let restoring = self.ready_frame().and_then(|ready| self.prefix.restore(&ready));
-                self.tell_kept_tokens(&mut process).await;
-                let changed = self.serve(&mut process, &mut jobs, &mut controls, warming, restoring).await;
-                if changed {
-                    self.save_warm_state(&mut process).await;
+        let holders = loop {
+            let mut process = match launched {
+                Ok(process) => process,
+                Err((message, holders)) => {
+                    self.fail(message);
+                    break holders;
                 }
-                // (the server stops on purpose: the conversation the worker holds is kept, once, with no request running)
-                self.keep_conversation(&mut process).await;
-                process.note_holders();
-                let shutdown = frame(vec![("id", pyjson::Value::Str("shutdown".into())),
-                                          ("command", pyjson::Value::Str("shutdown".into()))]);
-                let _ = process.send(&shutdown).await;
-                if tokio::time::timeout(Duration::from_secs(10), process.child.wait()).await.is_err() {
-                    process.end(Duration::from_secs(5)).await;
+            };
+            let warming = self.restore_warm_state(&mut process).await;
+            let restoring = self.ready_frame().and_then(|ready| self.prefix.restore(&ready));
+            self.tell_kept_tokens(&mut process).await;
+            match self.serve(&mut process, &mut jobs, &mut controls, warming, restoring).await {
+                Served::Closed(changed) => {
+                    if changed {
+                        self.save_warm_state(&mut process).await;
+                    }
+                    // (the server stops on purpose: the conversation the worker holds is kept, once, with no request running)
+                    self.keep_conversation(&mut process).await;
+                    process.note_holders();
+                    let shutdown = frame(vec![("id", pyjson::Value::Str("shutdown".into())),
+                                              ("command", pyjson::Value::Str("shutdown".into()))]);
+                    let _ = process.send(&shutdown).await;
+                    if tokio::time::timeout(Duration::from_secs(10), process.child.wait()).await.is_err() {
+                        process.end(Duration::from_secs(5)).await;
+                    }
+                    break process.holders;
                 }
-                process.holders
-            }
-            Err((message, holders)) => {
-                self.fail(message);
-                holders
+                Served::Failed(message) => {
+                    if !self.restart_allowed() {
+                        // (the reason goes to the server's last line; other clients see that it failed, nothing of why)
+                        let message = format!("{message}; restart the server");
+                        let public = message.split_once(": ").map_or(message.clone(), |(head, _)| format!("{head}; restart the server"));
+                        tracing::error!("{message}");
+                        self.set(Phase::Failed(public));
+                        self.shared.failure.send_replace(Some(message));
+                        break process.holders;
+                    }
+                    self.restarts.lock().unwrap().push(Instant::now());
+                    tracing::warn!("{message}; Straydog starts its worker again ({} of {RESTARTS} within {} minutes)",
+                                   self.restarts.lock().unwrap().len(), RESTART_WINDOW.as_secs() / 60);
+                    // (clients see it loading from now; the old worker's processes gone first, and with them what they held of the GPUs)
+                    self.set(Phase::Loading(json!({"stage": "restarting"})));
+                    released(&process.holders).await;
+                    launched = match &command {
+                        Ok(command) => self.launch(command.clone()).await,
+                        Err(_) => unreachable!("a worker ran, so its command was prepared"),
+                    };
+                }
             }
         };
         // (a state being sealed is written whole, or not at all: the end waits for it)
@@ -1178,6 +1222,18 @@ impl Driver {
             self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
         }
         released(&holders).await;
+    }
+
+    /// Whether a worker that failed may be started again: fewer than [`RESTARTS`] restarts within the last [`RESTART_WINDOW`].
+    fn restart_allowed(&self) -> bool {
+        let mut restarts = self.restarts.lock().unwrap();
+        restarts.retain(|at| at.elapsed() < RESTART_WINDOW);
+        restarts.len() < RESTARTS
+    }
+
+    /// What a request the worker failed for is told comes next.
+    fn after_failure(&self) -> &'static str {
+        if self.restart_allowed() { "; Straydog is starting its worker again" } else { "; restart the server" }
     }
 
     fn failure(&self) -> String {
@@ -1195,7 +1251,7 @@ impl Driver {
     /// request came.
     async fn serve(&self, process: &mut Process, jobs: &mut mpsc::UnboundedReceiver<Job>,
                    controls: &mut mpsc::UnboundedReceiver<Control>, warming: bool,
-                   mut restoring: Option<tokio::task::JoinHandle<Option<Restored>>>) -> bool {
+                   mut restoring: Option<tokio::task::JoinHandle<Option<Restored>>>) -> Served {
         let mut changed = warming;
         let mut save = tokio::time::interval(WARM_SAVE);
         save.tick().await;
@@ -1203,14 +1259,13 @@ impl Driver {
             let job = tokio::select! {
                 // (a request that is there goes first: the system block's state never holds one up)
                 biased;
-                job = jobs.recv() => match job { Some(job) => job, None => return changed },
+                job = jobs.recv() => match job { Some(job) => job, None => return Served::Closed(changed) },
                 status = process.child.wait() => {
                     let status = status.map_or_else(|exc| exc.to_string(), |status| exit_status(&status));
                     // (the worker's last lines, which name the cause, arrive after its exit)
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     let said = worker_said(&self.shared.stderr_tail.lock().unwrap());
-                    self.fail(format!("Straydog's worker exited ({status}){said}; restart the server"));
-                    return false;
+                    return Served::Failed(format!("Straydog's worker exited ({status}){said}"));
                 }
                 _ = save.tick(), if changed => {
                     self.save_warm_state(process).await;
@@ -1240,26 +1295,18 @@ impl Driver {
                     }
                     _ => String::new(),
                 };
-                let message = format!("{message}{died}; restart the server");
-                let _ = job.events.send(json!({"event": "error", "message": message, "fatal": true})).await;
+                let message = format!("{message}{died}");
+                let _ = job.events.send(json!({"event": "error", "message": format!("{message}{}", self.after_failure()), "fatal": true})).await;
                 self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
-                // (the reason goes to the client it failed for and to the server's last line; other clients see that it failed)
-                let public = message.split_once(": ").map_or(message.clone(), |(head, _)| format!("{head}; restart the server"));
-                tracing::error!("{message}");
-                self.set(Phase::Failed(public));
-                self.shared.failure.send_replace(Some(message));
+                // (the reason goes to the client it failed for and to the server's log; whether the worker starts again is run's to say)
                 process.end(Duration::from_secs(5)).await;
-                return false;
+                return Served::Failed(message);
             }
             self.shared.jobs.fetch_sub(1, Ordering::SeqCst);
             // (the reply is with its client: what the run keeps of its system block is done after it, never ahead of it)
             if let Err(message) = self.after_reply(process).await {
-                let message = format!("{message}; restart the server");
-                tracing::error!("{message}");
-                self.set(Phase::Failed(message.split_once(": ").map_or(message.clone(), |(head, _)| format!("{head}; restart the server"))));
-                self.shared.failure.send_replace(Some(message));
                 process.end(Duration::from_secs(5)).await;
-                return false;
+                return Served::Failed(message);
             }
         }
     }
@@ -1681,7 +1728,7 @@ impl Driver {
             });
             tokio::select! {
                 read = tokio::time::timeout(wait, process.read()) => {
-                    let event = read.map_err(|_| "Straydog did not acknowledge cancellation".to_string())??;
+                    let mut event = read.map_err(|_| "Straydog did not acknowledge cancellation".to_string())??;
                     if event["id"].as_str() != Some(job.id.as_str()) {
                         return Err("Straydog generation request id mismatch".into());
                     }
@@ -1702,8 +1749,13 @@ impl Driver {
                     }
                     self.observe(&kind, &event);
                     let fatal = kind == "error" && event["fatal"] == true;
-                    // (why the server is ending: its last line is what whatever started it shows, and that line must say)
+                    // (why the worker is ending: the server's log keeps it as the worker said it)
                     let why: String = event["message"].as_str().unwrap_or("no message").chars().take(500).flat_map(char::escape_debug).collect();
+                    if fatal {
+                        // (the client it failed for is told what comes next: the worker started again, or the server to be restarted)
+                        let told = format!("{}{}", event["message"].as_str().unwrap_or("Straydog failed"), self.after_failure());
+                        event["message"] = told.into();
+                    }
                     // (the failing client gets the event; the server log keeps why, escaped and cut short,
                     // and nothing of it reaches the failure other clients are told)
                     if kind == "error" {
