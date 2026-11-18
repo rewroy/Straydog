@@ -2582,6 +2582,12 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_interleave(
+        handle: *mut ::std::os::raw::c_void,
+        on: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_unmap(
         handle: *mut ::std::os::raw::c_void,
         gate: *const ::std::os::raw::c_void,

@@ -3444,6 +3444,13 @@ impl Backend {
         check(unsafe { ffi::sd_hybrid_assist_level(self.handle, level) }).map(drop)
     }
 
+    /// Whether this device's verifications through partially resident layers run their rows as two interleaved groups
+    /// (STRAYDOG_INTERLEAVE=1 or 0 holds it whatever this says).
+    pub fn set_interleave(&mut self, on: bool) -> Result<()> {
+        // SAFETY: a live handle and a plain value.
+        check(unsafe { ffi::sd_hybrid_interleave(self.handle, i32::from(on)) }).map(drop)
+    }
+
     /// Take the page lock of a mapped range, made by [`lock_host_range`] (on any thread), as this device's: it is released when this drops,
     /// before the range is unmapped.
     pub fn adopt_host(&mut self, range: &[u8]) {

@@ -662,6 +662,7 @@ struct Device {
     // Partially resident decode launches each layer's graph before the previous layer's
     // CPU result exists; the graph waits for it on the GPU (hybrid_await).
     bool hybrid_prelaunch = false;
+    bool hybrid_interleave = false;   // sd_hybrid_interleave: a verification's rows as two interleaved groups (STRAYDOG_INTERLEAVE overrides)
     // Kernels have a run-time limit (Windows display GPUs, 2 s): awaits give up after
     // ~1 s and only follow layers whose CPU experts read page-locked banks. Otherwise
     // an await may wait 10 s for a host stalled on storage.

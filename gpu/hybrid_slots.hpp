@@ -22,7 +22,9 @@ constexpr size_t hybrid_slot_of(size_t layer) { return layer & 1; }
 constexpr size_t hybrid_layer_slots = 49;
 constexpr size_t hybrid_slot_of(size_t layer) { return layer; }
 #endif
-constexpr size_t hybrid_sequence_slot = hybrid_layer_slots * hybrid_slot_floats;     // export completion counter (uint32)
+// An interleaved verification (hybrid_verify_span, STRAYDOG_INTERLEAVE) runs its rows as two groups, the second group's exports in the second half.
+constexpr size_t hybrid_exchange_slots = 2 * hybrid_layer_slots;
+constexpr size_t hybrid_sequence_slot = hybrid_exchange_slots * hybrid_slot_floats;     // export completion counter (uint32)
 constexpr size_t hybrid_exchange_floats = hybrid_sequence_slot + 16;
 // d.cpu_partial (device): the rows' staged CPU results and the plan's room after them, two exports' worth as before.
 constexpr size_t hybrid_partial_floats = 2 * hybrid_slot_floats + 16;
