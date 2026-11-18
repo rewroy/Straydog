@@ -1102,6 +1102,14 @@ pub fn visible_lock_cap(reservable: Option<u64>, pinned_state: u64) -> u64 {
     reservable.map_or(u64::MAX, |reservable| reservable.saturating_sub(pinned_state).saturating_sub(VISIBLE_KEPT))
 }
 
+/// The bytes of a layer-order pass's rows that may be page-locked beside the banks under `visible_cap` ([`visible_lock_cap`]): what the cap
+/// left of the GPUs' view of host memory, [`VISIBLE_KEPT`]; no bound where no cap is in force (u64::MAX). A 99K prompt's one pass page-locks
+/// 3.75 GiB of rows, which beside 18.8 GiB of banks and 1.4 GiB of state came to 24 GiB of the 22.5 GiB an RTX 5070 Ti PC with 62 GiB may
+/// reserve; within this the pass takes 49,152 rows (three 16,384s, 1.9 GiB) and the prompt is read in passes of that many.
+pub fn rows_visible_room(visible_cap: u64) -> u64 {
+    if visible_cap == u64::MAX { u64::MAX } else { VISIBLE_KEPT }
+}
+
 /// The layers of `planned` (in their order) that fit `room` together, stopping at the first that does not.
 pub fn layers_fitting(planned: &[usize], sizes: impl Fn(usize) -> u64, room: u64) -> Vec<usize> {
     let mut taken = 0u64;
