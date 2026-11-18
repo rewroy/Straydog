@@ -324,6 +324,25 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_capture_at(
+        handle: *mut ::std::os::raw::c_void,
+        row: u64,
+        states: *const *mut ::std::os::raw::c_void,
+        count: u64,
+        buffer: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_checkpoint_clone(
+        handle: *mut ::std::os::raw::c_void,
+        from: *mut ::std::os::raw::c_void,
+        to: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_capture_done(handle: *mut ::std::os::raw::c_void) -> u64;
+}
+unsafe extern "C" {
     pub fn sd_state_copy(
         handle: *mut ::std::os::raw::c_void,
         state: *mut ::std::os::raw::c_void,

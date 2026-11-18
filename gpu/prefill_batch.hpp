@@ -3,6 +3,20 @@
 // causal convolution, recurrence, selection and attention still advance in bounded
 // physical chunks. The idle MoE workspace of the device provides the row scratch.
 
+// A checkpoint taken inside a prompt batch (Device::capture, sd_capture_at): the batch's row it is taken after, if it falls inside the
+// `steps` rows of this call (0: none), and the copy of a recurrent state to its place in the checkpoint's buffer once the row loop that
+// carries it has ended a piece at that row (none for a state the checkpoint does not hold).
+inline size_t capture_row(const Device& d, size_t steps) {
+    return d.capture.buffer && d.capture.row < steps ? d.capture.row : 0;
+}
+inline void capture_state(Device& d, const void* state) {
+    const auto found = d.capture.offsets.find(state);
+    if (!d.capture.buffer || found == d.capture.offsets.end()) return;
+    check(hipMemcpyAsync(d.capture.buffer + found->second, state, d.allocations.find(const_cast<void*>(state))->second,
+                         hipMemcpyDeviceToHost, d.stream));
+    ++d.capture.done;
+}
+
 // Contiguous-row projection. In FP16 mode `half` must already hold the inputs. `kept` (FP16 mode): the matrix's expansion is in (or goes into) this
 // part of d.expanded, not at its start, and stays there for the next call over other rows of the same matrix (`expand_again` false: it is there already).
 void batch_project(Device& d, const Matrix& m, size_t steps, const float* input, const __half* half, float* output,
@@ -141,8 +155,15 @@ void gdn_prefill(Device& d, void* const* pointers, const int* kinds, void* conv,
     batch_project(d, beta_weights, steps, mixed, half, beta);
     batch_project(d, alpha_weights, steps, mixed, half, alpha);
     phase(d, "gdn_proj_in");
-    for (size_t first = 0; first < steps; first += chunk) {
-        const size_t count = std::min(chunk, steps - first);
+    // (a checkpoint taken inside the batch: its row ends a chunk, as a batch that ended there would, and the states after that chunk are
+    // the checkpoint's; the increment copies them, also after a chunk the paths below `continue` from)
+    const size_t at = capture_row(d, steps);
+    auto captured = [&](size_t done) {
+        if (at && done == at) { capture_state(d, conv); capture_state(d, recurrent); }
+    };
+    for (size_t first = 0, count = 0; first < steps; first += count, captured(first)) {
+        count = std::min(chunk, steps - first);
+        if (at > first && at < first + count) count = at - first;
         float* rows = qkv + first * H::channels;
 #if defined(__HIPCC__)
         // A long read's chunk goes through the chunked scan (gated_delta_chunk.hpp): its first kernel convolves, normalizes and packs, its

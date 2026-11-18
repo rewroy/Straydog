@@ -109,6 +109,9 @@ int sd_kv_format(void* handle, uint32_t row);
 int sd_kv_stage(void* handle, void* pointer, uint64_t rows);
 void* sd_checkpoint_buffer(void* handle, uint64_t bytes);
 int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t count, void* buffer);
+int sd_capture_at(void* handle, uint64_t row, void* const* states, uint64_t count, void* buffer);
+int sd_checkpoint_clone(void* handle, void* from, void* to);
+uint64_t sd_capture_done(void* handle);
 int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, uint64_t width, uint64_t height,
                   float* host, uint64_t first, int save);
 /* Asynchronous copies: page-locked host memory (sd_host_register, or sd_host_pin where devices
