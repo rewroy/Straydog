@@ -415,6 +415,47 @@ fn working_set_share(share: u64, pinned: u64, banks: u64, in_place: u64, own: u6
     share.saturating_sub(pinned + other).min((banks + pinned + other).max(in_place + own + other))
 }
 
+/// The minimums to ask beside a hard maximum of `share` ([`keep_resident`]), in turn, and whether each is hard: 7 in 8 of the share, then a
+/// quarter less each time while it is at least 1 GiB, then none (the maximum alone). Windows refuses a hard minimum the free memory cannot
+/// back (ERROR_NO_SYSTEM_RESOURCES); the maximum is not what it refuses and never steps down with it: the share is already no less than the
+/// banks locked in place and the process's own memory ([`working_set_share`]), and a hard maximum under them leaves the pages a read needs no
+/// room. An RTX 5070 Ti PC with 62 GiB (UD-IQ2_XS at --vram 5.5, 18.8 GiB of banks locked in place) had a 36 GiB share refused and took a hard
+/// maximum of 27 GiB with the minimum, under a working set of 28.5 GiB, and the next row read of a 99K prompt failed with ERROR_IO_DEVICE in all
+/// its ways.
+#[cfg(any(windows, test))]
+fn working_set_tries(share: u64) -> Vec<(u64, bool)> {
+    let mut tries = Vec::new();
+    // (under 1 GiB nothing is asked, as before)
+    if share < 1 << 30 {
+        return tries;
+    }
+    let mut least = share / 8 * 7;
+    while least >= 1 << 30 {
+        tries.push((least, true));
+        least = least / 4 * 3;
+    }
+    tries.push((0, false));
+    tries
+}
+
+#[cfg(test)]
+mod working_set_tries_tests {
+    /// Decides: where Windows refuses a working set's minimum, the minimum steps down and the maximum stays the share; with no minimum it can
+    /// back, the maximum is kept alone. (Both stepped down, a 36 GiB share went to a hard maximum of 27 GiB under 28.5 GiB of a working set
+    /// mostly page-locked, and a prompt's next read failed with ERROR_IO_DEVICE.)
+    #[test]
+    fn a_refused_minimum_steps_down_and_the_maximum_stays() {
+        const GIB: u64 = 1 << 30;
+        let tries = super::working_set_tries(36 * GIB);
+        assert_eq!(tries[0], (36 * GIB / 8 * 7, true), "first the minimum of 7 in 8 of the share");
+        assert!(tries.windows(2).all(|pair| pair[1].0 < pair[0].0), "each minimum less than the one before");
+        assert!(tries.iter().filter(|(_, hard)| *hard).all(|(least, _)| *least >= 1 << 30), "a hard minimum of at least 1 GiB");
+        assert_eq!(*tries.last().unwrap(), (0, false), "last the maximum alone");
+        assert_eq!(super::working_set_tries(GIB + GIB / 8), vec![(0, false)], "a minimum under 1 GiB: the maximum alone");
+        assert!(super::working_set_tries(GIB / 2).is_empty(), "a share under 1 GiB: nothing asked");
+    }
+}
+
 /// The marks of `memory` that the working set's limit follows: the lower under which it gives back, the upper over which it may take more.
 #[cfg(any(windows, test))]
 fn working_set_marks(memory: u64) -> (u64, u64) {
@@ -588,24 +629,24 @@ fn refusal_changed(share: u64, taken: u64) -> bool {
 pub fn keep_resident(memory: u64, pinned: u64, banks: u64, in_place: u64) {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
+        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = working_set_share((memory as f64 * HOST_SHARE) as u64, pinned, banks, in_place, windows_private(), HOST_OTHER);
         let available = windows_available().0;
         // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
         let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), available, memory);
-        let mut wanted = share;
-        while wanted >= 1 << 30 {
+        for (least, hard) in working_set_tries(share) {
+            let flags = if hard { QUOTA_LIMITS_HARDWS_MIN_ENABLE } else { QUOTA_LIMITS_HARDWS_MIN_DISABLE } | QUOTA_LIMITS_HARDWS_MAX_ENABLE;
             // SAFETY: the pseudo handle of this process and plain values.
-            let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), (wanted / 8 * 7) as usize, wanted as usize, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE) };
+            let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), least as usize, share as usize, flags) };
             if done != 0 {
-                if wanted < share && refusal_changed(share, wanted) {
-                    eprintln!("a working set of {} GiB was refused; {} GiB taken", share >> 30, wanted >> 30);
+                if least < share / 8 * 7 && refusal_changed(share, least) {
+                    eprintln!("a working set minimum of {} GiB was refused; {} GiB taken, the maximum kept at {} GiB", (share / 8 * 7) >> 30,
+                              if hard { least >> 30 } else { 0 }, share >> 30);
                 }
                 return;
             }
-            wanted = wanted / 4 * 3;
         }
         if refusal_changed(share, 0) {
             eprintln!("a working set of {} GiB was refused: {}", share >> 30, std::io::Error::last_os_error());
