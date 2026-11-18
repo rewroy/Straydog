@@ -15,7 +15,8 @@ It runs on Linux with AMD GPUs (ROCm) and on Windows with NVIDIA GPUs (CUDA). Li
 
 - **Every rounding named.** Weights run in the format their GGUF ships, decoded exactly,
   and every expert a token routes to is computed. The roundings that buy speed (FP16
-  operands in prompt batches; Qwen3.8's K/V in 8-bit blocks (Q8_0); for DeepSeek-V4.1 also INT8 and FP16
+  operands in prompt batches, INT8 for Qwen3.8's routed experts there on CUDA; Qwen3.8's
+  K/V in 8-bit blocks (Q8_0); for DeepSeek-V4.1 also INT8 and FP16
   inputs in decode and BF16 compressed K/V) are listed under [Numerics](#numerics), each with
   its switch where it has one. Speculative decoding never changes an answer.
 - **Isolated.** The engine runs in a worker without network access (bubblewrap on
@@ -62,7 +63,8 @@ The result is `target/release/straydog`. It needs the GPU vendor's runtime: ROCm
 (`libcublas.so.13` and `libcublasLt.so.13`, in `/usr/local/cuda/lib64` or `/usr/local/cuda-13/lib64`
 or wherever `ldconfig` lists them, as NVIDIA's packages install them) on Linux with NVIDIA GPUs, the
 NVIDIA driver and `cublas64_13.dll` (next to the executable or from the CUDA Toolkit) on Windows.
-Linux also needs bubblewrap. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
+Linux also needs bubblewrap. The released Linux executables are built on Ubuntu 24.04 and need glibc 2.39 or
+later; on an older system, build from source as above. DeepSeek-V4.1 has been run on Linux with ROCm, and with CUDA under WSL2.
 
 ## Run
 
@@ -123,6 +125,11 @@ work (`STRAYDOG_PRESTAGE=0` turns that off): on two RTX 4090s a new 32K-token pr
 instead of 6.4. The two GPUs of such a model read different batches of a prompt at the same time (the first GPU the next batch while the second
 finishes this one; `STRAYDOG_PREFILL_OVERLAP=0` reads them one after the other, the first logits are the same to the bit): the 32K prompt's first
 token comes in 7.4 s instead of 12.4.
+On one GPU where the CPU's experts take longer than the GPU's own work (low VRAM without the assist, as one NVIDIA GPU runs), a
+verification of two rows runs its rows interleaved: the host computes one row's CPU experts while the GPU runs the other row's layer.
+The engine compares each request's times and turns this on or off by itself (`STRAYDOG_INTERLEAVE=1` or `0` holds it): on an
+RTX 5070 Ti at `--vram 5.5`, Qwen3.8 UD-IQ2_XS decodes a chat prompt at 45.3 tok/s instead of 42.4 and a code prompt at 55.1
+instead of 48.6.
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
@@ -255,6 +262,7 @@ Where it rounds, and how to turn it off:
 | Qwen products over a batch of more than 4096 rows (a read of 16384 new tokens or more on the layers in parts) | as above, the products tiled for the wider batch, so the bits are those of a batch of that width (UD-IQ3_XXS, first logits against the F32 products: KL 2.0e-6, 2.0e-2, 1.0e-4 at 32K, 95K, 242K tokens against 6.6e-6, 2.6e-2, 2.9e-5 at 4096 rows; the same top token, KL between them 3.7e-6, 1.0e-3, 2.5e-5) | `STRAYDOG_PREFILL_WIDE=off` |
 | Qwen's long prompts' attention on RDNA4 | FP16 products, F32 softmax and sums | `--gemm fp32` |
 | Qwen's prompt attention on CUDA (Q8_0 K/V, RTX 30 series and later) | FP16 operands on the tensor cores, F32 softmax and sums, the numeric form of the RDNA4 row above. A layer's output against the F32 kernel's: 3.1e-4 at the most, relative to the largest value (FP16's rounding). The first logits after 8192- and 32768-token prompts (IQ2_XS, an RTX 5070 Ti, each kernel in a process of its own): KL 1.3e-3 and 2.2e-3 against the F32 kernel, the largest logit difference 0.58 and 0.83, the same first token; two runs of either kernel are bit for bit the same. Over the first 32 tokens after such prompts on two RTX 3090 (IQ3_S, partially resident, where two runs of one kernel differ by which experts the slots hold at a moment): mean KL 0.011 and 0.014 against an F32 run, 0.012 between two F32 runs. Its FP16 operands also widen what reaches them a few F32 bits apart: the chunked DeltaNet scan's first logits against the token scan's (3001 tokens, UD-IQ1_S) are KL 1.7e-3 apart under it and 8.6e-4 under the F32 kernel. One layer of 4096 rows at position 98304: 16.0-17.1 ms -> 3.0-4.4 ms on an RTX 3090, 9.3-10.2 -> 2.5-2.7 ms on an RTX 5070 Ti | `STRAYDOG_QSA_MMA=0` |
+| Qwen's routed experts in prompt batches on CUDA (RTX 30 series and later) | Where a layer's routed gate and up are both one of IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS or IQ3_S and its down one of those, IQ4_NL, IQ4_XS or the 2-bit format of 64 values to a half scale (GGUF type 42): the token rows go in as INT8 per 32 values with an F32 scale, and so does the gate/up product into the down; the weights' values as INT8, the dots exact in INT32, then scaled in F32 in order, so a route's sums do not depend on what shares its tile. The first logits of a chat prompt against the FP16 expert GEMM (UD-IQ2_XS, RTX 5070 Ti, --vram 9): KL 8.6e-4, 4.7e-3 and 1.25e-3 at 8K, 32K and 90K tokens, the top token and 16 greedy tokens the same | `STRAYDOG_PROMPT_Q8=0` |
 | Qwen's DeltaNet layers over a prompt read of 16384 new tokens or more (RDNA4) | the recurrence in chunks of 16 tokens, the products against the state in bf16 pieces (three to a value, six of nine products) with F32 sums: another order of sums, which the model amplifies as it does any other (first logits after a 95K / 242K read against the token-by-token scan's: KL 6.7e-4 / 1.6e-5; the token-by-token scan against itself at another batch width: 4.4e-2 / 1.6e-5). On the activations of a 95K read, against an F64 scan of 4 heads in 12 layers, the outputs' largest error is 4e-7 to 3.6e-6 of the largest output (the token-by-token scan's: 5e-7 to 1.6e-4). Shorter reads keep the token-by-token scan, bit for bit | `STRAYDOG_DELTA_SCAN=token` |
 | Qwen's DeltaNet layers over a prompt read of 16384 new tokens or more (CUDA) | the same recurrence in chunks of 16 tokens (the algebra of the RDNA4 row, `gdn_chunk_prep` shared), the products against the state in F32 fused multiply-adds (two lanes a column, each its half of the keys in order, the halves added): another order of sums than the token-by-token scan's, which the model amplifies as it does any other (Qwen3.8-Flash-Next IQ3_S on two RTX 4090s, first logits against the token-by-token scan's: KL 4.1e-6 after a 32K read and 3.0e-7 after a 95K read, the same top token; the token-by-token scan against itself at batch widths of 1024, 2048 and 3072 after a 32K read: 3.9e-6, 2.9e-6 and 7.5e-6; the first logits of a read are the same from run to run). Shorter reads keep the token-by-token scan, bit for bit | `STRAYDOG_DELTA_SCAN=token` |
 | Qwen's HyperConnections over a prompt read of 16384 new tokens or more (RDNA4, FP16 projections) | the up projection (10240 x 320) and the finish in one kernel: the projection's sums on the matrix cores in a plain kernel's order of 16 products a step from zero (rocBLAS's order is another), everything after it `hc_finish_hidden`'s arithmetic, expression for expression, so the mixed rows are bit for bit what `hc_finish_hidden` makes of that projection (`gpu/tests/hc_fused_test.cpp`). Against an F64 evaluation of the same FP16 operands, on random rows of a part's 4096 tokens: rms 9.5e-8 and largest 2.9e-6 of a row's scale (hipblasGemmEx and the finish: 9.6e-8 and 3.2e-6; on 4000 rows 9.5e-8 and 3.8e-6 against 9.5e-8 and 3.7e-6). First logits after a 32K / 95K / 242K read against the F32 products': KL 1.8e-6 / 2.1e-3 / 5.9e-5 (the two kernels': 5.2e-6 / 1.7e-2 / 1.6e-5), the same top token. Shorter reads keep the two kernels, bit for bit | `STRAYDOG_HC=blas` |

@@ -252,10 +252,17 @@ fn misaligned() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, "misaligned Straydog direct read")
 }
 
-/// Whether `error` is the refusal of a read by the working-set quota (`ERROR_WORKING_SET_QUOTA`, 1453): a process whose working set has a hard maximum
-/// is refused an unbuffered read that its pages would not fit under. Only Windows says so; elsewhere nothing is a quota refusal.
-pub fn working_set_quota(error: &std::io::Error) -> bool {
-    cfg!(windows) && error.raw_os_error() == Some(1453)
+/// Whether `error` is Windows refusing an unbuffered read for its target's pages rather than for the drive, so the read can be made again
+/// in smaller pieces or through the page cache: a process whose working set has a hard maximum is refused an unbuffered read that its pages
+/// would not fit under, with `ERROR_WORKING_SET_QUOTA` (1453) or, under the same limit, `ERROR_IO_DEVICE` (1117) (an RTX 5070 Ti machine at
+/// 5.5 GiB, 20.4 GiB of banks page-locked, an expert read at a layer-order pass's start: os error 1117, and no disk error in the system's log).
+/// A drive that does fail fails the smaller and the cached reads as well, and its error ends the read then. Elsewhere nothing is so refused.
+pub fn refused_for_pages(error: &std::io::Error) -> bool {
+    cfg!(windows) && refused_for_pages_code(error.raw_os_error())
+}
+
+fn refused_for_pages_code(code: Option<i32>) -> bool {
+    matches!(code, Some(1453 | 1117))
 }
 
 /// One read: at least a byte, or an error at the end of the file.
@@ -413,6 +420,18 @@ mod tests {
 
     const THREADS: usize = 16;
     const READS: usize = 300;
+
+    /// Decides: the working-set quota's and the I/O device's codes are refusals for the pages, which the reads make again in smaller pieces or
+    /// cached; a missing file, a sharing violation or a code-less error is not.
+    #[test]
+    fn the_quota_and_the_device_codes_are_refusals_for_the_pages() {
+        assert!(refused_for_pages_code(Some(1453)));
+        assert!(refused_for_pages_code(Some(1117)));
+        for code in [Some(2), Some(5), Some(32), Some(87), None] {
+            assert!(!refused_for_pages_code(code), "{code:?}");
+        }
+        assert_eq!(refused_for_pages(&std::io::Error::from_raw_os_error(1117)), cfg!(windows));
+    }
 
     /// The byte at `index` of the test files: unlike a repeating pattern, a read from the wrong place shows.
     fn byte(index: u64) -> u8 {

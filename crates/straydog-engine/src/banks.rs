@@ -326,7 +326,7 @@ impl Banks {
 /// the allocation is aligned for it, else through the page cache ([`read_in_ways`]).
 fn read_copy(file: &BankFile, offset: u64, target: &mut [u8], bytes: usize) -> std::io::Result<()> {
     let direct = file.direct.as_ref().filter(|_| offset.is_multiple_of(ALIGN as u64) && (target.as_ptr() as usize).is_multiple_of(ALIGN));
-    read_in_ways(direct.is_some(), offset, target, bytes, storage::working_set_quota, &mut |way, at, span, len| match (way, direct) {
+    read_in_ways(direct.is_some(), offset, target, bytes, storage::refused_for_pages, &mut |way, at, span, len| match (way, direct) {
         (Way::Direct, Some(direct)) => storage::read_direct_into(direct, at, span, len),
         _ => storage::read_at(&file.cached, at, &mut span[..len]),
     })
@@ -501,11 +501,38 @@ impl Registrar {
     const SYSTEM: Registrar = Registrar { lock: crate::gpu::lock_host_range, unlock: crate::gpu::unlock_host_range };
 }
 
-/// The threads that check a layer's banks on a machine of `cores`: every core for a locking that nothing waits behind, and at most a quarter of them
-/// (one at least) for the locking behind "ready", which leaves the rest to the request's CPU experts and the memory bandwidth they use.
+/// Requests running now in this process ([`RequestRunning`]): the locking behind "ready" checks a bank on every core while there are none.
+static REQUESTS_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A request under way, counted while it lives (the worker holds one for each request it runs): the locking behind "ready" checks its banks on
+/// a quarter of the cores meanwhile, and on all of them between requests ([`check_threads`]).
+pub struct RequestRunning(());
+
+impl RequestRunning {
+    pub fn begin() -> RequestRunning {
+        REQUESTS_RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        RequestRunning(())
+    }
+}
+
+impl Drop for RequestRunning {
+    fn drop(&mut self) {
+        REQUESTS_RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The threads that check a bank on a machine of `cores`, asked as each bank's check begins: every core for a locking that nothing waits behind,
+/// and for the locking behind "ready" while no request runs (its threads at the lowered priority still); a quarter of them (one at least) behind
+/// "ready" while one does, which leaves the rest to the request's CPU experts and the memory bandwidth they use. With a quarter of the cores
+/// throughout, two RTX 3090 on a 20-vCPU host locked 46.8 GiB in 94.0 s after ready, with no request meanwhile; with all of them, 57.4 s.
 pub(crate) fn check_threads(priority: Priority, cores: usize) -> usize {
+    check_threads_with(priority, cores, REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+fn check_threads_with(priority: Priority, cores: usize, running: usize) -> usize {
     match priority {
         Priority::Normal => cores.max(1),
+        Priority::Background if running == 0 => cores.max(1),
         Priority::Background => (cores / 4).max(1),
     }
 }
@@ -837,25 +864,50 @@ impl BankLocks {
     /// # Safety
     /// As [`BankLocks::lock_next`].
     unsafe fn register_turn(&self, layer: usize, banks: [Bank; 3], priority: Priority) -> Result<Locked, Stop> {
-        let mut locked = 0;
-        for bank in &banks {
-            // SAFETY: the caller's.
-            if let Err(error) = (self.registrar.lock)(self.ordinal, unsafe { bank.range() }) {
-                Self::release(&self.registrar, &banks[..locked]);
-                return Err(Stop::Refused { layer, error });
+        let started = std::time::Instant::now();
+        let (registrar, ordinal) = (self.registrar, self.ordinal);
+        // SAFETY: the caller's.
+        let ranges: [&[u8]; 3] = [0, 1, 2].map(|role| unsafe { banks[role].range() });
+        // A bank is registered on one thread and checked on many: the next bank is registered while this one is checked (on two RTX 3090,
+        // 46.9 GiB, the registering took 27.7 s of a 53.4 s locking and the checks 22.5, one after the other). Locked, a bank's pages stay as they
+        // are: with the shards' verity trees, check them (they may have been read again since loading verified their chunks).
+        (registrar.lock)(ordinal, ranges[0]).map_err(|error| Stop::Refused { layer, error })?;
+        let mut locked = 1;
+        let mut registering = 0.0;
+        let outcome = std::thread::scope(|scope| {
+            for role in 0..3 {
+                let next = (role + 1 < 3).then(|| scope.spawn(move || {
+                    let began = std::time::Instant::now();
+                    ((registrar.lock)(ordinal, ranges[role + 1]), began.elapsed().as_secs_f64())
+                }));
+                // SAFETY: the caller's, and the bank is locked.
+                let checked = unsafe { banks[role].verify(priority) };
+                let registered = next.map(|next| next.join().unwrap_or_else(|_| (Err("a bank's registration panicked".to_string()), 0.0)));
+                if let Some((Ok(()), seconds)) = &registered {
+                    locked += 1;
+                    registering += seconds;
+                }
+                if let Err(error) = checked {
+                    return Err(Stop::Unverified { layer, error });
+                }
+                if let Some((Err(error), _)) = registered {
+                    return Err(Stop::Refused { layer, error });
+                }
             }
-            locked += 1;
+            Ok(())
+        });
+        if let Err(stop) = outcome {
+            Self::release(&self.registrar, &banks[..locked]);
+            return Err(stop);
         }
-        // Locked, the banks' pages stay as they are now: with the shards' verity trees, check them (they may have been read again since
-        // loading verified their chunks).
-        for bank in &banks {
-            // SAFETY: the caller's, and the bank is locked above.
-            if let Err(error) = unsafe { bank.verify(priority) } {
-                Self::release(&self.registrar, &banks);
-                return Err(Stop::Unverified { layer, error });
-            }
-        }
+        let registered = registering;
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
+        // (as the copy mode's line: where a layer's turn goes, registering its pages or checking them)
+        if std::env::var_os("DS41_PROFILE").is_some() {
+            eprintln!("Straydog host banks register: layer {layer}, {:.2} GiB, turn {:.3} s, the later banks' registering beside the checks {registered:.3} s, {} threads",
+                      bytes as f64 / (1u64 << 30) as f64, started.elapsed().as_secs_f64(),
+                      check_threads(priority, std::thread::available_parallelism().map_or(8, |count| count.get())));
+        }
         self.registered.mark(layer);
         Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar), registered: Some(self.registered.clone()) })
     }
@@ -919,6 +971,21 @@ pub fn locking_room(available: u64, layer_bytes: u64, margin: u64, kv_ahead: u64
     } else {
         Err(Short { available, layer_bytes, margin, kv_ahead })
     }
+}
+
+/// The layers layer-order passes gave back (`given`, with their bytes, in the order given) to lock again with `left` bytes of commit left now:
+/// those in order whose locks leave at least `floor`, what the last pass found with them all locked. A layer that does not fit ends the list.
+pub fn relock_within(given: &[(usize, u64)], left: u64, floor: u64) -> Vec<usize> {
+    let mut room = left.saturating_sub(floor);
+    let mut layers = Vec::new();
+    for &(layer, bytes) in given {
+        if bytes > room {
+            break;
+        }
+        room -= bytes;
+        layers.push(layer);
+    }
+    layers
 }
 
 /// How many of the locked layers a K/V growth (or another request's allocation) that is `shortfall` bytes short of memory takes back, newest first:
@@ -1019,6 +1086,39 @@ pub fn pieces_of(layers: &[(usize, [(usize, u64); 3])], limit: u64) -> Vec<Piece
     pieces
 }
 
+/// What [`visible_lock_cap`] leaves of the host memory the GPUs see beside the banks and the sequence state: the K/V's growth holds its old
+/// and new planes at once for a moment, and a layer-order pass page-locks its rows.
+pub const VISIBLE_KEPT: u64 = 2 << 30;
+
+/// The most bank bytes to page-lock on Windows, given what DXGI says the process may reserve of the GPU's system memory group (`reservable`:
+/// the NON_LOCAL group's AvailableForReservation, the least of the GPUs') and the page-locked sequence state (`pinned_state`: the host K/V at
+/// the context's length and the checkpoints): what is left of it less [`VISIBLE_KEPT`]; no bound where Windows gives no such figure. Page-locked
+/// memory is charged to that group 1 to 1. On an RTX 5070 Ti PC with 62 GiB (22.54 GiB reservable, 2.6 GiB of state, UD-IQ2_XS at --vram 5.5
+/// and 9, -c 131072), a 99K prompt was read with 17.8 GiB of banks locked (at --vram 9) and with 19.7 GiB (the expert slots not kept across
+/// the K/V's growth); with 21.4 GiB, with 19.7 GiB and the slots kept, and with 23.0 GiB (at --vram 9), the GPU's work failed as out of memory
+/// with VRAM and the commit to spare, and the GPU faulted. The decode's speed hardly depends on the layers locked there (25 layers or none at
+/// --vram 5.5: the same tokens a second).
+pub fn visible_lock_cap(reservable: Option<u64>, pinned_state: u64) -> u64 {
+    reservable.map_or(u64::MAX, |reservable| reservable.saturating_sub(pinned_state).saturating_sub(VISIBLE_KEPT))
+}
+
+/// The bytes of a layer-order pass's rows that may be page-locked beside the banks under `visible_cap` ([`visible_lock_cap`]): what the cap
+/// left of the GPUs' view of host memory, [`VISIBLE_KEPT`]; no bound where no cap is in force (u64::MAX). A 99K prompt's one pass page-locks
+/// 3.75 GiB of rows, which beside 18.8 GiB of banks and 1.4 GiB of state came to 24 GiB of the 22.5 GiB an RTX 5070 Ti PC with 62 GiB may
+/// reserve; within this the pass takes 49,152 rows (three 16,384s, 1.9 GiB) and the prompt is read in passes of that many.
+pub fn rows_visible_room(visible_cap: u64) -> u64 {
+    if visible_cap == u64::MAX { u64::MAX } else { VISIBLE_KEPT }
+}
+
+/// The layers of `planned` (in their order) that fit `room` together, stopping at the first that does not.
+pub fn layers_fitting(planned: &[usize], sizes: impl Fn(usize) -> u64, room: u64) -> Vec<usize> {
+    let mut taken = 0u64;
+    planned.iter().copied().take_while(|&layer| {
+        taken = taken.saturating_add(sizes(layer));
+        taken <= room
+    }).collect()
+}
+
 /// The layers to page-lock: whole layers from the last, as many as `budget` holds. Reading went through the last layers most recently, so
 /// they are the likeliest to be cached.
 pub fn layers_within(sizes: &[u64], budget: u64) -> Vec<usize> {
@@ -1033,6 +1133,30 @@ pub fn layers_within(sizes: &[u64], budget: u64) -> Vec<usize> {
     layers
 }
 
+/// The unlocked layers (`layers`, with their banks' bytes, in the order wanted) whose banks a read back takes within `budget` bytes: in order,
+/// as long as the next one fits. A layer that does not fit ends the list, so that the likeliest go first and whole.
+pub fn read_back_plan(layers: &[(usize, u64)], budget: u64) -> Vec<usize> {
+    let mut left = budget;
+    let mut planned = Vec::new();
+    for &(layer, bytes) in layers {
+        if bytes > left {
+            break;
+        }
+        left -= bytes;
+        planned.push(layer);
+    }
+    planned
+}
+
+/// How long a read back waits after reading `bytes` in `took` so that it reads at no more than `rate` bytes a second on average: the drive
+/// is shared with the reply's own faults.
+pub fn read_back_pause(bytes: u64, took: std::time::Duration, rate: u64) -> std::time::Duration {
+    if rate == 0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_secs_f64(bytes as f64 / rate as f64).saturating_sub(took)
+}
+
 /// `layers` in the order they are locked: with an earlier run's counts, the layers whose experts the host ran most routes of first (locking
 /// a layer lets the GPU take some of its absent routes from the CPU, so those are where it saves most); layers with as many routes keep the
 /// order they were given, and without counts all do.
@@ -1044,22 +1168,69 @@ pub fn order_by_host_routes(layers: &mut [usize], host_routes: impl Fn(usize) ->
 mod tests {
     use super::*;
 
-    /// Decides: the check behind "ready" has at most a quarter of the cores and at least one, and the load's check, and a locking nothing runs beside,
-    /// has every core.
+    /// Decides: the banks' lock leaves the GPUs' view of host memory the sequence state and VISIBLE_KEPT, so that the 62 GiB PC's 22.54 GiB
+    /// reservable with 2.6 GiB of state leaves 17.96 GiB to the banks: UD-IQ2_XS's last 22 layers (17.8 GiB, as a 99K prompt was read with)
+    /// and not 25 (20.4 GiB); 21 of layers of its average size. No figure, no bound; and the layers given back come back only as far as the
+    /// room holds them.
     #[test]
-    fn the_check_behind_ready_has_a_quarter_of_the_cores_and_the_load_all_of_them() {
+    fn the_lock_leaves_the_gpus_view_of_host_memory_the_sequence_state_and_a_margin() {
+        const GIB: u64 = 1 << 30;
+        let gib = |value: f64| (value * GIB as f64) as u64;
+        // (UD-IQ2_XS: 39.4 GiB of banks over 48 layers, 0.82 GiB a layer on average)
+        let sizes = vec![gib(39.4 / 48.0); 48];
+        let cap = visible_lock_cap(Some(gib(22.54)), gib(2.58));
+        assert_eq!(cap, gib(22.54) - gib(2.58) - VISIBLE_KEPT);
+        let layers = layers_within(&sizes, cap);
+        assert_eq!(layers.len(), 21, "21 layers of {:.2} GiB fit {:.2} GiB", 39.4 / 48.0, cap as f64 / GIB as f64);
+        assert!(layers_within(&sizes, cap).iter().map(|&layer| sizes[layer]).sum::<u64>() <= cap);
+        assert_eq!(visible_lock_cap(None, gib(2.58)), u64::MAX);
+        assert_eq!(visible_lock_cap(Some(gib(3.0)), gib(2.58)), 0, "less than the state and the margin: nothing");
+        let given = [27, 28, 29];
+        assert_eq!(layers_fitting(&given, |_| 2 * GIB, 5 * GIB), vec![27, 28]);
+        assert_eq!(layers_fitting(&given, |_| 2 * GIB, GIB), Vec::<usize>::new());
+        assert_eq!(layers_fitting(&given, |_| 2 * GIB, u64::MAX), vec![27, 28, 29]);
+    }
+
+    /// Decides: a read back takes whole layers in the order given while each fits what is left of its budget, and stops at the first that does
+    /// not; it waits after each so that its reads average the rate given, and not at all when its read was already that slow.
+    #[test]
+    fn a_read_back_takes_whole_layers_in_order_within_its_budget_and_its_rate() {
+        const GIB: u64 = 1 << 30;
+        let layers = [(30, GIB), (12, GIB), (40, 2 * GIB), (7, GIB)];
+        assert_eq!(read_back_plan(&layers, 5 * GIB), vec![30, 12, 40, 7]);
+        assert_eq!(read_back_plan(&layers, 3 * GIB), vec![30, 12], "40's two GiB do not fit the one left, and 7 waits behind it");
+        assert_eq!(read_back_plan(&layers, GIB - 1), Vec::<usize>::new());
+        assert_eq!(read_back_plan(&[], 5 * GIB), Vec::<usize>::new());
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(read_back_pause(2 * GIB, second / 4, GIB), 2 * second - second / 4);
+        assert_eq!(read_back_pause(GIB, 3 * second, GIB), std::time::Duration::ZERO);
+        assert_eq!(read_back_pause(GIB, second / 2, 0), std::time::Duration::ZERO);
+    }
+
+    /// Decides: the check behind "ready" has at most a quarter of the cores and at least one while a request runs, and every core between
+    /// requests, as the load's check and a locking nothing runs beside always have; the count follows the requests as they begin and end.
+    #[test]
+    fn the_check_behind_ready_has_a_quarter_of_the_cores_while_a_request_runs_and_all_of_them_else() {
         for cores in [1, 2, 3, 4, 7, 8, 12, 16, 24, 32, 64] {
-            let behind = check_threads(Priority::Background, cores);
+            let behind = check_threads_with(Priority::Background, cores, 1);
             assert!(behind >= 1 && behind <= cores.div_ceil(4).max(1), "{behind} threads behind ready on {cores} cores");
-            assert_eq!(check_threads(Priority::Normal, cores), cores, "every core for the load's check on {cores} cores");
+            assert_eq!(check_threads_with(Priority::Background, cores, 0), cores, "every core behind ready with no request on {cores} cores");
+            assert_eq!(check_threads_with(Priority::Normal, cores, 1), cores, "every core for the load's check on {cores} cores");
             if cores >= 2 {
                 assert!(behind < cores, "{behind} threads behind ready on {cores} cores are not fewer than the cores");
             }
         }
-        assert_eq!((check_threads(Priority::Background, 16), check_threads(Priority::Background, 8), check_threads(Priority::Background, 2)), (4, 2, 1));
-        // (this machine's own count: what `Bank::verify` takes)
-        let cores = std::thread::available_parallelism().map_or(8, |count| count.get());
-        assert!(check_threads(Priority::Background, cores) <= check_threads(Priority::Normal, cores));
+        assert_eq!((check_threads_with(Priority::Background, 16, 2), check_threads_with(Priority::Background, 8, 1),
+                    check_threads_with(Priority::Background, 2, 1)), (4, 2, 1));
+        // (the count as the worker keeps it: a request begun lowers the check, its end raises it again)
+        let cores = 16;
+        let before = REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst);
+        {
+            let _request = RequestRunning::begin();
+            assert_eq!(REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(check_threads_with(Priority::Background, cores, before + 1), 4);
+        }
+        assert_eq!(REQUESTS_RUNNING.load(std::sync::atomic::Ordering::SeqCst), before);
         assert_eq!(check_threads(Priority::Normal, 0), 1);
     }
 
@@ -1141,6 +1312,21 @@ mod tests {
         // (the layers it names are the last of the list: the caller takes them from the end)
         let count = give_back_count(&locked, 2 * GIB + 1);
         assert_eq!(locked[locked.len() - count..].iter().map(|layer| layer.0).collect::<Vec<_>>(), vec![42, 43, 44]);
+    }
+
+    /// Decides: the layers passes gave back are locked again in the order given while their locks leave the commit where the last pass found it
+    /// with them all locked; one that does not fit ends it, and with the commit at or under that mark none is.
+    #[test]
+    fn layers_a_pass_gave_back_are_locked_again_within_the_commit_it_found() {
+        const GIB: u64 = 1 << 30;
+        let given = [(27, GIB), (28, GIB), (29, 2 * GIB)];
+        // (the pass found 5 GiB with them all locked: 9 GiB now is room for all four GiB of them)
+        assert_eq!(relock_within(&given, 9 * GIB, 5 * GIB), vec![27, 28, 29]);
+        assert_eq!(relock_within(&given, 8 * GIB, 5 * GIB), vec![27, 28], "29's two GiB would leave less than the pass found");
+        assert_eq!(relock_within(&given, 7 * GIB - 1, 5 * GIB), vec![27]);
+        assert_eq!(relock_within(&given, 5 * GIB, 5 * GIB), Vec::<usize>::new(), "other programs took what the pass let go");
+        assert_eq!(relock_within(&given, 4 * GIB, 5 * GIB), Vec::<usize>::new());
+        assert_eq!(relock_within(&[], 9 * GIB, 5 * GIB), Vec::<usize>::new());
     }
 
     /// Decides: the line a give-back leaves says the layers (newest first), their bytes, what asked, how much and what was available, and what stays.
@@ -1632,6 +1818,34 @@ mod tests {
         assert_eq!(refusal.blocks_more(0, 0), None, "a layer was taken before it");
         drop((first, locks));
         assert_eq!(memory.live(), 0);
+        fixture.finish();
+    }
+
+    /// Decides: a register turn registers a layer's next bank beside the check of the one before, and a check that fails gives up every bank
+    /// registered so far, the one registered beside it among them (a byte changed in the first bank: the second was registered meanwhile).
+    #[test]
+    fn a_failed_check_gives_up_the_bank_registered_beside_it() {
+        static RECORD: Mutex<Vec<(&str, usize, usize)>> = Mutex::new(Vec::new());
+        fn lock(_: usize, range: &[u8]) -> Result<(), String> {
+            RECORD.lock().unwrap().push(("lock", range.as_ptr() as usize, range.len()));
+            Ok(())
+        }
+        fn unlock(range: &[u8]) {
+            RECORD.lock().unwrap().push(("unlock", range.as_ptr() as usize, range.len()));
+        }
+        let fixture = Fixture::new("register-tampered", Some(SPANS[0].0 as usize + 10));
+        let base = fixture.map().as_ptr() as usize;
+        let ranges: Vec<(usize, usize)> = SPANS.iter().map(|&(offset, bytes)| (base + offset as usize, bytes as usize)).collect();
+        let mut locks = BankLocks::new(vec![(7, fixture.banks(true))], 0, 1 << 30).registering_with(Registrar { lock, unlock });
+        // SAFETY: the fixture keeps the mapping alive.
+        let stop = unsafe { locks.lock_next() }.expect("a layer").err().expect("the first bank does not match its tree");
+        assert!(matches!(stop, Stop::Unverified { layer: 7, .. }), "{stop:?}");
+        let record = RECORD.lock().unwrap().clone();
+        assert_eq!(record.iter().filter(|entry| entry.0 == "lock").map(|entry| (entry.1, entry.2)).collect::<Vec<_>>(), ranges[..2].to_vec(),
+                   "the first two banks registered, the third not begun");
+        assert_eq!(record.iter().filter(|entry| entry.0 == "unlock").map(|entry| (entry.1, entry.2)).collect::<Vec<_>>(), ranges[..2].to_vec(),
+                   "both given up");
+        drop(locks);
         fixture.finish();
     }
 

@@ -212,6 +212,47 @@ pub fn prefetch_available_bytes() -> u64 {
     physical
 }
 
+/// The memory a pass's read-ahead copies of the layers' banks may take now: what is available ([`prefetch_available_bytes`]), and where the
+/// system charges an allocation to the commit as it is made (Windows) no more than the commit left less [`READ_AHEAD_COMMIT_KEPT`] (what the
+/// pass goes on taking after its copies, and the rest of the system), the buffers' own margin then kept besides. On an RTX 5070 Ti PC with 64 GB
+/// (UD-IQ2_XS, --vram 9, a 90,000-token prompt, 22 layers' banks page-locked: 17.8 GiB) the pass took, in this order, its rows (3.44 GiB of
+/// commit), their lock (0.18) and four copies of 1.04 GiB (4.16), and the commit left came down from 7.58 GiB to 0.45, 0.26 at the least: with
+/// a layer more locked, or other programs holding more, the first batch failed for want of memory (out of memory at the next GPU call).
+/// With the room, the same PC with 19 layers locked (15.0 GiB) took two copies and kept 2.12 GiB at the least (35.12 s, where the build before
+/// took 36.2 with 21 and 22 layers); with 22 layers forced, 1.48 GiB left before the copies, it took none (the pass then reads through the
+/// mapping) and kept 0.76 GiB at the least (35.05 s), where the build before took four and ran out.
+pub fn read_ahead_room() -> u64 {
+    read_ahead_room_of(prefetch_available_bytes(), commit_left().map(|(_, commit)| commit))
+}
+fn read_ahead_room_of(available: u64, commit: Option<u64>) -> u64 {
+    commit.map_or(available, |commit| available.min(commit.saturating_sub(READ_AHEAD_COMMIT_KEPT)))
+}
+/// The commit a pass's read-ahead leaves, whatever its buffers' margin: after its copies the same PC's pass took 0.19-0.24 GiB more of it,
+/// and 0.72 GiB reading through the mapping with none.
+const READ_AHEAD_COMMIT_KEPT: u64 = 1 << 30;
+
+/// What a layer-order pass asks of the commit before its first batch, where the system charges an allocation to it as it is made (Windows),
+/// and the commit left now; None elsewhere. The pass takes, in this order, its rows (`rows_bytes`), their page lock (which charged 0.18 GiB
+/// of 3.43 GiB of rows on an RTX 5070 Ti PC with 64 GB, and is counted at most, a [`ROWS_LOCK_COMMIT_SHARE`]th), and its read-ahead copies
+/// (`copies_bytes`: those the caller wants room for, with their margin), which leave [`READ_AHEAD_COMMIT_KEPT`]. The memory it takes on the
+/// GPU is not counted: it is what the expert slots it lets go had taken (a 90,000-token pass gave back 0.65 GiB more than it took).
+pub fn pass_commit(rows_bytes: u64, copies_bytes: u64) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        commit_left().map(|(_, left)| (pass_commit_of(rows_bytes, copies_bytes), left))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (rows_bytes, copies_bytes);
+        None
+    }
+}
+
+#[cfg(any(windows, test))]
+fn pass_commit_of(rows_bytes: u64, copies_bytes: u64) -> u64 {
+    rows_bytes + rows_bytes / ROWS_LOCK_COMMIT_SHARE + copies_bytes + READ_AHEAD_COMMIT_KEPT
+}
+
 /// The memory a page-locked allocation can have now: where the system charges page-locked memory to the commit (Windows) the commit left, else
 /// (and elsewhere) the physical memory available. None where the system does not say. The physical memory that unlocked pages still hold in a
 /// working set is not counted as available until the system takes it back, which is why the commit is the figure there: it is given back at once.
@@ -372,6 +413,47 @@ pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {
 #[cfg(any(windows, test))]
 fn working_set_share(share: u64, pinned: u64, banks: u64, in_place: u64, own: u64, other: u64) -> u64 {
     share.saturating_sub(pinned + other).min((banks + pinned + other).max(in_place + own + other))
+}
+
+/// The minimums to ask beside a hard maximum of `share` ([`keep_resident`]), in turn, and whether each is hard: 7 in 8 of the share, then a
+/// quarter less each time while it is at least 1 GiB, then none (the maximum alone). Windows refuses a hard minimum the free memory cannot
+/// back (ERROR_NO_SYSTEM_RESOURCES); the maximum is not what it refuses and never steps down with it: the share is already no less than the
+/// banks locked in place and the process's own memory ([`working_set_share`]), and a hard maximum under them leaves the pages a read needs no
+/// room. An RTX 5070 Ti PC with 62 GiB (UD-IQ2_XS at --vram 5.5, 18.8 GiB of banks locked in place) had a 36 GiB share refused and took a hard
+/// maximum of 27 GiB with the minimum, under a working set of 28.5 GiB, and the next row read of a 99K prompt failed with ERROR_IO_DEVICE in all
+/// its ways.
+#[cfg(any(windows, test))]
+fn working_set_tries(share: u64) -> Vec<(u64, bool)> {
+    let mut tries = Vec::new();
+    // (under 1 GiB nothing is asked, as before)
+    if share < 1 << 30 {
+        return tries;
+    }
+    let mut least = share / 8 * 7;
+    while least >= 1 << 30 {
+        tries.push((least, true));
+        least = least / 4 * 3;
+    }
+    tries.push((0, false));
+    tries
+}
+
+#[cfg(test)]
+mod working_set_tries_tests {
+    /// Decides: where Windows refuses a working set's minimum, the minimum steps down and the maximum stays the share; with no minimum it can
+    /// back, the maximum is kept alone. (Both stepped down, a 36 GiB share went to a hard maximum of 27 GiB under 28.5 GiB of a working set
+    /// mostly page-locked, and a prompt's next read failed with ERROR_IO_DEVICE.)
+    #[test]
+    fn a_refused_minimum_steps_down_and_the_maximum_stays() {
+        const GIB: u64 = 1 << 30;
+        let tries = super::working_set_tries(36 * GIB);
+        assert_eq!(tries[0], (36 * GIB / 8 * 7, true), "first the minimum of 7 in 8 of the share");
+        assert!(tries.windows(2).all(|pair| pair[1].0 < pair[0].0), "each minimum less than the one before");
+        assert!(tries.iter().filter(|(_, hard)| *hard).all(|(least, _)| *least >= 1 << 30), "a hard minimum of at least 1 GiB");
+        assert_eq!(*tries.last().unwrap(), (0, false), "last the maximum alone");
+        assert_eq!(super::working_set_tries(GIB + GIB / 8), vec![(0, false)], "a minimum under 1 GiB: the maximum alone");
+        assert!(super::working_set_tries(GIB / 2).is_empty(), "a share under 1 GiB: nothing asked");
+    }
 }
 
 /// The marks of `memory` that the working set's limit follows: the lower under which it gives back, the upper over which it may take more.
@@ -547,24 +629,24 @@ fn refusal_changed(share: u64, taken: u64) -> bool {
 pub fn keep_resident(memory: u64, pinned: u64, banks: u64, in_place: u64) {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
+        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         use crate::arch::served::{HOST_OTHER, HOST_SHARE};
         let share = working_set_share((memory as f64 * HOST_SHARE) as u64, pinned, banks, in_place, windows_private(), HOST_OTHER);
         let available = windows_available().0;
         // (not so low that the CPU's experts fault on every page: 32 GiB of memory ran at 3 tokens/s when it gave them up)
         let share = working_set_limit(share, memory / 8 * 3, windows_working_set(), available, memory);
-        let mut wanted = share;
-        while wanted >= 1 << 30 {
+        for (least, hard) in working_set_tries(share) {
+            let flags = if hard { QUOTA_LIMITS_HARDWS_MIN_ENABLE } else { QUOTA_LIMITS_HARDWS_MIN_DISABLE } | QUOTA_LIMITS_HARDWS_MAX_ENABLE;
             // SAFETY: the pseudo handle of this process and plain values.
-            let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), (wanted / 8 * 7) as usize, wanted as usize, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE) };
+            let done = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), least as usize, share as usize, flags) };
             if done != 0 {
-                if wanted < share && refusal_changed(share, wanted) {
-                    eprintln!("a working set of {} GiB was refused; {} GiB taken", share >> 30, wanted >> 30);
+                if least < share / 8 * 7 && refusal_changed(share, least) {
+                    eprintln!("a working set minimum of {} GiB was refused; {} GiB taken, the maximum kept at {} GiB", (share / 8 * 7) >> 30,
+                              if hard { least >> 30 } else { 0 }, share >> 30);
                 }
                 return;
             }
-            wanted = wanted / 4 * 3;
         }
         if refusal_changed(share, 0) {
             eprintln!("a working set of {} GiB was refused: {}", share >> 30, std::io::Error::last_os_error());
@@ -807,6 +889,25 @@ mod priority_tests {
 
 #[cfg(test)]
 mod prefetch_tests {
+    /// Decides: the read-ahead's room is the commit left less a GiB where that is smaller than the physical memory available (the PC's
+    /// first batch above), and the physical memory elsewhere.
+    #[test]
+    fn the_read_ahead_takes_no_more_than_the_commit_left() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::read_ahead_room_of(21 * GIB, Some(4 * GIB)), 3 * GIB);
+        assert_eq!(super::read_ahead_room_of(3 * GIB, Some(20 * GIB)), 3 * GIB);
+        assert_eq!(super::read_ahead_room_of(21 * GIB, Some(GIB / 2)), 0);
+        assert_eq!(super::read_ahead_room_of(21 * GIB, None), 21 * GIB);
+    }
+    /// Decides: a layer-order pass asks the commit for its rows, an eighth of them for their lock, the copies asked for and the GiB the
+    /// read-ahead leaves: the 90,000-token pass's 3.43 GiB of rows with two copies of 1.04 GiB and their quarter-GiB margin, some 7.2 GiB.
+    #[test]
+    fn a_pass_asks_the_commit_for_its_rows_their_lock_and_its_copies() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::pass_commit_of(8 * GIB, 2 * GIB), 8 * GIB + GIB + 2 * GIB + GIB);
+        let wanted = super::pass_commit_of(90_000 * 10_240 * 4, 2 * 1_114_112_000 + (1 << 28));
+        assert!((7 * GIB..7 * GIB + GIB / 4).contains(&wanted), "{wanted}");
+    }
     /// Decides: a hint on the ranges of a mapped file (a bank's experts, joined or apart, one that is not a whole page, and none at all) is taken and
     /// changes nothing of what the mapping reads.
     #[test]

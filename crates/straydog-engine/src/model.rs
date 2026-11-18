@@ -371,6 +371,47 @@ const TWO_DRAFTS_START: f64 = 0.15;
 /// The experts' slots a partial placement keeps out of its pool for staging, its VRAM margin (`Group::create_expert_slots`), and the room its gate
 /// asks beyond them (`Model::prepare_hybrid_moe`).
 pub(crate) const STAGING_SLOTS: u64 = 32;
+/// The GPU's layer work with a verification's rows in two groups, against with them together, before a request has shown it: the dense
+/// weights are read once a group (one R9700, Qwen3.8 UD-IQ2_XS at --vram 5.5, 2-row passes: 6.2 -> 10.9 ms a token). It is not one figure:
+/// at --vram 9 with the assist off the same R9700 went 5.2 -> 13.9 and 5.7 -> 18.9, its experts beside the CPU 1.7 -> 4.5 and 1.8 -> 6.7, so
+/// [`InterleaveChoice`] keeps what a request with the rows interleaved measured.
+const INTERLEAVE_LAYER_FACTOR: f64 = 1.76;
+/// How much longer than the GPU's split work the CPU's experts must take before the rows are interleaved: wide enough that one R9700 at
+/// --vram 9 with the assist off (CPU 12.5 ms a token, layer work 5.2, experts 1.7, where interleaving lost) does not turn on, and an
+/// RTX 5070 Ti at 5.5 and 9 GiB (CPU 17.9 and 14.3, layer work 4.6 and 4.4, experts 1.2 and 1.5, where it gained) does.
+const INTERLEAVE_MARGIN: f64 = 1.25;
+
+/// Whether a partially resident model's verifications interleave their rows, chosen from each request's times (ms a token): the CPU's
+/// experts, the GPU's layer work and its experts beside the CPU. On where the CPU's side outlasts the GPU's as it would be with the rows
+/// split, by [`INTERLEAVE_MARGIN`]; kept on while it still does. The split's cost is learned from the last request that ran interleaved
+/// (its layer work and experts against the request before it), so that a machine where the guess was wrong pays it in one request, not
+/// in turns on and off.
+#[derive(Debug, Clone, Default)]
+struct InterleaveChoice {
+    on: bool,
+    /// The last request's layer work and experts with the rows together.
+    together: Option<(f64, f64)>,
+    /// What interleaving multiplied them by, as measured.
+    learned: Option<(f64, f64)>,
+}
+
+impl InterleaveChoice {
+    /// A request ended with `cpu`, `layer` and `experts` ms a token, with the rows as `self.on` had them: whether the next ones interleave.
+    fn observe(&mut self, cpu: f64, layer: f64, experts: f64) -> bool {
+        if self.on {
+            if let Some((layer_together, experts_together)) = self.together.filter(|(l, _)| *l > 0.0) {
+                self.learned = Some((layer / layer_together, if experts_together > 0.0 { experts / experts_together } else { 1.0 }));
+            }
+            self.on = cpu > layer + experts;
+        } else {
+            self.together = Some((layer, experts));
+            let (layer_factor, experts_factor) = self.learned.unwrap_or((INTERLEAVE_LAYER_FACTOR, 1.0));
+            self.on = cpu > INTERLEAVE_MARGIN * (layer_factor * layer + experts_factor * experts);
+        }
+        self.on
+    }
+}
+
 /// CUDA starts with missed routes on the CPU. Where its tuner runs ([`assist_tuned`]) it changes this level only after the level in force
 /// loses two consecutive rounds by at least 3%. STRAYDOG_ASSIST=N holds N instead.
 const CUDA_ASSIST: u32 = 0;
@@ -614,6 +655,12 @@ struct AssistScript {
 /// STRAYDOG_LAYER_PREFILL_ROWS sets it, to measure ([`layer_prefill_rows`]).
 const LAYER_PREFILL_ROWS: usize = 16384;
 const LAYER_PREFILL_MIN: usize = 512;
+/// The most a read back of the unlocked layers' banks reads a second ([`Model::read_back_banks`]), beside a reply's own faults: those read some
+/// 0.35 GB a second from the drive (7 GB/s class) of an RTX 5070 Ti PC while a reply after a 99K prompt decoded at 20.9 tok/s.
+const READ_BACK_RATE: u64 = 2 << 30;
+/// How long a read back waits for the memory it plans with: right after a layer-order pass its rows and read-ahead copies are still being let
+/// go (on an RTX 5070 Ti PC with 64 GB, 9-13 GiB available once they were, less than the 7.7 GiB kept free beside the first layer before).
+const READ_BACK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// The chunks of a layer queued before the next layer's bank loads ahead ([`Model::load_prefill_bank_copy`]): the GPU has them to compute while
 /// the host gathers a copied layer (some 50-90 ms on an RTX 5070 Ti PC). A layer of fewer chunks loads the next after its last, as before.
 const LAYER_BANK_AHEAD_AFTER: usize = 3;
@@ -624,7 +671,7 @@ fn layer_ple_ahead(capacity: usize, batch: usize) -> usize {
 }
 /// The part of the host's memory a pass's hidden rows may take: a 16th, 4 GiB of 64 (98,304 rows; 49,152 of 32). On a 5070 Ti with 64 GB
 /// and a 9 GiB budget, UD-IQ2_XS read 90,000 tokens in 76.1 s at 16,384 rows a pass, 52.7 s at 49,152 and 44.9 s at 98,304 (one pass), the
-/// logits the same to the bit; served there, a new 95K prompt took 50.0 s with Strata 0.2.14 and 53.1 s with a 32nd (two runs each).
+/// logits the same to the bit; served there, a new 95K prompt took 53.1 s with a 32nd, in two passes (two runs).
 const LAYER_PREFILL_MEMORY_SHARE: u64 = 16;
 
 /// The rows a layer-order pass takes: [`layer_prefill_rows_for`] this host's memory, or STRAYDOG_LAYER_PREFILL_ROWS when the process
@@ -1448,8 +1495,19 @@ pub struct Model {
     kv_ahead: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What the engine has given back to requests since it started, in order.
     pub gave_back: Vec<GaveBack>,
+    /// The layers layer-order passes gave back for their commit ([`Model::make_pass_room`]) and not locked again yet, and the commit the last
+    /// pass found with all of them locked: [`Model::more_bank_locks`] locks them again behind the request within it.
+    pass_given: Vec<usize>,
+    pass_floor: u64,
+    /// The most bank bytes page-locked at once on Windows, for the GPUs' view of host memory ([`crate::banks::visible_lock_cap`]), as the start
+    /// planned it; u64::MAX elsewhere. Every later lock keeps within it.
+    visible_cap: u64,
+    /// Counts the layer-order passes and the read backs of the banks begun: a read back ([`Model::read_back_banks`]) stops when either begins.
+    read_back_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
+    /// Whether the group's verifications interleave their rows (Group::set_interleave), as the requests' times chose it.
+    interleave: InterleaveChoice,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
     ple_counts: (u64, u64, u64),
     ple_wait: f64,
@@ -1692,7 +1750,12 @@ impl Model {
             lock_halt: Default::default(),
             kv_ahead: Default::default(),
             gave_back: Vec::new(),
+            pass_given: Vec::new(),
+            pass_floor: 0,
+            visible_cap: u64::MAX,
+            read_back_generation: Default::default(),
             hybrid_counts: Value::Null,
+            interleave: InterleaveChoice::default(),
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
             images: Vec::new(),
@@ -2405,6 +2468,10 @@ impl Model {
             // (the memory has grown by a layer's banks since, or nothing was refused: a refusal that comes later is told as its own)
             None => self.refusal_told = false,
         }
+        // (what a layer-order pass gave back comes back first, by its own measure: the plan below keeps far more free than a pass leaves)
+        if let Some(job) = self.pass_relock() {
+            return Some(job);
+        }
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
             .collect::<Result<Vec<_>>>().ok()?;
@@ -2412,7 +2479,8 @@ impl Model {
         let locked = self.locked_layers.iter().map(|&layer| sizes[layer]).sum::<u64>();
         let pinned = self.pinned_now.load(std::sync::atomic::Ordering::Relaxed);
         let by_memory = lock_budget(memory, sizes.iter().sum(), pinned).saturating_sub(locked);
-        let mut budget = by_memory.min(crate::host::lockable(memory, 0));
+        // (and within the GPUs' view of host memory the start planned for: banks::visible_lock_cap)
+        let mut budget = by_memory.min(crate::host::lockable(memory, 0)).min(self.visible_cap.saturating_sub(locked));
         let mut left: Vec<usize> = (0..48).rev().filter(|layer| sizes[*layer] > 0 && !self.locked_layers.contains(layer)).collect();
         self.refresh_kv_ahead();
         let (margin, kv_ahead) = (crate::host::left_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
@@ -2478,6 +2546,7 @@ impl Model {
             }
         }
         self.lock_pending.retain(|pending| *pending != layer);
+        self.pass_given.retain(|given| *given != layer);
         self.locked_layers.push(layer);
         self.count_in_place();
         let before = self.assist_mapped;
@@ -2509,6 +2578,8 @@ impl Model {
             self.bank_failure = failure;
         }
         self.hold_banks();
+        // (the layers left unlocked are read into memory behind the requests, before their faults would read them one at a time)
+        self.read_back_banks("after the locking");
     }
 
     /// Count the bytes of the banks page-locked in place (the locked layers that are not held as copies) for the working set's limit.
@@ -2629,7 +2700,15 @@ impl Model {
         let vram_room = vram_budget.saturating_sub(vram_used);
         let (by_memory, by_free) = (lock_budget(self.weights.host_memory_bytes, banks_total, pinned_state),
                                     crate::host::lockable(self.weights.host_memory_bytes, vram_room));
-        let budget = by_memory.min(by_free);
+        // (Windows: what the GPUs may see of host memory beside the sequence state, the least of the GPUs')
+        let reservable = if cfg!(windows) {
+            self.group.ordinals().into_iter().filter_map(crate::gpu::host_visible).map(|(_, _, reservable)| reservable).min()
+        } else {
+            None
+        };
+        let by_visible = crate::banks::visible_lock_cap(reservable, pinned_state);
+        self.visible_cap = by_visible;
+        let budget = by_memory.min(by_free).min(by_visible);
         // Whole layers from the last: reading went through those most recently, so they are the likeliest to be cached.
         let layers = crate::banks::layers_within(&sizes, budget);
         // What the start planned and why it planned no more, for a log that says where the CPU's experts are read from.
@@ -2640,6 +2719,9 @@ impl Model {
         let commit = crate::host::commit_left();
         let why = if layers.len() == 48 {
             "none left".to_string()
+        } else if by_visible < by_memory.min(by_free) {
+            format!("the GPUs' view of host memory allows {} (banks::visible_lock_cap: {} reservable less {} of sequence state and {} kept)",
+                    gib(by_visible), gib(reservable.unwrap_or(0)), gib(pinned_state), gib(crate::banks::VISIBLE_KEPT))
         } else if by_memory <= by_free {
             format!("the lock budget of {} was used", gib(by_memory))
         } else if commit.is_some_and(|(available, commit)| commit < available) {
@@ -2660,8 +2742,8 @@ impl Model {
             eprintln!("Straydog host banks: {copy_why}, so each layer's banks are page-locked as one verified copy in portable host memory, not in the model's mapping");
         }
         eprintln!("Straydog host banks: {} of 48 layers planned to be page-locked behind ready, {} of {}; no more planned because {why}; lock_budget {}, \
-                   lockable {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
-                  gib(by_memory), gib(by_free), gib(self.weights.host_memory_bytes), gib(vram_room));
+                   lockable {}, visible {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
+                  gib(by_memory), gib(by_free), gib(by_visible), gib(self.weights.host_memory_bytes), gib(vram_room));
         self.banks_bytes = banks_total;
         self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
@@ -4251,8 +4333,10 @@ impl Model {
         if self.wide_batch_size > batch && tokens.len() - position >= WIDE_READ_TOKENS && self.images.is_empty() && self.warm_stop.is_none() {
             batch = self.wide_batch_size;
         }
-        // (a batch that rests narrow widens sooner: 256 rows at a time would take a thousand tokens in four passes)
-        let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size * 2) };
+        // (a batch that rests narrow widens as soon as a read takes more than one of it, besides the last token's own: putting the slots back
+        // costs less than a second batch's streaming. One R9700 at --vram 5.5, 256-row batches, Qwen3.8 UD-IQ2_XS: a 390-token read 1.29 ->
+        // 0.96 s, two batches for three, 9.3K experts streamed for 13.6K; reads of one batch kept theirs, which borrowing slowed by 0.06 s)
+        let threshold = if self.group.backends.len() > 1 { MULTI_GPU_LONG_PREFILL } else { LONG_PREFILL.min(self.prefill_batch_size + 2) };
         let long = self.partial && tokens.len() - position >= threshold;
         let eligible = long && self.layer_prefill && self.group.backends.len() == 1 && self.images.is_empty() && self.warm_stop.is_none();
         let layer_order = eligible && {
@@ -4374,6 +4458,160 @@ impl Model {
         Ok(bank_bytes)
     }
 
+    /// The banks of the layers that are not page-locked read back whole into memory, layer by layer, on a thread of its own at the background's
+    /// CPU and I/O priority ([`crate::host::prefetch`]): after a layer-order pass (`when` says which, for the log), which reads them around the
+    /// page cache and leaves nothing of them in memory, and after the banks' locking at a start, which leaves the rest to the first requests'
+    /// faults. Either way a reply's first tokens otherwise read their CPU experts from the drive one fault at a time: on an RTX 5070 Ti PC, a 99K
+    /// prompt read first after a start replied at 20.9 tok/s where the same reply decodes at 37.7 once the pages are in memory, its first 64
+    /// tokens touching some 125 experts of each such layer, spread over every rank of their scores (so no ranking of experts picks them: the
+    /// layer goes whole); and a 2K chat turn, the first after a start, replied at 22.0 tok/s with 7.35 GB read from the drive, the same turn
+    /// later at 32.9-36.4 with 0.8-0.9 GB. The layers the host ran most routes of go first (this run's counts; without any, in order), as many
+    /// whole layers as the memory available keeps [`crate::host::left_free`] beside, planned once [`READ_BACK_WAIT`] at most has let a pass's
+    /// memory go, at [`READ_BACK_RATE`] at most. The next layer-order pass stops it.
+    fn read_back_banks(&mut self, when: &'static str) {
+        if !self.partial {
+            return;
+        }
+        let counts = self.route_counts().ok().filter(|routes| routes.total() > 0);
+        let mut layers: Vec<usize> = (0..48).filter(|layer| !self.locked_layers.contains(layer)).collect();
+        if let Some(counts) = &counts {
+            crate::banks::order_by_host_routes(&mut layers, |layer| counts.host_routes(layer));
+        }
+        let mut banks = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let Ok(three) = Self::host_banks(&self.weights, layer) else { continue };
+            let ranges: Vec<(usize, usize)> = three.iter().filter(|bank| !bank.is_empty()).map(|bank| (bank.as_ptr() as usize, bank.len())).collect();
+            banks.push((layer, ranges.iter().map(|&(_, length)| length as u64).sum::<u64>(), ranges));
+        }
+        if banks.is_empty() {
+            return;
+        }
+        let kept = crate::host::left_free(self.weights.host_memory_bytes);
+        let ordered = if counts.is_some() { ", the most host routes first" } else { "" };
+        // (an earlier read back stops: this one plans from what memory holds now)
+        let generation = self.read_back_generation.clone();
+        let mine = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        // (the mapping outlives the thread's reads: the weights stay mapped while the model lives, and a read of a range let go only fails)
+        let spawned = std::thread::Builder::new().name("bank read back".into()).spawn(move || {
+            // (the CPU and the drive at the background's priority, the pages read at the normal memory priority: they wait in memory for the
+            // reply's faults)
+            let _lowered = crate::host::Lowered::begin_reading(crate::host::Priority::Background);
+            let started = Instant::now();
+            let sizes: Vec<(usize, u64)> = banks.iter().map(|(layer, bytes, _)| (*layer, *bytes)).collect();
+            let mut available = crate::host::prefetch_available_bytes();
+            while available.saturating_sub(kept) < sizes[0].1 && started.elapsed() < READ_BACK_WAIT
+                && generation.load(std::sync::atomic::Ordering::SeqCst) == mine {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                available = crate::host::prefetch_available_bytes();
+            }
+            let planned = crate::banks::read_back_plan(&sizes, available.saturating_sub(kept)).len();
+            let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+            let bytes: u64 = sizes[..planned].iter().map(|(_, bytes)| bytes).sum();
+            eprintln!("Straydog host banks: {planned} of {} unlocked layers to be read back {when}, {} ({} available after {:.1} s, {} kept free){ordered}",
+                      sizes.len(), gib(bytes), gib(available), started.elapsed().as_secs_f64(), gib(kept));
+            let (mut layers, mut read) = (0usize, 0u64);
+            for (_, bytes, ranges) in &banks[..planned] {
+                if generation.load(std::sync::atomic::Ordering::SeqCst) != mine {
+                    break;
+                }
+                let asked = Instant::now();
+                if crate::host::prefetch(ranges).is_err() {
+                    break;
+                }
+                layers += 1;
+                read += bytes;
+                std::thread::sleep(crate::banks::read_back_pause(*bytes, asked.elapsed(), READ_BACK_RATE));
+            }
+            if planned > 0 {
+                eprintln!("Straydog host banks: read back {when}: {layers} layers, {} in {:.1} s", gib(read), started.elapsed().as_secs_f64());
+            }
+        });
+        if let Err(error) = spawned {
+            eprintln!("WARN Straydog cannot read back the unlocked layers' banks {when}: {error}");
+        }
+    }
+
+    /// Room in the commit for a layer-order pass of `rows` rows whose largest layer's banks are `bank_bytes`, before it takes any of it (Windows,
+    /// which charges an allocation to the commit as it is made; elsewhere nothing to do): the rows, their lock and two read-ahead copies
+    /// ([`crate::host::pass_commit`]). The start's plan leaves the commit the margin it keeps for the rest of the system, and a long pass took
+    /// nearly all of it: where the commit left lacks what the pass asks, locked layers are given back for it ([`Model::give_back`]) as for a K/V
+    /// growth, and the worker locks them again behind a request as the memory available allows ([`Model::more_bank_locks`], whose room
+    /// is the physical memory's: served on that PC with 6.9 GiB available after the request, it had not within two minutes); the request's
+    /// own reply decodes with them unlocked, which cost nothing that showed (99K tokens served: 20.8 tok/s with 4 layers given back, 19.5
+    /// with 1, the replies after 34-38 either way). On an RTX 5070 Ti PC with 64 GB (UD-IQ2_XS, --vram 9, a 90,000-token prompt), with 22
+    /// and 23 layers locked the pass asked for 7.2 GiB with 4.2 and 4.0 left, gave 4 layers back (3.5 and 3.8 GiB), took two copies and kept
+    /// 2.59 and 2.13 GiB of the commit at the least (33.6 and 34.6 s), where with only the read-ahead's room ([`crate::host::read_ahead_room`])
+    /// it kept 0.76 with 22, and before that 0.26 with 22 and ran out with 23; with the 19 the start planned it gave none back and kept 2.22
+    /// (35.2 s); the logits the same in all three.
+    fn make_pass_room(&mut self, rows: usize, bank_bytes: u64) -> Result<()> {
+        let copies = 2 * bank_bytes + crate::layer_bank::FIRST_COPIES_MARGIN;
+        let Some((wanted, left)) = crate::host::pass_commit(rows as u64 * WIDTH as u64 * 4, copies) else { return Ok(()) };
+        // (what the commit would be with every layer the passes gave back locked again: what they go back within after this pass; measured
+        // anew at each pass, so that what other programs took meanwhile is theirs)
+        if !self.pass_given.is_empty() || left < wanted {
+            let out = self.pass_given.iter().map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
+                .sum::<Result<u64>>()?;
+            self.pass_floor = left.saturating_sub(out);
+        }
+        if left >= wanted {
+            return Ok(());
+        }
+        if let Some(gave) = self.give_back(wanted, &format!("a layer-order pass of {rows} rows"))? {
+            self.last_metrics.insert("prefill_pass_gave_back_layers".into(), json!(gave.layers.len()));
+            self.pass_given.extend(gave.layers.iter().copied());
+        }
+        Ok(())
+    }
+
+    /// Behind a request: the layers layer-order passes gave back ([`Model::make_pass_room`]) locked again, as many as leave the commit at least
+    /// where the last pass found it with them all locked ([`crate::banks::relock_within`]). The pass's rows and copies are let go by then, so
+    /// what it gave back is there again; what other programs took meanwhile is not taken back. None where there is nothing to lock again or no
+    /// room for one layer: the next request's end asks again. Served on an RTX 5070 Ti PC with 64 GB (UD-IQ2_XS, --vram 9, 22 layers locked at
+    /// the start), new conversations of 32K, 32K, 99K, 95K, 32K and 32K tokens gave back 2, 1, 5, 7, 2 and 2 layers and had 1, 1, 6, 7, 2 and 2
+    /// locked again 0.2-1.2 s after each request, 22 locked at the end; without this they stayed given back, 16 locked after the 95K.
+    fn pass_relock(&mut self) -> Option<BankLocks> {
+        if self.pass_given.is_empty() {
+            return None;
+        }
+        let (_, left) = crate::host::commit_left()?;
+        let given = self.pass_given.iter().filter(|layer| !self.lock_pending.contains(layer))
+            .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| (layer, banks.iter().map(|bank| bank.len() as u64).sum::<u64>())))
+            .collect::<Result<Vec<_>>>().ok()?;
+        let layers = crate::banks::relock_within(&given, left, self.pass_floor);
+        // (no more than the GPUs' view of host memory the start planned for leaves beside the layers locked now: banks::visible_lock_cap)
+        let size = |layer: usize| given.iter().find(|(given, _)| *given == layer).map_or(0, |(_, bytes)| *bytes);
+        let locked = self.locked_layers.iter()
+            .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()).unwrap_or(0))
+            .sum::<u64>();
+        let layers = crate::banks::layers_fitting(&layers, size, self.visible_cap.saturating_sub(locked));
+        if layers.is_empty() {
+            return None;
+        }
+        let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+        let bytes = given.iter().filter(|(layer, _)| layers.contains(layer)).map(|(_, bytes)| bytes).sum::<u64>();
+        eprintln!("Straydog host banks: {} of the {} layers layer-order passes gave back are locked again behind the requests, {}, with {} of the commit \
+                   left ({} where the last pass began, with them all locked); {} locked already", layers.len(), given.len(), gib(bytes), gib(left),
+                  gib(self.pass_floor), self.locked_layers.len());
+        // (a give-back's halt was for the plan it stopped)
+        self.lock_halt = Default::default();
+        let job = match self.lock_job(&layers) {
+            Ok(job) => job,
+            Err(error) => {
+                eprintln!("WARN Straydog host banks: the layers a pass gave back are not locked again ({error})");
+                return None;
+            }
+        };
+        self.lock_pending = layers;
+        self.locking = true;
+        Some(job)
+    }
+
+    /// Bytes of a layer-order pass's rows that may be page-locked now: what the memory and the commit leave ([`crate::host::rows_lockable`]), and on
+    /// Windows no more than the banks' lock left of the GPUs' view of host memory ([`crate::banks::rows_visible_room`]).
+    fn rows_lockable(&self) -> u64 {
+        crate::host::rows_lockable().min(crate::banks::rows_visible_room(self.visible_cap))
+    }
+
     /// A layer-order pass's hidden rows (`hidden`) are on the host, not held in VRAM whole: move them beside the compute, to and from a ring of two
     /// chunk slots of `batch` rows in VRAM ([`crate::gpu::Backend::overlap_layer_rows`]), if STRAYDOG_LAYER_ROWS_OVERLAP allows, the page-locked rows
     /// are within what [`crate::host::rows_lockable`] leaves, and the ring fits in the VRAM beside what layer order holds. The guard (None where the rows
@@ -4385,7 +4623,7 @@ impl Model {
         let refusal = if !self.layer_rows_overlap {
             Some("STRAYDOG_LAYER_ROWS_OVERLAP=0".to_string())
         } else {
-            crate::gpu::rows_lock_refusal(bytes, crate::host::rows_lockable())
+            crate::gpu::rows_lock_refusal(bytes, self.rows_lockable())
         };
         let commit_before = crate::host::commit_left().map(|(_, commit)| commit);
         let refusal = match refusal {
@@ -4423,13 +4661,16 @@ impl Model {
                          cancelled: &dyn Fn() -> bool, progress: &mut dyn FnMut(usize, usize)) -> Result<LayerPrefill> {
         if tokens.iter().any(|token| *token as usize >= VOCABULARY) { return Err("Straydog token or context is out of range".into()); }
         let _trace_total = crate::layer_trace::Span::new("total", None, position, tokens.len(), 0);
+        // (a read back of the banks after an earlier pass stops: this pass reads them itself)
+        self.read_back_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // (the K/V grown to the prompt first: its growth asks the commit that the hidden rows would take, more of it at more rows a pass)
         self.ensure_kv(tokens.len())?;
         let mut segment = layer_prefill_rows();
         let count = (tokens.len() - position).min(segment);
+        let bank_bytes = self.layer_bank_bytes()?;
+        self.make_pass_room(count, bank_bytes)?;
         // (page-aligned: the pass may page-lock the rows to move them beside the compute)
         let Some(mut hidden) = crate::gpu::PageAlignedFloats::zeroed(count * WIDTH) else { return Ok(LayerPrefill::Fallback) };
-        let bank_bytes = self.layer_bank_bytes()?;
         let (mut layer_end, staging) = layer_prefill_split(position, tokens.len(), plan, segment);
         let preparing = Instant::now();
         let trace_prepare = crate::layer_trace::Span::new("prepare", None, position, tokens.len(), 0);
@@ -4455,7 +4696,7 @@ impl Model {
             // 66.0 s where two passes beside the compute take some 42. A layer's compute at such rows is far longer than its bank's load, which a
             // second pass reads again beside it)
             if host.is_some() && self.layer_rows_overlap {
-                let narrowed = layer_prefill_rows_lockable(count, crate::host::rows_lockable());
+                let narrowed = layer_prefill_rows_lockable(count, self.rows_lockable());
                 if narrowed < count {
                     let (end, needs_staging) = layer_prefill_split(position, tokens.len(), plan, narrowed);
                     if !needs_staging || staging {
@@ -4524,8 +4765,12 @@ impl Model {
         match output? {
             None => Ok(LayerPrefill::Fallback),
             Some(false) => Ok(LayerPrefill::Cancelled),
-            Some(true) if layer_end < tokens.len() => Ok(LayerPrefill::Continue(layer_end)),
             Some(true) => {
+                // (the pass is over whether the prompt ends with it or a short last segment follows the ordinary way, as a 99K one's does)
+                self.read_back_banks("behind the reply");
+                if layer_end < tokens.len() {
+                    return Ok(LayerPrefill::Continue(layer_end));
+                }
                 let row = self.final_hidden.clone().ok_or("layer prefill returned no final hidden row")?;
                 self.head_logits(&row, false).map(LayerPrefill::Ready)
             }
@@ -5886,6 +6131,21 @@ impl Model {
             // Where a partially resident model's request went, on every request: the log alone must say what held it up.
             let info = self.group.info().unwrap_or_default();
             let spent = |key: &str| (info[key].as_u64().unwrap_or(0) - self.hybrid_counts[key].as_u64().unwrap_or(0)) as f64;
+            // Whether the next requests interleave their verifications' rows (STRAYDOG_INTERLEAVE unset): [`InterleaveChoice`].
+            if generated >= 64.0 && std::env::var_os("STRAYDOG_INTERLEAVE").is_none() {
+                let ms = |key: &str| spent(key) / 1e6 / generated;
+                let (cpu, layer, experts) = (ms("cpu_ns"), ms("layer_ns"), ms("gpu_experts_ns"));
+                let was = self.interleave.on;
+                let wanted = self.interleave.observe(cpu, layer, experts);
+                if wanted != was {
+                    if self.group.set_interleave(wanted).is_err() {
+                        self.interleave.on = was;
+                    } else {
+                        eprintln!("Straydog interleaved 2-row verifications: {} (ms a token: CPU experts {cpu:.1}, the GPU's layer work {layer:.1} and \
+                                   experts {experts:.1})", if wanted { "on" } else { "off" });
+                    }
+                }
+            }
             let memory = crate::host::memory_note();
             let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
             // (the pages the drive gave back for faults while it ran, the working set's limit and the K/V's capacity: what the memory line
@@ -7340,6 +7600,22 @@ mod layer_prefill_tests {
         assert_eq!(layer_prefill_rows_lockable(95_000, 0), 95_000);
     }
 
+    /// Decides: with the banks' lock under the GPUs' view of host memory (Windows), a 99K prompt's pass takes the rows whose page-locks fit
+    /// what the lock left (VISIBLE_KEPT): 49,152 rows (1.9 GiB) a pass where one pass of 98,304 page-locked 3.75 GiB; with no cap, as before.
+    #[test]
+    fn a_pass_s_page_locked_rows_fit_what_the_banks_left_of_the_gpus_view() {
+        use super::{layer_prefill_rows_lockable, WIDTH};
+        use crate::banks::{rows_visible_room, visible_lock_cap, VISIBLE_KEPT};
+        let row = WIDTH as u64 * 4;
+        let cap = visible_lock_cap(Some(22 << 30), 2 << 30);
+        assert_eq!(rows_visible_room(cap), VISIBLE_KEPT);
+        let rows = layer_prefill_rows_lockable(98_304, rows_visible_room(cap));
+        assert_eq!(rows, 49_152);
+        assert!(rows as u64 * row <= VISIBLE_KEPT);
+        assert_eq!(rows_visible_room(visible_lock_cap(None, 2 << 30)), u64::MAX);
+        assert_eq!(layer_prefill_rows_lockable(98_304, rows_visible_room(u64::MAX)), 98_304);
+    }
+
     /// Decides: a pass of more rows takes a long prompt in fewer passes, each still stopping at a checkpoint: 249,925 tokens in 16 at 16,384,
     /// 4 at 65,536 and 1 at 262,144; a checkpoint inside a pass splits it there; the short last segment is left to the ordinary path the same.
     #[test]
@@ -7391,3 +7667,31 @@ mod layer_prefill_diagnostics;
 
 #[path = "model_pipeline.rs"]
 mod pipeline;
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::InterleaveChoice;
+
+    /// Decides: the rows are interleaved where the CPU's experts outlast the GPU's work with the rows split, and not where the GPU is the
+    /// longer side; a machine where the first guess of the split's cost was wrong turns it off after one request and does not turn it on
+    /// again on the same times (ms a token, as measured).
+    #[test]
+    fn the_cpu_s_longer_side_turns_it_on_and_a_wrong_guess_is_paid_once() {
+        // one RTX 5070 Ti at 5.5 GiB without its assist: CPU 17.9, layer work 4.6, experts 1.2 -> on, and on it stays (CPU 18.0, split 7.9 + 1.5)
+        let mut pc = InterleaveChoice::default();
+        assert!(pc.observe(17.9, 4.6, 1.2));
+        assert!(pc.observe(18.0, 7.9, 1.5));
+        // one R9700 at 5.5 GiB with its in-place assist: CPU 15.5, layer work 6.2, experts 12.4 -> off
+        assert!(!InterleaveChoice::default().observe(15.5, 6.2, 12.4));
+        // one RTX 5070 Ti at 9 GiB: CPU 14.3, layer work 4.4, experts 1.5 -> on
+        assert!(InterleaveChoice::default().observe(14.3, 4.4, 1.5));
+        // one R9700 at --vram 9 with the assist off (01:08 today, where it lost): CPU 12.5, layer 5.2, experts 1.7 stays off
+        assert!(!InterleaveChoice::default().observe(12.5, 5.2, 1.7));
+        // a wrong guess all the same (CPU 14.0): on, split 13.9 + 4.5 against CPU 11.0 -> off, and the same times then stay off
+        let mut wrong = InterleaveChoice::default();
+        assert!(wrong.observe(14.0, 5.2, 1.7));
+        assert!(!wrong.observe(11.0, 13.9, 4.5));
+        assert!(!wrong.observe(14.0, 5.2, 1.7));
+        assert!(!wrong.observe(13.2, 5.7, 1.8));
+    }
+}

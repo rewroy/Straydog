@@ -82,6 +82,16 @@ pub fn memory_diagnostic(ordinal: usize, ready: bool) -> Result<()> {
     check(unsafe { ffi::sd_device_memory_diagnostic(ordinal, c_int::from(ready)) }).map(drop)
 }
 
+/// The GPU's system memory group as Windows gives it to this process (DXGI NON_LOCAL), where page-locked host memory is charged 1 to 1:
+/// (the bytes this process holds there, the budget, what may be reserved). None where there is no such figure.
+pub fn host_visible(ordinal: usize) -> Result<Option<(u64, u64, u64)>> {
+    let ordinal = c_int::try_from(ordinal).map_err(|_| Error(format!("invalid GPU ordinal {ordinal}")))?;
+    let (mut usage, mut budget, mut reservable) = (0u64, 0u64, 0u64);
+    // SAFETY: the ordinal fits the native argument and the three output pointers are valid.
+    let reported = check(unsafe { ffi::sd_host_visible(ordinal, &mut usage, &mut budget, &mut reservable) })?;
+    Ok((reported != 0).then_some((usage, budget, reservable)))
+}
+
 /// Whether this CUDA GPU advertises support for registering host memory as read-only.
 #[cfg(feature = "cuda")]
 pub fn host_register_read_only_supported(ordinal: usize) -> Result<bool> {

@@ -327,7 +327,8 @@ struct ExpertSlots {
     std::vector<std::pair<ResidentMoe*,int32_t>> owner;
     std::vector<size_t> pending;   // decode swaps still loading on the copy stream
     // Opt-in cache allocations are independent; base then owns only the fixed stage.
-    bool retained_requested=[]() { const char* v=std::getenv("STRAYDOG_KV_CACHE_RETAIN"); return v && std::strcmp(v,"1")==0; }();
+    // (gpu.rs's kv_cache_retention_requested: unless STRAYDOG_KV_CACHE_RETAIN=0)
+    bool retained_requested=[]() { const char* v=std::getenv("STRAYDOG_KV_CACHE_RETAIN"); return !(v && std::strcmp(v,"0")==0); }();
     bool segmented=false, retained_disabled=false, retained_oom=false;
     bool restore_cap_live=false;
     size_t restore_cap=0;
@@ -661,6 +662,7 @@ struct Device {
     // Partially resident decode launches each layer's graph before the previous layer's
     // CPU result exists; the graph waits for it on the GPU (hybrid_await).
     bool hybrid_prelaunch = false;
+    bool hybrid_interleave = false;   // sd_hybrid_interleave: a verification's rows as two interleaved groups (STRAYDOG_INTERLEAVE overrides)
     // Kernels have a run-time limit (Windows display GPUs, 2 s): awaits give up after
     // ~1 s and only follow layers whose CPU experts read page-locked banks. Otherwise
     // an await may wait 10 s for a host stalled on storage.

@@ -23,6 +23,9 @@ int sd_device_info(int ordinal, char* name, size_t capacity, uint64_t* free_byte
 int sd_device_memory_diagnostic(int ordinal, int ready);
 /* Signed bytes until the process's memory budget; process_budget is 1 for DXGI, 0 for reported free. */
 int sd_device_headroom(int ordinal, int64_t* bytes, int* process_budget);
+/* Windows (CUDA): the GPU's system memory group (DXGI NON_LOCAL) as this process has it: the page-locked bytes it holds, the budget and what
+   may be reserved; 1 when Windows reports them, 0 where there is no such figure, negative on failure. */
+int sd_host_visible(int ordinal, uint64_t* usage, uint64_t* budget, uint64_t* reservable);
 /* CUDA: 1 if cudaHostRegisterReadOnly is supported on this device, 0 if not; negative on query failure. */
 int sd_host_register_read_only_supported(int ordinal);
 /* Where the device sits on the PCI bus: domain, bus and device numbers (function 0). */
@@ -715,6 +718,9 @@ uint32_t sd_hybrid_assist_cap(void);
 /* The assist level alone, once sd_hybrid_assist has mapped the banks; a level past the cap is refused. A change drops the layers'
    captured graphs, which carry the level, and the next pass captures them again. */
 int sd_hybrid_assist_level(void* handle, uint32_t assist);
+/* Whether this device's verifications through partially resident layers run their rows as two interleaved groups (on: 1), one group's
+   GPU work beside the other's CPU experts. STRAYDOG_INTERLEAVE=1 or 0 holds it whatever this says. */
+int sd_hybrid_interleave(void* handle, int on);
 /* The GPU stops reading the page-locked banks of the layer whose gate bank is at `gate` in place (the plan has its banks as it had them
    before sd_hybrid_assist mapped them): copies of its experts that were in flight, and the layers' graphs that hold the view, are waited
    for, and the graphs dropped. `found` is 1 where this device holds the plan. The caller unregisters the banks after (sd_host_unregister). */

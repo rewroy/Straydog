@@ -84,9 +84,29 @@ fn top_pairs(row: &[f32], top: usize) -> Vec<(f32, u32)> {
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// The development-only retained expert-cache allocator is selected before placement.
+/// Whether the expert slots keep what they hold across a growth of the K/V (the pool in chunks, gpu/core.hpp's `retained_requested` reads the
+/// same), selected before placement: unless STRAYDOG_KV_CACHE_RETAIN=0. Two RTX 3090 (IQ3_S,
+/// context 262144, served) grew the K/V for a 95,204-token prompt in 1.60 s with it where they took 3.36 s without, the 19 scenarios of the
+/// fixed benchmark as fast (98.9 and 98.7 s) with no error; one RTX 5070 Ti had grown it in 0.12-0.27 s where it took 1.04-1.55 s, and one
+/// R9700 in 0.11 s where it took 1.5-1.8 s, its GPU tests passing with it (kv_cache_retain_gpu, kv_growth_vram_gpu, behind_gpu, giveback_gpu).
 pub fn kv_cache_retention_requested() -> bool {
-    std::env::var("STRAYDOG_KV_CACHE_RETAIN").is_ok_and(|value| value == "1")
+    kv_cache_retention_named(std::env::var("STRAYDOG_KV_CACHE_RETAIN").ok().as_deref())
+}
+
+fn kv_cache_retention_named(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+#[cfg(test)]
+mod kv_cache_retention_tests {
+    /// Decides: the K/V growth keeps the expert slots by default, and the switch's 0 turns it off, as the native side reads it (gpu/core.hpp).
+    #[test]
+    fn retention_is_on_unless_named_off() {
+        assert!(super::kv_cache_retention_named(None));
+        assert!(super::kv_cache_retention_named(Some("1")));
+        assert!(super::kv_cache_retention_named(Some("2")));
+        assert!(!super::kv_cache_retention_named(Some("0")));
+    }
 }
 
 /// Cumulative native retained-growth counters, in the order of `sd_expert_slots_retain_stats`.
@@ -3424,6 +3444,13 @@ impl Backend {
         check(unsafe { ffi::sd_hybrid_assist_level(self.handle, level) }).map(drop)
     }
 
+    /// Whether this device's verifications through partially resident layers run their rows as two interleaved groups
+    /// (STRAYDOG_INTERLEAVE=1 or 0 holds it whatever this says).
+    pub fn set_interleave(&mut self, on: bool) -> Result<()> {
+        // SAFETY: a live handle and a plain value.
+        check(unsafe { ffi::sd_hybrid_interleave(self.handle, i32::from(on)) }).map(drop)
+    }
+
     /// Take the page lock of a mapped range, made by [`lock_host_range`] (on any thread), as this device's: it is released when this drops,
     /// before the range is unmapped.
     pub fn adopt_host(&mut self, range: &[u8]) {
@@ -3504,6 +3531,20 @@ impl Backend {
 pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
     // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
     check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
+}
+
+/// The GPU `ordinal`'s system memory group as Windows gives it to this process (DXGI NON_LOCAL): the page-locked bytes the process holds of
+/// it, its budget and what may be reserved ([`crate::banks::visible_lock_cap`]). None where there is no such figure (another system, HIP).
+pub fn host_visible(ordinal: usize) -> Option<(u64, u64, u64)> {
+    #[cfg(feature = "cuda")]
+    {
+        straydog_gpu::host_visible(ordinal).ok().flatten()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinal;
+        None
+    }
 }
 
 /// Whether the GPU `ordinal` registers host memory read-only, as the model's file mapping must be to page-lock it in place: None where the runtime cannot

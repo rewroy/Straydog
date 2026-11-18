@@ -34,7 +34,7 @@ use crate::storage::{self, Buffer, ALIGN};
 
 /// The default cache budget across a model's row tables.
 pub const DEFAULT_CACHE_BYTES: u64 = 256 << 20;
-/// A row read the working-set quota refused (`ERROR_WORKING_SET_QUOTA`, 1453).
+/// A row read Windows refused for its pages ([`crate::storage::refused_for_pages`]: 1453 or 1117).
 /// Not [`crate::gpu::HOST_NO_MEMORY`]: that suffix gives locked layers back for a conversation copy.
 pub const ROW_READ_REFUSED: &str = "a row read was refused";
 /// The cache budget that holds every row of a table of `rows` rows of `width` bytes.
@@ -219,7 +219,7 @@ impl Table {
         }
         let length = (end.min(self.size) - start) as usize;
         self.fill(start, buffer, length).map_err(|exc| {
-            if storage::working_set_quota(&exc) { format!("{exc}; {ROW_READ_REFUSED}") } else { exc.to_string() }
+            if storage::refused_for_pages(&exc) { format!("{exc}; {ROW_READ_REFUSED}") } else { exc.to_string() }
         })?;
         if let Some(verify) = &self.verifier {
             // The last block past the file's end is zero, as its tree hashed it.
@@ -231,17 +231,17 @@ impl Table {
     }
 
     /// The whole span, then the same bytes in smaller direct reads, then once through the page
-    /// cache. A working-set refusal (1453) is the only reason to try the next way. The caller
+    /// cache. A refusal for the pages (1453 or 1117) is the only reason to try the next way. The caller
     /// still verifies the span.
     fn fill(&self, start: u64, buffer: &mut Buffer, length: usize) -> std::io::Result<()> {
         match self.read_span(start, buffer, 0, length) {
             Ok(()) => return Ok(()),
-            Err(exc) if storage::working_set_quota(&exc) => {}
+            Err(exc) if storage::refused_for_pages(&exc) => {}
             Err(exc) => return Err(exc),
         }
         match self.read_smaller(start, buffer, length) {
             Ok(()) => return Ok(()),
-            Err(exc) if storage::working_set_quota(&exc) => {}
+            Err(exc) if storage::refused_for_pages(&exc) => {}
             Err(exc) => return Err(exc),
         }
         storage::read_into(&self.file, start, buffer, 0, length, false)

@@ -174,12 +174,12 @@ const REFUSED_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
 
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
     crate::layer_trace::proof_read(buffer.len() as u64);
-    read_exact_with(buffer, offset, crate::storage::working_set_quota, &mut |piece, at| crate::storage::read_partial(file, piece, at))
+    read_exact_with(buffer, offset, crate::storage::refused_for_pages, &mut |piece, at| crate::storage::read_partial(file, piece, at))
 }
 
 /// Fill `buffer` from `offset` with `read` (which reads into the start of the piece it is given, at the offset it is given, and returns the bytes it got, 0 at the
 /// end of the file). A process whose working set has a hard maximum (Windows, [`crate::host::keep_resident`]) can have a read refused (`refused`: the quota's
-/// error, 1453), the tree's among them, which a check that must pass would take for a failure of the file: after a refusal what is left is read a block at a time,
+/// error, 1453, or 1117 under the same limit), the tree's among them, which a check that must pass would take for a failure of the file: after a refusal what is left is read a block at a time,
 /// and a read refused again is tried again after a short pause, [`REFUSED_TRIES`] refusals in a row being put up with and the next one's error returned.
 fn read_exact_with(buffer: &mut [u8], offset: u64, refused: fn(&std::io::Error) -> bool,
                    read: &mut dyn FnMut(&mut [u8], u64) -> std::io::Result<usize>) -> std::io::Result<()> {
