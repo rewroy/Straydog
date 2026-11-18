@@ -3526,6 +3526,20 @@ pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
     check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
 }
 
+/// The GPU `ordinal`'s system memory group as Windows gives it to this process (DXGI NON_LOCAL): the page-locked bytes the process holds of
+/// it, its budget and what may be reserved ([`crate::banks::visible_lock_cap`]). None where there is no such figure (another system, HIP).
+pub fn host_visible(ordinal: usize) -> Option<(u64, u64, u64)> {
+    #[cfg(feature = "cuda")]
+    {
+        straydog_gpu::host_visible(ordinal).ok().flatten()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinal;
+        None
+    }
+}
+
 /// Whether the GPU `ordinal` registers host memory read-only, as the model's file mapping must be to page-lock it in place: None where the runtime cannot
 /// say (HIP has no such attribute, and a query that failed), which is taken as it being able to.
 pub fn host_registers_read_only(ordinal: usize) -> Option<bool> {
