@@ -89,11 +89,17 @@ impl Sampling {
 
     /// The raw top logits a target head may read instead of its whole row. With a presence
     /// penalty, read a full scan's worth and prove that its penalized top_k excludes every
-    /// unread token before drawing ([`try_accept_top`]). This does not change the drafter's
-    /// policy ([`Sampling::top_candidates`]).
+    /// unread token before drawing ([`try_accept_top`]); at temperature 0, that its penalized
+    /// greatest is the row's ([`proven_greedy`]: greedy needs no logits without a penalty, the
+    /// GPU's argmax decides). This does not change the drafter's policy ([`Sampling::top_candidates`]).
     pub fn target_read_top(&self) -> Option<usize> {
-        (self.check().is_ok() && self.temperature > 0.0 && (1..=SCANNED_TOP_K).contains(&self.top_k))
-            .then_some(if self.presence_penalty == 0.0 { self.top_k } else { SCANNED_TOP_K })
+        if self.check().is_err() {
+            return None;
+        }
+        if self.temperature == 0.0 {
+            return (self.presence_penalty != 0.0).then_some(SCANNED_TOP_K);
+        }
+        (1..=SCANNED_TOP_K).contains(&self.top_k).then_some(if self.presence_penalty == 0.0 { self.top_k } else { SCANNED_TOP_K })
     }
 
     /// Whether a draw is from the whole softmax of the logits at the temperature: above 0, with no
@@ -1008,11 +1014,65 @@ fn proven_top(drafts: &[u32], top: &[Vec<(f32, u32)>], vocabulary: usize, sampli
     Some(distributions)
 }
 
+/// At temperature 0 with a penalty, each row's token as [`choose`] scans it from the whole row (the penalty with the drafts before the row
+/// taken as accepted): the greatest penalized candidate of the row's raw greatest, the lowest token among equals as the scan keeps the first,
+/// proven greater than any unread token (no greater than the last raw candidate, a negative penalty raising it by its size; equality
+/// refused, an unread lower token could win it). None when a row is not proven or not a correct raw top row.
+fn proven_greedy(drafts: &[u32], top: &[Vec<(f32, u32)>], vocabulary: usize, sampling: &Sampling, generated: &Generated) -> Option<Vec<u32>> {
+    let read = sampling.target_read_top()?.min(vocabulary);
+    if read == 0 || sampling.temperature != 0.0 || top.len() != drafts.len().checked_add(1)? {
+        return None;
+    }
+    let mut prefix = generated.clone();
+    let mut tokens = Vec::with_capacity(top.len());
+    for (index, row) in top.iter().enumerate() {
+        if row.len() != read || row.iter().enumerate().any(|(at, &(logit, token))| {
+            !logit.is_finite() || token as usize >= vocabulary || row[..at].iter().any(|&(_, other)| token == other)
+        }) || row.windows(2).any(|pair| {
+            pair[0].0 < pair[1].0 || (pair[0].0 == pair[1].0 && pair[0].1 > pair[1].1)
+        }) {
+            return None;
+        }
+        let mut best: Option<(f64, u32)> = None;
+        for &(logit, token) in row {
+            let value = penalized_logit(logit, token, sampling, &prefix);
+            if best.is_none_or(|(greatest, chosen)| value > greatest || (value == greatest && token < chosen)) {
+                best = Some((value, token));
+            }
+        }
+        let (value, token) = best?;
+        if read < vocabulary && !(value > f64::from(row[read - 1].0) + (-sampling.presence_penalty).max(0.0)) {
+            return None;
+        }
+        tokens.push(token);
+        if let Some(&draft) = drafts.get(index) {
+            prefix.insert(draft);
+        }
+    }
+    Some(tokens)
+}
+
+/// Point drafts against proven greedy rows ([`proven_greedy`]), as [`accept`] keeps them at temperature 0: a draft is kept iff it is its
+/// row's token.
+fn accept_greedy(drafts: &[u32], tokens: &[u32], generated: &mut Generated) -> (usize, u32) {
+    for (index, draft) in drafts.iter().enumerate() {
+        if *draft != tokens[index] {
+            return (index, tokens[index]);
+        }
+        generated.insert(*draft);
+    }
+    (drafts.len(), tokens[drafts.len()])
+}
+
 /// [`accept_top`] after applying the presence penalty and proving that the candidates contain
-/// the full row's penalized top_k. None requests whole logits, with `generated` and `rng`
+/// the full row's penalized top_k (at temperature 0, its penalized greatest: [`proven_greedy`]). None requests whole logits, with `generated` and `rng`
 /// unchanged, including when only a later row fails the proof. The drafts remain point proposals.
 pub fn try_accept_top(drafts: &[u32], top: &[Vec<(f32, u32)>], vocabulary: usize, sampling: &Sampling,
                       generated: &mut Generated, rng: &mut Rng) -> Option<(usize, u32)> {
+    if sampling.temperature == 0.0 {
+        let tokens = proven_greedy(drafts, top, vocabulary, sampling, generated)?;
+        return Some(accept_greedy(drafts, &tokens, generated));
+    }
     let mut distributions = proven_top(drafts, top, vocabulary, sampling, generated)?;
     let bonus = distributions.pop()?;
     for (index, (draft, target)) in drafts.iter().zip(distributions).enumerate() {
@@ -1028,6 +1088,10 @@ pub fn try_accept_top(drafts: &[u32], top: &[Vec<(f32, u32)>], vocabulary: usize
 /// `key`, so falling back to full logits preserves every position's random stream.
 pub fn try_accept_top_keyed(drafts: &[u32], top: &[Vec<(f32, u32)>], vocabulary: usize, sampling: &Sampling,
                             generated: &mut Generated, key: &dyn Fn(usize) -> Rng) -> Option<(usize, u32)> {
+    if sampling.temperature == 0.0 {
+        let tokens = proven_greedy(drafts, top, vocabulary, sampling, generated)?;
+        return Some(accept_greedy(drafts, &tokens, generated));
+    }
     let mut distributions = proven_top(drafts, top, vocabulary, sampling, generated)?;
     let bonus = distributions.pop()?;
     for (index, (draft, target)) in drafts.iter().zip(distributions).enumerate() {
@@ -1309,6 +1373,13 @@ mod tests {
         for temperature in [0.0, -0.0, -1.0, f64::INFINITY, f64::NAN] {
             assert_eq!(Sampling { temperature, top_k: 20, ..Sampling::GREEDY }.target_read_top(), None);
         }
+        // (greedy reads them only with a penalty: without one the GPU's argmax decides)
+        for temperature in [0.0, -0.0] {
+            for top_k in [0, 20, 65] {
+                assert_eq!(Sampling { temperature, top_k, presence_penalty: 1.5, ..Sampling::GREEDY }.target_read_top(), Some(64));
+            }
+        }
+        assert_eq!(Sampling { temperature: -1.0, presence_penalty: 1.5, ..Sampling::GREEDY }.target_read_top(), None);
         for temperature in [f64::from_bits(1), f64::MAX] {
             assert_eq!(Sampling { temperature, top_k: 20, ..Sampling::GREEDY }.target_read_top(), Some(20));
         }
@@ -1392,6 +1463,81 @@ mod tests {
             }
         }
         assert!(proved > 0 && fallback > 0 && all_accepted > 0 && rejected > 0);
+    }
+
+    /// At temperature 0 with a penalty, the proven greedy rows decide what the whole rows decide: the same accepted drafts, the same next token,
+    /// the same generated tokens after, keyed or not, on random rows, clustered rows, ties, a small vocabulary and signed zeros; rows it cannot
+    /// prove fall back to the whole rows, and both happen.
+    #[test]
+    fn proven_greedy_rows_match_the_whole_rows() {
+        let mut made = Rng::new(907);
+        let random: Vec<Vec<f32>> = (0..4).map(|_| (0..257).map(|_| (made.random() * 64.0 - 32.0) as f32).collect()).collect();
+        let clustered: Vec<Vec<f32>> = (0..4).map(|row| (0..257).map(|token| {
+            4.0 - ((token * 37 + row * 11) % 257) as f32 / 4096.0
+        }).collect()).collect();
+        let ties: Vec<Vec<f32>> = (0..4).map(|row| (0..129).map(|token| ((token + row) % 3) as f32).collect()).collect();
+        let small: Vec<Vec<f32>> = (0..4).map(|row| (0..7).map(|token| ((token * 5 + row) % 7) as f32 / 2.0).collect()).collect();
+        let zeros: Vec<Vec<f32>> = (0..4).map(|_| (0..129).map(|token| if token % 2 == 0 { -0.0 } else { 0.0 }).collect()).collect();
+        // (a penalized leader: the raw greatest is penalized below the next one, which is read)
+        let leader: Vec<Vec<f32>> = (0..4).map(|row| (0..257).map(|token| match token {
+            3 => 10.0, 5 => 9.0, _ => -((token + row) as f32) / 64.0,
+        }).collect()).collect();
+        let (mut proved, mut fallback, mut all_accepted, mut rejected) = (0, 0, 0, 0);
+        for rows in [random, clustered, ties, small, zeros, leader] {
+            let vocabulary = rows[0].len();
+            let logits: Vec<f32> = rows.iter().flatten().copied().collect();
+            let mut seen = Generated::new(vocabulary);
+            for token in (0..vocabulary).step_by(3) {
+                seen.insert(token as u32);
+            }
+            for penalty in [1.5, -1.5, 0.25] {
+                for temperature in [0.0, -0.0] {
+                    let sampling = Sampling { temperature, top_k: 20, presence_penalty: penalty, ..Sampling::GREEDY };
+                    let top = raw_top_rows(&rows, &sampling);
+                    for pattern in 0..3 {
+                        let mut prefix = seen.clone();
+                        let drafts: Vec<u32> = rows[..3].iter().map(|row| {
+                            let draft = match pattern {
+                                0 => choose(row, &sampling, &prefix, &mut Rng::new(0)),
+                                1 => 3,
+                                _ => 0,
+                            };
+                            prefix.insert(draft);
+                            draft
+                        }).collect();
+                        match proven_greedy(&drafts, &top, vocabulary, &sampling, &seen) {
+                            Some(tokens) => {
+                                proved += 1;
+                                let mut prefix = seen.clone();
+                                for (index, token) in tokens.into_iter().enumerate() {
+                                    assert_eq!(token, choose(&rows[index], &sampling, &prefix, &mut Rng::new(0)),
+                                               "vocabulary {vocabulary}, penalty {penalty}, row {index}");
+                                    if let Some(&draft) = drafts.get(index) { prefix.insert(draft); }
+                                }
+                            }
+                            None => { fallback += 1; }
+                        }
+                        let (mut a, mut b) = (Rng::new(5), Rng::new(5));
+                        let (mut fast, mut full) = (seen.clone(), seen.clone());
+                        let expected = accept(&drafts, &logits, vocabulary, &sampling, &mut full, &mut b);
+                        let actual = try_accept_top(&drafts, &top, vocabulary, &sampling, &mut fast, &mut a)
+                            .unwrap_or_else(|| accept(&drafts, &logits, vocabulary, &sampling, &mut fast, &mut a));
+                        assert_eq!(actual, expected, "vocabulary {vocabulary}, penalty {penalty}, pattern {pattern}");
+                        assert_eq!(fast.0, full.0);
+                        all_accepted += usize::from(actual.0 == drafts.len());
+                        rejected += usize::from(actual.0 < drafts.len());
+                        let key = |index: usize| Rng::keyed(9, 100 + index as u64);
+                        let (mut fast, mut full) = (seen.clone(), seen.clone());
+                        let expected = accept_keyed(&drafts, &logits, vocabulary, &sampling, &mut full, &key);
+                        let actual = try_accept_top_keyed(&drafts, &top, vocabulary, &sampling, &mut fast, &key)
+                            .unwrap_or_else(|| accept_keyed(&drafts, &logits, vocabulary, &sampling, &mut fast, &key));
+                        assert_eq!(actual, expected, "keyed: vocabulary {vocabulary}, penalty {penalty}, pattern {pattern}");
+                        assert_eq!(fast.0, full.0);
+                    }
+                }
+            }
+        }
+        assert!(proved > 0 && fallback > 0 && all_accepted > 0 && rejected > 0, "{proved} {fallback} {all_accepted} {rejected}");
     }
 
     #[test]
