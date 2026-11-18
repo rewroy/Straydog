@@ -803,6 +803,10 @@ struct Device {
     // Page-locked host copies of recurrent sequence state (conversation checkpoints): pointer -> bytes.
     // Neither VRAM nor mapped state, so they take no budget and no K/V mirror rows.
     std::unordered_map<void*, size_t> checkpoints;
+    // A checkpoint taken inside the next prompt batch (sd_capture_at): after the batch's row `row`, each recurrent state the checkpoint
+    // holds is copied to its place in `buffer` (one of `checkpoints`, laid out as sd_checkpoint_copy lays it out) by the row loop that
+    // carries it, a loop that ends a piece at that row: the states are those of a batch that ended there. No buffer: none.
+    struct Capture { size_t row = 0; uint8_t* buffer = nullptr; std::unordered_map<const void*, size_t> offsets; size_t done = 0; } capture;
     // VRAM rows that multi-token prefill uses for host-resident K/V (sd_kv_stage): the copy holds
     // rows [0, kv_stage_valid) of kv_stage_owner's K/V in a kv_stage_rows-row layout.
     float* kv_stage = nullptr;

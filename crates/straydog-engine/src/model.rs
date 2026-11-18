@@ -152,6 +152,23 @@ const PARK_SLOTS: [usize; 2] = [CHECKPOINTS.len(), CHECKPOINTS.len() + 1];
 const PARK_MINIMUM: usize = 1024;
 /// Only a system prompt this long is worth a copy.
 const ROOT_MINIMUM: usize = 2048;
+
+/// The most rows a prompt batch reads past a checkpoint it takes inside itself ([`Model::prefill_batches`]): the MTP layer's indexer keeps
+/// its inputs of the last 16 positions (a ring), its pairs write up to the batch's end less two, and a resume at the checkpoint reads the
+/// three before its first pair there, which a batch of at most 13 rows past it leaves in place. A turn's checkpoint stands before the
+/// generation prompt, 7 tokens with thinking off, and up to 3 more to its multiple of four.
+const CAPTURE_TAIL: usize = 12;
+
+/// Where a checkpoint's recurrent states come from ([`Model::save_checkpoint_from`]).
+#[derive(Clone, Copy)]
+enum Saved {
+    /// The devices' states now: the sequence ends at the checkpoint.
+    Device,
+    /// The capture a prompt batch took at the checkpoint, inside itself.
+    Capture,
+    /// The checkpoint slot another kind took at the same place.
+    Slot(usize),
+}
 const VOCABULARY: usize = 248320;
 
 /// Host bytes of one sequence's state before the GPU takes its attention and recurrence: each
@@ -1394,6 +1411,12 @@ pub struct Model {
     pub placement_note: Option<String>,
     pub history: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
+    /// Inside a prompt batch that takes a checkpoint (Model::prefill_batches): its rows after the checkpoint (0: none), and its row before
+    /// the checkpoint once the batch has run ([`Model::forward`]).
+    capture_back: usize,
+    captured_hidden: Option<Vec<f32>>,
+    /// Whether a prompt's last checkpoint may be taken inside a batch ([`Model::capture_possible`]; STRAYDOG_CAPTURE=0 says no).
+    capture: bool,
     checkpoints: IndexMap<&'static str, Checkpoint>,
     /// The length of the held sequence from which the reply being written is marked next ([`MARK_EVERY`]); `usize::MAX` for a reply that
     /// is not marked.
@@ -1697,6 +1720,9 @@ impl Model {
             placement_note,
             history: Vec::new(),
             final_hidden: None,
+            capture_back: 0,
+            captured_hidden: None,
+            capture: std::env::var("STRAYDOG_CAPTURE").map_or(true, |value| value.trim() != "0"),
             checkpoints: IndexMap::new(),
             mark_at: usize::MAX,
             reply_marks: true,
@@ -2868,9 +2894,21 @@ impl Model {
         self.warm_stop = stop;
     }
 
+    /// Whether a prompt's last checkpoint may be taken inside a batch (for tests: the two ways side by side in one process).
+    pub fn set_capture(&mut self, on: bool) {
+        self.capture = on;
+    }
+
     fn save_checkpoint(&mut self, kind: &'static str) -> Result<()> {
+        self.save_checkpoint_from(kind, self.history.len(), Saved::Device, None).map(|_| ())
+    }
+
+    /// [`Model::save_checkpoint`] of the sequence's first `length` tokens, its recurrent states from `saved` ([`Saved`]; `hidden`: a capture's
+    /// last row before `length`, the row a prompt resuming there pairs its first token with). The slot it took.
+    fn save_checkpoint_from(&mut self, kind: &'static str, length: usize, saved: Saved, hidden: Option<Vec<f32>>) -> Result<usize> {
+        let tokens = self.history[..length].to_vec();
         if kind == "root" {
-            if let Some(given_up) = keep_root_before(&mut self.checkpoints, |checkpoint| &checkpoint.tokens, &self.history) {
+            if let Some(given_up) = keep_root_before(&mut self.checkpoints, |checkpoint| &checkpoint.tokens, &tokens) {
                 self.release_checkpoint(given_up)?;
             }
         }
@@ -2886,7 +2924,7 @@ impl Model {
             // (the last mark becomes the one before it where the sequence still goes on from it; one the sequence has left is given up)
             if let Some(mark) = self.checkpoints.shift_remove("mark") {
                 let before = self.checkpoints.shift_remove(MARK_BEFORE);
-                let (kept, given_up) = if self.history.starts_with(&mark.tokens) { (Some(mark), before) } else { (before, Some(mark)) };
+                let (kept, given_up) = if tokens.starts_with(&mark.tokens) { (Some(mark), before) } else { (before, Some(mark)) };
                 if let Some(given_up) = given_up {
                     self.release_checkpoint(given_up)?;
                 }
@@ -2898,19 +2936,32 @@ impl Model {
         let used: Vec<usize> =
             self.checkpoints.iter().filter(|(name, _)| **name != kind).map(|(_, checkpoint)| checkpoint.slot).collect();
         let slot = (0..CHECKPOINTS.len()).find(|slot| !used.contains(slot)).unwrap();
-        self.group.checkpoint(slot, true)?;
-        // (inside a pipelined prompt, the row its last batch kept: a prompt resuming here pairs
-        // its first token with it)
-        let final_hidden = match self.final_hidden.clone() {
-            None => self.kept_hidden()?,
-            hidden => hidden,
+        let final_hidden = match saved {
+            Saved::Device => {
+                self.group.checkpoint(slot, true)?;
+                // (inside a pipelined prompt, the row its last batch kept: a prompt resuming here pairs
+                // its first token with it)
+                match self.final_hidden.clone() {
+                    None => self.kept_hidden()?,
+                    hidden => hidden,
+                }
+            }
+            Saved::Capture => {
+                self.group.adopt_capture(slot)?;
+                hidden
+            }
+            Saved::Slot(from) => {
+                self.group.clone_checkpoint(from, slot)?;
+                hidden
+            }
         };
-        // (the MTP layer's alone: the target's layers resume at a block boundary and read none)
-        let history = if self.speculative > 0 { Some(self.group.save_history(self.history.len() as u64, Some("blk.48."))?) } else { None };
-        if let Some(replaced) = self.checkpoints.insert(kind, Checkpoint { slot, tokens: self.history.clone(), final_hidden, history }) {
+        // (the MTP layer's alone: the target's layers resume at a block boundary and read none; after a capture its ring still holds the
+        // inputs a resume at `length` reads, CAPTURE_TAIL)
+        let history = if self.speculative > 0 { Some(self.group.save_history(length as u64, Some("blk.48."))?) } else { None };
+        if let Some(replaced) = self.checkpoints.insert(kind, Checkpoint { slot, tokens, final_hidden, history }) {
             self.release_checkpoint(replaced)?;
         }
-        Ok(())
+        Ok(slot)
     }
 
     /// Between two passes of a reply: a mark of the sequence where it has grown [`MARK_EVERY`] tokens past the last (or past the prompt),
@@ -3745,6 +3796,11 @@ impl Model {
         self.history.extend_from_slice(tokens);
         self.draft_note(tokens);
         self.final_hidden = (!hidden.is_empty()).then(|| last_row(&hidden).to_vec());
+        if self.capture_back > 0 {
+            // (the row before a checkpoint this batch took inside itself, capture_back rows before its last)
+            let rows = row_count(&hidden);
+            self.captured_hidden = (rows > self.capture_back).then(|| hidden[(rows - 1 - self.capture_back) * WIDTH..(rows - self.capture_back) * WIDTH].to_vec());
+        }
         if !logits {
             return Ok((None, assist_layers));
         }
@@ -3839,7 +3895,8 @@ impl Model {
     }
 
     /// The state a checkpoint of the held sequence is, as bytes: [`export_prefix`](Self::export_prefix)'s, of the checkpoint `kind`.
-    fn export_checkpoint(&mut self, kind: &str) -> Result<Option<Prefix>> {
+    /// The state of checkpoint `kind` ([`Model::export_conversation`]'s form), where the held sequence still begins with its tokens.
+    pub fn export_checkpoint(&mut self, kind: &str) -> Result<Option<Prefix>> {
         let Some(root) = self.checkpoints.get(kind) else { return Ok(None) };
         let tokens = root.tokens.len();
         if tokens == 0 || tokens % 4 != 0 || shared(&self.history, &root.tokens) < tokens || (self.speculative > 0) != root.history.is_some() {
@@ -4031,7 +4088,8 @@ impl Model {
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
             let rows = match last {
                 48 if !keep_rows => 0,
-                48 => if self.speculative > 0 && !stash && !self.deferred && !self.group.mtp_parts() { steps } else { 1 },
+                // (a batch that takes a checkpoint inside itself also keeps its row before the checkpoint: the last capture_back + 1)
+                48 => if self.speculative > 0 && !stash && !self.deferred && !self.group.mtp_parts() { steps } else { (self.capture_back as u64 + 1).min(steps) },
                 _ => 0,
             };
             let output = self.group.prefill_layers(first, last, None, position, steps, rows)?;
@@ -5079,7 +5137,12 @@ impl Model {
             let (slots, held) = self.group.slots()?;
             slots > 0 && held < slots && (held == 0 || empty_before_prepare)
         } else { false };
-        let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
+        // The plan's last checkpoint, where it stands a few rows before the end (a turn's, before the generation prompt), is taken inside the
+        // batch that reaches it, not by ending a batch there: a second batch of those rows streamed their experts again (a partially resident
+        // model, read serially; CAPTURE_TAIL).
+        let capture = plan.last().filter(|(at, _)| self.capture_possible(*at, position, tokens.len())).map(|(at, kinds)| (*at, kinds.clone()));
+        let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).filter(|at| capture.as_ref().is_none_or(|(taken, _)| taken != at))
+            .chain([tokens.len()]).collect();
         for stop in stops {
             // (Both devices at once where the segment has batches to overlap: the checkpoints between segments, and the end of the read, drain it. A read
             // that fills empty slots takes its first batch alone and fills them (below), and the batches after it overlap: the cold first request of a
@@ -5117,8 +5180,39 @@ impl Model {
                 // The next batch's PLE rows arrive while this one runs.
                 let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
-                output = self.forward(&tokens[position..end], end == tokens.len())?.0;
+                let inside = capture.as_ref().map(|(at, _)| *at).filter(|at| *at > position && *at < end);
+                if let Some(at) = inside {
+                    self.group.capture_at((at - position) as u64)?;
+                    self.capture_back = end - at;
+                    self.captured_hidden = None;
+                }
+                let forwarded = self.forward(&tokens[position..end], end == tokens.len());
+                let complete = inside.is_some() && self.group.capture_complete();
+                if inside.is_some() {
+                    self.capture_back = 0;
+                    self.group.capture_at(0)?;
+                }
+                output = forwarded?.0;
                 self.metric_count("prefill_batches", 1);
+                if inside.is_some() && !complete {
+                    // (a batch read another way, as passes, took no capture: the checkpoint is not taken, and the next request that would
+                    // have resumed there reads from an earlier one)
+                    self.metric_count("prefill_capture_missed", 1);
+                } else if let (Some(at), Some((_, kinds))) = (inside, capture.as_ref()) {
+                    let hidden = self.captured_hidden.take();
+                    let mut first = None;
+                    for kind in kinds.clone() {
+                        let saved = first.map_or(Saved::Capture, Saved::Slot);
+                        first = Some(self.save_checkpoint_from(kind, at, saved, hidden.clone())?);
+                    }
+                    self.metric_count("prefill_captured_checkpoints", 1);
+                } else if let Some((at, kinds)) = capture.as_ref().filter(|(at, _)| *at == end) {
+                    // (a batch that happened to end there: the checkpoint as before)
+                    let _ = at;
+                    for kind in kinds.clone() {
+                        self.save_checkpoint(kind)?;
+                    }
+                }
                 if cancelled() {
                     return Ok(None);
                 }
@@ -5142,6 +5236,14 @@ impl Model {
             }
         }
         Ok(Some(output))
+    }
+
+    /// Whether a read from `position` to `end` takes its checkpoint at `at` inside a batch ([`Model::prefill_batches`]): a partially resident
+    /// text prompt read serially, the checkpoint at most [`CAPTURE_TAIL`] rows before the end and after where the read begins, and a spare
+    /// checkpoint buffer on every device. STRAYDOG_CAPTURE=0 (development) ends a batch there as before.
+    fn capture_possible(&self, at: usize, position: usize, end: usize) -> bool {
+        self.capture && self.partial && at > position && at < end && end - at <= CAPTURE_TAIL && self.images.is_empty() && !self.deferred
+            && !self.group.mtp_parts() && !self.overlap_possible() && self.warm_stop.is_none() && self.group.can_capture()
     }
 
     /// Whether a partially resident read may take both devices' layers at once (see [`Model::prefill_overlapped`]): two NVIDIA GPUs, a text prompt,

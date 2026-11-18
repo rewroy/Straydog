@@ -421,3 +421,78 @@ fn a_fresh_model_takes_the_conversation_with_the_mtp_layers_too() {
     let Some(drafter) = common::model_env("STRAYDOG_DRAFTER", "the MTP drafter's directory") else { return };
     kept_conversation(Some(&drafter), &root);
 }
+
+/// A turn's checkpoint taken inside the prompt's last batch (the place the reply begins, a few rows before the end: Model::prefill_batches), not by
+/// ending a batch there, holds nothing of the rows after it: two prompts that differ only after that place (the role the generation prompt names),
+/// read the same way, export the same checkpoint (its tokens, the row before it, every layer's recurrent states, the positions before it; with
+/// the MTP layer, its indexer's ring but for the positions past the place, which a resume writes before it reads them), and the next request
+/// from it has the same logits, tokens and drafts. (Against a read that ended a batch there it is not the same bits: the first attention layer's
+/// output for the rows before the place moves with the batch's length, 5.97e-2 in the next request's logits; the layers before it match to the
+/// bit, the capture's own rows. That difference is printed.)
+fn turn_captured(drafter: Option<&std::ffi::OsStr>, root_dir: &std::ffi::OsStr) {
+    let _gpu = GPUS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let chat = "<|im_start|>system\nYou answer questions about rules and sources, briefly.<|im_end|>\n\
+                <|im_start|>user\nWhat do the rules say about topic 3 when 5 facts are asked, citing source 7?<|im_end|>\n\
+                <|im_start|>assistant\nThe rules for topic 3 give 5 facts, from source 7.<|im_end|>\n\
+                <|im_start|>user\nWhat is the capital of France?<|im_end|>\n";
+    let read = |role: &str, capture: bool| {
+        let (mut model, text) = open(root_dir, drafter);
+        model.set_capture(capture);
+        let first = text.encode(&format!("{chat}<|im_start|>{role}\n")).unwrap();
+        let second = text.encode(&format!("{chat}<|im_start|>assistant\nParis.<|im_end|>\n<|im_start|>user\nAnd of Japan?<|im_end|>\n\
+                                           <|im_start|>assistant\n")).unwrap();
+        let place = reply_place(&first);
+        model.generate(&first, 8, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |_| {}).unwrap();
+        let captured = model.last_metrics.get("prefill_captured_checkpoints").and_then(|count| count.as_u64()).unwrap_or(0);
+        assert_eq!(model.last_metrics.get("prefill_capture_missed"), None, "a capture set was not taken");
+        let state = model.export_checkpoint("turn").unwrap().expect("the turn's checkpoint").bytes;
+        // The next request, from the place the reply began: its first token's logits, 24 tokens, and the drafts the MTP layer made for them.
+        model.logits_capture = Some(Vec::new());
+        let mut written = Vec::new();
+        model.generate(&second, 24, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| written.push(token)).unwrap();
+        let continued = model.logits_capture.take().unwrap().remove(0);
+        assert_eq!(model.last_metrics["cached_tokens"], place, "{:?}", model.last_metrics);
+        let drafts = (model.last_metrics.get("drafted_tokens").cloned(), model.last_metrics.get("accepted_tokens").cloned());
+        eprintln!("{role}, capture {capture}: {} tokens, {captured} checkpoints captured, the next request from {place}, drafts {drafts:?}", first.len());
+        (first.len(), place, captured, state, continued, written, drafts)
+    };
+    let (length, place, captured, state, continued, written, drafts) = read("assistant", true);
+    let (other_length, other_place, other_captured, other_state, other_continued, other_written, other_drafts) = read("user", true);
+    assert_eq!((other_length, other_place), (length, place), "the two prompts differ only after the place");
+    assert_eq!((captured, other_captured), (1, 1), "both took the place inside the batch");
+    let (a, b) = (prefix::parse(&state).unwrap(), prefix::parse(&other_state).unwrap());
+    assert_eq!(a.sections, b.sections);
+    let mut at = 0usize;
+    for (index, (tag, bytes)) in a.sections.iter().enumerate() {
+        let (x, y) = (&a.payload[at..at + *bytes as usize], &b.payload[at..at + *bytes as usize]);
+        at += *bytes as usize;
+        // (the MTP layer's indexer ring, 16 positions of 128 floats: the slots of the positions from the place on hold the rows read after it)
+        let ring = drafter.is_some() && *bytes == 16 * 128 * 4;
+        let differ: Vec<usize> = x.chunks(4).zip(y.chunks(4)).enumerate().filter(|(_, (p, q))| p != q).map(|(word, _)| word)
+            .filter(|word| !ring || !(place..length).any(|position| position % 16 == word / 128)).collect();
+        assert!(differ.is_empty(), "section {index} (tag {tag:x}, {bytes} bytes): {} words differ, the first at byte {}", differ.len(), differ[0] * 4);
+    }
+    let differ = continued.iter().zip(&other_continued).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    assert!(differ == 0, "{differ} logits of the next request differ, by {:.2e}", relative_difference(&continued, &other_continued));
+    // (the reply after that first token runs on slots that differ between the two models, which decoded other replies, and a route a slot
+    // does not hold is the CPU's in a decode pass: its tokens and drafts are printed, not compared)
+    eprintln!("the next request's tokens the same: {}, drafts {drafts:?} and {other_drafts:?}", written == other_written);
+    // For the record: against a read that ended a batch at the place.
+    let (_, _, none, _, ended, _, _) = read("assistant", false);
+    assert_eq!(none, 0);
+    eprintln!("against the read that ended a batch at the place: the next request's logits differ by {:.2e}", relative_difference(&continued, &ended));
+}
+
+#[test]
+fn a_turns_checkpoint_taken_inside_its_batch_holds_nothing_of_the_rows_after_it() {
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    turn_captured(None, &root);
+}
+
+
+#[test]
+fn a_turns_checkpoint_taken_inside_its_batch_holds_nothing_of_the_rows_after_it_with_the_mtp_layers_too() {
+    let Some(root) = common::model_env("STRAYDOG_MODEL", "the UD-IQ1_S model bundle directory") else { return };
+    let Some(drafter) = common::model_env("STRAYDOG_DRAFTER", "the MTP drafter's directory") else { return };
+    turn_captured(Some(&drafter), &root);
+}
