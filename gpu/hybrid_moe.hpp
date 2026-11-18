@@ -349,7 +349,10 @@ inline bool hybrid_staged(const Device& d, const ResidentMoe& plan) {
 #endif
 }
 constexpr size_t hybrid_plan_list = 40, hybrid_plan_count = 72, hybrid_plan_need = 73;
+// (an interleaved verification's second group of rows has a need of its own: its tick runs before the first group's next await reads that one)
+constexpr size_t hybrid_plan_group_need = 91;
 inline int32_t* hybrid_need(const Device& d) { return hybrid_plan_room(d) + hybrid_plan_need; }
+inline int32_t* hybrid_need(const Device& d, size_t group) { return hybrid_plan_room(d) + (group ? hybrid_plan_group_need : hybrid_plan_need); }
 // DS41_PROFILE=hc counts: the layer passes by how many distinct experts they miss (none ... five or more), the MTP layer's apart from the model's (the room's
 // ints 74 ... 79 and 84 ... 89; 80 is the count of staged bytes differing from the bank's).
 constexpr size_t hybrid_plan_histogram = 74, hybrid_plan_draft_histogram = 84, hybrid_plan_bad = 80, hybrid_plan_tick_bad = 81, hybrid_plan_overlap_bad = 82;
@@ -701,7 +704,8 @@ void hybrid_resident_experts(Device& d, ResidentMoe& plan, const float* input, f
 
 // The layer's export is complete: publish it, with the staging plan where the GPU takes the missed routes.
 // `activation` (CUDA: the router's input, rows of `activation_stride`; null: the export has it already) goes to the host here where the host has a route.
-void hybrid_publish(Device& d, ResidentMoe& plan, size_t rows, bool finish, size_t slot, const float* activation = nullptr, size_t activation_stride = 0) {
+void hybrid_publish(Device& d, ResidentMoe& plan, size_t rows, bool finish, size_t slot, const float* activation = nullptr, size_t activation_stride = 0,
+                    size_t group = 0) {
     auto* published = reinterpret_cast<uint32_t*>(d.exchange_device + hybrid_sequence_slot);
 #if !defined(__HIPCC__)
     if (hybrid_staged(d, plan)) {
@@ -710,15 +714,15 @@ void hybrid_publish(Device& d, ResidentMoe& plan, size_t rows, bool finish, size
         const uint32_t cap = uint32_t(std::min<size_t>(std::min<size_t>(hybrid_level(d, plan), d.slots.stage), 32));
         hybrid_tick_plan<<<1, 256, 0, d.stream>>>(d.flags + 1, published, hybrid_clock(d), finish, s.selected, static_cast<const MoeGroup*>(plan.table),
                                                 uint32_t(rows), cap, room, room + hybrid_plan_list, room + hybrid_plan_count, d.exchange_device + slot * hybrid_slot_floats,
-                                                hybrid_need(d), hybrid_histogram(d, plan), hybrid_check(), hybrid_plan_room(d) + hybrid_plan_tick_bad, activation, activation_stride);
+                                                hybrid_need(d, group), hybrid_histogram(d, plan), hybrid_check(), hybrid_plan_room(d) + hybrid_plan_tick_bad, activation, activation_stride);
         return;
     }
 #endif
 #if defined(__HIPCC__)
-    hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, published, hybrid_clock(d), finish, hybrid_need(d), hybrid_scratch(plan, rows).selected,
+    hybrid_tick<<<1, 1, 0, d.stream>>>(d.flags + 1, published, hybrid_clock(d), finish, hybrid_need(d, group), hybrid_scratch(plan, rows).selected,
                                        static_cast<const MoeGroup*>(plan.table), uint32_t(rows), hybrid_histogram(d, plan));
 #else
-    hybrid_tick<<<1, 256, 0, d.stream>>>(d.flags + 1, published, hybrid_clock(d), finish, hybrid_need(d), hybrid_scratch(plan, rows).selected,
+    hybrid_tick<<<1, 256, 0, d.stream>>>(d.flags + 1, published, hybrid_clock(d), finish, hybrid_need(d, group), hybrid_scratch(plan, rows).selected,
                                          static_cast<const MoeGroup*>(plan.table), uint32_t(rows), hybrid_histogram(d, plan), hybrid_check(),
                                          hybrid_plan_room(d) + hybrid_plan_tick_bad, d.exchange_device + slot * hybrid_slot_floats, activation, activation_stride);
 #endif

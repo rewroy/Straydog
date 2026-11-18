@@ -1213,6 +1213,11 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.set_assist_level(level))
     }
 
+    /// Run every device's verifications with their rows interleaved, or not (see [`Backend::set_interleave`]).
+    pub fn set_interleave(&mut self, on: bool) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.set_interleave(on))
+    }
+
     /// Page locks are process-wide; one backend holds them: the device whose context a thread that makes them uses ([`crate::gpu::lock_host_range`]).
     pub fn host_ordinal(&self) -> usize {
         self.backends[0].ordinal

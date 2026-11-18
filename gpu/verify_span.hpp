@@ -82,20 +82,32 @@ size_t window_variant(const Device& d) { return d.window << 24; }
 struct SpanAborted : std::runtime_error { SpanAborted() : std::runtime_error("Straydog span aborted") {} };
 
 // steps tokens of a DeltaNet layer; a replay reads the states from the snapshot.
-void gdn_verify(Device& d, const DecoderLayer& plan, size_t steps, bool replay, float* post) {
+// `first`: the verification's row the steps start at (an interleaved verification's second group). Only the rows from the first save the
+// state before them (plan.snapshot, what a replay starts from); a later group continues from the state the earlier rows left.
+void gdn_verify(Device& d, const DecoderLayer& plan, size_t steps, bool replay, float* post, size_t first = 0) {
     void* const* p = plan.pointers.data() + 4;
     auto* conv = static_cast<float*>(plan.states[0]); auto* recurrent = static_cast<float*>(plan.states[1]);
     const float* history_in = replay ? plan.snapshot : gdn_history_snapshot(d, conv);
     gdn_tokens<<<48,gdn_threads,0,d.stream>>>(replay ? plan.snapshot + 4 * 10240 : recurrent, history_in,
         recurrent, conv, static_cast<const float*>(p[5]), static_cast<const float*>(p[6]), static_cast<const float*>(p[7]),
-        static_cast<const float*>(p[8]), plan.projections, verify_projection, steps, replay ? nullptr : plan.snapshot, post);
+        static_cast<const float*>(p[8]), plan.projections + first * verify_projection, verify_projection, steps,
+        replay || first ? nullptr : plan.snapshot, post);
 }
 
 // A layer's part on a device of two (qwen_parts.hpp).
 void verify_layer_part(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v);
 
-// A layer up to its experts: the rows in v.mixed, the attention's residual in v.hidden.
-void verify_layer_front(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v) {
+// The layout's rows from `first` on (an interleaved verification's second group): the same buffers, `first` rows in.
+VerifyLayout verify_rows(const VerifyLayout& v, size_t first) {
+    VerifyLayout rows = v;
+    rows.hidden += first * 10240; rows.mixed += first * 2564; rows.branch += first * 2560; rows.positions += first;
+    rows.post += first * 6144; rows.qsa += first * verify_qsa; rows.attended += first * 6144;
+    return rows;
+}
+
+// A layer up to its experts: the rows in v.mixed, the attention's residual in v.hidden. `first`: the verification's row v starts at
+// (verify_rows), for the linear layers' projections and state snapshot.
+void verify_layer_front(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v, size_t first = 0) {
     void* const* pointers = plan.pointers.data(); const int* kinds = plan.kinds.data();
     const bool linear = decoder_linear(plan.index);
     const size_t attention = linear ? 9 : 10;
@@ -111,8 +123,8 @@ void verify_layer_front(Device& d, DecoderLayer& plan, size_t steps, const Verif
             m[i] = {static_cast<const uint8_t*>(pointers[4+i]),matrix_row_bytes(kinds[4+i],cols[i]),rows[i],cols[i],0,0,0,kinds[4+i]};
             if (i < 4) { m[i].output_offset = offset; offset += rows[i]; }
         }
-        gemv(d, m, 4, v.mixed, plan.projections, steps, 2564, verify_projection);
-        gdn_verify(d, plan, steps, false, v.post);
+        gemv(d, m, 4, v.mixed, plan.projections + first * verify_projection, steps, 2564, verify_projection);
+        gdn_verify(d, plan, steps, false, v.post, first);
         gemv(d, &m[4], 1, v.post, nullptr, steps, 6144, 0, residual);
     } else {
         Matrix m[6];
@@ -135,6 +147,19 @@ void verify_layer_front(Device& d, DecoderLayer& plan, size_t steps, const Verif
 void verify_layer(Device& d, DecoderLayer& plan, size_t steps, const VerifyLayout& v) {
     verify_layer_front(d, plan, steps, v);
     moe_tokens(d, plan.moe, steps, v.mixed, 2564, v.hidden);
+}
+
+// A verification through partially resident layers runs its rows as two interleaved groups (hybrid_verify_span) where the engine asks
+// (sd_hybrid_interleave: where the CPU's experts take longer than the GPU's work would with the rows split) or STRAYDOG_INTERLEAVE=1
+// names it (=0: never), and no layer stages experts for the GPU (CUDA's assist). Where the GPU is the longer side it loses (one R9700 at
+// --vram 5.5 with its assist: 2-row passes 37.4-40.2 ms -> 46.4-47.7).
+inline bool hybrid_interleave_on(const Device& d) {
+    // (-1: unset, the engine's choice, sd_hybrid_interleave)
+    static const int named = [] {
+        const char* value = std::getenv("STRAYDOG_INTERLEAVE");
+        return !value ? -1 : std::string(value) == "1" ? 1 : std::string(value) == "0" ? 0 : -1;
+    }();
+    return named < 0 ? d.hybrid_interleave : named == 1;
 }
 
 // Rows of a verification through partially resident layers: verify_layer's arithmetic up to the experts, then the rows' routes
@@ -226,34 +251,131 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             flush_launches(d);
         }
     };
-    if (ahead) launch(begin);
-    for (size_t layer = begin; layer < end; ++layer) {
-        const bool before = ahead && hybrid_early(d, layer);
-        if (!ahead) launch(layer);
-        else if (before) launch_after(layer);
-        ResidentMoe& experts = *d.resident.find(d.decoder.find(layer)->second.moe)->second;
-        const auto waited = std::chrono::steady_clock::now();
-        hybrid_wait_export(d, ++d.hybrid_sequence);
-        if (ahead) await.check_failed();
+    // Interleaved (hybrid_interleave_on), the two rows run as two groups of rows, one layer of a group a unit, in the order (layer, group). The host
+    // computes a unit's CPU experts while the GPU runs the other group's unit before it and then this group's next layer (queued behind it,
+    // awaiting this unit's result), so the GPU's layer work and resident experts overlap the CPU's experts instead of following them.
+    // Each row's arithmetic is the one of the rows taken together: the rows of a layer still run in order (the first group's before the
+    // second's: its attention reads their K/V, its linear state continues from theirs), and only the first group saves the state a replay
+    // starts from. Each group's exports have exchange slots of their own (the second half, hybrid_exchange_slots).
+    // (two rows only: one RTX 5070 Ti at 5.5 GiB took 3- and 4-row passes longer interleaved, 57-65 -> 68 and 69-76 -> 77-79 ms, where
+    // its 2-row passes gained: decode chat 38.4 -> 43.4, code 47.6 -> 49.8 tok/s)
+    bool interleaved = hybrid_interleave_on(d) && steps == 2 && end - begin >= 2 && !epoch && d.hybrid_prelaunch;
 #if !defined(__HIPCC__)
-        if (d.aborted()) throw SpanAborted();
+    // (CUDA: a layer that stages experts copies them on a stream of its own into slots both groups would share)
+    for (size_t layer = begin; interleaved && layer < end; ++layer)
+        interleaved = !hybrid_staged(d, *d.resident.find(d.decoder.find(layer)->second.moe)->second);
+    // (and only under prelaunch: CUDA's hybrid_await stages into its target, which is d.cpu_partial only then)
+    interleaved = interleaved && ahead;
 #endif
-        const auto computed = std::chrono::steady_clock::now();
-        {
-            const float* rows_exported[16]; float* rows_result[16];
-            for (size_t row = 0; row < steps; ++row) {
-                rows_exported[row] = d.exchange + hybrid_export_at(row, hybrid_slot_of(layer));
-                rows_result[row] = d.exchange + hybrid_result_at(row, hybrid_slot_of(layer));
+    if (interleaved) {
+        const size_t first_rows[2] = {0, (steps + 1) / 2}, group_rows[2] = {(steps + 1) / 2, steps / 2};
+        const size_t units = 2 * (end - begin);
+        auto unit_slot = [&](size_t u) { return hybrid_slot_of(begin + u / 2) + (u % 2) * hybrid_layer_slots; };
+        // Unit u's CPU result, awaited and added to its group's rows (at the start of the group's next unit, or after the last layer).
+        auto finish_unit = [&](size_t u) {
+            const size_t g = u % 2;
+            const VerifyLayout r = verify_rows(v, first_rows[g]);
+            // (CUDA stages the rows' CPU results into device memory first, as the rows taken together do under prelaunch)
+            hybrid_await<<<1,256,0,d.stream>>>(counters, d.exchange_device + hybrid_result_at(0, unit_slot(u)), stage ? d.cpu_partial : nullptr, d.await_timeout,
+                                               hybrid_need(d, g), HYBRID_AWAITED(d), d.flags + hybrid_await_device_failed);
+#if !defined(__HIPCC__)
+            if (stage && group_rows[g] > 1)
+                hybrid_stage<<<dim3(1,unsigned(group_rows[g] - 1)),256,0,d.stream>>>(d.exchange_device + hybrid_result_at(1, unit_slot(u)), d.cpu_partial + 2560,
+                                                                                    hybrid_need(d, g));
+#endif
+            hybrid_finish<<<dim3(40,unsigned(group_rows[g])),256,0,d.stream>>>(r.hidden, r.mixed, 2564, r.branch,
+                                                                              stage ? d.cpu_partial : d.exchange_device + hybrid_result_at(0, unit_slot(u)),
+                                                                              stage ? 2560 : hybrid_row_floats, hybrid_clock(d));
+        };
+        auto launch_unit = [&](size_t u) {
+            const size_t layer = begin + u / 2, g = u % 2;
+            DecoderLayer& plan = d.decoder.find(layer)->second;
+            ResidentMoe& experts = *d.resident.find(plan.moe)->second;
+            const VerifyLayout r = verify_rows(v, first_rows[g]);
+            const bool finish = layer > begin;
+            auto submit = [&]() {
+                if (finish) finish_unit(u - 2);
+                verify_layer_front(d, plan, group_rows[g], r, first_rows[g]);
+                const bool deferred = hybrid_route_export(d, experts, r.mixed, group_rows[g], 2564, unit_slot(u));
+                hybrid_publish(d, experts, group_rows[g], finish, unit_slot(u), deferred ? r.mixed : nullptr, 2564, g);
+                hybrid_resident_experts(d, experts, r.mixed, r.branch, group_rows[g]);
+                check(hipGetLastError());
+            };
+            if (finish) ++await.launched;
+            run_graph(d, "hybrid-verify-pair", plan.dependencies.data(), plan.dependencies.size(),
+                      ((((layer * 2 + finish) * 8 + steps) * 2 + g) << 4) + window_variant(d), submit);
+            flush_launches(d);
+        };
+        launch_unit(0);
+        launch_unit(1);
+        // The group's next layer (or, after the last, the group's finish), queued behind the other group's unit the GPU runs meanwhile.
+        auto queue_next = [&](size_t u) {
+            if (u + 2 < units) launch_unit(u + 2);
+            else {
+                ++await.launched;
+                finish_unit(u);
+                check(hipGetLastError());
+                flush_launches(d);
             }
-            hybrid_host_experts_rows(d, experts, steps, rows_exported, rows_result);
+        };
+        for (size_t u = 0; u < units; ++u) {
+            const size_t layer = begin + u / 2, g = u % 2;
+            ResidentMoe& experts = *d.resident.find(d.decoder.find(layer)->second.moe)->second;
+            // (as for the rows taken together: under a kernel run-time limit only a layer whose CPU experts never wait for storage is
+            // awaited by a launch made before them)
+            const bool before = hybrid_early(d, layer);
+            const auto waited = std::chrono::steady_clock::now();
+            hybrid_wait_export(d, ++d.hybrid_sequence);
+            await.check_failed();
+#if !defined(__HIPCC__)
+            if (d.aborted()) throw SpanAborted();
+#endif
+            const auto computed = std::chrono::steady_clock::now();
+            if (before) queue_next(u);
+            {
+                const float* rows_exported[16]; float* rows_result[16];
+                for (size_t row = 0; row < group_rows[g]; ++row) {
+                    rows_exported[row] = d.exchange + hybrid_export_at(row, unit_slot(u));
+                    rows_result[row] = d.exchange + hybrid_result_at(row, unit_slot(u));
+                }
+                hybrid_host_experts_rows(d, experts, group_rows[g], rows_exported, rows_result);
+            }
+            await.publish();
+            const auto finished = std::chrono::steady_clock::now();
+            d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());
+            d.hybrid_cpu_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count());
+            if (!before) queue_next(u);
         }
-        if (ahead) await.publish();
-        const auto finished = std::chrono::steady_clock::now();
-        d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());
-        d.hybrid_cpu_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count());
-        if (ahead && !before) launch_after(layer);
+    } else {
+        if (ahead) launch(begin);
+        for (size_t layer = begin; layer < end; ++layer) {
+            const bool before = ahead && hybrid_early(d, layer);
+            if (!ahead) launch(layer);
+            else if (before) launch_after(layer);
+            ResidentMoe& experts = *d.resident.find(d.decoder.find(layer)->second.moe)->second;
+            const auto waited = std::chrono::steady_clock::now();
+            hybrid_wait_export(d, ++d.hybrid_sequence);
+            if (ahead) await.check_failed();
+    #if !defined(__HIPCC__)
+            if (d.aborted()) throw SpanAborted();
+    #endif
+            const auto computed = std::chrono::steady_clock::now();
+            {
+                const float* rows_exported[16]; float* rows_result[16];
+                for (size_t row = 0; row < steps; ++row) {
+                    rows_exported[row] = d.exchange + hybrid_export_at(row, hybrid_slot_of(layer));
+                    rows_result[row] = d.exchange + hybrid_result_at(row, hybrid_slot_of(layer));
+                }
+                hybrid_host_experts_rows(d, experts, steps, rows_exported, rows_result);
+            }
+            if (ahead) await.publish();
+            const auto finished = std::chrono::steady_clock::now();
+            d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());
+            d.hybrid_cpu_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count());
+            if (ahead && !before) launch_after(layer);
+        }
+        if (!ahead) finish_previous(end - 1);
     }
-    if (!ahead) finish_previous(end - 1);
     d.hybrid_layers += end - begin; d.hybrid_timed_layers += end - begin - 1;
     check(hipGetLastError());
     for (size_t layer = begin; layer < end; ++layer) d.decoder.find(layer)->second.verified = steps;

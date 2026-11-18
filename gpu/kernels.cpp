@@ -2301,6 +2301,13 @@ int sd_hybrid_assist_level(void* handle,uint32_t assist) {
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_hybrid_interleave(void* handle,int on) {
+    try {
+        if (on!=0 && on!=1) throw std::runtime_error("invalid hybrid interleave");
+        device(handle).hybrid_interleave=on==1;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_hybrid_decay(double decay) {
     if (!(decay>0 && decay<1)) { last_error="invalid hybrid routing decay"; return -1; }
     hybrid_token_decay=decay; return 0;

@@ -371,6 +371,22 @@ const TWO_DRAFTS_START: f64 = 0.15;
 /// The experts' slots a partial placement keeps out of its pool for staging, its VRAM margin (`Group::create_expert_slots`), and the room its gate
 /// asks beyond them (`Model::prepare_hybrid_moe`).
 pub(crate) const STAGING_SLOTS: u64 = 32;
+/// The GPU's layer work with a verification's rows in two groups, against with them together: the dense weights are read once a group
+/// (one R9700, Qwen3.8 UD-IQ2_XS at --vram 5.5, 2-row passes: 6.2 -> 10.9 ms a token).
+const INTERLEAVE_LAYER_FACTOR: f64 = 1.76;
+/// How much longer than the GPU's split work the CPU's experts must take before the rows are interleaved.
+const INTERLEAVE_MARGIN: f64 = 1.1;
+
+/// Whether a request's verifications should interleave their rows, given whether the last ones did and that request's CPU experts,
+/// GPU layer work and GPU experts (any one unit, all over the same tokens): the GPU's side with the rows split must fit beside the CPU's.
+fn interleave_wanted(on: bool, cpu: f64, layer: f64, experts: f64) -> bool {
+    if on {
+        cpu > layer + experts
+    } else {
+        cpu > INTERLEAVE_MARGIN * (INTERLEAVE_LAYER_FACTOR * layer + experts)
+    }
+}
+
 /// CUDA starts with missed routes on the CPU. Where its tuner runs ([`assist_tuned`]) it changes this level only after the level in force
 /// loses two consecutive rounds by at least 3%. STRAYDOG_ASSIST=N holds N instead.
 const CUDA_ASSIST: u32 = 0;
@@ -1465,6 +1481,8 @@ pub struct Model {
     read_back_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The group's counters when the request began (a request's partial residency counts).
     hybrid_counts: Value,
+    /// Whether the group's verifications interleave their rows (Group::set_interleave), as the last request's times chose it.
+    interleave: bool,
     /// The PLE table's row counts when the request began, and the seconds it has waited for rows since.
     ple_counts: (u64, u64, u64),
     ple_wait: f64,
@@ -1712,6 +1730,7 @@ impl Model {
             visible_cap: u64::MAX,
             read_back_generation: Default::default(),
             hybrid_counts: Value::Null,
+            interleave: false,
             ple_counts: (0, 0, 0),
             ple_wait: 0.0,
             images: Vec::new(),
@@ -6085,6 +6104,17 @@ impl Model {
             // Where a partially resident model's request went, on every request: the log alone must say what held it up.
             let info = self.group.info().unwrap_or_default();
             let spent = |key: &str| (info[key].as_u64().unwrap_or(0) - self.hybrid_counts[key].as_u64().unwrap_or(0)) as f64;
+            // Whether the next requests interleave their verifications' rows (STRAYDOG_INTERLEAVE unset): where this one's CPU experts took
+            // longer than the GPU's layer work and experts would with the rows split, by INTERLEAVE_MARGIN; once on, while they still do.
+            if generated >= 64.0 && std::env::var_os("STRAYDOG_INTERLEAVE").is_none() {
+                let (cpu, layer, experts) = (spent("cpu_ns"), spent("layer_ns"), spent("gpu_experts_ns"));
+                let wanted = interleave_wanted(self.interleave, cpu, layer, experts);
+                if wanted != self.interleave && self.group.set_interleave(wanted).is_ok() {
+                    self.interleave = wanted;
+                    eprintln!("Straydog interleaved 2-row verifications: {} (ms a token: CPU experts {:.1}, the GPU's layer work {:.1} and experts {:.1})",
+                              if wanted { "on" } else { "off" }, cpu / 1e6 / generated, layer / 1e6 / generated, experts / 1e6 / generated);
+                }
+            }
             let memory = crate::host::memory_note();
             let faults = memory.zip(self.memory_before).map_or(0, |(now, before)| now.2.saturating_sub(before.2));
             // (the pages the drive gave back for faults while it ran, the working set's limit and the K/V's capacity: what the memory line
@@ -7606,3 +7636,23 @@ mod layer_prefill_diagnostics;
 
 #[path = "model_pipeline.rs"]
 mod pipeline;
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::interleave_wanted;
+
+    /// Decides: the rows are interleaved where the CPU's experts outlast the GPU's work with the rows split, and not where the GPU is the
+    /// longer side, with the measured splits (ms a token).
+    #[test]
+    fn the_cpu_s_longer_side_turns_it_on_and_the_gpu_s_keeps_it_off() {
+        // one RTX 5070 Ti at 5.5 GiB without its assist: CPU 14.6, layer work 3.9, experts 6.7 (split: 6.9 + 6.7 = 13.6, by 10% 15.0)
+        assert!(!interleave_wanted(false, 14.6, 3.9, 6.7));
+        assert!(interleave_wanted(false, 16.0, 3.9, 6.7));
+        // one R9700 at 5.5 GiB with its in-place assist: CPU 15.5, layer work 6.2, experts 12.4
+        assert!(!interleave_wanted(false, 15.5, 6.2, 12.4));
+        // on, the layer work is the split one: R9700's 10.9 + 14.5 against its CPU's 16.1 turns it off again
+        assert!(!interleave_wanted(true, 16.1, 10.9, 14.5));
+        // on and still the CPU's side: it stays
+        assert!(interleave_wanted(true, 16.0, 6.9, 6.7));
+    }
+}

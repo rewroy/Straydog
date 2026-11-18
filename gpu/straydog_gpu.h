@@ -718,6 +718,9 @@ uint32_t sd_hybrid_assist_cap(void);
 /* The assist level alone, once sd_hybrid_assist has mapped the banks; a level past the cap is refused. A change drops the layers'
    captured graphs, which carry the level, and the next pass captures them again. */
 int sd_hybrid_assist_level(void* handle, uint32_t assist);
+/* Whether this device's verifications through partially resident layers run their rows as two interleaved groups (on: 1), one group's
+   GPU work beside the other's CPU experts. STRAYDOG_INTERLEAVE=1 or 0 holds it whatever this says. */
+int sd_hybrid_interleave(void* handle, int on);
 /* The GPU stops reading the page-locked banks of the layer whose gate bank is at `gate` in place (the plan has its banks as it had them
    before sd_hybrid_assist mapped them): copies of its experts that were in flight, and the layers' graphs that hold the view, are waited
    for, and the graphs dropped. `found` is 1 where this device holds the plan. The caller unregisters the banks after (sd_host_unregister). */
