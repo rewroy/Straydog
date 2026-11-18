@@ -125,6 +125,11 @@ work (`STRAYDOG_PRESTAGE=0` turns that off): on two RTX 4090s a new 32K-token pr
 instead of 6.4. The two GPUs of such a model read different batches of a prompt at the same time (the first GPU the next batch while the second
 finishes this one; `STRAYDOG_PREFILL_OVERLAP=0` reads them one after the other, the first logits are the same to the bit): the 32K prompt's first
 token comes in 7.4 s instead of 12.4.
+On one GPU where the CPU's experts take longer than the GPU's own work (low VRAM without the assist, as one NVIDIA GPU runs), a
+verification of two rows runs its rows interleaved: the host computes one row's CPU experts while the GPU runs the other row's layer.
+The engine compares each request's times and turns this on or off by itself (`STRAYDOG_INTERLEAVE=1` or `0` holds it): on an
+RTX 5070 Ti at `--vram 5.5`, Qwen3.8 UD-IQ2_XS decodes a chat prompt at 45.3 tok/s instead of 42.4 and a code prompt at 55.1
+instead of 48.6.
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
