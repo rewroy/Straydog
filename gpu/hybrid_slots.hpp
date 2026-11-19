@@ -41,6 +41,8 @@ inline size_t hybrid_check_scratch_floats() { return 0; }
 // From hybrid_sequence_slot, as uint32: +1 CPU results published by the host, +2 results
 // awaited by the GPU (hybrid_await), +3 nonzero once an await gave up.
 constexpr size_t hybrid_published_slot = 1, hybrid_awaited_slot = 2, hybrid_await_failed_slot = 3;
+// +4: the waits that passed their deadline and found the host's result there (the GPU held off meanwhile), counted by the GPU from the start.
+constexpr size_t hybrid_await_late_slot = 4;
 // Device::flags[4]: a failed await stays latched until checked recovery; the existing device initialization clears it.
 constexpr size_t hybrid_await_device_failed = 4;
 // Device::flags[16 + row]: the blocks of a row that hybrid_router has counted in (zero between launches, from create_hybrid_moe on).

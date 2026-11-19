@@ -218,6 +218,7 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
             if (await_clock() - start > timeout) {
                 // (the count is read again past the deadline: hybrid_await_past_deadline)
                 if (int32_t(counters[hybrid_published_slot] - wanted) < 0) ready = 0;
+                else counters[hybrid_await_late_slot] = counters[hybrid_await_late_slot] + 1;
                 break;
             }
             __builtin_amdgcn_s_sleep(2);
@@ -239,6 +240,7 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
                 if (await_clock() - start > timeout) {
                     // (the count is read again past the deadline: hybrid_await_past_deadline)
                     if (int32_t(counters[hybrid_published_slot] - expected) < 0) ready = 0;
+                    else counters[hybrid_await_late_slot] = counters[hybrid_await_late_slot] + 1;
                     break;
                 }
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
@@ -313,6 +315,19 @@ struct HybridAwait {
         d.span_call_ns = d.span_cpu_ns = d.span_export_ns = 0;
         d.span_call = "none";
         d.span_layer = SIZE_MAX;
+        // (waits the spans before found past their deadline with the result there: the GPU was held off, and the request went on)
+        const uint32_t late = counters[hybrid_await_late_slot];
+        if (late != d.late_seen) {
+            d.late_waits += uint32_t(late - d.late_seen);
+            d.late_seen = late;
+            const auto now = std::chrono::steady_clock::now();
+            if (d.late_told == std::chrono::steady_clock::time_point{} || now - d.late_told >= std::chrono::seconds(10)) {
+                d.late_told = now;
+                std::fprintf(stderr, "Straydog GPU wait: GPU %d's wait passed its deadline and found the host's result there, %llu times in all "
+                                     "(the GPU was held off meanwhile, as when VRAM runs short; before, each stopped its request)\n",
+                             d.ordinal, static_cast<unsigned long long>(d.late_waits));
+            }
+        }
     }
     void publish() {
         std::atomic_thread_fence(std::memory_order_release);

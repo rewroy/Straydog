@@ -944,6 +944,11 @@ struct Device {
     uint64_t span_call_ns=0, span_cpu_ns=0, span_export_ns=0;
     const char* span_call="none";
     size_t span_layer=SIZE_MAX;
+    // The GPU's waits that passed their deadline and found the host's result there (hybrid_await_past_deadline): read from the exchange,
+    // told in the log at most every ten seconds (HybridAwait's start), with when they were told last.
+    uint32_t late_seen=0;
+    uint64_t late_waits=0;
+    std::chrono::steady_clock::time_point late_told{};
     uint64_t hybrid_layers=0, hybrid_timed_layers=0;   // layers decoded hybrid, and of them those with a start on the GPU clock (hybrid_clock)
     uint32_t hybrid_sequence=0;
     size_t hybrid_position=SIZE_MAX;
