@@ -758,9 +758,9 @@ void hybrid_host_experts_rows(Device& d, ResidentMoe& plan, size_t rows, const f
             if (e[2592 + route] != 0) { ++(e[2592 + route] > 1.5f ? d.assisted_experts : d.gpu_experts); continue; }
             // (speed first: a CPU route below the floor's weight is left out, sd_hybrid_route_floor)
             if (e[16 + route] < d.route_floor) { ++d.dropped_experts; continue; }
-            gate[count] = plan.host[0] + expert * plan.host_bytes[0];
-            up[count] = plan.host[1] + expert * plan.host_bytes[1];
-            down[count] = plan.host[2] + expert * plan.host_bytes[2];
+            gate[count] = expert_host(plan, 0, expert);
+            up[count] = expert_host(plan, 1, expert);
+            down[count] = expert_host(plan, 2, expert);
             weights[count++] = e[16 + route];
             // (a layer held as page-locked copies has nothing to read ahead: the copies are in memory)
             if (d.hint_experts && !plan.host_copy) {

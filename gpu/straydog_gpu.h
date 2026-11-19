@@ -721,6 +721,10 @@ uint32_t sd_hybrid_assist_cap(void);
 /* The assist level alone, once sd_hybrid_assist has mapped the banks; a level past the cap is refused. A change drops the layers'
    captured graphs, which carry the level, and the next pass captures them again. */
 int sd_hybrid_assist_level(void* handle, uint32_t assist);
+/* The pinned tier of the partially resident layer whose gate bank is at `from`: per role, `experts` host addresses in page-locked memory
+   (null where the expert's bank is read), or none (gate null) to clear it. Readers in flight are waited for. *found 0: no such layer. */
+int sd_hybrid_tier(void* handle, const void* from, uint64_t experts, const uint8_t* const* gate, const uint8_t* const* up,
+                   const uint8_t* const* down, uint64_t* found);
 /* Whether this device's verifications through partially resident layers run their rows as two interleaved groups (on: 1), one group's
    GPU work beside the other's CPU experts. STRAYDOG_INTERLEAVE=1 or 0 holds it whatever this says. */
 int sd_hybrid_interleave(void* handle, int on);

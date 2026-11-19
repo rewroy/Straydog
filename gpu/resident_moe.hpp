@@ -499,25 +499,42 @@ inline std::vector<size_t> prompt_cpu_share(const Device& d,const ResidentMoe& p
     std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b) { return counts[a]<counts[b]; });
     // (at most prompt_cpu_routes_max routes a batch: the CPU's buffers and the batch's pinned results stay within some tens of MB)
     size_t routes_taken=0;
-    if (prompt_gathered(d,plan)) {
-        // Banks not page-locked: the CPU's workers gather each streamed expert into pinned memory before the bus takes it, and the
-        // CPU's own routes wait behind those gathers on the same workers, so the CPU's time is the layer's. An expert goes to the CPU
-        // only when its routes cost less than its gather (before any measurement, a gather at 8 GB/s).
+    // Banks not page-locked: the CPU's workers gather each streamed expert into pinned memory before the bus takes it, and the CPU's own
+    // routes wait behind those gathers on the same workers, so the CPU's time is the layer's. An expert goes to the CPU only when its routes
+    // cost less than its gather (before any measurement, a gather at 8 GB/s).
+    auto gathered_rule=[&](const std::vector<size_t>& candidates) {
         const double gather=d.prompt_gather_ns>0 ? d.prompt_gather_ns : double(expert_slot_bytes(plan))/8.0;
-        for (size_t expert : order) {
+        for (size_t expert : candidates) {
             if (route*counts[expert]>0.9*gather || routes_taken+counts[expert]>prompt_cpu_routes_max) break;
             routes_taken+=counts[expert];
             taken.push_back(expert);
         }
-    } else {
+    };
+    // Experts the bus takes by DMA (a page-locked layer's, a tier's): the CPU computes the fewest-rowed of them beside the streaming of the
+    // rest, while its time stays under its share of what streaming those left takes.
+    auto parallel_rule=[&](const std::vector<size_t>& candidates) {
         double cpu=0;
-        size_t left=missing.size();
-        for (size_t expert : order) {
+        size_t left=candidates.size();
+        for (size_t expert : candidates) {
             const double next=cpu+route*counts[expert];
             if (next>d.prompt_scale*stream*double(left-1) || routes_taken+counts[expert]>prompt_cpu_routes_max) break;
             routes_taken+=counts[expert];
             cpu=next; --left; taken.push_back(expert);
         }
+    };
+    if (prompt_gathered(d,plan) && !plan.tier[0].empty()) {
+        // A layer with a host tier: where every expert the batch streams is tiered, nothing is gathered and the bus takes them all by DMA,
+        // as a page-locked layer's: the CPU takes its share beside them. Where some are not, the CPU's workers gather those, and a route
+        // given to the CPU slows that gather: the gathered rule. (Tiered experts by the parallel rule beside a gather gave the CPU 44-49K
+        // routes of a 2,076-token prompt on an RTX 5070 Ti at --vram 5.5, where whole layers gave it 15-18K, and read it 33 % slower.)
+        bool all=true;
+        for (size_t expert : order) all=all && expert_tiered(plan,expert);
+        if (all) parallel_rule(order);
+        else gathered_rule(order);
+    } else if (prompt_gathered(d,plan)) {
+        gathered_rule(order);
+    } else {
+        parallel_rule(order);
     }
     if (taken.empty()) return taken;
     std::vector<bool> gone(plan.experts,false);
@@ -861,6 +878,9 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     const size_t resident_tiles=host_tiles.size();
     for (size_t expert : prestaged) add(expert);
     const size_t prestaged_end=host_tiles.size();
+    // (a pageable layer's tiered experts first: hybrid_stream_missing copies them by DMA and gathers only the chunks after them)
+    if (!plan.mapped[0] && !plan.tier[0].empty())
+        std::stable_partition(missing.begin(),missing.end(),[&](size_t expert) { return expert_tiered(plan,expert); });
     std::vector<size_t> offsets{prestaged_end};
     for (size_t expert : missing) { add(expert); offsets.push_back(host_tiles.size()); }
     if (host_tiles.size()>max_tiles) throw std::runtime_error("inconsistent Straydog expert grouping");
@@ -941,9 +961,9 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
         std::vector<uint32_t> counts(n,1);
         for (size_t i=0;i<n;++i) {
             const size_t expert=cpu_experts[i];
-            gate[i]=plan.host[0]+expert*plan.host_bytes[0];
-            up[i]=plan.host[1]+expert*plan.host_bytes[1];
-            down[i]=plan.host[2]+expert*plan.host_bytes[2];
+            gate[i]=expert_host(plan,0,expert);
+            up[i]=expert_host(plan,1,expert);
+            down[i]=expert_host(plan,2,expert);
             xs[i]=cpu_rows+size_t(cpu_routes[i])/10*2560;
             outs[i]=cpu_results+i*2560;
         }
@@ -978,7 +998,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     if (cpu_routes.size()>=16) prompt_cost(d.prompt_cpu_ns,double(compute_ns)/double(cpu_routes.size()));
     // The share moves toward the CPU finishing at nine tenths of the GPU's time (a CPU that took everything finished last); a gathered
     // layer's CPU time is its gathers' too, and its share is set otherwise (prompt_cpu_share).
-    if (!cpu_routes.empty() && !prompt_gathered(d,plan)) {
+    if (!cpu_routes.empty() && (!prompt_gathered(d,plan) || !plan.tier[0].empty())) {
         const double ratio=stream_ns ? double(cpu_ns)/double(stream_ns) : 2.0;
         d.prompt_scale=std::clamp(d.prompt_scale*std::clamp(0.9/ratio,0.6,1.2),0.05,2.0);
     }

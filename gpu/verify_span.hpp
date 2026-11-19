@@ -323,7 +323,6 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             ResidentMoe& experts = *d.resident.find(d.decoder.find(layer)->second.moe)->second;
             // (as for the rows taken together: under a kernel run-time limit only a layer whose CPU experts never wait for storage is
             // awaited by a launch made before them)
-            const bool before = hybrid_early(d, layer);
             const auto waited = std::chrono::steady_clock::now();
             hybrid_wait_export(d, ++d.hybrid_sequence);
             await.check_failed();
@@ -331,15 +330,15 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             if (d.aborted()) throw SpanAborted();
 #endif
             const auto computed = std::chrono::steady_clock::now();
-            if (before) queue_next(u);
-            {
-                const float* rows_exported[16]; float* rows_result[16];
-                for (size_t row = 0; row < group_rows[g]; ++row) {
-                    rows_exported[row] = d.exchange + hybrid_export_at(row, unit_slot(u));
-                    rows_result[row] = d.exchange + hybrid_result_at(row, unit_slot(u));
-                }
-                hybrid_host_experts_rows(d, experts, group_rows[g], rows_exported, rows_result);
+            const float* rows_exported[16]; float* rows_result[16];
+            for (size_t row = 0; row < group_rows[g]; ++row) {
+                rows_exported[row] = d.exchange + hybrid_export_at(row, unit_slot(u));
+                rows_result[row] = d.exchange + hybrid_result_at(row, unit_slot(u));
             }
+            // (early as a layer, or this unit's CPU routes all in the layer's tier: hybrid_unit_tiered)
+            const bool before = hybrid_early(d, layer) || hybrid_unit_tiered(d, experts, group_rows[g], rows_exported);
+            if (before) queue_next(u);
+            hybrid_host_experts_rows(d, experts, group_rows[g], rows_exported, rows_result);
             await.publish();
             const auto finished = std::chrono::steady_clock::now();
             d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());
@@ -349,7 +348,7 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
     } else {
         if (ahead) launch(begin);
         for (size_t layer = begin; layer < end; ++layer) {
-            const bool before = ahead && hybrid_early(d, layer);
+            bool before = ahead && hybrid_early(d, layer);
             if (!ahead) launch(layer);
             else if (before) launch_after(layer);
             ResidentMoe& experts = *d.resident.find(d.decoder.find(layer)->second.moe)->second;
@@ -365,6 +364,11 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
                 for (size_t row = 0; row < steps; ++row) {
                     rows_exported[row] = d.exchange + hybrid_export_at(row, hybrid_slot_of(layer));
                     rows_result[row] = d.exchange + hybrid_result_at(row, hybrid_slot_of(layer));
+                }
+                // (a layer not early as a whole whose routes this pass are all in its tier: the next layer goes ahead of them now)
+                if (ahead && !before && hybrid_unit_tiered(d, experts, steps, rows_exported)) {
+                    launch_after(layer);
+                    before = true;
                 }
                 hybrid_host_experts_rows(d, experts, steps, rows_exported, rows_result);
             }

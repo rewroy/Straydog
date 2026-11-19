@@ -2295,6 +2295,36 @@ int sd_hybrid_repoint(void* handle,const void* from,const uint8_t* const* host,c
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+// The pinned tier of the layer whose gate bank is at `from` (sd_hybrid_repoint's key): `experts` addresses per role (null: the expert's bank),
+// or none (`gate` null) to clear it. Every reader of the layer's host bytes is waited for first, as a repoint waits.
+int sd_hybrid_tier(void* handle,const void* from,uint64_t experts,const uint8_t* const* gate,const uint8_t* const* up,const uint8_t* const* down,
+                   uint64_t* found) {
+    try {
+        if (!from || !found || (gate && (!up || !down))) throw std::runtime_error("invalid hybrid tier");
+        auto& d=device(handle);
+        *found=0;
+        ResidentMoe* target=nullptr;
+        for (auto& item : d.resident)
+            if (item.second->hybrid && item.second->host[0]==from) { target=item.second.get(); break; }
+        if (!target) return 0;
+        if (gate && experts!=target->experts) throw std::runtime_error("invalid hybrid tier: its experts");
+        *found=1;
+        if (d.copier) d.copier->wait();
+        if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+        check(hipDeviceSynchronize());
+        for (unsigned waited=0;d.bank_readers.load()!=0;++waited) {
+            if (waited>5000) throw std::runtime_error("the CPU's experts are still reading the layer's banks");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const uint8_t* const* roles[3]={gate,up,down};
+        for (size_t role=0;role<3;++role) {
+            if (gate) target->tier[role].assign(roles[role],roles[role]+experts);
+            else target->tier[role].clear();
+        }
+        target->prefetched.clear();
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 // The assist level alone, once sd_hybrid_assist has mapped the banks (mapping them again is the dear part of that call). A level past
 // the cap is refused.
 int sd_hybrid_assist_level(void* handle,uint32_t assist) {
