@@ -190,6 +190,11 @@ __global__ void hybrid_finish(float* hidden, const float* mixed, size_t mixed_st
 // `timeout` ticks (~1 s under Windows' 2 s kernel watchdog, 10 s elsewhere) it gives up
 // and marks the failure for the host instead of hanging the device; the layer's output is
 // then void.
+// hybrid_await_past_deadline: a wait gives up only on a count read after its deadline. Most of a spin is the read of the host's count over
+// the bus, and a GPU held off the device meanwhile (WDDM pages VRAM when it runs short) comes back to compare the count it read before
+// with a clock past the deadline: the host had long published (an RTX 5070 Ti at an automatic 12.4 GiB of 16 with 2.3 GiB taken by other
+// programs failed its first request so, the host's last CPU step 0 ms and its slowest 6 ms, 46 of 47 results published; an RTX 4060 PC at
+// 5.07 to 5.5 GiB of 8, five times in one day, never at 4.57).
 __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* result, float* target, uint64_t timeout,
                              const volatile int32_t* need, volatile uint32_t* awaited, volatile uint32_t* device_failed) { SD_KERNEL_ACQUIRE;
     __shared__ uint32_t ready, none;
@@ -207,8 +212,13 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
         uint32_t spin = 0;
         while (ready && int32_t(counters[hybrid_published_slot] - wanted) < 0) {
             // The host can cancel a wait after entry; keep its clock deadline checked every spin.
-            if (((++spin & 255) == 0 && counters[hybrid_await_failed_slot]) || await_clock() - start > timeout) {
+            if ((++spin & 255) == 0 && counters[hybrid_await_failed_slot]) {
                 ready = 0; break;
+            }
+            if (await_clock() - start > timeout) {
+                // (the count is read again past the deadline: hybrid_await_past_deadline)
+                if (int32_t(counters[hybrid_published_slot] - wanted) < 0) ready = 0;
+                break;
             }
             __builtin_amdgcn_s_sleep(2);
         }
@@ -223,8 +233,13 @@ __global__ void hybrid_await(volatile uint32_t* counters, const volatile float* 
             const uint64_t start = await_clock();
             uint32_t spin = 0;
             while (ready && int32_t(counters[hybrid_published_slot] - expected) < 0) {
-                if (((++spin & 255) == 0 && counters[hybrid_await_failed_slot]) || await_clock() - start > timeout) {
+                if ((++spin & 255) == 0 && counters[hybrid_await_failed_slot]) {
                     ready = 0; break;
+                }
+                if (await_clock() - start > timeout) {
+                    // (the count is read again past the deadline: hybrid_await_past_deadline)
+                    if (int32_t(counters[hybrid_published_slot] - expected) < 0) ready = 0;
+                    break;
                 }
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
                 __nanosleep(256);
