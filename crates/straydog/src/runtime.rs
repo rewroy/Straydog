@@ -534,13 +534,15 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// placed; so does the account of the host banks a partially resident model page-locked; of the GPU memory freed after the start that the
 /// expert slots took, or could not; and of the drafts a pass offers, which the engine chooses by what its passes cost, at the first choice
 /// and at each change. When the read-ahead hint opens and shuts (Windows) is only with --verbose: it follows the drive's reads, a line every
-/// few seconds through a day of serving, and each request's line already says how many hints were taken and left.
+/// few seconds through a day of serving, and each request's line already says how many hints were taken and left. The expert store's account
+/// of its evictions against an LRU's and the best possible ones stays: a line every 2^20 uses of decode and verify passes, a few minutes
+/// of decoding.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
-     "Straydog assist profile:"]
+     "Straydog assist profile:", "Straydog expert reuse"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -2167,6 +2169,9 @@ mod tests {
         assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
         assert!(stays_in_the_log("Straydog assist profile: decision round=2 held=0 qualified=4 chosen=4"));
         assert!(stays_in_the_log("Straydog assist profile: setter_succeeded from=0 to=4"));
+        assert!(stays_in_the_log("Straydog expert reuse: 1048576 uses of decode and verify passes on the first GPU; VRAM missed 12.6%, an LRU \
+                                  store of the same slots would miss 13.4%, the best possible 7.9%; by class (missed / LRU / best): 0 (layers 0-2, 400 \
+                                  slots) 11.0 / 11.8 / 6.5%"));
         assert!(!stays_in_the_log("some other line"));
     }
 
