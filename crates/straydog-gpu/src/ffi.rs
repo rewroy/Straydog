@@ -2601,6 +2601,17 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_hybrid_tier(
+        handle: *mut ::std::os::raw::c_void,
+        from: *const ::std::os::raw::c_void,
+        experts: u64,
+        gate: *const *const u8,
+        up: *const *const u8,
+        down: *const *const u8,
+        found: *mut u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_hybrid_interleave(
         handle: *mut ::std::os::raw::c_void,
         on: ::std::os::raw::c_int,

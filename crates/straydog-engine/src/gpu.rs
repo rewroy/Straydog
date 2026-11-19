@@ -3485,6 +3485,27 @@ impl Backend {
         unsafe { ffi::sd_hybrid_assist_cap() }
     }
 
+    /// The pinned tier of the partially resident layer whose gate bank starts at `from_gate`: per expert, its gate, up and down bytes in
+    /// page-locked memory of the engine's (null: read from its bank), or `None` to clear it. Ok(false) where no layer has that bank.
+    /// Readers in flight are waited for; the memory must stay page-locked and unchanged until the tier is cleared or replaced.
+    pub fn set_tier(&mut self, from_gate: *const u8, tier: Option<&[[*const u8; 3]]>) -> Result<bool> {
+        let mut found = 0u64;
+        let status = match tier {
+            Some(experts) => {
+                let roles: [Vec<*const u8>; 3] = std::array::from_fn(|role| experts.iter().map(|expert| expert[role]).collect());
+                // SAFETY: a live handle; three arrays of experts.len() addresses that live through the call (the library copies them).
+                unsafe {
+                    ffi::sd_hybrid_tier(self.handle, from_gate.cast(), experts.len() as u64, roles[0].as_ptr(), roles[1].as_ptr(), roles[2].as_ptr(),
+                                        &mut found)
+                }
+            }
+            // SAFETY: a live handle; null arrays clear the tier.
+            None => unsafe { ffi::sd_hybrid_tier(self.handle, from_gate.cast(), 0, std::ptr::null(), std::ptr::null(), std::ptr::null(), &mut found) },
+        };
+        check(status)?;
+        Ok(found == 1)
+    }
+
     /// Change the assist level alone, once [`Backend::enable_assist`] has mapped the banks. The layers' captured graphs, which
     /// carry the level, are dropped when it changes: the next pass captures them again.
     pub fn set_assist_level(&mut self, level: u32) -> Result<()> {
