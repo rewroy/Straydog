@@ -206,7 +206,7 @@ pub fn lrfu_misses(uses: &[Key], slots: usize, half_life: f64) -> u64 {
     if slots == 0 {
         return uses.len() as u64;
     }
-    let rate = 1.0 / half_life.max(1.0);
+    let rate = lrfu_rate(half_life);
     // (each expert's log2 of its score times 2^(rate * its last use), and its last use)
     let mut scores: HashMap<Key, (f64, u64)> = HashMap::new();
     let mut held: BTreeSet<(i64, Key)> = BTreeSet::new();
@@ -222,13 +222,23 @@ pub fn lrfu_misses(uses: &[Key], slots: usize, half_life: f64) -> u64 {
                 held.pop_first();
             }
         }
-        // (the old score decayed to now, plus this use: log2(1 + 2^(old - rate * (now - last))) + rate * now)
-        let decayed = if log_scaled.is_finite() { log_scaled - rate * time as f64 } else { f64::NEG_INFINITY };
-        let now = (1.0 + decayed.exp2()).log2() + rate * time as f64;
+        let now = lrfu_raise(log_scaled.is_finite().then_some(log_scaled), time, rate);
         scores.insert(key, (now, time));
         held.insert((fixed(now), key));
     }
     misses
+}
+
+/// An LRFU score's decay a use, for scores that halve every `half_life` uses.
+pub fn lrfu_rate(half_life: f64) -> f64 {
+    1.0 / half_life.max(1.0)
+}
+
+/// An LRFU score (log2 of the score times 2^(rate x the use it was last raised at), so that scores of different ages compare
+/// as they are) raised by a use at `time`: the old one decayed to then, plus one.
+pub fn lrfu_raise(old: Option<f64>, time: u64, rate: f64) -> f64 {
+    let decayed = old.map_or(f64::NEG_INFINITY, |old| old - rate * time as f64);
+    (1.0 + decayed.exp2()).log2() + rate * time as f64
 }
 
 /// A store's window of uses, by class, and how many of them VRAM did not hold.
@@ -407,6 +417,17 @@ mod tests {
         assert_eq!(lrfu_misses(&uses, 3, 1e9), 40);
         assert_eq!(lru_misses(&uses, 3), 41);
         assert!(lrfu_misses(&uses, 3, 1e9) >= best_misses(&uses, 3));
+    }
+
+    #[test]
+    fn an_lrfu_score_counts_uses_and_halves_with_age() {
+        let rate = lrfu_rate(100.0);
+        let once = lrfu_raise(None, 0, rate);
+        let twice = lrfu_raise(Some(once), 0, rate);
+        assert!((once - 0.0).abs() < 1e-12 && (twice - 1.0).abs() < 1e-12, "{once} {twice}");
+        // (a use 100 uses later counts the first at half: log2(1.5) + 1 at that age)
+        let later = lrfu_raise(Some(once), 100, rate);
+        assert!((later - (1.5f64.log2() + 1.0)).abs() < 1e-12, "{later}");
     }
 
     #[test]

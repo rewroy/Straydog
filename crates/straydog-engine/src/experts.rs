@@ -1071,6 +1071,22 @@ pub struct DeviceExperts {
     warm_origin: Option<u64>,
     /// The uses of passes of a few rows, replayed against an LRU and the best possible store ([`observe_reuse`](Self::observe_reuse)).
     reuse: Option<crate::reuse::Reuse>,
+    /// With STRAYDOG_EXPERT_LRFU=H, each class's VRAM order is by LRFU score instead of the last use ([`crate::reuse::lrfu_misses`]):
+    /// scores that halve every H times the class's slots of its uses, the experts' scores (log2, as crate::reuse::lrfu_raise keeps
+    /// them) kept after they go, and each class's uses counted once an expert a release.
+    lrfu: Option<Lrfu>,
+}
+
+/// [`DeviceExperts::lrfu`]'s state.
+struct Lrfu {
+    times: f64,
+    scores: HashMap<Key, f64>,
+    uses: Vec<u64>,
+}
+
+/// An LRFU score as a VRAM order's key (2^-24ths of its log2; every score is at least 1, so its log2 is not negative).
+fn lrfu_order(score: f64) -> u64 {
+    (score.max(0.0) * (1u64 << 24) as f64) as u64
 }
 
 impl DeviceExperts {
@@ -1188,6 +1204,8 @@ impl DeviceExperts {
             done_tx, done_rx, clock: 0, in_use: Vec::new(), touched: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
             uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None, reuse: None,
+            lrfu: std::env::var("STRAYDOG_EXPERT_LRFU").ok().and_then(|value| value.parse::<f64>().ok()).filter(|&times| times > 0.0)
+                .map(|times| Lrfu { times, scores: HashMap::new(), uses: vec![0; distinct.len()] }),
         })
     }
 
@@ -1845,8 +1863,23 @@ impl DeviceExperts {
     fn settle_touches(&mut self) {
         let probation = self.probation.unwrap_or_else(probation);
         let mut depth: Vec<Option<Option<u64>>> = vec![None; self.classes.len()];
+        let mut raised: Vec<usize> = Vec::new();
         for (slot, mut used) in std::mem::take(&mut self.touched) {
             let class = self.slots[slot].class;
+            // (LRFU: the expert's score raised by one use, once a release however often it was held)
+            if let (Some(lrfu), Some(key)) = (self.lrfu.as_mut(), self.slots[slot].key) {
+                let class_slots = self.classes[class].count.max(1) as f64;
+                if raised.contains(&slot) {
+                    used = lrfu_order(lrfu.scores.get(&key).copied().unwrap_or(0.0));
+                } else {
+                    raised.push(slot);
+                    let time = lrfu.uses[class];
+                    lrfu.uses[class] += 1;
+                    let score = crate::reuse::lrfu_raise(lrfu.scores.get(&key).copied(), time, crate::reuse::lrfu_rate(lrfu.times * class_slots));
+                    lrfu.scores.insert(key, score);
+                    used = lrfu_order(score);
+                }
+            }
             // (every hold of a fresh slot in this pass: a request's fill holds it, and the acquire after it again)
             if self.slots[slot].fresh && probation > 0 && self.slots[slot].key.is_some() {
                 // (the stamp of the slot at the probation's depth, found once a class a release: the fresh ones of a pass share it)
@@ -1871,13 +1904,18 @@ impl DeviceExperts {
 
     fn touch(&mut self, slot: usize) {
         self.clock += 1;
+        // (LRFU: a fill takes its expert's score as it stands; the release after its use raises it)
+        let used = match (self.lrfu.as_ref(), self.slots[slot].key) {
+            (Some(lrfu), Some(key)) => lrfu_order(lrfu.scores.get(&key).copied().unwrap_or(0.0)),
+            _ => self.clock,
+        };
         let entry = &mut self.slots[slot];
         let lru = &mut self.classes[entry.class].lru;
         if entry.key.is_some() {
             lru.remove(&(entry.used, slot));
-            lru.insert((self.clock, slot));
+            lru.insert((used, slot));
         }
-        entry.used = self.clock;
+        entry.used = used;
     }
 
     /// Keep `slot` until the next release, as just used. Its place in the LRU order moves at the
