@@ -258,12 +258,16 @@ pub fn replay(uses: &[Vec<Key>], missed: &[u64], classes: &[(usize, String)]) ->
         }
         let (lru, best) = (lru_misses(list, *slots), best_misses(list, *slots));
         let (arc, lru2) = (arc_misses(list, *slots), lru2_misses(list, *slots));
+        // (what a class's slots are worth to it: an LRU of three quarters, five quarters and three halves of them)
+        let scaled: Vec<String> = [3, 5, 6].iter().map(|&quarters| percent(lru_misses(list, slots * quarters / 4), list.len() as u64))
+            .map(|share| format!("{share:.1}")).collect();
         let used = list.len() as u64;
         for (sum, value) in total.iter_mut().zip([used, actual, lru, best, arc, lru2]) {
             *sum += value;
         }
-        parts.push(format!("{class} ({label}, {slots} slots) {:.1} / {:.1} / {:.1} / {:.1} / {:.1}%", percent(actual, used), percent(lru, used),
-                           percent(arc, used), percent(lru2, used), percent(best, used)));
+        parts.push(format!("{class} ({label}, {slots} slots) {:.1} / {:.1} / {:.1} / {:.1} / {:.1}% (an LRU of 3/4, 5/4, 3/2: {}%)",
+                           percent(actual, used), percent(lru, used), percent(arc, used), percent(lru2, used), percent(best, used),
+                           scaled.join(" / ")));
     }
     format!("Straydog expert reuse: {} uses of decode and verify passes on the first GPU; VRAM missed {:.1}%, an LRU store of the same \
              slots would miss {:.1}%, ARC {:.1}%, LRU-2 {:.1}%, the best possible {:.1}%; by class (missed / LRU / ARC / LRU-2 / best): {}",
@@ -368,6 +372,8 @@ mod tests {
         assert!(line.contains("12 uses"), "{line}");
         assert!(line.contains("VRAM missed 75.0%, an LRU store of the same slots would miss 83.3%, ARC "), "{line}");
         assert!(line.contains(", the best possible 58.3%; by class (missed / LRU / ARC / LRU-2 / best): 0 (layers 0-9, 3 slots) 75.0 / 83.3 / "), "{line}");
+        // (an LRU of 2, 3 and 4 slots: 12, 10 and 8 of the 12 uses missed)
+        assert!(line.contains("58.3% (an LRU of 3/4, 5/4, 3/2: 100.0 / 83.3 / 66.7%)"), "{line}");
         assert!(!line.contains("layers 10-19"), "{line}");
     }
 }
