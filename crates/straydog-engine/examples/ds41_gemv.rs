@@ -60,13 +60,22 @@ fn main() -> Result<(), String> {
     gpu.write_buffer(&input, 0, &input_values)?;
     let output = gpu.buffer((16384 * 4 * vectors) as u64)?;
     let scratch = gpu.buffer(1 << 20)?;
-    for (label, rows, cols) in [("q_b", 16384usize, 1280usize), ("wo_a", 4096, 4096), ("wo_b", 5120, 4096)] {
+    // (the router, F32 384 x 5120 whatever DS41_GEMV_KIND: "router" its GEMV alone, "routed" with its routes in the launch's last block,
+    // sd_op_linear_route's square-root softplus, a bias and top 6, as the engine takes them)
+    let (bias, ids, route_weights) = (gpu.buffer(384 * 4)?, gpu.buffer(4 * 6 * 4)?, gpu.buffer(4 * 6 * 4)?);
+    gpu.write_buffer(&bias, 0, &random.floats(384))?;
+    for (label, rows, cols) in [("q_b", 16384usize, 1280usize), ("wo_a", 4096, 4096), ("wo_b", 5120, 4096), ("router", 384, 5120), ("routed", 384, 5120)] {
         if only.as_ref().is_some_and(|text| !label.contains(text.as_str())) {
             continue;
         }
+        let f32 = label.starts_with("rout");
+        let (kind, per, block) = if f32 { (0u32, 1usize, 4usize) } else { (kind, per, block) };
         // (wo_a: the engine's four linears, group g's rows of the weights over its 4096 inputs of each row's 16384, into 4096 outputs a row)
         let run = |gpu: &mut Backend, bank: &Buffer| -> Result<(), String> {
-            if label == "wo_a" {
+            if label == "routed" {
+                gpu.linear_route(bank, 0, rows as u64, cols as u64, input.base(), vectors as u64, output.base(), Some(bias.base()), 6, 2, true,
+                                 2.5, ids.base(), route_weights.base(), &scratch)
+            } else if label == "wo_a" {
                 let items: Vec<Linear> = (0..4).map(|g| Linear { weights: *bank, kind, rows: 1024, cols: 4096, first_row: (g * 1024) as u64,
                                                                input: input.at(g * 4096), output: output.at(g * 1024) }).collect();
                 gpu.linears(&items, vectors as u64, 16384, 4096, &scratch)
@@ -76,7 +85,12 @@ fn main() -> Result<(), String> {
         };
         let bytes = rows * cols / per * block;
         let copies = ((384usize << 20) / bytes).max(2);
-        let banks: Vec<Buffer> = (0..copies).map(|_| gpu.upload_bytes(&random.blocks(kind, block, rows * cols / per))).collect::<Result<_, _>>()?;
+        let banks: Vec<Buffer> = (0..copies).map(|_| if f32 {
+                let bank = gpu.buffer((rows * cols * 4) as u64)?;
+                gpu.write_buffer(&bank, 0, &random.floats(rows * cols))?;
+                Ok(bank)
+            } else { gpu.upload_bytes(&random.blocks(kind, block, rows * cols / per)) })
+            .collect::<Result<_, String>>()?;
         let started = std::time::Instant::now();
         for iteration in 0..iterations {
             let bank = &banks[iteration * 7 % copies];
