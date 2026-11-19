@@ -14,7 +14,7 @@ use straydog_engine::arch::deepseek41::engine::IMAGE_TOKEN;
 use straydog_engine::pyjson::Value;
 use straydog_engine::qwen_vision::{self, Prepared, VISION_END, VISION_START};
 use straydog_engine::text::{Text, TextError};
-use straydog_engine::vision::{self, Patches, VisionConfig};
+use straydog_engine::vision::{self, Patches, Plan, VisionConfig};
 
 const MARK: char = '\u{f8ff}';
 const MARKER: &str = "\u{f8ff}straydog-image-";
@@ -26,14 +26,28 @@ fn marker(index: usize) -> String {
 /// An image of the request: its encoded bytes' digest and its patches.
 pub struct Image {
     pub digest: [u8; 32],
-    pub patches: Patches,
+    /// Its size for the encoder, which says how long its span is.
+    pub plan: Plan,
+    /// What the encoder takes. None for an image whose rows are kept from an earlier request ([`known`]), which is not decoded again.
+    pub patches: Option<Patches>,
 }
 
 impl Image {
     /// The ids of its span: from its digest, consecutive.
     fn ids(&self) -> impl Iterator<Item = u32> + '_ {
-        span_ids(&self.digest, self.patches.plan.tokens())
+        span_ids(&self.digest, self.plan.tokens())
     }
+}
+
+/// The digest an image is known by: its encoded bytes'.
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// An image sent again, whose encoder rows are kept, with its plan from when it was first prepared: a conversation sends all its images with every
+/// request, and decoding each again was ~15 ms an image of every request's first token (0.37 s of 2 s at the 24 screenshots of an agent's page checks).
+pub fn known(digest: [u8; 32], plan: Plan) -> Image {
+    Image { digest, plan, patches: None }
 }
 
 /// The messages with each image part replaced by its marker, and the images' encoded bytes in
@@ -130,19 +144,36 @@ fn base64(text: &str) -> Result<Vec<u8>, String> {
 /// Decode an image and cut it into the encoder's patches.
 pub fn prepare(bytes: &[u8]) -> Result<Image, String> {
     let rgb = vision::decode(bytes)?;
-    Ok(Image { digest: Sha256::digest(bytes).into(), patches: vision::patches(&rgb, &VisionConfig::DEEPSEEK41) })
+    let patches = vision::patches(&rgb, &VisionConfig::DEEPSEEK41);
+    Ok(Image { digest: digest(bytes), plan: patches.plan, patches: Some(patches) })
 }
 
 /// A Qwen3.8 request's image: its encoded bytes' digest and what its encoder takes.
 pub struct QwenImage {
     pub digest: [u8; 32],
-    pub prepared: Prepared,
+    /// Its grid of merged tokens (rows, columns), which its positions are of.
+    pub grid: (usize, usize),
+    /// What its encoder takes. None for an image whose rows are kept from an earlier request ([`known_qwen`]), which is not decoded again.
+    pub prepared: Option<Prepared>,
+}
+
+impl QwenImage {
+    /// How long its span is.
+    pub fn tokens(&self) -> usize {
+        self.grid.0 * self.grid.1
+    }
+}
+
+/// [`known`], for Qwen3.8: an image sent again, whose rows are kept, with the grid it had when it was first prepared.
+pub fn known_qwen(digest: [u8; 32], grid: (usize, usize)) -> QwenImage {
+    QwenImage { digest, grid, prepared: None }
 }
 
 /// Decode an image and size it for Qwen3.8's encoder.
 pub fn prepare_qwen(bytes: &[u8]) -> Result<QwenImage, String> {
     let rgb = vision::decode_upright(bytes)?;
-    Ok(QwenImage { digest: Sha256::digest(bytes).into(), prepared: qwen_vision::prepare(&rgb)? })
+    let prepared = qwen_vision::prepare(&rgb)?;
+    Ok(QwenImage { digest: digest(bytes), grid: prepared.grid(), prepared: Some(prepared) })
 }
 
 /// The ids of a span of `count` positions: from its image's digest, consecutive, past the vocabulary.
@@ -161,7 +192,7 @@ pub fn qwen_ids(text: &Text, pieces: &[Piece<'_>], images: &[QwenImage]) -> Resu
             Piece::Image(index) => {
                 ids.push(VISION_START);
                 spans.push((index, ids.len()));
-                ids.extend(span_ids(&images[index].digest, images[index].prepared.tokens()));
+                ids.extend(span_ids(&images[index].digest, images[index].tokens()));
                 ids.push(VISION_END);
             }
         }
@@ -262,7 +293,8 @@ mod tests {
         // 512x256: 16 merged columns by 8 rows
         let image = qwen_vision::prepare(&vision::Rgb { width: 512, height: 256, pixels: vec![9; 512 * 256 * 3] }).unwrap();
         assert_eq!((image.grid(), image.tokens()), ((8, 16), 128));
-        let images = [QwenImage { digest: [7; 32], prepared: image }];
+        assert_eq!(image.grid().0 * image.grid().1, image.tokens());
+        let images = [QwenImage { digest: [7; 32], grid: image.grid(), prepared: Some(image) }];
         let prompt = format!("a{}a", marker(0));
         let pieces = pieces(&prompt, 1).unwrap();
         let (ids, spans) = qwen_ids(&text, &pieces, &images).unwrap();
@@ -272,6 +304,8 @@ mod tests {
         assert!(ids[2..130].iter().all(|id| *id >= IMAGE_TOKEN));
         assert_eq!(ids[3], ids[2] + 1);
         assert_eq!(qwen_ids(&text, &pieces, &images).unwrap().0, ids);
+        // (sent again, with its rows kept: the same span from its digest and grid alone)
+        assert_eq!(qwen_ids(&text, &pieces, &[known_qwen([7; 32], (8, 16))]).unwrap().0, ids);
     }
 
     /// A reply read back in other tokens than the tokenizer's moves what follows it, the images too.
@@ -287,6 +321,21 @@ mod tests {
         let shorter = [9, image(0), image(1), 3, image(0), image(1), 5];
         assert_eq!(spans_in(&spans, &ids, &shorter).unwrap(), [(0, 1), (1, 4)]);
         assert!(spans_in(&spans, &ids, &[1, 2, 3]).is_none());
+    }
+
+    /// An image sent again is known by its digest and its plan, without its pixels, and has the span that preparing it gave.
+    #[test]
+    fn a_known_image_has_the_span_its_preparing_gave() {
+        // (a white pixel, as a GIF)
+        const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        let text = Text::new(br#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"a":0},"unk_token":"a"}}"#).unwrap();
+        let prepared = prepare(GIF).unwrap();
+        assert!(prepared.patches.is_some() && prepared.plan.tokens() > 0);
+        let again = known(digest(GIF), prepared.plan);
+        assert!(again.patches.is_none());
+        let prompt = format!("a{}a", marker(0));
+        let pieces = pieces(&prompt, 1).unwrap();
+        assert_eq!(ids(&text, &pieces, &[again]).unwrap(), ids(&text, &pieces, &[prepared]).unwrap());
     }
 
     #[test]

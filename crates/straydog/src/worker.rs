@@ -137,7 +137,7 @@ struct Engine {
     vision: Result<Encoder, String>,
     /// The rows of the images encoded last (by their bytes' digest), newest last: a conversation sends its images
     /// again with every turn.
-    encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
+    encoded: Vec<([u8; 32], Arc<Vec<f32>>, (usize, usize))>,
     /// The route counts of the runs before this one, from the warm-up state it started with (a partially resident model's: [`straydog_engine::routes`]).
     earlier: Option<Routes>,
     /// The draft widths that state kept, by placement, which the next state keeps beside this placement's own ([`routes::with_drafts`]).
@@ -1582,7 +1582,7 @@ impl Engine {
                 continue;
             }
             let digest = images[index].digest;
-            if let Some(at) = self.encoded.iter().position(|(kept, _)| *kept == digest) {
+            if let Some(at) = self.encoded.iter().position(|(kept, _, _)| *kept == digest) {
                 let kept = self.encoded.remove(at);
                 rows[index] = Some(kept.1.clone());
                 self.encoded.push(kept);
@@ -1590,14 +1590,16 @@ impl Engine {
             }
             // (a refusal: nothing of the model's state has moved, and the worker reads on)
             // (whatever an image does in there, the worker reads on)
-            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encoder.encode(&images[index].prepared, &|| cancel.load(Ordering::SeqCst))))
+            // (an image taken as known had its rows above: one with nothing to encode here would be a mistake of this worker's, said and not served)
+            let prepared = images[index].prepared.as_ref().ok_or_else(|| refused("an image's kept rows went before they were read"))?;
+            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encoder.encode(prepared, &|| cancel.load(Ordering::SeqCst))))
                 .unwrap_or_else(|_| Err("it failed on this image".to_string()))
                 .map_err(|message| refused(format!("the vision encoder: {message}")))?;
             let Some(encoded) = encoded else { return Ok(None) };
             let encoded = Arc::new(encoded);
             rows[index] = Some(encoded.clone());
-            self.encoded.push((digest, encoded));
-            while self.encoded.iter().map(|(_, values)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
+            self.encoded.push((digest, encoded, images[index].grid));
+            while self.encoded.iter().map(|(_, values, _)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
                 self.encoded.remove(0);
             }
         }
@@ -1906,7 +1908,19 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         (ids, Vec::new(), Vec::new())
     } else {
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
-        let prepared: Vec<images::QwenImage> = images.iter().map(|bytes| images::prepare_qwen(bytes)).collect::<Result<_, _>>().map_err(refused)?;
+        // (one whose rows are kept is not decoded again: its grid says how long its span is. Decoding each again was ~15 ms an image of
+        // every request's first token, with an agent's screenshots all sent each time.)
+        let prepared: Vec<images::QwenImage> = images
+            .iter()
+            .map(|bytes| {
+                let digest = images::digest(bytes);
+                match engine.encoded.iter().find(|(kept, _, _)| *kept == digest) {
+                    Some(&(_, _, grid)) => Ok(images::known_qwen(digest, grid)),
+                    None => images::prepare_qwen(bytes),
+                }
+            })
+            .collect::<Result<_, _>>()
+            .map_err(refused)?;
         let (ids, spans) = images::qwen_ids(text, &pieces, &prepared).map_err(Failure::from)?;
         (ids, prepared, spans)
     };
@@ -2006,7 +2020,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         eprintln!("Straydog: a reply read back moves this request's images by {} tokens", agreed.len() as i64 - ids.len() as i64);
     }
     engine.model.set_images(placed.iter().map(|&(index, start)| ImageSpan {
-        start, grid: prepared[index].prepared.grid(), rows: image_rows[index].clone().unwrap_or_default(),
+        start, grid: prepared[index].grid, rows: image_rows[index].clone().unwrap_or_default(),
     }).collect());
     let max_new = max_new.min(context - agreed.len());
     // (a conversation an earlier run kept, which this prompt goes on from)

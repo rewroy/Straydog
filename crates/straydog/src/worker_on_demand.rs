@@ -29,9 +29,9 @@ struct Loaded<E: Engines> {
     template: ChatTemplate,
     /// Whether the template takes a reasoning effort of its own (DeepSeek-V4.1's levels).
     efforts: bool,
-    /// The span rows of the images encoded last (by their bytes' digest), newest last: a
+    /// The span rows of the images encoded last (by their bytes' digest), newest last, with each one's plan: a
     /// conversation sends its images again with every turn.
-    encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
+    encoded: Vec<([u8; 32], Arc<Vec<f32>>, straydog_engine::vision::Plan)>,
 }
 
 /// Bytes of image rows kept for the turns after ([`Loaded::encoded`]): ~30 screenshots (a
@@ -362,7 +362,18 @@ impl<E: Engines> Loaded<E> {
         let prompt = if unreasoned && prompt.ends_with(THINK_OPEN) { prompt + THINK_CLOSE } else { prompt };
         let thinking = thinking && !unreasoned;
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
-        let images: Vec<images::Image> = images.iter().map(|bytes| images::prepare(bytes)).collect::<Result<_, _>>().map_err(refused)?;
+        // (one whose rows are kept is not decoded again: its plan says how long its span is)
+        let images: Vec<images::Image> = images
+            .iter()
+            .map(|bytes| {
+                let digest = images::digest(bytes);
+                match self.encoded.iter().find(|(kept, _, _)| *kept == digest) {
+                    Some(&(_, _, plan)) => Ok(images::known(digest, plan)),
+                    None => images::prepare(bytes),
+                }
+            })
+            .collect::<Result<_, _>>()
+            .map_err(refused)?;
         let (mut ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
         // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
         // encoded again can be split otherwise, and the engines then read the reply again from the first such place.
@@ -498,7 +509,7 @@ impl<E: Engines> Loaded<E> {
         let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
         let mut missing = Vec::new();
         for &(index, _) in spans {
-            match self.encoded.iter().position(|(digest, _)| *digest == images[index].digest) {
+            match self.encoded.iter().position(|(digest, _, _)| *digest == images[index].digest) {
                 Some(at) => {
                     let kept = self.encoded.remove(at);
                     rows[index] = Some(kept.1.clone());
@@ -511,15 +522,19 @@ impl<E: Engines> Loaded<E> {
         if missing.is_empty() {
             return Ok(rows);
         }
-        let patches: Vec<_> = missing.iter().map(|&index| images[index].patches.clone()).collect();
+        // (an image taken as known had its rows above: one with no patches here would be a mistake of this worker's, said and not served)
+        let patches: Vec<_> = missing
+            .iter()
+            .map(|&index| images[index].patches.clone().ok_or_else(|| refused("an image's kept rows went before they were read".to_string())))
+            .collect::<Result<_, _>>()?;
         // (a refusal: a device that failed fails the reset after it)
         let encoded = self.model.engines.encode_images(&patches).map_err(|message| refused(format!("the vision encoder: {message}")))?;
         for (index, values) in missing.into_iter().zip(encoded) {
             let values = Arc::new(values);
             rows[index] = Some(values.clone());
-            self.encoded.push((images[index].digest, values));
+            self.encoded.push((images[index].digest, values, images[index].plan));
         }
-        while self.encoded.iter().map(|(_, values)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
+        while self.encoded.iter().map(|(_, values, _)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
             self.encoded.remove(0);
         }
         Ok(rows)
