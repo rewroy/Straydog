@@ -234,6 +234,10 @@ int sd_op_norm_linears_rope(void* handle, const float* x, const float* weight, u
    of x (one of their outputs) into normed and side's row as sd_op_norm_rope forms it: the results of
    the three ops, in one launch where it can. */
 int sd_op_linears_norm_rope(void* handle, const sd_linear* items, uint64_t count, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_norm_rope* side);
+/* sd_op_linears_norm_rope of 2 to 4 rows (a verify pass's): the items' input rows `input_stride` floats apart; their output rows, x's,
+   normed's and side->input's `stride` apart; side's positions and out_rows (or out's rows) one a row. Each row's results are those of
+   the row through sd_op_linears_norm_rope alone. */
+int sd_op_linears_norm_rope_rows(void* handle, const sd_linear* items, uint64_t count, uint64_t rows, uint64_t input_stride, uint64_t stride, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_norm_rope* side);
 int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up, const float* scale, float* hidden, float* out);
 /* sd_op_swiglu_linear, and meanwhile (one launch where the GEMV takes it) the routes of one row of
    256 router logits as sd_op_route picks them with softmax gating, normalized, no bias, scale 1:

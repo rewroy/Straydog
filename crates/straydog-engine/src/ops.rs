@@ -451,6 +451,30 @@ impl Backend {
         })
     }
 
+    /// [`linears_norm_rope`](Self::linears_norm_rope) of 2 to 4 rows (a verify pass's) in one launch: the items' input rows
+    /// `input_stride` floats apart; their output rows, `x`'s, `normed`'s and `side.input`'s `stride` apart; `side`'s positions and
+    /// output rows one a row. Each row's results are those of the row alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linears_norm_rope_rows(&mut self, items: &[Linear], rows: u64, input_stride: u64, stride: u64, x: P, weight: &Buffer, width: u64,
+                                  eps: f32, normed: M, side: &NormRope) -> Result<()> {
+        let items: Vec<ffi::sd_linear> = items.iter().map(|item| ffi::sd_linear {
+            weights: item.weights.pointer.cast_const(), kind: item.kind as i32, rows: item.rows, cols: item.cols,
+            first_row: item.first_row, input: item.input.cast(), output: item.output.cast(),
+        }).collect();
+        let (rope_dims, positions, frequencies) =
+            side.rope.map_or((0, std::ptr::null(), std::ptr::null()), |(dims, p, f)| (dims, p.pointer.cast_const().cast(), f.pointer.cast_const().cast()));
+        let side = ffi::sd_norm_rope {
+            input: side.input.cast(), weight: side.weight.pointer.cast_const().cast(), width: side.width, eps: side.eps, rope_dims,
+            positions, frequencies, out_rows: side.out_rows.map_or(std::ptr::null(), |rows| rows.cast()), out: side.out.cast(),
+            out_count: side.out_count,
+        };
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_linears_norm_rope_rows(self.handle(), items.as_ptr(), items.len() as u64, rows, input_stride, stride, x.cast(),
+                                              weight.pointer.cast(), width, eps, normed.cast(), &side)
+        })
+    }
+
     /// One vector: `out` = W . SwiGLU(gate, up) (`cols` values each; `hidden` takes the SwiGLU
     /// when it is formed apart), each row times sigmoid(`*scale`) when given: the results of
     /// [`swiglu`](Self::swiglu), [`linear`](Self::linear) and [`scale_rows`](Self::scale_rows).

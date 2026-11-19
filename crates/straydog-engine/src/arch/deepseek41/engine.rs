@@ -3505,6 +3505,9 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
     let same_rows = plan.kv_from == plan.full_from && rope > 0 && n > 0 && kv_rows > 0;
     shard.gpu.attention_turns_arm(if same_rows { kv_rows as u64 } else { 0 })?;
     let fused = n == 1 && kv_rows == 1;
+    // A verify pass's rows (2 to 4, each with its kv row) take the same one launch, each row's q normed in place: q_a's and kv's rows
+    // q_rank floats apart (kv's in its buffer of a batch's rows). It was five: q_a, kv, q's norm, then after q_b kv's norm and rope.
+    let fused_rows = !fused && n > 1 && n <= VERIFY_ROWS && kv_rows == n && (n - 1) * hp.q_rank + dim <= (work.kv.bytes / 4) as usize;
     let normed_q = if fused { work.qn } else { work.qr };
     if fused {
         let (q_a_norm, kv_norm) = (shard.dense(&name(layer, "attn_q_a_norm"))?, shard.dense(&name(layer, "attn_kv_a_norm"))?);
@@ -3516,6 +3519,17 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         shard.gpu.linears_norm_rope(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())],
                                     work.qr.base(), &q_a_norm.buffer, hp.q_rank as u64, hp.norm_eps, work.qn.base(), &side)?;
         shard.linear(&name(layer, "attn_q_b"), work.qn.base(), 1, work.q.base())?;
+    } else if fused_rows {
+        let (q_a_norm, kv_norm) = (shard.dense(&name(layer, "attn_q_a_norm"))?, shard.dense(&name(layer, "attn_kv_a_norm"))?);
+        let side = ops::NormRope {
+            input: work.kv.base() as P, weight: &kv_norm.buffer, width: dim as u64, eps: hp.norm_eps,
+            rope: Some((rope, &kv_work.positions, &freqs)), out_rows: Some(kv_work.ring_rows.base() as P), out: ring.base(),
+            out_count: plan.ring_rows,
+        };
+        shard.gpu.linears_norm_rope_rows(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())],
+                                         n as u64, hp.width as u64, hp.q_rank as u64, work.qr.base(), &q_a_norm.buffer, hp.q_rank as u64,
+                                         hp.norm_eps, work.qr.base(), &side)?;
+        shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
     } else if kv_rows == n {
         if n > 0 {
             shard.gpu.linears(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())], n as u64, 0,
@@ -3527,7 +3541,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
             shard.gpu.linears(&[whole(&q_a, q_work.x.base(), work.qr.base())], n as u64, 0, 0, &scratch)?;
         }
     }
-    if !fused {
+    if !fused && !fused_rows {
         if n > 0 {
             shard.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank, hp.norm_eps)?;
             shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
