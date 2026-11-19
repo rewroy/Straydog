@@ -1924,6 +1924,14 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
     let prompt = if images.is_empty() { engine.template.render(messages, &tools, thinking, effort) } else { engine.template.render_parts(messages, &tools, thinking, effort) }
         .map_err(|exc| refused(exc.0))?;
+    // A reply asked with no reasoning in a conversation that thinks (`"reasoning": false`): the prompt as it is, its reasoning closed empty where the
+    // generation prompt opens it. Rendered with thinking off, the template would drop its effort's words from the system message, and all of the
+    // conversation would be read again; closed so, it is what the template writes back of a reply that had none, and the next request goes on from it.
+    let unreasoned = thinking && matches!(body.get("reasoning"), Some(Py::Bool(false)));
+    let (prompt, thinking) = match unreasoned.then(|| reasoning_closed(&prompt)).flatten() {
+        Some(closed) => (closed, false),
+        None => (prompt, thinking),
+    };
     let (ids, prepared, spans) = if images.is_empty() {
         // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
         // encoded again can be split otherwise, and the model then read the reply again from the first such place.
@@ -2156,8 +2164,33 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     }))
 }
 
+/// `prompt` with the reasoning its generation prompt opens closed empty, as the template writes back a reply with none (`<think>\n` reasoning
+/// `\n</think>\n\n`); none for a prompt that does not end by opening it.
+fn reasoning_closed(prompt: &str) -> Option<String> {
+    const OPENS: &str = "<think>\n";
+    prompt.ends_with(OPENS).then(|| format!("{prompt}\n{THINK_CLOSE}\n\n"))
+}
+
 #[cfg(test)]
 mod tests {
+    /// A reply without reasoning is the generation prompt with its reasoning closed empty: the text the template writes back of a reply with none, so
+    /// that the next request reads on from it.
+    #[test]
+    fn a_reply_without_reasoning_closes_it_as_the_template_writes_one_that_had_none() {
+        let template = straydog_engine::chat::ChatTemplate::new(
+            "{%- for m in messages %}<|im_start|>{{ m.role }}\n{% if m.role == 'assistant' %}<think>\n{{ m.reasoning_content|default('') }}\n</think>\n\n{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}\
+             {%- if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
+        )
+        .unwrap();
+        let parse = |text: &str| straydog_engine::pyjson::parse(text).unwrap();
+        let prompt = template.render(&parse(r#"[{"role": "user", "content": "hi"}]"#), &parse("null"), true, "medium").unwrap();
+        let closed = reasoning_closed(&prompt).unwrap();
+        let answered = parse(r#"[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]"#);
+        let next = template.render(&answered, &parse("null"), true, "medium").unwrap();
+        assert!(next.starts_with(&format!("{closed}hello")), "{closed:?} then {next:?}");
+        assert!(reasoning_closed("<|im_start|>assistant\n").is_none());
+    }
+
     use super::*;
 
     const MIB: u64 = 1 << 20;
