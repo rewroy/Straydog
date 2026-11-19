@@ -1142,7 +1142,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let laying = std::time::Instant::now();
             let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?.with_experts(hp.experts));
             let laid = laying.elapsed().as_secs_f64();
-            let shard = Shard::new(&hp, &settings, device, budget, layout, rows, parts)?;
+            let mut shard = Shard::new(&hp, &settings, device, budget, layout, rows, parts)?;
+            if part == 0 {
+                // (how far the store's evictions are from an LRU's and the best possible ones, on the uses it sees: a log line every
+                // window of uses)
+                shard.experts.observe_reuse();
+            }
             let [init, buffers, store, f32_warm, f16_warm] = shard.startup;
             // (the wait before a server starts, by step: T161)
             startup.extend([(format!("GPU {device} expert layout"), laid), (format!("GPU {device} init"), init),

@@ -1069,6 +1069,8 @@ pub struct DeviceExperts {
     /// clock value they count from.
     warm_ranks: HashMap<Key, u64>,
     warm_origin: Option<u64>,
+    /// The uses of passes of a few rows, replayed against an LRU and the best possible store ([`observe_reuse`](Self::observe_reuse)).
+    reuse: Option<crate::reuse::Reuse>,
 }
 
 impl DeviceExperts {
@@ -1185,8 +1187,29 @@ impl DeviceExperts {
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), touched: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
-            uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None,
+            uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None, reuse: None,
         })
+    }
+
+    /// From here on, log every [`crate::reuse::WINDOW`] uses by passes of a few rows (decode and verify) the share VRAM
+    /// missed beside the shares a least-recently-used store and the best possible one of the same slots would have
+    /// missed, by class (a diagnostic: counts alone are kept).
+    pub fn observe_reuse(&mut self) {
+        self.reuse = Some(crate::reuse::Reuse::new(self.classes.len()));
+    }
+
+    /// A use by a pass that does not stream its experts, for [`observe_reuse`](Self::observe_reuse); `hit`: VRAM held it.
+    fn note_use(&mut self, key: Key, hit: bool) {
+        if self.streaming {
+            return;
+        }
+        let Some(class) = self.class_of.get(key.0 as usize).copied().flatten() else { return };
+        let Some(reuse) = self.reuse.as_mut() else { return };
+        let (slots, class_of, count) = (&self.slots, &self.class_of, self.classes.len());
+        reuse.note(key, class, hit, || (0..count).map(|index| {
+            let layers: Vec<usize> = class_of.iter().enumerate().filter(|(_, of)| **of == Some(index)).map(|(layer, _)| layer).collect();
+            (slots.iter().filter(|slot| slot.class == index).count(), crate::reuse::layer_label(&layers))
+        }).collect());
     }
 
     pub fn counts(&self) -> Counts {
@@ -1431,9 +1454,11 @@ impl DeviceExperts {
                 let key = (layer as u32, expert as u32);
                 if let Some(&slot) = self.map.get(&key) {
                     self.counts.hits += 1;
+                    self.note_use(key, true);
                     self.hold(slot);
                     self.requested.push(key);
                 } else {
+                    self.note_use(key, false);
                     self.unfilled.push_back(key);
                 }
             }
@@ -1497,6 +1522,7 @@ impl DeviceExperts {
             if let Some(&slot) = self.map.get(&key) {
                 if !requested.contains(&key) {
                     self.counts.hits += 1;
+                    self.note_use(key, true);
                 }
                 self.hold(slot);
                 slots[index] = slot;
@@ -1512,7 +1538,12 @@ impl DeviceExperts {
                     let key = (layer as u32, expert as u32);
                     let slot = match self.map.get(&key) {
                         Some(&slot) => slot,
-                        None => self.fill(gpu, key, true, CHUNK)?,
+                        None => {
+                            if !requested.contains(&key) {
+                                self.note_use(key, false);
+                            }
+                            self.fill(gpu, key, true, CHUNK)?
+                        }
                     };
                     self.hold(slot);
                     slots[index] = slot;
