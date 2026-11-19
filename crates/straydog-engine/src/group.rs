@@ -1331,6 +1331,32 @@ impl Group {
         self.backends.iter_mut().try_for_each(|backend| backend.checkpoint(slot, save))
     }
 
+    /// Every device's next prompt batch also leaves its recurrent states after its row `row` in its spare checkpoint buffer
+    /// ([`Backend::capture_at`]); 0 takes it back.
+    pub fn capture_at(&mut self, row: u64) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.capture_at(row))
+    }
+
+    /// Whether every device's capture copied every state it was to ([`Backend::capture_complete`]).
+    pub fn capture_complete(&self) -> bool {
+        self.backends.iter().all(Backend::capture_complete)
+    }
+
+    /// Whether every device can take a checkpoint inside a prompt batch ([`Backend::can_capture`]).
+    pub fn can_capture(&self) -> bool {
+        self.backends.iter().all(Backend::can_capture)
+    }
+
+    /// What the last capture filled becomes checkpoint `slot` on every device ([`Backend::adopt_capture`]).
+    pub fn adopt_capture(&mut self, slot: usize) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.adopt_capture(slot))
+    }
+
+    /// Checkpoint `to` holds what checkpoint `from` holds, on every device ([`Backend::clone_checkpoint`]).
+    pub fn clone_checkpoint(&mut self, from: usize, to: usize) -> Result<()> {
+        self.backends.iter_mut().try_for_each(|backend| backend.clone_checkpoint(from, to))
+    }
+
     /// Host bytes [`save_positions`](Self::save_positions) takes per position.
     pub fn position_bytes(&self) -> u64 {
         self.backends.iter().map(Backend::position_bytes).sum()

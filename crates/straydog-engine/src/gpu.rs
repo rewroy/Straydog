@@ -600,6 +600,8 @@ pub struct Backend {
     decoder_layers: HashSet<usize>,
     states: IndexMap<String, Entry>,
     checkpoints: Vec<*mut c_void>,
+    /// A spare checkpoint buffer a prompt batch's capture fills ([`Backend::capture_at`]); the checkpoint it becomes trades buffers with it.
+    capture: Option<*mut c_void>,
     checkpoint_states: Vec<*mut c_void>,
     /// Bytes of one checkpoint buffer (the recurrent states packed).
     checkpoint_bytes: u64,
@@ -704,6 +706,7 @@ impl Backend {
             decoder_layers: HashSet::new(),
             states: IndexMap::new(),
             checkpoints: Vec::new(),
+            capture: None,
             checkpoint_states: Vec::new(),
             checkpoint_bytes: 0,
             prefill_capacity: 1024,
@@ -746,6 +749,7 @@ impl Backend {
             decoder_layers: HashSet::new(),
             states: IndexMap::new(),
             checkpoints: Vec::new(),
+            capture: None,
             checkpoint_states: Vec::new(),
             checkpoint_bytes: 0,
             prefill_capacity: 1024,
@@ -2857,14 +2861,58 @@ impl Backend {
         self.checkpoint_states = keys.iter().map(|key| self.states[*key].pointer).collect();
         let size: u64 = keys.iter().map(|key| self.states[*key].rows * self.states[*key].cols * 4).sum();
         self.checkpoints.clear();
+        self.capture = None;
         self.checkpoint_bytes = size;
         if !self.checkpoint_states.is_empty() {
-            for _ in 0..count {
+            // (and one more, the spare a prompt batch's capture fills)
+            for _ in 0..=count {
                 // SAFETY: a live handle.
                 self.checkpoints.push(pointer(unsafe { ffi::sd_checkpoint_buffer(self.handle, size) })?);
             }
+            self.capture = self.checkpoints.pop();
         }
-        Ok(size * self.checkpoints.len() as u64)
+        Ok(size * (self.checkpoints.len() + usize::from(self.capture.is_some())) as u64)
+    }
+
+    /// The next prompt batch also leaves its recurrent states after its row `row` (0 < row < the batch's rows) in the spare checkpoint buffer,
+    /// as [`Backend::checkpoint`] would after a batch that ended there (sd_capture_at); 0 takes it back. Nothing on a device with no recurrent
+    /// state.
+    pub fn capture_at(&mut self, row: u64) -> Result<()> {
+        let Some(buffer) = self.capture else { return Ok(()) };
+        let (states, count, buffer) = if row == 0 { (std::ptr::null(), 0, std::ptr::null_mut()) }
+                                      else { (self.checkpoint_states.as_ptr(), self.checkpoint_states.len() as u64, buffer) };
+        // SAFETY: the states and the buffer were reserved together on this device (or none, to take it back).
+        check(unsafe { ffi::sd_capture_at(self.handle, row, states, count, buffer) })?;
+        Ok(())
+    }
+
+    /// Whether the capture set by [`Backend::capture_at`] has copied every state it was to (a batch read another way copies none).
+    pub fn capture_complete(&self) -> bool {
+        // SAFETY: a live handle.
+        self.capture.is_none() || unsafe { ffi::sd_capture_done(self.handle) } == self.checkpoint_states.len() as u64
+    }
+
+    /// Whether a prompt batch can take a checkpoint inside itself here: a spare buffer, or no recurrent state to take.
+    pub fn can_capture(&self) -> bool {
+        self.capture.is_some() || self.checkpoint_states.is_empty()
+    }
+
+    /// What the last capture filled becomes checkpoint `slot`: the spare buffer and the slot's trade places (the copies into it are on the
+    /// stream before anything that reads the slot).
+    pub fn adopt_capture(&mut self, slot: usize) -> Result<()> {
+        if let (Some(capture), Some(held)) = (self.capture.as_mut(), self.checkpoints.get_mut(slot)) {
+            std::mem::swap(capture, held);
+        }
+        Ok(())
+    }
+
+    /// Checkpoint `to` holds what checkpoint `from` holds (on the host, once the stream's copies into `from` are done).
+    pub fn clone_checkpoint(&mut self, from: usize, to: usize) -> Result<()> {
+        if let (Some(&from), Some(&to)) = (self.checkpoints.get(from), self.checkpoints.get(to)) {
+            // SAFETY: two checkpoint buffers of this device.
+            check(unsafe { ffi::sd_checkpoint_clone(self.handle, from, to) })?;
+        }
+        Ok(())
     }
 
     /// Bytes [`save_positions`](Self::save_positions) copies per position.
@@ -3435,6 +3483,27 @@ impl Backend {
     pub fn assist_cap() -> u32 {
         // SAFETY: a constant of the library.
         unsafe { ffi::sd_hybrid_assist_cap() }
+    }
+
+    /// The pinned tier of the partially resident layer whose gate bank starts at `from_gate`: per expert, its gate, up and down bytes in
+    /// page-locked memory of the engine's (null: read from its bank), or `None` to clear it. Ok(false) where no layer has that bank.
+    /// Readers in flight are waited for; the memory must stay page-locked and unchanged until the tier is cleared or replaced.
+    pub fn set_tier(&mut self, from_gate: *const u8, tier: Option<&[[*const u8; 3]]>) -> Result<bool> {
+        let mut found = 0u64;
+        let status = match tier {
+            Some(experts) => {
+                let roles: [Vec<*const u8>; 3] = std::array::from_fn(|role| experts.iter().map(|expert| expert[role]).collect());
+                // SAFETY: a live handle; three arrays of experts.len() addresses that live through the call (the library copies them).
+                unsafe {
+                    ffi::sd_hybrid_tier(self.handle, from_gate.cast(), experts.len() as u64, roles[0].as_ptr(), roles[1].as_ptr(), roles[2].as_ptr(),
+                                        &mut found)
+                }
+            }
+            // SAFETY: a live handle; null arrays clear the tier.
+            None => unsafe { ffi::sd_hybrid_tier(self.handle, from_gate.cast(), 0, std::ptr::null(), std::ptr::null(), std::ptr::null(), &mut found) },
+        };
+        check(status)?;
+        Ok(found == 1)
     }
 
     /// Change the assist level alone, once [`Backend::enable_assist`] has mapped the banks. The layers' captured graphs, which

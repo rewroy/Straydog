@@ -109,6 +109,9 @@ int sd_kv_format(void* handle, uint32_t row);
 int sd_kv_stage(void* handle, void* pointer, uint64_t rows);
 void* sd_checkpoint_buffer(void* handle, uint64_t bytes);
 int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t count, void* buffer);
+int sd_capture_at(void* handle, uint64_t row, void* const* states, uint64_t count, void* buffer);
+int sd_checkpoint_clone(void* handle, void* from, void* to);
+uint64_t sd_capture_done(void* handle);
 int sd_state_copy(void* handle, void* state, uint64_t offset, uint64_t pitch, uint64_t width, uint64_t height,
                   float* host, uint64_t first, int save);
 /* Asynchronous copies: page-locked host memory (sd_host_register, or sd_host_pin where devices
@@ -718,6 +721,10 @@ uint32_t sd_hybrid_assist_cap(void);
 /* The assist level alone, once sd_hybrid_assist has mapped the banks; a level past the cap is refused. A change drops the layers'
    captured graphs, which carry the level, and the next pass captures them again. */
 int sd_hybrid_assist_level(void* handle, uint32_t assist);
+/* The pinned tier of the partially resident layer whose gate bank is at `from`: per role, `experts` host addresses in page-locked memory
+   (null where the expert's bank is read), or none (gate null) to clear it. Readers in flight are waited for. *found 0: no such layer. */
+int sd_hybrid_tier(void* handle, const void* from, uint64_t experts, const uint8_t* const* gate, const uint8_t* const* up,
+                   const uint8_t* const* down, uint64_t* found);
 /* Whether this device's verifications through partially resident layers run their rows as two interleaved groups (on: 1), one group's
    GPU work beside the other's CPU experts. STRAYDOG_INTERLEAVE=1 or 0 holds it whatever this says. */
 int sd_hybrid_interleave(void* handle, int on);

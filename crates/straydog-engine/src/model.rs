@@ -152,6 +152,36 @@ const PARK_SLOTS: [usize; 2] = [CHECKPOINTS.len(), CHECKPOINTS.len() + 1];
 const PARK_MINIMUM: usize = 1024;
 /// Only a system prompt this long is worth a copy.
 const ROOT_MINIMUM: usize = 2048;
+
+/// The most rows a prompt batch reads past a checkpoint it takes inside itself ([`Model::prefill_batches`]): the MTP layer's indexer keeps
+/// its inputs of the last 16 positions (a ring), its pairs write up to the batch's end less two, and a resume at the checkpoint reads the
+/// three before its first pair there, which a batch of at most 13 rows past it leaves in place. A turn's checkpoint stands before the
+/// generation prompt, 7 tokens with thinking off, and up to 3 more to its multiple of four.
+const CAPTURE_TAIL: usize = 12;
+
+/// Whether the lock budget, where it cannot hold every layer, takes the most routed experts of every layer (a host tier, banks::tier_within)
+/// in place of whole layers: on a CUDA build on Windows, where the CPU's experts of the layers not locked fault their pages back into a
+/// working set at its limit (plan/20261119-qwen-host-tier.md); not elsewhere, where memory holds the banks and whole layers turn the
+/// GPU's assist on. STRAYDOG_HOST_TIER=1 or 0 says which on any build.
+fn host_tier_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("STRAYDOG_HOST_TIER").as_deref().map(str::trim) {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => cfg!(all(windows, feature = "cuda")),
+    })
+}
+
+/// Where a checkpoint's recurrent states come from ([`Model::save_checkpoint_from`]).
+#[derive(Clone, Copy)]
+enum Saved {
+    /// The devices' states now: the sequence ends at the checkpoint.
+    Device,
+    /// The capture a prompt batch took at the checkpoint, inside itself.
+    Capture,
+    /// The checkpoint slot another kind took at the same place.
+    Slot(usize),
+}
 const VOCABULARY: usize = 248320;
 
 /// Host bytes of one sequence's state before the GPU takes its attention and recurrence: each
@@ -1394,6 +1424,19 @@ pub struct Model {
     pub placement_note: Option<String>,
     pub history: Vec<u32>,
     final_hidden: Option<Vec<f32>>,
+    /// Inside a prompt batch that takes a checkpoint (Model::prefill_batches): its rows after the checkpoint (0: none), and its row before
+    /// the checkpoint once the batch has run ([`Model::forward`]).
+    capture_back: usize,
+    captured_hidden: Option<Vec<f32>>,
+    /// The host tier (STRAYDOG_HOST_TIER=1, plan/20261119-qwen-host-tier.md): the lock budget and the layers' bank bytes the plan had, and the
+    /// tiers the devices read, kept alive here.
+    tier_budget: u64,
+    tier_sizes: Vec<u64>,
+    tiers: Vec<crate::banks::ExpertTier>,
+    /// The experts each layer's tier was made of (by layer), for a tier a pass gave back to be made again ([`Model::pass_relock`]).
+    tier_chosen: Option<Vec<Vec<usize>>>,
+    /// Whether a prompt's last checkpoint may be taken inside a batch ([`Model::capture_possible`]; STRAYDOG_CAPTURE=0 says no).
+    capture: bool,
     checkpoints: IndexMap<&'static str, Checkpoint>,
     /// The length of the held sequence from which the reply being written is marked next ([`MARK_EVERY`]); `usize::MAX` for a reply that
     /// is not marked.
@@ -1697,6 +1740,13 @@ impl Model {
             placement_note,
             history: Vec::new(),
             final_hidden: None,
+            capture_back: 0,
+            captured_hidden: None,
+            tier_budget: 0,
+            tier_sizes: Vec::new(),
+            tiers: Vec::new(),
+            tier_chosen: None,
+            capture: std::env::var("STRAYDOG_CAPTURE").map_or(true, |value| value.trim() != "0"),
             checkpoints: IndexMap::new(),
             mark_at: usize::MAX,
             reply_marks: true,
@@ -2373,17 +2423,19 @@ impl Model {
 
     /// The page locks for `layers`, to be taken one layer at a time ([`BankLocks::lock_next`]).
     fn lock_job(&self, layers: &[usize]) -> Result<BankLocks> {
+        self.lock_job_reading(layers, self.lock_mode == LockMode::Copy)
+    }
+
+    /// [`Model::lock_job`] whose banks can be read from their files (`reading`: the copy mode's turns and the host tier's read them).
+    fn lock_job_reading(&self, layers: &[usize], reading: bool) -> Result<BankLocks> {
         self.refresh_kv_ahead();
         let mut planned = Vec::with_capacity(layers.len());
         for &layer in layers {
             let bank = |role: &str| -> Result<crate::banks::Bank> {
                 let name = format!("blk.{layer}.ffn_{role}_exps.weight");
                 let bank = self.weights.mapped_bank(&name)?;
-                // (the copy mode reads each bank's copy from its file)
-                Ok(match self.lock_mode {
-                    LockMode::Register => bank,
-                    LockMode::Copy => bank.reading(self.weights.bank_file(&name)?),
-                })
+                // (the copy mode reads each bank's copy from its file, as the host tier does its experts')
+                Ok(if reading { bank.reading(self.weights.bank_file(&name)?) } else { bank })
             };
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
@@ -2407,6 +2459,32 @@ impl Model {
         }
         if let Some(prior) = prior.filter(|prior| prior.total() > 0) {
             crate::banks::order_by_host_routes(&mut self.lock_pending, |layer| prior.host_routes(layer));
+            // The host tier: where the budget holds fewer than every layer, the most routed experts of every layer in its place ([`host_tier_on`]).
+            if host_tier_on() && self.tier_sizes.len() == 48 {
+                let expert_bytes: Vec<u64> = self.tier_sizes.iter().map(|bytes| bytes / 512).collect();
+                // (ranked by the routes that went to the host, not all of them: an expert VRAM's slots hold is neither the CPU's to read in a
+                // decode nor a prompt's to move, and a tier of the most routed overall held copies of those; the two tiers apart, as the
+                // expert store keeps them, experts.rs)
+                if let Some(chosen) = crate::banks::tier_within(&self.tier_sizes, &expert_bytes, 512, self.tier_budget,
+                                                                &|layer, expert| prior.host_used(layer, expert)) {
+                    let mut layers: Vec<usize> = (0..48).filter(|layer| !chosen[*layer].is_empty()).collect();
+                    crate::banks::order_by_host_routes(&mut layers, |layer| prior.host_routes(layer));
+                    let experts: usize = chosen.iter().map(Vec::len).sum();
+                    eprintln!("Straydog host tier: {experts} experts of 48 layers to copy behind ready, {:.1} GiB, in place of {} whole layers",
+                              chosen.iter().zip(&expert_bytes).map(|(list, bytes)| list.len() as u64 * bytes).sum::<u64>() as f64 / (1u64 << 30) as f64,
+                              self.lock_pending.len());
+                    let memory: std::sync::Arc<dyn crate::banks::HostMemory> = std::sync::Arc::new(PinnedMemory { ordinal: self.group.host_ordinal() });
+                    match self.lock_job_reading(&layers, true) {
+                        Ok(job) => {
+                            self.lock_pending = layers;
+                            self.locking = true;
+                            self.tier_chosen = Some(chosen.clone());
+                            return Some(job.tiering(memory, chosen, 512));
+                        }
+                        Err(error) => eprintln!("WARN Straydog host tier: none made ({error}); whole layers instead"),
+                    }
+                }
+            }
         }
         match self.lock_job(&self.lock_pending) {
             Ok(job) => {
@@ -2472,6 +2550,11 @@ impl Model {
         if let Some(job) = self.pass_relock() {
             return Some(job);
         }
+        // (a host tier's layers are not locked whole behind the requests: the tier holds what the budget did, and a whole lock beside it
+        // would hold its experts twice)
+        if self.tier_chosen.is_some() {
+            return None;
+        }
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
             .collect::<Result<Vec<_>>>().ok()?;
@@ -2534,6 +2617,20 @@ impl Model {
             return Err("its page locks were given back to a K/V growth".into());
         }
         let layer = locked.layer;
+        if let Some(tier) = locked.take_tier() {
+            // A layer's tier (the host tier): its most routed experts' checked copies, which every device's plan of the layer reads in place of
+            // the mapping for those experts. The layer is not locked: the assist, the give-back and the early launches take it as unlocked.
+            let pointers = tier.pointers(512);
+            let gate = locked.gate_address();
+            // (held before any device reads it: a device that took it before another refused keeps reading it, so it is never freed here)
+            self.tiers.push(tier);
+            for backend in &mut self.group.backends {
+                backend.set_tier(gate, Some(&pointers))?;
+            }
+            self.lock_pending.retain(|pending| *pending != layer);
+            self.pass_given.retain(|given| *given != layer);
+            return Ok(self.assist_mapped);
+        }
         let copied = locked.is_copy();
         if let Some(copy) = locked.take_copy() {
             // The layer's banks are page-locked copies, checked: every device's plan of the layer reads them (one copy for all) from here, and the assist
@@ -2745,6 +2842,8 @@ impl Model {
                    lockable {}, visible {}, host memory {}, available {available}{commit}, VRAM slots to come {}", layers.len(), gib(planned), gib(banks_total),
                   gib(by_memory), gib(by_free), gib(by_visible), gib(self.weights.host_memory_bytes), gib(vram_room));
         self.banks_bytes = banks_total;
+        self.tier_budget = budget;
+        self.tier_sizes = sizes.clone();
         self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
         // Paging must be observed even while a request holds up bank locking. The quota alone waits for the locks.
@@ -2868,9 +2967,21 @@ impl Model {
         self.warm_stop = stop;
     }
 
+    /// Whether a prompt's last checkpoint may be taken inside a batch (for tests: the two ways side by side in one process).
+    pub fn set_capture(&mut self, on: bool) {
+        self.capture = on;
+    }
+
     fn save_checkpoint(&mut self, kind: &'static str) -> Result<()> {
+        self.save_checkpoint_from(kind, self.history.len(), Saved::Device, None).map(|_| ())
+    }
+
+    /// [`Model::save_checkpoint`] of the sequence's first `length` tokens, its recurrent states from `saved` ([`Saved`]; `hidden`: a capture's
+    /// last row before `length`, the row a prompt resuming there pairs its first token with). The slot it took.
+    fn save_checkpoint_from(&mut self, kind: &'static str, length: usize, saved: Saved, hidden: Option<Vec<f32>>) -> Result<usize> {
+        let tokens = self.history[..length].to_vec();
         if kind == "root" {
-            if let Some(given_up) = keep_root_before(&mut self.checkpoints, |checkpoint| &checkpoint.tokens, &self.history) {
+            if let Some(given_up) = keep_root_before(&mut self.checkpoints, |checkpoint| &checkpoint.tokens, &tokens) {
                 self.release_checkpoint(given_up)?;
             }
         }
@@ -2886,7 +2997,7 @@ impl Model {
             // (the last mark becomes the one before it where the sequence still goes on from it; one the sequence has left is given up)
             if let Some(mark) = self.checkpoints.shift_remove("mark") {
                 let before = self.checkpoints.shift_remove(MARK_BEFORE);
-                let (kept, given_up) = if self.history.starts_with(&mark.tokens) { (Some(mark), before) } else { (before, Some(mark)) };
+                let (kept, given_up) = if tokens.starts_with(&mark.tokens) { (Some(mark), before) } else { (before, Some(mark)) };
                 if let Some(given_up) = given_up {
                     self.release_checkpoint(given_up)?;
                 }
@@ -2898,19 +3009,32 @@ impl Model {
         let used: Vec<usize> =
             self.checkpoints.iter().filter(|(name, _)| **name != kind).map(|(_, checkpoint)| checkpoint.slot).collect();
         let slot = (0..CHECKPOINTS.len()).find(|slot| !used.contains(slot)).unwrap();
-        self.group.checkpoint(slot, true)?;
-        // (inside a pipelined prompt, the row its last batch kept: a prompt resuming here pairs
-        // its first token with it)
-        let final_hidden = match self.final_hidden.clone() {
-            None => self.kept_hidden()?,
-            hidden => hidden,
+        let final_hidden = match saved {
+            Saved::Device => {
+                self.group.checkpoint(slot, true)?;
+                // (inside a pipelined prompt, the row its last batch kept: a prompt resuming here pairs
+                // its first token with it)
+                match self.final_hidden.clone() {
+                    None => self.kept_hidden()?,
+                    hidden => hidden,
+                }
+            }
+            Saved::Capture => {
+                self.group.adopt_capture(slot)?;
+                hidden
+            }
+            Saved::Slot(from) => {
+                self.group.clone_checkpoint(from, slot)?;
+                hidden
+            }
         };
-        // (the MTP layer's alone: the target's layers resume at a block boundary and read none)
-        let history = if self.speculative > 0 { Some(self.group.save_history(self.history.len() as u64, Some("blk.48."))?) } else { None };
-        if let Some(replaced) = self.checkpoints.insert(kind, Checkpoint { slot, tokens: self.history.clone(), final_hidden, history }) {
+        // (the MTP layer's alone: the target's layers resume at a block boundary and read none; after a capture its ring still holds the
+        // inputs a resume at `length` reads, CAPTURE_TAIL)
+        let history = if self.speculative > 0 { Some(self.group.save_history(length as u64, Some("blk.48."))?) } else { None };
+        if let Some(replaced) = self.checkpoints.insert(kind, Checkpoint { slot, tokens, final_hidden, history }) {
             self.release_checkpoint(replaced)?;
         }
-        Ok(())
+        Ok(slot)
     }
 
     /// Between two passes of a reply: a mark of the sequence where it has grown [`MARK_EVERY`] tokens past the last (or past the prompt),
@@ -3411,7 +3535,7 @@ impl Model {
     /// the slots read it as they read any layer that is not locked. One line in the log says what was given. None when there is nothing left to give back
     /// (no layer is locked and the locking was ended already): the request is refused as before.
     fn give_back(&mut self, wanted: u64, asked_by: &str) -> Result<Option<GaveBack>> {
-        if self.locked_layers.is_empty() && self.lock_pending.is_empty() {
+        if self.locked_layers.is_empty() && self.lock_pending.is_empty() && self.tiers.is_empty() {
             return Ok(None);
         }
         self.lock_halt.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3419,6 +3543,29 @@ impl Model {
         let available = crate::host::room_now();
         let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
         let mut gave = GaveBack { layers: Vec::new(), bytes: 0, left: 0, left_bytes: 0, asked_by: asked_by.into(), wanted, available };
+        if self.locked_layers.is_empty() && !self.tiers.is_empty() {
+            // A host tier's layers, the last made first, until what the memory available lacks is given (all of them where that is not known),
+            // and at least one, as give_back_count gives whole layers (the allocation was refused whatever the system says is available, and a
+            // caller that is given nothing would ask again): every device's plan reads the mapping again for those experts (set_tier waits for
+            // its readers), and only then is the copy freed.
+            let shortfall = available.map_or(u64::MAX, |available| wanted.saturating_sub(available));
+            while gave.layers.is_empty() || gave.bytes < shortfall {
+                // (the tier stays held until every device has let it go: one whose clearing failed may still read it, so it is not freed then)
+                let Some((layer, bytes)) = self.tiers.last().map(|tier| (tier.layer(), tier.bytes())) else { break };
+                let gate = Self::host_banks(&self.weights, layer)?[0].as_ptr();
+                for backend in &mut self.group.backends {
+                    backend.set_tier(gate, None)?;
+                }
+                drop(self.tiers.pop());
+                gave.layers.push(layer);
+                gave.bytes += bytes;
+            }
+            gave.left = self.tiers.len();
+            gave.left_bytes = self.tiers.iter().map(crate::banks::ExpertTier::bytes).sum();
+            eprintln!("Straydog host tier: {} of its layers given back, {}, for {asked_by} (it asked for {}, {} available); {} left, {}",
+                      gave.layers.len(), gib(gave.bytes), gib(wanted), available.map_or("not known".to_string(), gib), gave.left, gib(gave.left_bytes));
+            return Ok(Some(gave));
+        }
         if self.locked_layers.is_empty() {
             // (the locking was under way and the model had taken no layer of it: ending it is all there is to give, once)
             eprintln!("Straydog host banks: the locking behind ready ended with no layer taken, for {asked_by} (it asked for {}, {} available)",
@@ -3745,6 +3892,11 @@ impl Model {
         self.history.extend_from_slice(tokens);
         self.draft_note(tokens);
         self.final_hidden = (!hidden.is_empty()).then(|| last_row(&hidden).to_vec());
+        if self.capture_back > 0 {
+            // (the row before a checkpoint this batch took inside itself, capture_back rows before its last)
+            let rows = row_count(&hidden);
+            self.captured_hidden = (rows > self.capture_back).then(|| hidden[(rows - 1 - self.capture_back) * WIDTH..(rows - self.capture_back) * WIDTH].to_vec());
+        }
         if !logits {
             return Ok((None, assist_layers));
         }
@@ -3839,7 +3991,8 @@ impl Model {
     }
 
     /// The state a checkpoint of the held sequence is, as bytes: [`export_prefix`](Self::export_prefix)'s, of the checkpoint `kind`.
-    fn export_checkpoint(&mut self, kind: &str) -> Result<Option<Prefix>> {
+    /// The state of checkpoint `kind` ([`Model::export_conversation`]'s form), where the held sequence still begins with its tokens.
+    pub fn export_checkpoint(&mut self, kind: &str) -> Result<Option<Prefix>> {
         let Some(root) = self.checkpoints.get(kind) else { return Ok(None) };
         let tokens = root.tokens.len();
         if tokens == 0 || tokens % 4 != 0 || shared(&self.history, &root.tokens) < tokens || (self.speculative > 0) != root.history.is_some() {
@@ -4031,7 +4184,8 @@ impl Model {
             // Speculation keeps every final row: the MTP layer reads the prompt's hidden states.
             let rows = match last {
                 48 if !keep_rows => 0,
-                48 => if self.speculative > 0 && !stash && !self.deferred && !self.group.mtp_parts() { steps } else { 1 },
+                // (a batch that takes a checkpoint inside itself also keeps its row before the checkpoint: the last capture_back + 1)
+                48 => if self.speculative > 0 && !stash && !self.deferred && !self.group.mtp_parts() { steps } else { (self.capture_back as u64 + 1).min(steps) },
                 _ => 0,
             };
             let output = self.group.prefill_layers(first, last, None, position, steps, rows)?;
@@ -4478,9 +4632,18 @@ impl Model {
             crate::banks::order_by_host_routes(&mut layers, |layer| counts.host_routes(layer));
         }
         let mut banks = Vec::with_capacity(layers.len());
+        // (a layer with a host tier: its experts the tier does not hold, whose pages a prompt's experts and the CPU's routes still read; the
+        // tier's pages in the mapping are read by nothing)
+        let held: std::collections::HashMap<usize, Vec<bool>> = self.tiers.iter().map(|tier| (tier.layer(), tier.held(512))).collect();
         for layer in layers {
             let Ok(three) = Self::host_banks(&self.weights, layer) else { continue };
-            let ranges: Vec<(usize, usize)> = three.iter().filter(|bank| !bank.is_empty()).map(|bank| (bank.as_ptr() as usize, bank.len())).collect();
+            let ranges: Vec<(usize, usize)> = match held.get(&layer) {
+                Some(held) => crate::banks::untiered_ranges(&three, 512, held),
+                None => three.iter().filter(|bank| !bank.is_empty()).map(|bank| (bank.as_ptr() as usize, bank.len())).collect(),
+            };
+            if ranges.is_empty() {
+                continue;
+            }
             banks.push((layer, ranges.iter().map(|&(_, length)| length as u64).sum::<u64>(), ranges));
         }
         if banks.is_empty() {
@@ -4543,14 +4706,21 @@ impl Model {
     /// 2.59 and 2.13 GiB of the commit at the least (33.6 and 34.6 s), where with only the read-ahead's room ([`crate::host::read_ahead_room`])
     /// it kept 0.76 with 22, and before that 0.26 with 22 and ran out with 23; with the 19 the start planned it gave none back and kept 2.22
     /// (35.2 s); the logits the same in all three.
+    /// The bytes locking `layer` again takes: its tier's experts where the host tier made one ([`Model::tier_chosen`]), its banks otherwise.
+    fn relock_bytes(&self, layer: usize) -> Result<u64> {
+        match &self.tier_chosen {
+            Some(chosen) => Ok(self.tier_sizes.get(layer).map_or(0, |bytes| bytes / 512) * chosen.get(layer).map_or(0, Vec::len) as u64),
+            None => Ok(Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>()),
+        }
+    }
+
     fn make_pass_room(&mut self, rows: usize, bank_bytes: u64) -> Result<()> {
         let copies = 2 * bank_bytes + crate::layer_bank::FIRST_COPIES_MARGIN;
         let Some((wanted, left)) = crate::host::pass_commit(rows as u64 * WIDTH as u64 * 4, copies) else { return Ok(()) };
         // (what the commit would be with every layer the passes gave back locked again: what they go back within after this pass; measured
         // anew at each pass, so that what other programs took meanwhile is theirs)
         if !self.pass_given.is_empty() || left < wanted {
-            let out = self.pass_given.iter().map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
-                .sum::<Result<u64>>()?;
+            let out = self.pass_given.iter().map(|&layer| self.relock_bytes(layer)).sum::<Result<u64>>()?;
             self.pass_floor = left.saturating_sub(out);
         }
         if left >= wanted {
@@ -4575,14 +4745,14 @@ impl Model {
         }
         let (_, left) = crate::host::commit_left()?;
         let given = self.pass_given.iter().filter(|layer| !self.lock_pending.contains(layer))
-            .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| (layer, banks.iter().map(|bank| bank.len() as u64).sum::<u64>())))
+            .map(|&layer| self.relock_bytes(layer).map(|bytes| (layer, bytes)))
             .collect::<Result<Vec<_>>>().ok()?;
         let layers = crate::banks::relock_within(&given, left, self.pass_floor);
         // (no more than the GPUs' view of host memory the start planned for leaves beside the layers locked now: banks::visible_lock_cap)
         let size = |layer: usize| given.iter().find(|(given, _)| *given == layer).map_or(0, |(_, bytes)| *bytes);
         let locked = self.locked_layers.iter()
             .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()).unwrap_or(0))
-            .sum::<u64>();
+            .sum::<u64>() + self.tiers.iter().map(crate::banks::ExpertTier::bytes).sum::<u64>();
         let layers = crate::banks::layers_fitting(&layers, size, self.visible_cap.saturating_sub(locked));
         if layers.is_empty() {
             return None;
@@ -4594,7 +4764,14 @@ impl Model {
                   gib(self.pass_floor), self.locked_layers.len());
         // (a give-back's halt was for the plan it stopped)
         self.lock_halt = Default::default();
-        let job = match self.lock_job(&layers) {
+        // (a host tier's layers are made again from the experts they had)
+        let job = match &self.tier_chosen {
+            Some(chosen) => self.lock_job_reading(&layers, true).map(|job| {
+                job.tiering(std::sync::Arc::new(PinnedMemory { ordinal: self.group.host_ordinal() }), chosen.clone(), 512)
+            }),
+            None => self.lock_job(&layers),
+        };
+        let job = match job {
             Ok(job) => job,
             Err(error) => {
                 eprintln!("WARN Straydog host banks: the layers a pass gave back are not locked again ({error})");
@@ -5079,7 +5256,12 @@ impl Model {
             let (slots, held) = self.group.slots()?;
             slots > 0 && held < slots && (held == 0 || empty_before_prepare)
         } else { false };
-        let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).chain([tokens.len()]).collect();
+        // The plan's last checkpoint, where it stands a few rows before the end (a turn's, before the generation prompt), is taken inside the
+        // batch that reaches it, not by ending a batch there: a second batch of those rows streamed their experts again (a partially resident
+        // model, read serially; CAPTURE_TAIL).
+        let capture = plan.last().filter(|(at, _)| self.capture_possible(*at, position, tokens.len())).map(|(at, kinds)| (*at, kinds.clone()));
+        let stops: Vec<usize> = plan.iter().map(|(at, _)| *at).filter(|at| capture.as_ref().is_none_or(|(taken, _)| taken != at))
+            .chain([tokens.len()]).collect();
         for stop in stops {
             // (Both devices at once where the segment has batches to overlap: the checkpoints between segments, and the end of the read, drain it. A read
             // that fills empty slots takes its first batch alone and fills them (below), and the batches after it overlap: the cold first request of a
@@ -5117,8 +5299,39 @@ impl Model {
                 // The next batch's PLE rows arrive while this one runs.
                 let next = (end + batch).min(tokens.len());
                 self.prefetch_ple(&tokens[..end], &tokens[end..next])?;
-                output = self.forward(&tokens[position..end], end == tokens.len())?.0;
+                let inside = capture.as_ref().map(|(at, _)| *at).filter(|at| *at > position && *at < end);
+                if let Some(at) = inside {
+                    self.group.capture_at((at - position) as u64)?;
+                    self.capture_back = end - at;
+                    self.captured_hidden = None;
+                }
+                let forwarded = self.forward(&tokens[position..end], end == tokens.len());
+                let complete = inside.is_some() && self.group.capture_complete();
+                if inside.is_some() {
+                    self.capture_back = 0;
+                    self.group.capture_at(0)?;
+                }
+                output = forwarded?.0;
                 self.metric_count("prefill_batches", 1);
+                if inside.is_some() && !complete {
+                    // (a batch read another way, as passes, took no capture: the checkpoint is not taken, and the next request that would
+                    // have resumed there reads from an earlier one)
+                    self.metric_count("prefill_capture_missed", 1);
+                } else if let (Some(at), Some((_, kinds))) = (inside, capture.as_ref()) {
+                    let hidden = self.captured_hidden.take();
+                    let mut first = None;
+                    for kind in kinds.clone() {
+                        let saved = first.map_or(Saved::Capture, Saved::Slot);
+                        first = Some(self.save_checkpoint_from(kind, at, saved, hidden.clone())?);
+                    }
+                    self.metric_count("prefill_captured_checkpoints", 1);
+                } else if let Some((at, kinds)) = capture.as_ref().filter(|(at, _)| *at == end) {
+                    // (a batch that happened to end there: the checkpoint as before)
+                    let _ = at;
+                    for kind in kinds.clone() {
+                        self.save_checkpoint(kind)?;
+                    }
+                }
                 if cancelled() {
                     return Ok(None);
                 }
@@ -5142,6 +5355,14 @@ impl Model {
             }
         }
         Ok(Some(output))
+    }
+
+    /// Whether a read from `position` to `end` takes its checkpoint at `at` inside a batch ([`Model::prefill_batches`]): a partially resident
+    /// text prompt read serially, the checkpoint at most [`CAPTURE_TAIL`] rows before the end and after where the read begins, and a spare
+    /// checkpoint buffer on every device. STRAYDOG_CAPTURE=0 (development) ends a batch there as before.
+    fn capture_possible(&self, at: usize, position: usize, end: usize) -> bool {
+        self.capture && self.partial && at > position && at < end && end - at <= CAPTURE_TAIL && self.images.is_empty() && !self.deferred
+            && !self.group.mtp_parts() && !self.overlap_possible() && self.warm_stop.is_none() && self.group.can_capture()
     }
 
     /// Whether a partially resident read may take both devices' layers at once (see [`Model::prefill_overlapped`]): two NVIDIA GPUs, a text prompt,

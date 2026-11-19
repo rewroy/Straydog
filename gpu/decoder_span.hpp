@@ -111,9 +111,26 @@ void register_decoder_layer(Device& d,size_t layer,size_t context,void* const* p
 bool hybrid_early(const Device& d,size_t layer) {
     return !d.await_watchdog || d.resident.find(d.decoder.find(layer)->second.moe)->second->mapped[0]!=nullptr;
 }
+// For one unit of a layer that is not early as a whole: whether every route its CPU takes (the rows' exports: a route the CPU runs has the
+// flag 0 and a weight at the floor or over, as hybrid_host_experts_rows takes them) reads an expert of the layer's tier (page-locked
+// copies), so its CPU work waits for no storage either and the next launch may go ahead of it.
+bool hybrid_unit_tiered(const Device& d,const ResidentMoe& plan,size_t rows,const float* const* exported) {
+    if (plan.tier[0].empty()) return false;
+    for (size_t r=0;r<rows;++r) {
+        const float* e=exported[r];
+        for (size_t route=0;route<10;++route) {
+            if (e[2592+route]!=0 || e[16+route]<d.route_floor) continue;
+            const float raw=e[route];
+            if (!(raw>=0 && raw<float(plan.experts)) || !expert_tiered(plan,size_t(raw))) return false;
+        }
+    }
+    return true;
+}
 bool hybrid_ahead(const Device& d,size_t begin,size_t end) {
     bool any_early=false;
-    for (size_t layer=begin;layer<end;++layer) any_early|=hybrid_early(d,layer);
+    // (a layer with a tier may be early unit by unit: hybrid_unit_tiered)
+    for (size_t layer=begin;layer<end;++layer)
+        any_early|=hybrid_early(d,layer) || !d.resident.find(d.decoder.find(layer)->second.moe)->second->tier[0].empty();
 #if defined(__HIPCC__)
     // With high residency, the CPU fits inside the resident GPU work and the
     // extra wait dispatch loses. Use accumulated timings, not a VRAM cutoff:
@@ -198,7 +215,7 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
     };
     if (ahead) launch(begin);
     for (size_t layer=begin;layer<end;++layer) {
-        const bool before=ahead && early(layer);
+        bool before=ahead && early(layer);
         if (!ahead) launch(layer);
         else if (before) launch_after(layer);
         auto& experts=*d.resident.find(d.decoder.find(layer)->second.moe)->second;
@@ -206,7 +223,13 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
         hybrid_wait_export(d,++d.hybrid_sequence);
         if (ahead) await.check_failed();
         const auto computed=std::chrono::steady_clock::now();
-        hybrid_host_experts(d,experts,d.exchange+hybrid_export_at(0,hybrid_slot_of(layer)),d.exchange+hybrid_result_at(0,hybrid_slot_of(layer)));
+        const float* exported=d.exchange+hybrid_export_at(0,hybrid_slot_of(layer));
+        // (a layer not early as a whole whose routes this token are all in its tier: the next layer goes ahead of them now)
+        if (ahead && !before && hybrid_unit_tiered(d,experts,1,&exported)) {
+            launch_after(layer);
+            before=true;
+        }
+        hybrid_host_experts(d,experts,exported,d.exchange+hybrid_result_at(0,hybrid_slot_of(layer)));
         if (ahead) await.publish();
         const auto finished=std::chrono::steady_clock::now();
         d.hybrid_wait_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed-waited).count());

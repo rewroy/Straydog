@@ -322,6 +322,171 @@ impl Banks {
     }
 }
 
+/// One region of an [`ExpertTier`]: an expert's bytes of one role, with the whole blocks around them, at `offset` of the tier's allocation.
+#[derive(Clone, Copy)]
+struct TierRegion {
+    /// The file offset of the region's first byte (a block boundary), its place in the allocation, its bytes, and the expert's first byte's
+    /// place and its bytes in it.
+    start: u64,
+    offset: usize,
+    bytes: usize,
+    at: usize,
+    len: usize,
+}
+
+/// The memory of a layer's tier, freed with the last [`ExpertTier`] that holds it.
+struct TierBlock {
+    memory: Arc<dyn HostMemory>,
+    layer: usize,
+    base: *mut u8,
+    capacity: usize,
+    /// The tiered experts, in the order chosen, with their regions by role.
+    experts: Vec<(usize, [TierRegion; 3])>,
+}
+
+// SAFETY: page-locked memory that only this block frees, and nothing writes after the tier was made and checked.
+unsafe impl Send for TierBlock {}
+unsafe impl Sync for TierBlock {}
+
+impl Drop for TierBlock {
+    fn drop(&mut self) {
+        if !self.base.is_null() {
+            // SAFETY: allocated by `memory`, once, and freed only here; whoever read it held an `ExpertTier`, which this block outlives.
+            unsafe { self.memory.free(self.base) };
+        }
+    }
+}
+
+/// A page-locked copy of some of a layer's experts (the most routed ones), each read from the model's file with the whole blocks around it and
+/// checked against the file's tree as a [`LayerCopy`] is: the pinned tier the devices read those experts' host bytes from
+/// ([`crate::gpu::Backend::set_tier`]), where memory cannot hold the layer's whole banks. Freed with its last holder.
+pub struct ExpertTier(Arc<TierBlock>);
+
+impl ExpertTier {
+    /// Allocate the tier of `chosen` of the layer's `count` experts and read their bytes from the banks' files: one allocation, each expert's
+    /// three regions in it. Nothing is checked yet ([`ExpertTier::verify`]). An allocation that is refused, or a read that fails, frees it.
+    pub(crate) fn make(memory: &Arc<dyn HostMemory>, layer: usize, banks: &[Bank; 3], count: usize, chosen: &[usize]) -> Result<ExpertTier, String> {
+        if count == 0 || chosen.iter().any(|&expert| expert >= count) {
+            return Err(format!("an expert past layer {layer}'s {count}"));
+        }
+        let mut files = Vec::with_capacity(3);
+        for (role, bank) in banks.iter().enumerate() {
+            files.push(bank.file.as_deref().ok_or_else(|| format!("a bank with no file to copy from (role {role})"))?);
+        }
+        let mut experts = Vec::with_capacity(chosen.len());
+        let mut capacity = 0usize;
+        for &expert in chosen {
+            let mut regions = [TierRegion { start: 0, offset: 0, bytes: 0, at: 0, len: 0 }; 3];
+            for (role, bank) in banks.iter().enumerate() {
+                let per = bank.bytes / count as u64;
+                let offset = bank.offset + expert as u64 * per;
+                let (start, end) = verity::covering_blocks(bank.map_len as u64, offset, per).ok_or("an expert past its file's end")?;
+                let bytes = (end - start) as usize;
+                regions[role] = TierRegion { start, offset: capacity, bytes, at: (offset - start) as usize, len: per as usize };
+                capacity += bytes.next_multiple_of(ALIGN);
+            }
+            experts.push((expert, regions));
+        }
+        if capacity == 0 {
+            return Err(format!("no experts to tier in layer {layer}"));
+        }
+        let base = memory.allocate(capacity as u64)?;
+        let block = TierBlock { memory: memory.clone(), layer, base, capacity, experts };
+        // The experts' reads on several threads at once (as many as a bank's check takes now, check_threads): one at a time a layer's ~660
+        // reads of half a megabyte took as long as the drive's latency each (17 GiB in 25.5 s on one R9700, where locking whole layers took 4-9).
+        let threads = check_threads(Priority::Background, std::thread::available_parallelism().map_or(1, |cores| cores.get())).min(block.experts.len()).max(1);
+        let address = base as usize;
+        let failed = std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for part in block.experts.chunks(block.experts.len().div_ceil(threads)) {
+                let (files, failed) = (&files, &failed);
+                scope.spawn(move || {
+                    for (expert, regions) in part {
+                        for (role, region) in regions.iter().enumerate() {
+                            // SAFETY: within the new allocation, each region written by one thread alone, nothing reading it before the tier is made.
+                            let target = unsafe { std::slice::from_raw_parts_mut((address as *mut u8).add(region.offset), region.bytes.next_multiple_of(ALIGN)) };
+                            if let Err(error) = read_copy(files[role], region.start, target, region.bytes) {
+                                failed.lock().unwrap().get_or_insert(format!("reading layer {layer}'s expert {expert} (role {role}) from its file: {error}"));
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(error) = failed.into_inner().unwrap() {
+            return Err(error);
+        }
+        Ok(ExpertTier(Arc::new(block)))
+    }
+
+    /// Check the tier's own bytes against the file's tree, each expert's region as the blocks around it: `Ok(false)` when the files have no tree.
+    pub(crate) fn verify(&self, banks: &[Bank; 3], priority: Priority) -> Result<bool, String> {
+        if banks.iter().all(|bank| bank.verifier.is_none()) {
+            return Ok(false);
+        }
+        // (the experts' checks on several threads, as many as a bank's check takes now: check_threads)
+        let experts = &self.0.experts;
+        let threads = check_threads(priority, std::thread::available_parallelism().map_or(1, |cores| cores.get())).min(experts.len()).max(1);
+        let address = self.0.base as usize;
+        let verifiers = [0, 1, 2].map(|role| banks[role].verifier.as_ref());
+        let failed = std::sync::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for part in experts.chunks(experts.len().div_ceil(threads)) {
+                let (failed, verifiers) = (&failed, &verifiers);
+                scope.spawn(move || {
+                    for (_, regions) in part {
+                        for (region, verifier) in regions.iter().zip(verifiers) {
+                            let Some(verifier) = verifier else { continue };
+                            // SAFETY: inside the allocation, alive as long as `self` and written only by `make`.
+                            let held = unsafe { std::slice::from_raw_parts((address as *const u8).add(region.offset), region.bytes) };
+                            if let Err(error) = verity::verify_copy_at(held, region.start, verifier, region.start + region.at as u64, region.len as u64, 1, priority) {
+                                failed.lock().unwrap().get_or_insert(error);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        match failed.into_inner().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(true),
+        }
+    }
+
+    /// The layer the tier is of.
+    pub fn layer(&self) -> usize {
+        self.0.layer
+    }
+
+    /// Which of the layer's `count` experts the tier holds.
+    pub fn held(&self, count: usize) -> Vec<bool> {
+        let mut held = vec![false; count];
+        for (expert, _) in &self.0.experts {
+            if let Some(slot) = held.get_mut(*expert) {
+                *slot = true;
+            }
+        }
+        held
+    }
+
+    /// Per expert of the layer's `count`, its gate, up and down bytes in the tier (null where it has none), as the devices take them.
+    pub fn pointers(&self, count: usize) -> Vec<[*const u8; 3]> {
+        let mut pointers = vec![[std::ptr::null(); 3]; count];
+        for (expert, regions) in &self.0.experts {
+            // SAFETY: inside the allocation (`make`), which lives as long as `self`.
+            pointers[*expert] = regions.map(|region| unsafe { self.0.base.add(region.offset + region.at).cast_const() });
+        }
+        pointers
+    }
+
+    /// The page-locked bytes the tier holds.
+    pub fn bytes(&self) -> u64 {
+        self.0.capacity as u64
+    }
+}
+
 /// Read `bytes` bytes from `offset` of the bank's file (a block boundary) into `target`, the copy's allocation: directly where the file has a direct handle and
 /// the allocation is aligned for it, else through the page cache ([`read_in_ways`]).
 fn read_copy(file: &BankFile, offset: u64, target: &mut [u8], bytes: usize) -> std::io::Result<()> {
@@ -633,6 +798,8 @@ pub struct Locked {
     banks: [Bank; 3],
     /// The copy mode: the layer's page-locked copies, checked, that nothing reads yet.
     copy: Option<LayerCopy>,
+    /// The tier mode: the layer's chosen experts' page-locked copies, checked, that nothing reads yet.
+    tier: Option<ExpertTier>,
     /// The register mode: how the banks were registered, to give the registrations up, and the model's marks of them.
     registrar: Option<Registrar>,
     registered: Option<Arc<Registered>>,
@@ -665,6 +832,17 @@ impl Locked {
     /// The layer's copies, for the model to take ([`Copies::take_over`]); none for a layer that was registered in place.
     pub fn take_copy(&mut self) -> Option<LayerCopy> {
         self.copy.take()
+    }
+
+    /// The layer's tier of experts (the tier mode, [`BankLocks::tiering`]), for the model to hand to the devices.
+    pub fn take_tier(&mut self) -> Option<ExpertTier> {
+        self.tier.take()
+    }
+
+    /// The address of the layer's gate bank in the mapping, which names its plan on the devices ([`crate::gpu::Backend::set_tier`]).
+    pub fn gate_address(&self) -> *const u8 {
+        // SAFETY: the address alone, not read.
+        unsafe { self.banks[0].map.add(self.banks[0].offset as usize) }
     }
 }
 
@@ -715,6 +893,9 @@ pub struct BankLocks {
     /// The layers of this plan handed out so far, and where a refusal is kept for the model ([`Refusal`]).
     taken: usize,
     refusal: Option<Refusal>,
+    /// The tier mode ([`BankLocks::tiering`]): each layer's experts to copy (by layer), of `experts` a layer; None: whole layers.
+    tier: Option<Arc<Vec<Vec<usize>>>>,
+    experts: usize,
 }
 
 // SAFETY: the banks hold the address of the weights' mappings, which the thread that uses them keeps alive ([`BankLocks::lock_next`]).
@@ -724,7 +905,7 @@ impl BankLocks {
     pub(crate) fn new(layers: Vec<(usize, [Bank; 3])>, ordinal: usize, margin: u64) -> BankLocks {
         BankLocks {
             layers: layers.into(), ordinal, margin, halt: Arc::default(), kv_ahead: Arc::default(), copies: None, registrar: Registrar::SYSTEM,
-            registered: Arc::default(), taken: 0, refusal: None,
+            registered: Arc::default(), taken: 0, refusal: None, tier: None, experts: 0,
         }
     }
 
@@ -732,6 +913,24 @@ impl BankLocks {
     pub(crate) fn copying(mut self, memory: Arc<dyn HostMemory>) -> BankLocks {
         self.copies = Some(memory);
         self
+    }
+
+    /// The plan in the tier mode (plan/20261119-qwen-host-tier.md): each layer's turn copies only the experts `chosen` names for it (of
+    /// `experts` a layer, [`tier_within`]) into `memory` and checks them ([`ExpertTier`]); a layer with none chosen is not in the plan.
+    pub(crate) fn tiering(mut self, memory: Arc<dyn HostMemory>, chosen: Vec<Vec<usize>>, experts: usize) -> BankLocks {
+        self.copies = Some(memory);
+        self.tier = Some(Arc::new(chosen));
+        self.experts = experts;
+        self
+    }
+
+    /// The bytes the turn of `layer` with `banks` takes: its chosen experts' in the tier mode, its banks' otherwise.
+    fn turn_bytes(&self, layer: usize, banks: &[Bank; 3]) -> u64 {
+        let whole: u64 = banks.iter().map(|bank| bank.bytes).sum();
+        match &self.tier {
+            Some(chosen) if self.experts > 0 => whole / self.experts as u64 * chosen.get(layer).map_or(0, Vec::len) as u64,
+            _ => whole,
+        }
     }
 
     /// The plan keeps a refusal that came with nothing locked in `refusal`, for the model's later plans ([`Refusal::blocks_more`]).
@@ -787,7 +986,7 @@ impl BankLocks {
     /// Whether the next layer's turn would leave the machine too little memory with `available` bytes available now, and if so why
     /// ([`locking_room`]): the plan's margin and the K/V still to grow are kept free. None when it fits, and when no layer is left.
     pub fn room_for_next(&self, available: u64) -> Option<Short> {
-        let layer_bytes = self.layers.front().filter(|_| !self.halted()).map(|(_, banks)| banks.iter().map(|bank| bank.bytes).sum::<u64>())?;
+        let layer_bytes = self.layers.front().filter(|_| !self.halted()).map(|(layer, banks)| self.turn_bytes(*layer, banks))?;
         locking_room(available, layer_bytes, self.margin, self.kv_ahead.load(Ordering::Relaxed)).err()
     }
 
@@ -839,7 +1038,7 @@ impl BankLocks {
             return None;
         }
         let (layer, banks) = self.layers.pop_front()?;
-        let layer_bytes: u64 = banks.iter().map(|bank| bank.bytes).sum();
+        let layer_bytes = self.turn_bytes(layer, &banks);
         let _lowered = turn_lowered(priority);
         // (the copy mode reads the file: the next layer's pages in the mapping would be read for nothing, into the working set)
         if let Some((_, next)) = self.layers.front().filter(|_| self.copies.is_none()) {
@@ -847,10 +1046,13 @@ impl BankLocks {
             let ranges: Vec<(usize, usize)> = next.iter().map(|bank| unsafe { bank.range() }).map(|range| (range.as_ptr() as usize, range.len())).collect();
             let _ = crate::host::prefetch(&ranges);
         }
-        let turn = match self.copies.clone() {
-            Some(memory) => Self::copy_turn(&memory, layer, banks, priority),
+        let turn = match (self.copies.clone(), self.tier.clone()) {
+            (Some(memory), Some(chosen)) => {
+                Self::tier_turn(&memory, layer, banks, chosen.get(layer).map_or(&[][..], Vec::as_slice), self.experts, priority)
+            }
+            (Some(memory), None) => Self::copy_turn(&memory, layer, banks, priority),
             // SAFETY: the caller's.
-            None => unsafe { self.register_turn(layer, banks, priority) },
+            (None, _) => unsafe { self.register_turn(layer, banks, priority) },
         };
         Some(turn.inspect(|_| self.taken += 1).inspect_err(|stop| {
             if let (true, Some(refusal)) = (stop.is_refusal(), &self.refusal) {
@@ -909,7 +1111,7 @@ impl BankLocks {
                       check_threads(priority, std::thread::available_parallelism().map_or(8, |count| count.get())));
         }
         self.registered.mark(layer);
-        Ok(Locked { layer, bytes, banks, copy: None, registrar: Some(self.registrar), registered: Some(self.registered.clone()) })
+        Ok(Locked { layer, bytes, banks, copy: None, tier: None, registrar: Some(self.registrar), registered: Some(self.registered.clone()) })
     }
 
     /// The copy mode's turn: read the layer's banks from their file into page-locked memory, then check the copies against the file's tree. The mapping is
@@ -925,7 +1127,17 @@ impl BankLocks {
             eprintln!("Straydog host banks check: layer {layer}, verification {:.3} s", started.elapsed().as_secs_f64());
         }
         let bytes = banks.iter().map(|bank| bank.bytes).sum();
-        Ok(Locked { layer, bytes, banks, copy: Some(copy), registrar: None, registered: None })
+        Ok(Locked { layer, bytes, banks, copy: Some(copy), tier: None, registrar: None, registered: None })
+    }
+
+    /// The tier mode's turn: copy the layer's `chosen` experts (of `experts`) into page-locked memory and check the copies against the file's tree.
+    fn tier_turn(memory: &Arc<dyn HostMemory>, layer: usize, banks: [Bank; 3], chosen: &[usize], experts: usize, priority: Priority)
+                 -> Result<Locked, Stop> {
+        let tier = ExpertTier::make(memory, layer, &banks, experts, chosen).map_err(|error| Stop::NotCopied { layer, error })?;
+        if let Err(error) = tier.verify(&banks, priority) {
+            return Err(Stop::Unverified { layer, error });
+        }
+        Ok(Locked { layer, bytes: tier.bytes(), banks, copy: None, tier: Some(tier), registrar: None, registered: None })
     }
 
     /// Give up the registrations of `banks`, made by [`BankLocks::lock_next`].
@@ -1131,6 +1343,63 @@ pub fn layers_within(sizes: &[u64], budget: u64) -> Vec<usize> {
         taken += sizes[layer];
     }
     layers
+}
+
+/// The experts of a host tier (plan/20261119-qwen-host-tier.md): where `budget` holds every layer's banks (`sizes`), none (whole layers are
+/// locked instead); otherwise, for each layer, the experts to copy into page-locked memory, the most routed of all layers first (`used`:
+/// a layer and an expert's routes, an earlier run's counts), each costing `expert_bytes[layer]`, as long as the next one fits. Experts never
+/// routed are not taken; equal counts keep the lower layer, then the lower expert. Each layer's list is in expert order.
+pub fn tier_within(sizes: &[u64], expert_bytes: &[u64], experts: usize, budget: u64, used: &dyn Fn(usize, usize) -> u64)
+                   -> Option<Vec<Vec<usize>>> {
+    if sizes.iter().sum::<u64>() <= budget {
+        return None;
+    }
+    let mut ranked: Vec<(u64, usize, usize)> = (0..sizes.len())
+        .flat_map(|layer| (0..experts).map(move |expert| (layer, expert)))
+        .map(|(layer, expert)| (used(layer, expert), layer, expert))
+        .filter(|(count, _, _)| *count > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut chosen = vec![Vec::new(); sizes.len()];
+    let mut taken = 0u64;
+    for (_, layer, expert) in ranked {
+        let bytes = expert_bytes[layer];
+        if taken + bytes > budget {
+            break;
+        }
+        taken += bytes;
+        chosen[layer].push(expert);
+    }
+    for list in &mut chosen {
+        list.sort_unstable();
+    }
+    Some(chosen)
+}
+
+/// The parts of a layer's banks (`banks`: gate, up, down, each `count` experts end to end) that hold the experts `held` does not, as ranges
+/// (address, bytes) with neighbouring experts' merged: what a read back of a layer with a host tier asks for (the tier's experts are read
+/// from its copies, never from these pages).
+pub fn untiered_ranges(banks: &[&[u8]; 3], count: usize, held: &[bool]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for bank in banks {
+        if bank.is_empty() || count == 0 {
+            continue;
+        }
+        let per = bank.len() / count;
+        let mut expert = 0;
+        while expert < count {
+            if held.get(expert).copied().unwrap_or(false) {
+                expert += 1;
+                continue;
+            }
+            let first = expert;
+            while expert < count && !held.get(expert).copied().unwrap_or(false) {
+                expert += 1;
+            }
+            ranges.push((bank.as_ptr() as usize + first * per, (expert - first) * per));
+        }
+    }
+    ranges
 }
 
 /// The unlocked layers (`layers`, with their banks' bytes, in the order wanted) whose banks a read back takes within `budget` bytes: in order,
@@ -1670,6 +1939,32 @@ mod tests {
         locked.take_copy().expect("a copy")
     }
 
+    /// Decides: a tiered layer's read back is its banks' parts the tier does not hold, neighbouring experts' merged, in each role.
+    #[test]
+    fn a_tiered_layers_read_back_leaves_the_tiers_experts_out() {
+        let (gate, up, down) = (vec![0u8; 40], vec![0u8; 40], vec![0u8; 80]);
+        let banks = [&gate[..], &up[..], &down[..]];
+        let held = [true, false, false, true];
+        let ranges = untiered_ranges(&banks, 4, &held);
+        let at = |bank: &[u8], offset: usize| bank.as_ptr() as usize + offset;
+        assert_eq!(ranges, vec![(at(&gate, 10), 20), (at(&up, 10), 20), (at(&down, 20), 40)]);
+        assert_eq!(untiered_ranges(&banks, 4, &[false; 4]).len(), 3, "nothing held: the banks whole");
+        assert!(untiered_ranges(&banks, 4, &[true; 4]).is_empty(), "all held: nothing to read");
+    }
+
+    /// Decides: a tier only where the budget cannot hold every layer; then the most routed experts of all layers, never-routed ones left out,
+    /// stopping at the first that does not fit, each layer's list in expert order.
+    #[test]
+    fn a_tier_takes_the_most_routed_experts_of_every_layer_where_whole_layers_do_not_fit() {
+        let counts = [[5u64, 0, 9, 1], [7, 2, 0, 3]];
+        let used = |layer: usize, expert: usize| counts[layer][expert];
+        assert_eq!(tier_within(&[40, 40], &[10, 10], 4, 80, &used), None, "every layer fits: whole layers");
+        assert_eq!(tier_within(&[40, 40], &[10, 10], 4, 30, &used), Some(vec![vec![0, 2], vec![0]]), "9, 7, 5");
+        assert_eq!(tier_within(&[40, 40], &[10, 10], 4, 79, &used), Some(vec![vec![0, 2, 3], vec![0, 1, 3]]), "the routed ones only");
+        assert_eq!(tier_within(&[40, 40], &[10, 20], 4, 25, &used), Some(vec![vec![2], vec![]]), "7 does not fit beside 9: stop");
+        assert_eq!(tier_within(&[40, 40], &[10, 10], 4, 0, &used), Some(vec![vec![], vec![]]));
+    }
+
     /// Decides: the banks are copied where any GPU says it cannot register host memory read-only, or the variable says `0` whatever they say, and are
     /// registered in place otherwise, also where the runtime cannot say; the reason names the GPUs or the variable.
     #[test]
@@ -1781,6 +2076,45 @@ mod tests {
         }
         assert_eq!(copy.verify(&fixture.banks(false), Priority::Normal), Ok(false), "no tree: nothing to check against");
         drop(copy);
+        drop(banks);
+        fixture.finish();
+    }
+
+    /// Decides: a tier holds the chosen experts' bytes as the file has them, checks its own bytes (a byte changed after it was made fails, and
+    /// restored passes), points the others at nothing, and is freed with its last holder.
+    #[test]
+    fn a_tier_holds_its_experts_as_the_file_has_them_and_checks_them() {
+        let fixture = Fixture::new("tier", None);
+        let memory = Arc::new(HeapMemory::default());
+        let held: Arc<dyn HostMemory> = memory.clone();
+        let banks = fixture.banks(true);
+        const COUNT: usize = 7;
+        let tier = ExpertTier::make(&held, 7, &banks, COUNT, &[5, 0, 3]).unwrap();
+        assert_eq!(tier.verify(&banks, Priority::Normal), Ok(true));
+        let pointers = tier.pointers(COUNT);
+        for expert in 0..COUNT {
+            for (role, bank) in banks.iter().enumerate() {
+                let per = (bank.bytes / COUNT as u64) as usize;
+                if [5, 0, 3].contains(&expert) {
+                    // SAFETY: the tier holds `per` bytes there; the mapping's bank holds the expert at that stride.
+                    let (tiered, mapped) = unsafe { (std::slice::from_raw_parts(pointers[expert][role], per),
+                                                     std::slice::from_raw_parts(bank.map.add(bank.offset as usize + expert * per), per)) };
+                    assert!(tiered == mapped, "expert {expert}, role {role}");
+                } else {
+                    assert!(pointers[expert][role].is_null(), "expert {expert} is not tiered");
+                }
+            }
+        }
+        let (_, regions) = tier.0.experts[1];
+        // SAFETY: the expert's first byte, inside the allocation, which nothing reads meanwhile.
+        unsafe { *tier.0.base.add(regions[2].offset + regions[2].at) ^= 1 };
+        assert!(tier.verify(&banks, Priority::Normal).is_err(), "a changed byte fails");
+        // SAFETY: as above.
+        unsafe { *tier.0.base.add(regions[2].offset + regions[2].at) ^= 1 };
+        assert_eq!(tier.verify(&banks, Priority::Normal), Ok(true), "restored");
+        assert!(ExpertTier::make(&held, 7, &banks, COUNT, &[COUNT]).is_err(), "an expert past the layer's");
+        drop(tier);
+        assert_eq!((memory.allocated(), memory.live()), (1, 0), "one allocation, freed");
         drop(banks);
         fixture.finish();
     }

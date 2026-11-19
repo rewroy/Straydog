@@ -130,6 +130,17 @@ verification of two rows runs its rows interleaved: the host computes one row's 
 The engine compares each request's times and turns this on or off by itself (`STRAYDOG_INTERLEAVE=1` or `0` holds it): on an
 RTX 5070 Ti at `--vram 5.5`, Qwen3.8 UD-IQ2_XS decodes a chat prompt at 45.3 tok/s instead of 42.4 and a code prompt at 55.1
 instead of 48.6.
+A partially resident read takes the checkpoint a conversation goes on from (where its last reply begins, a few tokens before the end of
+the prompt) inside the batch that reaches it, where it ended a batch there and read the generation prompt's tokens as a batch of their own,
+which streamed their experts again: on one R9700 at `--vram 9` (UD-IQ2_XS), a 51-token question is read in 0.31 s instead of 0.41
+(its first token 0.47 s instead of 0.57; at `--vram 5.5`, 0.39 s instead of 0.50) and a new 2,076-token conversation in 1.97 s instead
+of 2.23. `STRAYDOG_CAPTURE=0` ends the batch there as before.
+Where the lock budget holds fewer layers than the model has (a PC whose GPU may see less host memory than the banks take), a CUDA build
+on Windows page-locks a host tier instead of whole layers: the experts of every layer that an earlier run's decode routed to the host most,
+copied from the model's file and checked against its tree behind "ready". The CPU's routes then read page-locked copies where they faulted
+the mapping's pages back in: on an RTX 5070 Ti at `--vram 5.5` (UD-IQ2_XS, a 19 GiB budget), decode at 47.6-48.2 tok/s instead of 39.4-40.4,
+and a new 2,076-token conversation read in 5.6 s instead of 5.4. `STRAYDOG_HOST_TIER=0`
+locks whole layers; `=1` takes the tier on any build.
 
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory

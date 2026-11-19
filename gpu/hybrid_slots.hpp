@@ -67,7 +67,7 @@ void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_
         if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(30)) continue;
         last = now;
         for (size_t role = 0; role < 3; ++role)
-            ranges.emplace_back(plan.host[role] + experts[i] * plan.host_bytes[role], plan.host_bytes[role]);
+            ranges.emplace_back(expert_host(plan, role, experts[i]), plan.host_bytes[role]);
     }
     if (ranges.empty()) return;
 #endif
@@ -523,7 +523,7 @@ void set_expert(Device& d, ResidentMoe& plan, size_t expert, uint8_t* base, hipS
 void copy_expert(Device& d, const ResidentMoe& plan, size_t expert, uint8_t* base, hipStream_t stream) {
     size_t offset = 0;
     for (size_t role = 0; role < 3; ++role) {
-        const uint8_t* source=plan.host[role]+expert*plan.host_bytes[role];
+        const uint8_t* source=expert_host(plan,role,expert);
         if (slot_soa_layout(d,plan,base,role)) {
             uint8_t* scratch=expert_scratch_pointer(d);
             check(hipMemcpyAsync(scratch,source,plan.host_bytes[role],hipMemcpyHostToDevice,stream));
@@ -570,7 +570,7 @@ void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, si
     for (size_t i = 0; i < count; ++i) {
         size_t offset = 0;
         for (size_t role = 0; role < 3; ++role) {
-            sources.push_back((bank_sources ? bank_sources[role] : plan.host[role]) + experts[i] * plan.host_bytes[role]);
+            sources.push_back(bank_sources ? bank_sources[role] + experts[i] * plan.host_bytes[role] : expert_host(plan, role, experts[i]));
             targets.push_back(slots[i] + offset);
             bytes.push_back(plan.host_bytes[role]);
             offset += plan.host_bytes[role];
@@ -634,9 +634,9 @@ void prestage_issue(Device& d, ResidentMoe& plan) {
     prestage_regions(d, plan, regions);
     for (size_t i = 0; i < candidates.size();) {
         size_t j = i + 1;
-        while (j < candidates.size() && candidates[j] == candidates[j - 1] + 1) ++j;
+        while (j < candidates.size() && candidates[j] == candidates[j - 1] + 1 && expert_host_follows(plan, candidates[j - 1], candidates[j])) ++j;
         for (size_t role = 0; role < 3; ++role)
-            check(hipMemcpyAsync(regions[role] + i * plan.host_bytes[role], plan.host[role] + candidates[i] * plan.host_bytes[role],
+            check(hipMemcpyAsync(regions[role] + i * plan.host_bytes[role], expert_host(plan, role, candidates[i]),
                                  (j - i) * plan.host_bytes[role], hipMemcpyHostToDevice, d.copy_stream));
         i = j;
     }

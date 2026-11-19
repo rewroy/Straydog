@@ -245,6 +245,9 @@ struct ResidentMoe {
     // The decode and verification rows routed to each expert, to one in a slot and not (hybrid_host_experts): the warm-up state's counts.
     std::vector<uint32_t> routed_gpu, routed_host;
     const uint8_t* mapped[3]{};   // device view of page-locked host banks (zero-copy assist)
+    // The pinned tier (sd_hybrid_tier): per role, each expert's host bytes in page-locked memory of the engine's, null where the expert has
+    // none (its bank's bytes are read); empty where the layer has no tier. Read through expert_host.
+    std::vector<const uint8_t*> tier[3];
     std::vector<uint32_t> host_read;   // the token each expert was last read on the host (hybrid_host_experts)
     uint32_t host_token=0;
     // Expert parallelism: this device holds only some routed experts (the
@@ -258,6 +261,20 @@ struct ResidentMoe {
     void* batch_table=nullptr;
     std::vector<unsigned> last_counts;   // the rows each expert had in the last prompt batch through this layer (prestage's guess of the next)
 };
+// An expert's bytes of `role` on the host, wherever its layer keeps them (the bank's mapping or its copy): every reader of a routed expert's
+// host bytes goes through this, so that a layer's experts need not sit at one stride from one base.
+inline const uint8_t* expert_host(const ResidentMoe& plan, size_t role, size_t expert) {
+    if (!plan.tier[role].empty() && plan.tier[role][expert]) return plan.tier[role][expert];
+    return plan.host[role] + expert * plan.host_bytes[role];
+}
+// Whether the expert's host bytes are in the pinned tier (copies by DMA whatever its layer's banks are).
+inline bool expert_tiered(const ResidentMoe& plan, size_t expert) { return !plan.tier[0].empty() && plan.tier[0][expert]; }
+// Whether `next` follows `expert` in host memory in every role (one copy can take both).
+inline bool expert_host_follows(const ResidentMoe& plan, size_t expert, size_t next) {
+    for (size_t role = 0; role < 3; ++role)
+        if (expert_host(plan, role, next) != expert_host(plan, role, expert) + plan.host_bytes[role]) return false;
+    return true;
+}
 #if defined(__linux__)
 // Read-ahead hints off the compute thread. One MADV_WILLNEED reads at most the device's largest
 // request (e.g. 256 KiB) of its range, and submitting it runs at device speed, so this thread
@@ -803,6 +820,10 @@ struct Device {
     // Page-locked host copies of recurrent sequence state (conversation checkpoints): pointer -> bytes.
     // Neither VRAM nor mapped state, so they take no budget and no K/V mirror rows.
     std::unordered_map<void*, size_t> checkpoints;
+    // A checkpoint taken inside the next prompt batch (sd_capture_at): after the batch's row `row`, each recurrent state the checkpoint
+    // holds is copied to its place in `buffer` (one of `checkpoints`, laid out as sd_checkpoint_copy lays it out) by the row loop that
+    // carries it, a loop that ends a piece at that row: the states are those of a batch that ended there. No buffer: none.
+    struct Capture { size_t row = 0; uint8_t* buffer = nullptr; std::unordered_map<const void*, size_t> offsets; size_t done = 0; } capture;
     // VRAM rows that multi-token prefill uses for host-resident K/V (sd_kv_stage): the copy holds
     // rows [0, kv_stage_valid) of kv_stage_owner's K/V in a kv_stage_rows-row layout.
     float* kv_stage = nullptr;

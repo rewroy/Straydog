@@ -1608,9 +1608,12 @@ int sd_prefill_ple(void* handle,void* const* pointers,const int* kinds,void* his
         // the layer's rows on the host, and what follows is queued on the stream: no wait at its end either.)
         float* rows=found->second.workspace+size_t(steps)*10240;
         stage_rows(d,d.ple_rows,rows,embeddings,size_t(steps)*2560);
-        for (size_t first=0;first<steps;first+=256) {
-            const size_t count=std::min<size_t>(256,size_t(steps)-first);
+        const size_t at=capture_row(d,size_t(steps));
+        for (size_t first=0,count=0;first<steps;first+=count) {
+            count=std::min<size_t>(256,size_t(steps)-first);
+            if (at>first && at<first+count) count=at-first;
             ple(d,pointers,kinds,history,count,rows+first*2560,nullptr,nullptr,found->second.workspace+first*10240,false,false,true);
+            if (first+count==at) capture_state(d,history);
         }
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
@@ -2289,6 +2292,36 @@ int sd_hybrid_repoint(void* handle,const void* from,const uint8_t* const* host,c
         bool any=false;
         for (const auto& item : d.resident) any|=item.second->hybrid && item.second->mapped[0];
         d.hint_experts=!any;
+        return 0;
+    } catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
+// The pinned tier of the layer whose gate bank is at `from` (sd_hybrid_repoint's key): `experts` addresses per role (null: the expert's bank),
+// or none (`gate` null) to clear it. Every reader of the layer's host bytes is waited for first, as a repoint waits.
+int sd_hybrid_tier(void* handle,const void* from,uint64_t experts,const uint8_t* const* gate,const uint8_t* const* up,const uint8_t* const* down,
+                   uint64_t* found) {
+    try {
+        if (!from || !found || (gate && (!up || !down))) throw std::runtime_error("invalid hybrid tier");
+        auto& d=device(handle);
+        *found=0;
+        ResidentMoe* target=nullptr;
+        for (auto& item : d.resident)
+            if (item.second->hybrid && item.second->host[0]==from) { target=item.second.get(); break; }
+        if (!target) return 0;
+        if (gate && experts!=target->experts) throw std::runtime_error("invalid hybrid tier: its experts");
+        *found=1;
+        if (d.copier) d.copier->wait();
+        if (d.copy_stream) check(hipStreamSynchronize(d.copy_stream));
+        check(hipDeviceSynchronize());
+        for (unsigned waited=0;d.bank_readers.load()!=0;++waited) {
+            if (waited>5000) throw std::runtime_error("the CPU's experts are still reading the layer's banks");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const uint8_t* const* roles[3]={gate,up,down};
+        for (size_t role=0;role<3;++role) {
+            if (gate) target->tier[role].assign(roles[role],roles[role]+experts);
+            else target->tier[role].clear();
+        }
+        target->prefetched.clear();
         return 0;
     } catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
@@ -3851,6 +3884,49 @@ void* sd_checkpoint_buffer(void* handle, uint64_t bytes) {
 
 // Copy `count` whole device state allocations into (save) or out of a checkpoint buffer, packed
 // in order, with one stream synchronization. Restored states invalidate their K/V mirrors.
+// The next prompt batch also leaves, after its row `row` (0 < row), the recurrent states `states` (a checkpoint's, in its order) in the
+// checkpoint buffer `buffer`, where sd_checkpoint_copy would put them after a batch that ended at that row (Device::capture); a row of 0
+// takes it back. The copies are queued on the stream: what reads the buffer on the host waits for the stream first.
+int sd_capture_at(void* handle, uint64_t row, void* const* states, uint64_t count, void* buffer) {
+    try {
+        auto& value = device(handle);
+        if (!row) {
+            value.capture = Device::Capture{};
+            return 0;
+        }
+        const auto found = value.checkpoints.find(buffer);
+        if (found == value.checkpoints.end() || !states || !count || count > 4096)
+            throw std::runtime_error("invalid Straydog capture");
+        Device::Capture capture{size_t(row), static_cast<uint8_t*>(buffer), {}};
+        size_t total = 0;
+        for (uint64_t i = 0; i < count; ++i) {
+            const auto state = value.allocations.find(states[i]);
+            if (state == value.allocations.end() || value.host_states.count(states[i]) || state->second > found->second - total)
+                throw std::runtime_error("invalid Straydog capture state");
+            capture.offsets.emplace(states[i], total);
+            total += state->second;
+        }
+        value.capture = std::move(capture);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+// The states the capture set by sd_capture_at has copied so far: all of them once a batch's row loops passed its row (a batch read
+// another way, as passes, copies none, and its capture is not to be taken).
+uint64_t sd_capture_done(void* handle) {
+    try { return device(handle).capture.done; } catch (...) { return 0; }
+}
+// Checkpoint buffer `to` holds what `from` holds: a host copy once the stream (its copies into `from` among them) is done.
+int sd_checkpoint_clone(void* handle, void* from, void* to) {
+    try {
+        auto& value = device(handle);
+        const auto source = value.checkpoints.find(from), target = value.checkpoints.find(to);
+        if (source == value.checkpoints.end() || target == value.checkpoints.end() || source->second != target->second || from == to)
+            throw std::runtime_error("invalid Straydog checkpoint clone");
+        check(hipStreamSynchronize(value.stream));
+        std::memcpy(to, from, source->second);
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
 int sd_checkpoint_copy(void* handle, int save, void* const* states, uint64_t count, void* buffer) {
     try {
         auto& value = device(handle);

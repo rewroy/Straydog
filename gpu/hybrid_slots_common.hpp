@@ -123,13 +123,21 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     // computes the previous one, so cold pages fault in concurrently instead of one copy at a time
     // (cached ones pay an extra pass through host memory); the experts then copy by DMA.
     // Page-locked (registered) banks copy directly.
-    const bool gather = d.slots.host && d.cpu && !plan.mapped[0];
+    // (a layer's tiered experts copy by DMA as a page-locked bank's do: only a chunk with an expert of the pageable bank in it is gathered;
+    // the caller puts the tiered ones first)
+    const bool gather_layer = d.slots.host && d.cpu && !plan.mapped[0];
+    const std::vector<size_t>& order = missing;
     uint64_t gathered_ns = 0;
     StreamEvents events;
     std::vector<uint8_t*> targets;
-    for (size_t first = 0, chunk = 0; first < missing.size(); first += half, ++chunk) {
-        const size_t count = std::min(half, missing.size() - first), buffer = chunk % 2;
+    for (size_t first = 0, chunk = 0; first < order.size(); first += half, ++chunk) {
+        const size_t count = std::min(half, order.size() - first), buffer = chunk % 2;
         uint8_t* base = expert_stage_pointer(d) + buffer * half * d.slots.bytes;
+        bool gather = gather_layer;
+        if (gather && !plan.tier[0].empty()) {
+            gather = false;
+            for (size_t i = 0; i < count && !gather; ++i) gather = !expert_tiered(plan, order[first + i]);
+        }
         uint8_t* host = gather ? d.slots.host + buffer * half * d.slots.bytes : nullptr;
         if (gather) {
             // The DMA two chunks back read this mirror (its `loaded` event follows it on the copy stream).
@@ -137,7 +145,7 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
             targets.clear();
             for (size_t i = 0; i < count; ++i) targets.push_back(host + i * d.slots.bytes);
             const auto began = std::chrono::steady_clock::now();
-            hybrid_gather(d, plan, missing.data() + first, count, targets.data());
+            hybrid_gather(d, plan, order.data() + first, count, targets.data());
             gathered_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
         }
         if (chunk >= 2) check(hipStreamWaitEvent(d.copy_stream, events.used[buffer], 0));
@@ -151,9 +159,9 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         } else {
             for (size_t i = 0; i < count;) {
                 size_t j = i + 1;
-                while (j < count && missing[first + j] == missing[first + j - 1] + 1) ++j;
+                while (j < count && order[first + j] == order[first + j - 1] + 1 && expert_host_follows(plan, order[first + j - 1], order[first + j])) ++j;
                 for (size_t role = 0; role < 3; ++role)
-                    check(hipMemcpyAsync(regions[role] + i * plan.host_bytes[role], plan.host[role] + missing[first + i] * plan.host_bytes[role],
+                    check(hipMemcpyAsync(regions[role] + i * plan.host_bytes[role], expert_host(plan, role, order[first + i]),
                                          (j - i) * plan.host_bytes[role], hipMemcpyHostToDevice, d.copy_stream));
                 i = j;
             }
@@ -161,7 +169,7 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         check(hipEventRecord(events.loaded[buffer], d.copy_stream));
         check(hipStreamWaitEvent(d.stream, events.loaded[buffer], 0));
         phase(d, "moe_stream_wait");
-        hybrid_point_experts(d, plan, missing.data() + first, count, base, gather ? nullptr : regions);
+        hybrid_point_experts(d, plan, order.data() + first, count, base, gather ? nullptr : regions);
         compute(first, count);
         phase(d, "moe_stream_gemm");
         if (fail_streamed_chunk.load() && fail_streamed_chunk.fetch_sub(1) == 1) throw std::runtime_error("Straydog test: a streamed chunk fails");
@@ -174,7 +182,7 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     float ms = 0;
     check(hipEventElapsedTime(&ms, span.began, span.ended));
     // (what a gathered expert cost the CPU's workers: prompt_cpu_share weighs a route against it)
-    if (gather && missing.size() >= 16) {
+    if (gather_layer && plan.tier[0].empty() && missing.size() >= 16) {
         const double sample = double(gathered_ns) / double(missing.size());
         d.prompt_gather_ns = d.prompt_gather_ns > 0 ? 0.7 * d.prompt_gather_ns + 0.3 * sample : sample;
     }

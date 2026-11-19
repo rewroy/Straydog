@@ -68,6 +68,11 @@ impl Routes {
         u64::from(self.gpu[at]) + u64::from(self.host[at])
     }
 
+    /// The routes to an expert that went to the host (the CPU computed it, or the GPU read it over the bus): what VRAM did not hold.
+    pub fn host_used(&self, layer: usize, expert: usize) -> u64 {
+        u64::from(self.host[layer * self.experts + expert])
+    }
+
     /// The routes of a layer that went to the host: to an expert the CPU computed, or one the GPU read over the bus (none for a layer outside the
     /// model).
     pub fn host_routes(&self, layer: usize) -> u64 {
