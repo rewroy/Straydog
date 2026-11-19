@@ -411,8 +411,10 @@ void linears_norm(Device& value, const sd_linear* items, uint64_t count, const f
         // (256 threads, whatever gemv() would take: the same waves, rows, lanes and dots)
         bool launched = false;
 #if defined(__HIPCC__)
-        if (const size_t lds = kind == 13 || kind == 8 ? gemv_q8_input(value, list, input, 1) : 0) {
+        // (Q6_K too, as its q_b and wo_b: on the F32 rows a 2-row q_a and kv of DeepSeek-V4.1's Q6_K layers read 7.5 MB in 40.8 us)
+        if (const size_t lds = kind == 13 || kind == 8 || kind == 14 ? gemv_q8_input(value, list, input, 1) : 0) {
             if (kind == 13) gemv_norm_tail_q8<13><<<blocks, 256, lds, value.stream>>>(list, input, output, tail);
+            else if (kind == 14) gemv_norm_tail_q8<14><<<blocks, 256, lds, value.stream>>>(list, input, output, tail);
             else gemv_norm_tail_q8<8><<<blocks, 256, lds, value.stream>>>(list, input, output, tail);
             launched = true;
         }
@@ -483,9 +485,10 @@ void linears_norm_rows(Device& value, const sd_linear* items, uint64_t count, ui
     if (uniform && kind != 30) {
         const unsigned blocks = unsigned((waves + 7) / 8);
 #if defined(__HIPCC__)
-        if (const size_t lds = kind == 13 || kind == 8 ? gemv_q8_input(value, list, input, size_t(rows)) : 0) {
+        if (const size_t lds = kind == 13 || kind == 8 || kind == 14 ? gemv_q8_input(value, list, input, size_t(rows)) : 0) {
             #define SD_NORM_TAIL_Q8(format, V) gemv_norm_tail_q8<format, V><<<blocks, 256, lds, value.stream>>>(list, input, output, tail)
             if (kind == 13) { if (rows == 2) SD_NORM_TAIL_Q8(13, 2); else if (rows == 3) SD_NORM_TAIL_Q8(13, 3); else SD_NORM_TAIL_Q8(13, 4); }
+            else if (kind == 14) { if (rows == 2) SD_NORM_TAIL_Q8(14, 2); else if (rows == 3) SD_NORM_TAIL_Q8(14, 3); else SD_NORM_TAIL_Q8(14, 4); }
             else { if (rows == 2) SD_NORM_TAIL_Q8(8, 2); else if (rows == 3) SD_NORM_TAIL_Q8(8, 3); else SD_NORM_TAIL_Q8(8, 4); }
             #undef SD_NORM_TAIL_Q8
             launched = true;

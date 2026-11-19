@@ -9,7 +9,7 @@
 //!   and sd_op_norm_rope: the same bits (Q8_0 rows on the F32 and on the Q8 decode kernels);
 //! - sd_op_linears_norm_rope_rows (a verify pass's 2 to 4 rows of q_a and kv, q's norm in place, kv's
 //!   norm and rope into scattered ring rows) against sd_op_linears, sd_op_rms_norm and sd_op_norm_rope:
-//!   the same bits (Q8_0 on both kernels, Q6_K);
+//!   the same bits (Q8_0 and Q6_K on both kernels; and one row of Q6_K on the Q8 kernels);
 //! - sd_op_top_k against a reference of its rule (ties keep the lower index, -inf never kept, -1 for
 //!   empty slots) on scores with many ties, 511 to 131072 groups, top 512: the same indices;
 //! - sd_op_index_select (DeepSeek-V4.1's indexer: 32 heads of 128, 64 rotated, top 512 of a few
@@ -683,13 +683,20 @@ fn linears_norm_tail_graph_matches_separate_ops() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (rank, dim, rope, context) = (1280usize, 512usize, 64usize, 16usize);
-    // (Q8_0 rows also on the Q8 decode kernels: the same rows in either launch)
-    for (kind, cols, q8) in [(0u32, 128usize, false), (8, 5120, false), (8, 5120, true)] {
+    // (Q8_0 rows also on the Q8 decode kernels: the same rows in either launch; Q6_K's on them)
+    for (kind, cols, q8) in [(0u32, 128usize, false), (8, 5120, false), (8, 5120, true), (14, 5120, true)] {
         gpu.configure_decode(q8).unwrap();
-        let key = 121 + u64::from(q8);
+        let key = 121 + u64::from(q8) + 2 * u64::from(kind == 14);
         let matrices: Vec<Buffer> = [rank, dim].into_iter().map(|rows| {
             if kind == 0 { upload(&mut gpu, &random.floats(rows * cols, 0.02)) }
-            else {
+            else if kind == 14 {
+                let mut bytes = Vec::new();
+                for _ in 0..rows * cols / 256 {
+                    for _ in 0..208 { bytes.push(random.next() as u8); }
+                    bytes.extend_from_slice(&0x1c00u16.to_le_bytes());
+                }
+                gpu.upload_bytes(&bytes).unwrap()
+            } else {
                 let mut bytes = Vec::new();
                 for _ in 0..rows * cols / 32 {
                     bytes.extend_from_slice(&0x2000u16.to_le_bytes());
@@ -747,8 +754,8 @@ fn linears_norm_rope_of_a_verify_pass_gives_each_row_its_own_bits() {
     let frequencies = upload(&mut gpu, &(0..rope / 2).map(|i| 1e4f32.powf(-(2.0 * i as f32) / rope as f32)).collect::<Vec<_>>());
     let qweight = upload(&mut gpu, &random.floats(rank, 1.0));
     let kvweight = upload(&mut gpu, &random.floats(dim, 1.0));
-    // (Q8_0 on the F32 and on the Q8 decode kernels; Q6_K, UD-IQ1_M's, on the F32 ones)
-    for (kind, q8) in [(8u32, false), (8, true), (14, false)] {
+    // (Q8_0 and Q6_K, the attention's formats of Unsloth's UD-IQ2_XXS, on the F32 and on the Q8 decode kernels)
+    for (kind, q8) in [(8u32, false), (8, true), (14, false), (14, true)] {
         gpu.configure_decode(q8).unwrap();
         let matrices: Vec<Buffer> = [rank, dim].into_iter().map(|rows| {
             let mut bytes = Vec::new();
