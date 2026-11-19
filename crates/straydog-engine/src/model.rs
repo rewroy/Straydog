@@ -1435,6 +1435,9 @@ pub struct Model {
     tiers: Vec<crate::banks::ExpertTier>,
     /// The experts each layer's tier was made of (by layer), for a tier a pass gave back to be made again ([`Model::pass_relock`]).
     tier_chosen: Option<Vec<Vec<usize>>>,
+    /// The mapping's pages of the tiers made since the last locking ended, given back from the working set ([`crate::host::leave_working_set`]):
+    /// the bytes asked, and the bytes the working set fell by. Said when the locking ends ([`Model::banks_lock_ended`]).
+    tier_left: (u64, u64),
     /// Whether a prompt's last checkpoint may be taken inside a batch ([`Model::capture_possible`]; STRAYDOG_CAPTURE=0 says no).
     capture: bool,
     checkpoints: IndexMap<&'static str, Checkpoint>,
@@ -1749,6 +1752,7 @@ impl Model {
             tier_sizes: Vec::new(),
             tiers: Vec::new(),
             tier_chosen: None,
+            tier_left: (0, 0),
             capture: std::env::var("STRAYDOG_CAPTURE").map_or(true, |value| value.trim() != "0"),
             checkpoints: IndexMap::new(),
             recoverable: (0, Vec::new()),
@@ -2555,9 +2559,9 @@ impl Model {
             return Some(job);
         }
         // (a host tier's layers are not locked whole behind the requests: the tier holds what the budget did, and a whole lock beside it
-        // would hold its experts twice)
+        // would hold its experts twice; what its locking left of it is made behind the requests instead)
         if self.tier_chosen.is_some() {
-            return None;
+            return self.tier_more(prior);
         }
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
@@ -2610,6 +2614,55 @@ impl Model {
         Some(job)
     }
 
+    /// Behind a request, with a host tier: the layers of it the start chose that no locking has made (it stopped short, with too little memory
+    /// available then), made now as far as the memory available leaves room beside what is kept free and the K/V still to grow, and the GPUs'
+    /// view of host memory beside what is tiered and locked ([`crate::banks::tier_more_within`]). What a layer-order pass gave back is
+    /// [`Model::pass_relock`]'s. None where nothing is left or nothing fits: the next request's end asks again. Before, a tier that stopped
+    /// short stayed so for the run (an RTX 4060 PC with 63.5 GiB, 0.1.14: 9 of the 29 layers planned, 4.4 of 19.7 GiB).
+    fn tier_more(&mut self, prior: impl FnOnce(&Model) -> Option<Routes>) -> Option<BankLocks> {
+        let chosen = self.tier_chosen.clone()?;
+        let made: HashSet<usize> = self.tiers.iter().map(crate::banks::ExpertTier::layer).collect();
+        let mut layers: Vec<usize> = (0..chosen.len())
+            .filter(|layer| !chosen[*layer].is_empty() && !made.contains(layer) && !self.pass_given.contains(layer) && !self.lock_pending.contains(layer))
+            .collect();
+        if layers.is_empty() {
+            return None;
+        }
+        if let Some(prior) = prior(self).filter(|prior| prior.total() > 0) {
+            crate::banks::order_by_host_routes(&mut layers, |layer| prior.host_routes(layer));
+        }
+        let left = layers.iter().map(|&layer| self.relock_bytes(layer).map(|bytes| (layer, bytes))).collect::<Result<Vec<_>>>().ok()?;
+        let memory = self.weights.host_memory_bytes;
+        let held = self.locked_layers.iter()
+            .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()).unwrap_or(0))
+            .sum::<u64>() + self.tiers.iter().map(crate::banks::ExpertTier::bytes).sum::<u64>();
+        // (within the GPUs' view of host memory the start planned for, banks::visible_lock_cap, and what the commit left allows)
+        let visible = self.visible_cap.saturating_sub(held).min(crate::host::lockable(memory, 0));
+        self.refresh_kv_ahead();
+        let (margin, kv_ahead) = (crate::host::left_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
+        let available = crate::host::available_bytes();
+        let layers = crate::banks::tier_more_within(&left, visible, available, margin, kv_ahead);
+        if layers.is_empty() {
+            return None;
+        }
+        let bytes = left.iter().filter(|(layer, _)| layers.contains(layer)).map(|(_, bytes)| bytes).sum::<u64>();
+        let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+        eprintln!("Straydog host tier: {} of its {} layers not made yet planned behind the requests, {}, with {} available ({} kept free, K/V to grow {}); \
+                   {} made already", layers.len(), left.len(), gib(bytes), gib(available), gib(margin), gib(kv_ahead), made.len());
+        // (a give-back's halt was for the plan it stopped)
+        self.lock_halt = Default::default();
+        let job = match self.lock_job_reading(&layers, true) {
+            Ok(job) => job.tiering(std::sync::Arc::new(PinnedMemory { ordinal: self.group.host_ordinal() }), chosen, 512),
+            Err(error) => {
+                eprintln!("WARN Straydog host tier: its layers not made yet are not made ({error})");
+                return None;
+            }
+        };
+        self.lock_pending = layers;
+        self.locking = true;
+        Some(job)
+    }
+
     /// A layer whose banks were page-locked and checked against the file's tree ([`BankLocks::lock_next`]), taken under the model's lock: its locks
     /// are the device's from here (released when the model ends), its banks are mapped for the GPU's assist, which the tuner then times anew,
     /// and a warm start no longer plans the OS's reads of its pages. The plans the GPU can read now.
@@ -2624,7 +2677,7 @@ impl Model {
         if let Some(tier) = locked.take_tier() {
             // A layer's tier (the host tier): its most routed experts' checked copies, which every device's plan of the layer reads in place of
             // the mapping for those experts. The layer is not locked: the assist, the give-back and the early launches take it as unlocked.
-            let pointers = tier.pointers(512);
+            let (pointers, held) = (tier.pointers(512), tier.held(512));
             let gate = locked.gate_address();
             // (held before any device reads it: a device that took it before another refused keeps reading it, so it is never freed here)
             self.tiers.push(tier);
@@ -2633,6 +2686,14 @@ impl Model {
             }
             self.lock_pending.retain(|pending| *pending != layer);
             self.pass_given.retain(|given| *given != layer);
+            // Nothing reads the mapping's pages of the tier's experts from here (the devices read the tier): out of the working set, where they
+            // held those experts a second time and kept the memory the tier's next layers need from being available. An RTX 4060 PC with 63.5 GiB
+            // (0.1.14, the tier made behind three requests): the CPU's routes took every bank's pages into a working set of 24.2, then 38.0 GiB,
+            // and the locking stopped at 9 of the 29 layers planned, 4.4 of 19.7 GiB, with 7.5 GiB available (7.9 kept free).
+            let ranges = crate::banks::tiered_ranges(&Self::host_banks(&self.weights, layer)?, 512, &held);
+            let asked = ranges.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>();
+            let fell = crate::host::leave_working_set(&ranges);
+            self.tier_left = (self.tier_left.0 + asked, self.tier_left.1 + fell);
             return Ok(self.assist_mapped);
         }
         let copied = locked.is_copy();
@@ -2677,6 +2738,12 @@ impl Model {
         self.locking = false;
         if failure.is_some() {
             self.bank_failure = failure;
+        }
+        let (asked, fell) = std::mem::take(&mut self.tier_left);
+        if asked > 0 && cfg!(windows) {
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            eprintln!("Straydog host tier: the mapping's pages of its new layers' experts left the working set, {:.1} GiB asked, the working set {:.1} GiB \
+                       less; {} of its layers made", gib(asked), gib(fell), self.tiers.len());
         }
         self.hold_banks();
         // (the layers left unlocked are read into memory behind the requests, before their faults would read them one at a time)

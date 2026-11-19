@@ -394,6 +394,35 @@ pub fn prefetch(ranges: &[(usize, usize)]) -> Result<(), String> {
     }
 }
 
+/// Give back from this process's working set the pages of these byte ranges (address, length) of a mapped file: the whole pages inside each range,
+/// the pages a range shares with its neighbours kept. Windows moves them to the standby list (`VirtualUnlock` takes pages that are not locked out
+/// of the working set, and says ERROR_NOT_LOCKED): they count as available again, and a touch takes one back with a soft fault; nothing is
+/// freed, unmapped or read. The bytes the working set fell by meanwhile; 0 elsewhere, where a mapping's pages are the page cache's, not the
+/// process's. For pages nothing is to read any more (a host tier's experts, read from its copies): with them in the working set the copies
+/// sit beside the mapping, and the memory that should hold more of the tier is not available.
+pub fn leave_working_set(ranges: &[(usize, usize)]) -> u64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::VirtualUnlock;
+        const PAGE: usize = 4096;
+        let before = windows_working_set();
+        for &(start, length) in ranges {
+            let (begin, end) = ((start + PAGE - 1) & !(PAGE - 1), (start + length) & !(PAGE - 1));
+            if end > begin {
+                // SAFETY: pages of a mapping the caller keeps mapped; the call changes only whether they are in the working set (the error it
+                // returns for pages that were not locked is what it is called for).
+                unsafe { VirtualUnlock(begin as *const std::ffi::c_void, end - begin) };
+            }
+        }
+        before.saturating_sub(windows_working_set())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ranges;
+        0
+    }
+}
+
 /// Physical memory a guaranteed working set and page locks leave to the rest of the system, which
 /// they otherwise take without looking at what the other applications and the kernel need.
 pub fn left_free(memory: u64) -> u64 {
