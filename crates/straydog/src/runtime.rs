@@ -599,7 +599,17 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
             }
             _ => String::new(),
         };
-        format!("; prefill layers first,{passes} {} rows a batch{held}{moved}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
+        // (the layers' banks the pass loaded: their loads' time, of it the CPU's gathers of banks not page-locked and the waits for the staging's
+        // copies, and the time the pass waited for a layer's bank to be read: where a pass whose experts take 1.5 ms each spends it, as an RTX
+        // 4060 PC's 5,089-token prompt did, 80.8 s where another 4060 took 16.9 s for as many)
+        let banks = match (number("prefill_bank_loads"), number("prefill_bank_load_seconds")) {
+            (Some(loads), Some(load)) if loads > 0.0 => format!(", banks {loads:.0} loads in {load:.1} s (gathers {:.1} s, staging waits {:.1} s), \
+                                                             waited {:.1} s for their reads", number("prefill_bank_gather_seconds").unwrap_or(0.0),
+                                                            number("prefill_bank_staging_wait_seconds").unwrap_or(0.0),
+                                                            number("prefill_bank_wait_seconds").unwrap_or(0.0)),
+            _ => String::new(),
+        };
+        format!("; prefill layers first,{passes} {} rows a batch{held}{moved}{banks}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
     } else {
         // (a long prompt's layer order considered and not taken: the rows it could have had, the banks and the memory they had now)
         let policy = &timings["layer_prefill_policy"];
@@ -2104,6 +2114,11 @@ mod tests {
         assert!(moved.contains("; prefill layers first, in 16 passes of up to 16384 rows, 2048 rows a batch, hidden rows up 491.2 GB in 31.0 s \
                                 and down 491.2 GB in 28.4 s"), "{moved}");
         assert_eq!(moved.lines().count(), 1);
+        // (and the banks it loaded: their loads' time, the gathers and staging waits in it, and the waits for their reads)
+        let banks = request_summary(&event(json!({"prefill_bank_loads": 96, "prefill_bank_load_seconds": 60.2, "prefill_bank_gather_seconds": 41.0,
+                                                  "prefill_bank_staging_wait_seconds": 3.1, "prefill_bank_wait_seconds": 12.4})), None);
+        assert!(banks.contains("2048 rows a batch, banks 96 loads in 60.2 s (gathers 41.0 s, staging waits 3.1 s), waited 12.4 s for their reads"), "{banks}");
+        assert!(!moved.contains(", banks "), "no loads counted: no clause");
         // (the rows held in VRAM, or on the host with why)
         let held = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536, "prefill_rows_vram": true})), None);
         assert!(held.contains("2048 rows a batch, rows held in VRAM"), "{held}");
