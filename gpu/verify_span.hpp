@@ -235,9 +235,13 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             check(hipGetLastError());
         };
         if (ahead && finish) ++await.launched;
+        const auto launched = std::chrono::steady_clock::now();
         run_graph(d, ahead ? "hybrid-verify-await" : "hybrid-verify", plan.dependencies.data(), plan.dependencies.size(),
                   (layer * 2 + finish) * 8 + steps + window_variant(d), submit);
+        span_call_took(d, launched, "a layer's launch");
+        const auto flushed = std::chrono::steady_clock::now();
         flush_launches(d);
+        span_call_took(d, flushed, "a stream query flushing a launch");
         // CUDA gdn_tokens saves every state before its token loop and has no abort path.
         // A successful issue plus the checked drain proves this generation's snapshot was written.
         if (epoch) plan.touched_epoch=epoch;
@@ -248,7 +252,9 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             ++await.launched;
             finish_previous(end - 1);
             check(hipGetLastError());
+            const auto flushed = std::chrono::steady_clock::now();
             flush_launches(d);
+            span_call_took(d, flushed, "a stream query flushing a launch");
         }
     };
     // Interleaved (hybrid_interleave_on), the two rows run as two groups of rows, one layer of a group a unit, in the order (layer, group). The host
@@ -302,9 +308,13 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
                 check(hipGetLastError());
             };
             if (finish) ++await.launched;
+            const auto launched = std::chrono::steady_clock::now();
             run_graph(d, "hybrid-verify-pair", plan.dependencies.data(), plan.dependencies.size(),
                       ((((layer * 2 + finish) * 8 + steps) * 2 + g) << 4) + window_variant(d), submit);
+            span_call_took(d, launched, "a unit's launch");
+            const auto flushed = std::chrono::steady_clock::now();
             flush_launches(d);
+            span_call_took(d, flushed, "a stream query flushing a launch");
         };
         launch_unit(0);
         launch_unit(1);
@@ -315,7 +325,9 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
                 ++await.launched;
                 finish_unit(u);
                 check(hipGetLastError());
+                const auto flushed = std::chrono::steady_clock::now();
                 flush_launches(d);
+                span_call_took(d, flushed, "a stream query flushing a launch");
             }
         };
         for (size_t u = 0; u < units; ++u) {
@@ -343,6 +355,8 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             const auto finished = std::chrono::steady_clock::now();
             d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());
             d.hybrid_cpu_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count());
+            span_unit_took(d, layer, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count()),
+                           uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count()));
             if (!before) queue_next(u);
         }
     } else {
@@ -376,6 +390,8 @@ void hybrid_verify_span(Device& d, size_t begin, size_t end, size_t position, si
             const auto finished = std::chrono::steady_clock::now();
             d.hybrid_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count());
             d.hybrid_cpu_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count());
+            span_unit_took(d, layer, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed - waited).count()),
+                           uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - computed).count()));
             if (ahead && !before) launch_after(layer);
         }
         if (!ahead) finish_previous(end - 1);

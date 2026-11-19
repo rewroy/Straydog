@@ -454,6 +454,15 @@ void* expert_cache_kv_allocate(Device& d,size_t bytes) {
 int recover_hybrid_wait(void* handle) {
     try {
         auto& d = device(handle);
+        // What held the host up in the pass the GPU gave up waiting for (Device::span_call_ns): a call, its CPU experts or an export, against
+        // the GPU's wait of ~1 s under a kernel run-time limit. Until this, a timeout said only that it happened (an RTX 4060 PC, five a day).
+        {
+            char layer[24] = "none";
+            if (d.span_layer != SIZE_MAX) std::snprintf(layer, sizeof(layer), "%zu", d.span_layer);
+            std::fprintf(stderr, "Straydog GPU wait timed out on GPU %d: in the pass, the host last took layer %s's export; its longest call %.1f ms (%s), "
+                                 "its longest CPU experts of a unit %.1f ms, its longest wait for an export %.1f ms\n",
+                         d.ordinal, layer, d.span_call_ns / 1e6, d.span_call, d.span_cpu_ns / 1e6, d.span_export_ns / 1e6);
+        }
         check(hipStreamSynchronize(d.stream));
         hybrid_settle(d, true);
         check(hipStreamSynchronize(d.stream));

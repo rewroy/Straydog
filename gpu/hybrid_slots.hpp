@@ -489,6 +489,23 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
     }
 }
 
+// The nanoseconds since `began`.
+inline uint64_t span_ns_since(std::chrono::steady_clock::time_point began) {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+}
+// A host call of a hybrid span that took the time since `began`: the longest is kept with what it was (Device::span_call_ns). Under a kernel
+// run-time limit the GPU awaits the host's result for ~1 s at most (hybrid_await), and a host held up in a call meanwhile is one way to miss it.
+inline void span_call_took(Device& d, std::chrono::steady_clock::time_point began, const char* what) {
+    const uint64_t ns = span_ns_since(began);
+    if (ns > d.span_call_ns) { d.span_call_ns = ns; d.span_call = what; }
+}
+// A unit's wait for its export and its CPU experts, in nanoseconds: the longest of each is kept (Device::span_export_ns, span_cpu_ns).
+inline void span_unit_took(Device& d, size_t layer, uint64_t export_ns, uint64_t cpu_ns) {
+    d.span_layer = layer;
+    d.span_export_ns = std::max(d.span_export_ns, export_ns);
+    d.span_cpu_ns = std::max(d.span_cpu_ns, cpu_ns);
+}
+
 // Spin until the GPU publishes this export (pinned memory written by stream-ordered
 // copies), failing instead of hanging if the stream reports an error.
 void hybrid_wait_export(Device& d, uint32_t expected) {
@@ -496,7 +513,9 @@ void hybrid_wait_export(Device& d, uint32_t expected) {
     // (the count may be ahead of this layer's: the GPU goes on, up to a layer, while the host has not yet read this export)
     for (uint64_t spin = 0; int32_t(*published - expected) < 0; ++spin) {
         if ((spin & 4095) == 4095) {
+            const auto queried = std::chrono::steady_clock::now();
             const hipError_t state = hipStreamQuery(d.stream);
+            span_call_took(d, queried, "a stream query waiting for an export");
             if (state != hipSuccess && state != hipErrorNotReady) check(state);
             if (state == hipSuccess && int32_t(*published - expected) < 0) throw std::runtime_error("hybrid export was not published");
         }

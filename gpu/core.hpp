@@ -939,6 +939,11 @@ struct Device {
     float route_floor=0;      // speed first (sd_hybrid_route_floor): CPU routes below this weight are left out
     uint64_t dropped_experts=0;   // the routes it left out
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
+    // The host's longest steps in the hybrid span under way (from its HybridAwait on), said when a GPU wait times out (recover_hybrid_wait):
+    // a launch or a stream query (and which), a unit's CPU experts, a wait for an export; and the layer the host last took an export of.
+    uint64_t span_call_ns=0, span_cpu_ns=0, span_export_ns=0;
+    const char* span_call="none";
+    size_t span_layer=SIZE_MAX;
     uint64_t hybrid_layers=0, hybrid_timed_layers=0;   // layers decoded hybrid, and of them those with a start on the GPU clock (hybrid_clock)
     uint32_t hybrid_sequence=0;
     size_t hybrid_position=SIZE_MAX;

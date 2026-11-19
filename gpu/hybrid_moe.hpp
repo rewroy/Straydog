@@ -295,6 +295,9 @@ struct HybridAwait {
         check(hipMemsetAsync(hybrid_awaited(device), 0, 4, device.stream));
 #endif
         counters[hybrid_await_failed_slot] = 0;
+        d.span_call_ns = d.span_cpu_ns = d.span_export_ns = 0;
+        d.span_call = "none";
+        d.span_layer = SIZE_MAX;
     }
     void publish() {
         std::atomic_thread_fence(std::memory_order_release);
