@@ -301,8 +301,8 @@ pub fn replay(uses: &[Vec<Key>], missed: &[u64], classes: &[(usize, String)]) ->
         }
         let (lru, best) = (lru_misses(list, *slots), best_misses(list, *slots));
         let (arc, lru2) = (arc_misses(list, *slots), lru2_misses(list, *slots));
-        // (LRFU whose scores halve every 4, 16 and 64 times the class's slots of its uses)
-        let lrfu: Vec<String> = [4.0, 16.0, 64.0].iter().map(|&times| percent(lrfu_misses(list, *slots, times * *slots as f64), list.len() as u64))
+        // (LRFU whose scores halve every 1, 2, 4 and 16 times the class's slots of its uses: 4 missed less than 16 and 64, served)
+        let lrfu: Vec<String> = [1.0, 2.0, 4.0, 16.0].iter().map(|&times| percent(lrfu_misses(list, *slots, times * *slots as f64), list.len() as u64))
             .map(|share| format!("{share:.1}")).collect();
         // (what a class's slots are worth to it: an LRU of three quarters, five quarters and three halves of them)
         let scaled: Vec<String> = [3, 5, 6].iter().map(|&quarters| percent(lru_misses(list, slots * quarters / 4), list.len() as u64))
@@ -312,7 +312,7 @@ pub fn replay(uses: &[Vec<Key>], missed: &[u64], classes: &[(usize, String)]) ->
             *sum += value;
         }
         parts.push(format!("{class} ({label}, {slots} slots) {:.1} / {:.1} / {:.1} / {:.1} / {:.1}% (an LRU of 3/4, 5/4, 3/2: {}%; LRFU \
-                            halving every 4, 16, 64 x its slots: {}%)",
+                            halving every 1, 2, 4, 16 x its slots: {}%)",
                            percent(actual, used), percent(lru, used), percent(arc, used), percent(lru2, used), percent(best, used),
                            scaled.join(" / "), lrfu.join(" / ")));
     }
@@ -444,7 +444,7 @@ mod tests {
         assert!(line.contains("VRAM missed 75.0%, an LRU store of the same slots would miss 83.3%, ARC "), "{line}");
         assert!(line.contains(", the best possible 58.3%; by class (missed / LRU / ARC / LRU-2 / best): 0 (layers 0-9, 3 slots) 75.0 / 83.3 / "), "{line}");
         // (an LRU of 2, 3 and 4 slots: 12, 10 and 8 of the 12 uses missed)
-        assert!(line.contains("58.3% (an LRU of 3/4, 5/4, 3/2: 100.0 / 83.3 / 66.7%; LRFU halving every 4, 16, 64 x its slots: "), "{line}");
+        assert!(line.contains("58.3% (an LRU of 3/4, 5/4, 3/2: 100.0 / 83.3 / 66.7%; LRFU halving every 1, 2, 4, 16 x its slots: "), "{line}");
         assert!(!line.contains("layers 10-19"), "{line}");
     }
 }
