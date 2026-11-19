@@ -159,6 +159,9 @@ struct Engine {
     /// Failed explicit growth attempts keep their measured headroom requirement across budget cooldowns.
     #[cfg(windows)]
     vram_growth_holds: Vec<Option<VramGrowthHold>>,
+    /// The budget a GPU wait timeout lowered each GPU to: its budget grows no further in this run ([`held_growth`]).
+    #[cfg(windows)]
+    vram_timed_out: Vec<Option<u64>>,
     #[cfg(windows)]
     vram_poison: ExplicitVramPoison,
 }
@@ -352,8 +355,8 @@ impl Engine {
             return Ok(());
         }
         #[cfg(windows)]
-        return adjust_windows_vram(&mut self.model, &mut self.vram_limits, &mut self.vram_growth_holds, self.vram_caps.as_deref(),
-                                   self.requests, allow_grow, phase);
+        return adjust_windows_vram(&mut self.model, &mut self.vram_limits, &mut self.vram_growth_holds, &self.vram_timed_out,
+                                   self.vram_caps.as_deref(), self.requests, allow_grow, phase);
         #[cfg(not(windows))]
         {
             let _ = phase;
@@ -383,6 +386,7 @@ impl Engine {
         let devices = self.model.vram_budgets()?;
         validate_vram_caps(self.vram_caps.as_deref(), devices.len())?;
         self.vram_limits.resize(devices.len(), None);
+        self.vram_timed_out.resize(devices.len(), None);
         let mut lowered = false;
         for (index, (ordinal, _, budget)) in devices.into_iter().enumerate() {
             let cap = self.vram_caps.as_ref().map(|caps| caps[index]);
@@ -393,7 +397,9 @@ impl Engine {
                 return Err(vram_refused(ordinal, "the memory budget could not be reduced after the wait timeout"));
             }
             self.vram_limits[index] = Some(VramLimit::new(actual, self.requests));
-            eprintln!("Straydog VRAM: GPU {ordinal}'s budget {budget} -> {actual} bytes after a wait timeout; expert slots {before} -> {after}");
+            self.vram_timed_out[index] = Some(self.vram_timed_out[index].map_or(actual, |held| held.min(actual)));
+            eprintln!("Straydog VRAM: GPU {ordinal}'s budget {budget} -> {actual} bytes after a wait timeout; expert slots {before} -> {after}; \
+                       it grows no further in this run");
             lowered = true;
         }
         Ok(lowered)
@@ -923,6 +929,17 @@ fn vram_target(budget: u64, wanted: u64, requests: u64, allow_grow: bool, limit:
     wanted.min(budget.saturating_add(VRAM_GROWTH)).min(ceiling)
 }
 
+/// A growth of a budget that a GPU wait timeout lowered to `held`, which stops there for the rest of the run (a shrink is not held). On an RTX 4060
+/// (8 GB) under Windows, every growth back to the budget that had timed out (4.57 -> 5.07 GiB) timed out again, 2 to 117 minutes later, three times
+/// in one afternoon: each stopped a request, and the next one read its whole conversation again (22,452 and 28,303 tokens, 199 and 252 s).
+#[cfg(any(windows, test))]
+fn held_growth(budget: u64, target: u64, held: Option<u64>) -> u64 {
+    match held {
+        Some(held) if target > budget => target.min(held).max(budget),
+        _ => target,
+    }
+}
+
 #[cfg(any(windows, test))]
 fn validate_vram_caps(caps: Option<&[u64]>, devices: usize) -> Result<(), String> {
     if let Some(caps) = caps {
@@ -942,7 +959,7 @@ fn vram_refused(ordinal: usize, why: &str) -> String {
 /// measurement: releasing the pool may change Windows' process budget as well as its usage.
 #[cfg(windows)]
 fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, growth_holds: &mut Vec<Option<VramGrowthHold>>,
-                       caps: Option<&[u64]>, requests: u64, allow_grow: bool, phase: &str) -> Result<(), String> {
+                       timed_out: &[Option<u64>], caps: Option<&[u64]>, requests: u64, allow_grow: bool, phase: &str) -> Result<(), String> {
     let devices = model.vram_budgets()?;
     validate_vram_caps(caps, devices.len())?;
     limits.resize(devices.len(), None);
@@ -960,6 +977,7 @@ fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, g
                 && !explicit_growth_allowed(headroom, target - budget, total, requests, growth_holds[index]) {
                 target = budget;
             }
+            target = held_growth(budget, target, timed_out.get(index).copied().flatten());
             if std::env::var("STRAYDOG_VRAM_DIAGNOSTIC").as_deref() == Ok("1") {
                 eprintln!("Straydog VRAM diagnostic: phase={phase} GPU={ordinal} used={used} budget={budget} headroom={headroom} \
                            process_budget={} wanted={wanted} target={target}", u8::from(process_budget));
@@ -1320,7 +1338,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         let mut limits = vec![None; devices.len()];
         let mut growth_holds = vec![None; devices.len()];
         if model.partial {
-            adjust_windows_vram(&mut model, &mut limits, &mut growth_holds, caps.as_deref(), 0, false, "ready")
+            adjust_windows_vram(&mut model, &mut limits, &mut growth_holds, &[], caps.as_deref(), 0, false, "ready")
                 .map_err(|error| plan.startup_error(error))?;
         }
         let (actual, adjusted) = if model.partial {
@@ -1378,6 +1396,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
                                                        #[cfg(windows)] vram_limits,
                                                        #[cfg(windows)] vram_caps,
                                                        #[cfg(windows)] vram_growth_holds,
+                                                       #[cfg(windows)] vram_timed_out: Vec::new(),
                                                        #[cfg(windows)] vram_poison: ExplicitVramPoison::default() }));
     #[cfg(all(windows, feature = "cuda"))]
     memory_diagnostic(&args.devices, true);
@@ -2152,6 +2171,17 @@ mod tests {
         assert_eq!(vram_target(budget, budget + VRAM_GROWTH - 1, 10, true, None, None), budget);
         assert_eq!(vram_target(budget, budget + (4 << 30), 10, true, None, None), budget + VRAM_GROWTH);
         assert_eq!(VramLimit::new(0, u64::MAX).retry_after, u64::MAX);
+    }
+
+    #[test]
+    fn a_budget_a_wait_timeout_lowered_grows_no_further_but_still_shrinks() {
+        let held = 4909273976;
+        // (the growth that timed out again: 4.57 -> 5.07 GiB)
+        assert_eq!(held_growth(held, held + VRAM_GROWTH, Some(held)), held);
+        assert_eq!(held_growth(held, held - MIB, Some(held)), held - MIB);
+        // a budget that shrank below it under pressure grows back as far as it, no further
+        assert_eq!(held_growth(held - VRAM_GROWTH, held + VRAM_GROWTH, Some(held)), held);
+        assert_eq!(held_growth(held, held + VRAM_GROWTH, None), held + VRAM_GROWTH);
     }
 
     #[test]
