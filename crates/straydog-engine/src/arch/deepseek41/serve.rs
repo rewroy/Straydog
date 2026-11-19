@@ -165,9 +165,9 @@ impl served::Engines for Engines {
         self.engines.iter().map(Engine::cache_counts).reduce(|sum, counts| sum + counts)
     }
 
-    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>)> {
+    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>, f64)> {
         let stats = self.drafting.as_mut()?.policy.take_stats();
-        Some((stats.runs, stats.widths.to_vec()))
+        Some((stats.runs, stats.widths.to_vec(), stats.draft_ms))
     }
 
     fn take_profile(&mut self) -> Vec<(&'static str, f64)> {

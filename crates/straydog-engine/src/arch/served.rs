@@ -85,7 +85,7 @@ pub trait Engines {
     }
     /// How often the engines' own drafter was asked for a draft since the last call, and how many
     /// tokens each verified (index 0: none, the draft thrown away), when there is one.
-    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>)> {
+    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>, f64)> {
         None
     }
     /// Seconds per phase of the passes since the last call, when the engines profile them
@@ -918,9 +918,10 @@ impl<E: Engines> Session<E> {
         .as_object()
         .unwrap()
         .clone();
-        if let Some((runs, widths)) = draft_stats {
+        if let Some((runs, widths, draft_ms)) = draft_stats {
             self.last_metrics.insert("engine_draft_runs".into(), json!(runs));
             self.last_metrics.insert("engine_draft_widths".into(), json!(widths));
+            self.last_metrics.insert("engine_draft_ms".into(), json!(draft_ms));
         }
         Ok(())
     }
