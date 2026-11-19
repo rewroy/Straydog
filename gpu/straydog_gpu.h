@@ -856,6 +856,42 @@ int sd_vision_encode(void* handle, const sd_vision* model, const void* patches, 
 /* `count` BF16 values in place as FP16. */
 int sd_vision_half(void* handle, void* values, uint64_t count);
 
+/* One block of Qwen3.8's vision tower (width 1152, 16 heads of 72, FFN 4304): its products FP16 ([rows][cols]), its vectors F32. */
+typedef struct sd_qwen_vision_layer {
+    const void* norm1;
+    const void* norm1_bias;
+    const void* qkv;
+    const void* qkv_bias;
+    const void* out;
+    const void* out_bias;
+    const void* norm2;
+    const void* norm2_bias;
+    const void* up;
+    const void* up_bias;
+    const void* down;
+    const void* down_bias;
+} sd_qwen_vision_layer;
+
+/* Qwen3.8's merger: the post norm, mm.0 (4608 to 4608) and mm.2 (4608 to 2560). */
+typedef struct sd_qwen_vision_merger {
+    const void* norm;
+    const void* norm_bias;
+    const void* up;
+    const void* up_bias;
+    const void* down;
+    const void* down_bias;
+} sd_qwen_vision_merger;
+
+/* The scratch bytes `patches` patches (a multiple of four) take, for a block and for the merger. */
+int sd_qwen_vision_scratch_bytes(uint64_t patches, uint64_t* bytes);
+/* One block on the device's stream over `x` ([patches][1152], F32, merge order), in place; `cosines` and `sines` are each
+ * patch's 36 angles (18 by its row, then 18 by its column). */
+int sd_qwen_vision_block(void* handle, const sd_qwen_vision_layer* layer, float* x, const float* cosines, const float* sines,
+                         uint64_t patches, void* scratch, uint64_t scratch_bytes);
+/* The merger over `x` after the last block: `out` is [patches / 4][2560], F32. */
+int sd_qwen_vision_merge(void* handle, const float* x, const sd_qwen_vision_merger* merger, uint64_t patches, void* scratch,
+                         uint64_t scratch_bytes, float* out);
+
 #ifdef __cplusplus
 }
 #endif

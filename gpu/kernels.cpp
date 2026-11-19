@@ -6057,4 +6057,5 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 #include "dspark_inject.hpp"
 #include "host_exchange.hpp"
 #include "vision.hpp"
+#include "qwen_vision.hpp"
 #include "dspark_attention.hpp"

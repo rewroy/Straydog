@@ -1577,37 +1577,67 @@ impl Engine {
                   -> Result<Option<Vec<Option<Arc<Vec<f32>>>>>, Failure> {
         let encoder = self.vision.as_ref().map_err(|reason| refused(format!("this model reads no images: {reason}")))?;
         let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
-        // Every kept image's rows first: an image taken as known has nothing to encode, and an image encoded before it in the
-        // prompt could evict its rows (a new image placed before kept ones, with the kept rows near ENCODED_BYTES).
+        // The kept ones first, all of them: encoding a new one lets the oldest kept ones go past ENCODED_BYTES, and one the prompt holds after it
+        // would then have none.
+        let mut missing: Vec<usize> = Vec::new();
         for &(index, _) in spans {
-            if let Some(at) = self.encoded.iter().position(|(kept, _, _)| *kept == images[index].digest) {
-                let kept = self.encoded.remove(at);
-                rows[index] = Some(kept.1.clone());
-                self.encoded.push(kept);
-            }
-        }
-        for &(index, _) in spans {
-            if rows[index].is_some() {
+            if rows[index].is_some() || missing.contains(&index) {
                 continue;
             }
             let digest = images[index].digest;
-            // (a refusal: nothing of the model's state has moved, and the worker reads on)
-            // (whatever an image does in there, the worker reads on)
-            // (an image taken as known had its rows above: one with nothing to encode here would be a mistake of this worker's, said and not served)
-            let prepared = images[index].prepared.as_ref().ok_or_else(|| refused("an image's kept rows went before they were read"))?;
-            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encoder.encode(prepared, &|| cancel.load(Ordering::SeqCst))))
-                .unwrap_or_else(|_| Err("it failed on this image".to_string()))
-                .map_err(|message| refused(format!("the vision encoder: {message}")))?;
-            let Some(encoded) = encoded else { return Ok(None) };
-            let encoded = Arc::new(encoded);
-            rows[index] = Some(encoded.clone());
-            self.encoded.push((digest, encoded, images[index].grid));
-            while self.encoded.iter().map(|(_, values, _)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
-                self.encoded.remove(0);
+            if let Some(at) = self.encoded.iter().position(|(kept, _, _)| *kept == digest) {
+                let kept = self.encoded.remove(at);
+                rows[index] = Some(kept.1.clone());
+                self.encoded.push(kept);
+                continue;
             }
+            missing.push(index);
+        }
+        if missing.is_empty() {
+            return Ok(Some(rows));
+        }
+        // (an image taken as known had its rows above: one with nothing to encode here would be a mistake of this worker's, said and not served)
+        let prepared: Vec<&straydog_engine::qwen_vision::Prepared> = missing.iter()
+            .map(|&index| images[index].prepared.as_ref().ok_or_else(|| refused("an image's kept rows went before they were read")))
+            .collect::<Result<_, _>>()?;
+        let cancelled = || cancel.load(Ordering::SeqCst);
+        // The first device's, all of them in one stay there, where it can (a screenshot in about half a second, against eight and a half on the
+        // CPU); else the CPU's.
+        let on_device = if vision_on_device() { self.model.first_device().map(|gpu| encoder.encode_all_on(gpu, &prepared, &cancelled)) } else { None };
+        let encoded = match on_device {
+            Some(Ok(rows)) => rows,
+            other => {
+                if let Some(Err(reason)) = other {
+                    eprintln!("Straydog vision: on the CPU, as the GPU could not: {reason}");
+                }
+                let mut all = Vec::with_capacity(prepared.len());
+                for image in &prepared {
+                    // (a refusal: nothing of the model's state has moved, and the worker reads on; whatever an image does in there, the worker reads on)
+                    let one = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encoder.encode(image, &cancelled)))
+                        .unwrap_or_else(|_| Err("it failed on this image".to_string()))
+                        .map_err(|message| refused(format!("the vision encoder: {message}")))?;
+                    let Some(one) = one else { return Ok(None) };
+                    all.push(one);
+                }
+                Some(all)
+            }
+        };
+        let Some(encoded) = encoded else { return Ok(None) };
+        for (index, values) in missing.into_iter().zip(encoded) {
+            let values = Arc::new(values);
+            rows[index] = Some(values.clone());
+            self.encoded.push((images[index].digest, values, images[index].grid));
+        }
+        while self.encoded.iter().map(|(_, values, _)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
+            self.encoded.remove(0);
         }
         Ok(Some(rows))
     }
+}
+
+/// Whether Qwen3.8's vision encoder runs on the first device (STRAYDOG_VISION_GPU=0: on the CPU, as it did before).
+fn vision_on_device() -> bool {
+    std::env::var("STRAYDOG_VISION_GPU").map_or(true, |value| value != "0")
 }
 
 /// Read bounded frames until stdin closes or `shutdown`; reject concurrent generation.

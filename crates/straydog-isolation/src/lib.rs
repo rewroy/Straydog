@@ -22,7 +22,7 @@ pub use tree::{prepare, ProcessTree};
 /// The engine's own switches, passed to the worker on both systems when the server's environment sets them: DS41_PROFILE (the engines'
 /// phase timing, which a request's log line reports), DeepSeek-V4.1's drafts (DS41_DRAFTS, DS41_DSPARK, DS41_DSPARK_RESIDENT),
 /// STRAYDOG_DIRECT (the GPU queues written directly), STRAYDOG_ENGRAM (the engram table Qwen3.8 reads), STRAYDOG_EXPERT_FLOOR (speed
-/// first's router weight floor), STRAYDOG_CPU_INT8 (=0: the CPU experts' F32 path), STRAYDOG_CPU_AVX512 (=0: their kernels of a
+/// first's router weight floor), STRAYDOG_VISION_GPU (=0: Qwen3.8's vision encoder on the CPU, not the first GPU), STRAYDOG_CPU_INT8 (=0: the CPU experts' F32 path), STRAYDOG_CPU_AVX512 (=0: their kernels of a
 /// CPU without AVX-512, to measure those on one with it), STRAYDOG_PROMPT_CPU (=0: a prompt batch streams every expert beyond the
 /// slots, none to the CPU), STRAYDOG_PEER_DIRECT (=0: two GPUs linked through host memory, as on Windows) and STRAYDOG_HOST_REGISTER_READ_ONLY
 /// (=0: the GPUs are taken as unable to register host memory read-only, so the expert banks are page-locked as copies, to try that on a GPU that
@@ -35,8 +35,8 @@ pub use tree::{prepare, ProcessTree};
 /// DeepSeek-V4.1's DS41_ ones. One list for both: a switch named on one system's list alone never reached the other's worker (speed first
 /// and the engram table did nothing in a Linux worker), and one on neither never reached a worker at all (the layer order's rows and the K/V's
 /// format measured nothing on 2026-11-11): every name the engine reads is here or a test's (the test below).
-pub const ENGINE_VARIABLES: [&str; 92] = ["STRAYDOG_HOST_TIER", "STRAYDOG_KEEP_FREE", "STRAYDOG_CAPTURE", "STRAYDOG_INTERLEAVE", "STRAYDOG_LAYER_ROWS_OVERLAP", "STRAYDOG_PROMPT_Q8", "STRAYDOG_LAYER_BANK_DIRECT", "STRAYDOG_LAYER_BANK_BUFFERS", "STRAYDOG_QSA_MMA", "STRAYDOG_HC_FUSED", "STRAYDOG_PIPELINE_DRAWS", "STRAYDOG_PROMPT_PASSES_OVERLAP", "STRAYDOG_PROMPT_REFRESH_AHEAD", "STRAYDOG_PROMPT_PASSES", "STRAYDOG_PIPELINE_DRAWN_GUESSES", "STRAYDOG_DRAFTER_RESIDENT", "STRAYDOG_PIPELINE_HEAD_SHARE", "STRAYDOG_LOCK_BUDGET", "STRAYDOG_EXPERT_Q8", "STRAYDOG_EXPERT_Q8_LANES", "STRAYDOG_EXPERT_Q8_GRID", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
-                                         "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512",
+pub const ENGINE_VARIABLES: [&str; 93] = ["STRAYDOG_HOST_TIER", "STRAYDOG_KEEP_FREE", "STRAYDOG_CAPTURE", "STRAYDOG_INTERLEAVE", "STRAYDOG_LAYER_ROWS_OVERLAP", "STRAYDOG_PROMPT_Q8", "STRAYDOG_LAYER_BANK_DIRECT", "STRAYDOG_LAYER_BANK_BUFFERS", "STRAYDOG_QSA_MMA", "STRAYDOG_HC_FUSED", "STRAYDOG_PIPELINE_DRAWS", "STRAYDOG_PROMPT_PASSES_OVERLAP", "STRAYDOG_PROMPT_REFRESH_AHEAD", "STRAYDOG_PROMPT_PASSES", "STRAYDOG_PIPELINE_DRAWN_GUESSES", "STRAYDOG_DRAFTER_RESIDENT", "STRAYDOG_PIPELINE_HEAD_SHARE", "STRAYDOG_LOCK_BUDGET", "STRAYDOG_EXPERT_Q8", "STRAYDOG_EXPERT_Q8_LANES", "STRAYDOG_EXPERT_Q8_GRID", "DS41_PROFILE", "DS41_DRAFTS", "DS41_DSPARK", "DS41_DSPARK_RESIDENT", "STRAYDOG_DIRECT",
+                                         "STRAYDOG_ENGRAM", "STRAYDOG_EXPERT_FLOOR", "STRAYDOG_CPU_INT8", "STRAYDOG_CPU_AVX512", "STRAYDOG_VISION_GPU",
                                          "STRAYDOG_PROMPT_CPU", "STRAYDOG_LAYER_PREFILL", "STRAYDOG_PEER_DIRECT",
                                          "STRAYDOG_HOST_REGISTER_READ_ONLY", "STRAYDOG_LAYER_PREFILL_ROWS", "STRAYDOG_LOCK_DURING_PREFILL", "STRAYDOG_KV",
                                          "STRAYDOG_Q8", "STRAYDOG_HC_Q8", "STRAYDOG_PARTS", "STRAYDOG_MTP_PARTS", "STRAYDOG_DRAFT_VOCABULARY",

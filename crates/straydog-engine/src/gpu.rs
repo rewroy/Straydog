@@ -1467,6 +1467,38 @@ impl Backend {
         Ok(self.prefill_capacity)
     }
 
+    /// Room in the budget for `bytes` more, for a while (the vision encoder's, between requests): where what is free is short, the
+    /// expert pool is let go as a long prompt lets it go, and [`Backend::room_back`] puts it back. Whether it was let go; Err where
+    /// even so there would be no room (nothing is let go then).
+    pub fn make_room(&mut self, bytes: u64) -> Result<bool> {
+        let (used, budget) = self.budget_memory()?;
+        if used.saturating_add(self.slot_margin).saturating_add(bytes) <= budget {
+            return Ok(false);
+        }
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() {
+            return Err(format!("no room for {} MB more in this device's budget", bytes >> 20));
+        }
+        // SAFETY: a live handle, between requests.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        self.restore_slots(0)?;
+        let (used, budget) = self.budget_memory()?;
+        if used.saturating_add(self.slot_margin).saturating_add(bytes) > budget {
+            self.room_back(true)?;
+            return Err(format!("no room for {} MB more in this device's budget, even with its expert pool let go", bytes >> 20));
+        }
+        Ok(true)
+    }
+
+    /// The expert pool [`Backend::make_room`] let go, back (when it did), with the experts that use it most.
+    pub fn room_back(&mut self, let_go: bool) -> Result<()> {
+        if !let_go {
+            return Ok(());
+        }
+        // SAFETY: a live handle, between requests.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        self.slots_back()
+    }
+
     /// Lend the vocabulary projection, whose authenticated host copy the model keeps. No decoder plan owns it.
     pub fn lend_prefill_head(&mut self) -> Result<()> {
         let key = "output.weight:None";

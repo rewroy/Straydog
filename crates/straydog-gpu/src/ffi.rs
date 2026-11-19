@@ -2976,3 +2976,55 @@ unsafe extern "C" {
         count: u64,
     ) -> ::std::os::raw::c_int;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_qwen_vision_layer {
+    pub norm1: *const ::std::os::raw::c_void,
+    pub norm1_bias: *const ::std::os::raw::c_void,
+    pub qkv: *const ::std::os::raw::c_void,
+    pub qkv_bias: *const ::std::os::raw::c_void,
+    pub out: *const ::std::os::raw::c_void,
+    pub out_bias: *const ::std::os::raw::c_void,
+    pub norm2: *const ::std::os::raw::c_void,
+    pub norm2_bias: *const ::std::os::raw::c_void,
+    pub up: *const ::std::os::raw::c_void,
+    pub up_bias: *const ::std::os::raw::c_void,
+    pub down: *const ::std::os::raw::c_void,
+    pub down_bias: *const ::std::os::raw::c_void,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_qwen_vision_merger {
+    pub norm: *const ::std::os::raw::c_void,
+    pub norm_bias: *const ::std::os::raw::c_void,
+    pub up: *const ::std::os::raw::c_void,
+    pub up_bias: *const ::std::os::raw::c_void,
+    pub down: *const ::std::os::raw::c_void,
+    pub down_bias: *const ::std::os::raw::c_void,
+}
+unsafe extern "C" {
+    pub fn sd_qwen_vision_scratch_bytes(patches: u64, bytes: *mut u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_qwen_vision_block(
+        handle: *mut ::std::os::raw::c_void,
+        layer: *const sd_qwen_vision_layer,
+        x: *mut f32,
+        cosines: *const f32,
+        sines: *const f32,
+        patches: u64,
+        scratch: *mut ::std::os::raw::c_void,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_qwen_vision_merge(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        merger: *const sd_qwen_vision_merger,
+        patches: u64,
+        scratch: *mut ::std::os::raw::c_void,
+        scratch_bytes: u64,
+        out: *mut f32,
+    ) -> ::std::os::raw::c_int;
+}

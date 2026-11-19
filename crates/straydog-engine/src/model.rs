@@ -1602,6 +1602,11 @@ pub struct ForcedRows {
 }
 
 impl Model {
+    /// The first device's backend, for work beside the model's between requests (Qwen3.8's vision encoder).
+    pub fn first_device(&mut self) -> Option<&mut crate::gpu::Backend> {
+        self.group.backends.first_mut()
+    }
+
     /// Place the model on the group's GPUs, then read and authenticate the weights into the
     /// placement (see `crate::load`); `progress` follows the reading.
     pub fn new(weights: Weights, mut group: Group, settings: &Settings, progress: Progress) -> Result<Model> {
