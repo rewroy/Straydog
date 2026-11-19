@@ -429,6 +429,17 @@ pub fn left_free(memory: u64) -> u64 {
     (memory / 8).max(4 << 30)
 }
 
+/// What the banks' locking (whole layers or a host tier) leaves free beside a layer: [`left_free`], or, for a measurement, STRAYDOG_KEEP_FREE
+/// GiB (as STRAYDOG_LOCK_BUDGET stands in for the lock budget's rule). A tier whose locking meets CPU routes' pages of the mapping that come
+/// back into the working set stops near this mark (an RTX 5070 Ti PC with 33-38 GiB available at the start: 3 to 8 of 29 layers); whether
+/// a complete tier is worth a lower mark is what the knob measures.
+pub fn lock_kept_free(memory: u64) -> u64 {
+    static KEPT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    KEPT.get_or_init(|| std::env::var("STRAYDOG_KEEP_FREE").ok().and_then(|gib| gib.trim().parse::<f64>().ok())
+        .filter(|gib| *gib >= 0.0).map(|gib| (gib * (1u64 << 30) as f64) as u64))
+        .unwrap_or_else(|| left_free(memory))
+}
+
 /// `wanted` bytes held in memory by a process with `held` there already, at most what `available`
 /// physical memory gives while [`left_free`] stays free.
 pub fn within_free(wanted: u64, held: u64, available: u64, memory: u64) -> u64 {

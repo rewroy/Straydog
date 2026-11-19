@@ -2447,7 +2447,7 @@ impl Model {
             };
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
-        let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes))
+        let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::lock_kept_free(self.weights.host_memory_bytes))
             .tied_to(self.lock_halt.clone(), self.kv_ahead.clone()).remembering(self.lock_refusal.clone()).marking(self.registered.clone());
         // (a GPU that cannot register the read-only mapping is not asked to: each layer's turn copies its banks, and checks the copies)
         Ok(match self.lock_mode {
@@ -2574,7 +2574,7 @@ impl Model {
         let mut budget = by_memory.min(crate::host::lockable(memory, 0)).min(self.visible_cap.saturating_sub(locked));
         let mut left: Vec<usize> = (0..48).rev().filter(|layer| sizes[*layer] > 0 && !self.locked_layers.contains(layer)).collect();
         self.refresh_kv_ahead();
-        let (margin, kv_ahead) = (crate::host::left_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
+        let (margin, kv_ahead) = (crate::host::lock_kept_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
         let available = crate::host::available_bytes();
         // (the least of them first: on most requests' ends nothing fits, and the routes are not asked for)
         let least = left.iter().map(|&layer| sizes[layer]).min()?;
@@ -2639,7 +2639,7 @@ impl Model {
         // (within the GPUs' view of host memory the start planned for, banks::visible_lock_cap, and what the commit left allows)
         let visible = self.visible_cap.saturating_sub(held).min(crate::host::lockable(memory, 0));
         self.refresh_kv_ahead();
-        let (margin, kv_ahead) = (crate::host::left_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
+        let (margin, kv_ahead) = (crate::host::lock_kept_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
         let available = crate::host::available_bytes();
         let layers = crate::banks::tier_more_within(&left, visible, available, margin, kv_ahead);
         if layers.is_empty() {
