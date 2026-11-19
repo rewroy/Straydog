@@ -6893,6 +6893,60 @@ mod wait_recovery_gpu {
         model.raise_vram(0, before).unwrap();
         generate(&mut model, &prompt).unwrap();
     }
+
+    /// Decides whether a request after a recovered wait that writes other tokens than one without it (one run in three on an RTX 5070 Ti)
+    /// shows a state the recovery broke or the numbers of a partially resident pass: the same request from the same checkpoint, twice with
+    /// no timeout, then once after one and once more. Where the two without differ as well, the comparison is with the numbers.
+    #[test]
+    #[ignore = "requires model files and an exclusive GPU"]
+    fn a_request_from_one_checkpoint_writes_the_same_tokens_each_time_with_or_without_a_timeout() {
+        let root = std::env::var_os("STRAYDOG_MODEL").expect("STRAYDOG_MODEL must name the model directory");
+        let quant = std::env::var("STRAYDOG_MODEL_QUANT").unwrap_or_else(|_| "UD-IQ1_S".into());
+        let drafter = std::env::var_os("STRAYDOG_DRAFTER").map(std::path::PathBuf::from);
+        let bundle = crate::bundle::Id::find(Some(crate::bundle::MODEL), None, &quant).expect("a known Qwen bundle");
+        let mut group = Group::new(&[0], &[6 << 30], crate::group::SplitMode::Experts).unwrap();
+        group.configure_gemm(2, true).unwrap();
+        let weights = Weights::open(&std::path::PathBuf::from(root), bundle, drafter.as_deref(),
+                                    crate::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+        let text = crate::text::Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap();
+        let settings = Settings { context: 65536, state_budget_bytes: 8 << 30, prefill_batch_size: 256,
+                                  speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 8, row_cache_bytes: None };
+        let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+        model.prompt_share(false).unwrap();
+        assert!(model.lock_layers_for_test(&[0]).unwrap() > 0);
+        let prompt = text.encode("<|im_start|>user\nCount from one to thirty in English.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+        let written = |model: &mut Model, tokens: &[u32]| {
+            let mut out = Vec::new();
+            model.generate(tokens, 32, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| out.push(token)).map(|()| out)
+        };
+        written(&mut model, &prompt).unwrap();
+        let held = model.history.clone();
+        model.save_checkpoint("root").unwrap();
+        model.save_checkpoint("turn").unwrap();
+        let mut next = held.clone();
+        next.extend(text.encode("\nContinue counting: ").unwrap());
+        let first = written(&mut model, &next).unwrap();
+        let second = written(&mut model, &next).unwrap();
+        struct ClearFault;
+        impl Drop for ClearFault {
+            fn drop(&mut self) { unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); } }
+        }
+        let _clear = ClearFault;
+        // SAFETY: a development-only counter; one GPU job holds the test's process.
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(1); }
+        let error = written(&mut model, &next).unwrap_err();
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); }
+        assert!(error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED), "{error}");
+        assert_eq!(model.history, held);
+        let after = written(&mut model, &next).unwrap();
+        let again = written(&mut model, &next).unwrap();
+        let split = |a: &[u32], b: &[u32]| a.iter().zip(b).position(|(x, y)| x != y).map_or("same".to_string(), |at| format!("first differs at {at}"));
+        eprintln!("checkpoint runs: second against first {}; after the timeout against second {}; again against after {}",
+                  split(&second, &first), split(&after, &second), split(&again, &after));
+        assert_eq!(second, first, "the baseline: two runs with no timeout differ, {:?} against {:?}", text.decode(&second), text.decode(&first));
+        assert_eq!(after, second, "after the timeout {:?}, without {:?}", text.decode(&after), text.decode(&second));
+        assert_eq!(again, after);
+    }
 }
 
 /// The first layer of the second GPU when experts are split, as far as the placement allows:
