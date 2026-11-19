@@ -1577,17 +1577,20 @@ impl Engine {
                   -> Result<Option<Vec<Option<Arc<Vec<f32>>>>>, Failure> {
         let encoder = self.vision.as_ref().map_err(|reason| refused(format!("this model reads no images: {reason}")))?;
         let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
+        // Every kept image's rows first: an image taken as known has nothing to encode, and an image encoded before it in the
+        // prompt could evict its rows (a new image placed before kept ones, with the kept rows near ENCODED_BYTES).
+        for &(index, _) in spans {
+            if let Some(at) = self.encoded.iter().position(|(kept, _, _)| *kept == images[index].digest) {
+                let kept = self.encoded.remove(at);
+                rows[index] = Some(kept.1.clone());
+                self.encoded.push(kept);
+            }
+        }
         for &(index, _) in spans {
             if rows[index].is_some() {
                 continue;
             }
             let digest = images[index].digest;
-            if let Some(at) = self.encoded.iter().position(|(kept, _, _)| *kept == digest) {
-                let kept = self.encoded.remove(at);
-                rows[index] = Some(kept.1.clone());
-                self.encoded.push(kept);
-                continue;
-            }
             // (a refusal: nothing of the model's state has moved, and the worker reads on)
             // (whatever an image does in there, the worker reads on)
             // (an image taken as known had its rows above: one with nothing to encode here would be a mistake of this worker's, said and not served)
