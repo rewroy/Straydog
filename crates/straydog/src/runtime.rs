@@ -542,7 +542,7 @@ fn stays_in_the_log(line: &str) -> bool {
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
-     "Straydog assist profile:", "Straydog expert reuse"]
+     "Straydog assist profile:", "Straydog expert reuse", "Straydog vision"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -2165,6 +2165,9 @@ mod tests {
         assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
         assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        // (why a picture was slow: the vision encoder on the CPU, as the GPU could not, and what the GPU took)
+        assert!(stays_in_the_log("Straydog vision: on the CPU, as the GPU could not: no room for 412 MB more in this device's budget"));
+        assert!(stays_in_the_log("Straydog vision: 3 image(s) on the GPU in 1.07 s (room 0.01 s, the expert pool let go, back 0.12 s)"));
         assert!(!stays_in_the_log("Straydog host paging: 4.5 GiB available; the CPU's experts are read ahead from now"));
         assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
         assert!(stays_in_the_log("Straydog assist profile: decision round=2 held=0 qualified=4 chosen=4"));
