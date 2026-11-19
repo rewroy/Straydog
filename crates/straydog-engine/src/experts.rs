@@ -1866,10 +1866,12 @@ impl DeviceExperts {
         let mut raised: Vec<usize> = Vec::new();
         for (slot, mut used) in std::mem::take(&mut self.touched) {
             let class = self.slots[slot].class;
-            // (LRFU: the expert's score raised by one use, once a release however often it was held)
+            // (LRFU: the expert's score raised by one use, once a release however often it was held; a streaming prefill's uses do not
+            // raise it: one takes nearly every expert of a layer, which made every score alike, and on 2 R9700s serving the store with them
+            // missed 3.1% fewer than an LRU of the same decode uses where the replay of LRFU missed ~5% fewer, 2026-11-20)
             if let (Some(lrfu), Some(key)) = (self.lrfu.as_mut(), self.slots[slot].key) {
                 let class_slots = self.classes[class].count.max(1) as f64;
-                if raised.contains(&slot) {
+                if raised.contains(&slot) || self.streaming {
                     used = lrfu_order(lrfu.scores.get(&key).copied().unwrap_or(0.0));
                 } else {
                     raised.push(slot);
