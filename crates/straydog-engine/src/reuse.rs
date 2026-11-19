@@ -198,6 +198,39 @@ pub fn lru2_misses(uses: &[Key], slots: usize) -> u64 {
     misses
 }
 
+/// The misses of `uses` through an LRFU store of `slots` whose scores halve every `half_life` uses: an expert's score is the
+/// sum over its uses of 2^-(age / half_life), and on a miss with every slot taken the held expert of the lowest goes (a
+/// short half-life is LRU, a long one LFU). Scores are kept for experts gone too. Compared as log2(score) + age's
+/// exponent at the use, which every score shares, in 2^-20ths.
+pub fn lrfu_misses(uses: &[Key], slots: usize, half_life: f64) -> u64 {
+    if slots == 0 {
+        return uses.len() as u64;
+    }
+    let rate = 1.0 / half_life.max(1.0);
+    // (each expert's log2 of its score times 2^(rate * its last use), and its last use)
+    let mut scores: HashMap<Key, (f64, u64)> = HashMap::new();
+    let mut held: BTreeSet<(i64, Key)> = BTreeSet::new();
+    let mut misses = 0;
+    let fixed = |value: f64| (value * (1u64 << 20) as f64) as i64;
+    for (index, &key) in uses.iter().enumerate() {
+        let time = index as u64;
+        let (log_scaled, _) = scores.get(&key).copied().unwrap_or((f64::NEG_INFINITY, 0));
+        let was_held = log_scaled.is_finite() && held.remove(&(fixed(log_scaled), key));
+        if !was_held {
+            misses += 1;
+            if held.len() == slots {
+                held.pop_first();
+            }
+        }
+        // (the old score decayed to now, plus this use: log2(1 + 2^(old - rate * (now - last))) + rate * now)
+        let decayed = if log_scaled.is_finite() { log_scaled - rate * time as f64 } else { f64::NEG_INFINITY };
+        let now = (1.0 + decayed.exp2()).log2() + rate * time as f64;
+        scores.insert(key, (now, time));
+        held.insert((fixed(now), key));
+    }
+    misses
+}
+
 /// A store's window of uses, by class, and how many of them VRAM did not hold.
 pub struct Reuse {
     uses: Vec<Vec<Key>>,
@@ -258,6 +291,9 @@ pub fn replay(uses: &[Vec<Key>], missed: &[u64], classes: &[(usize, String)]) ->
         }
         let (lru, best) = (lru_misses(list, *slots), best_misses(list, *slots));
         let (arc, lru2) = (arc_misses(list, *slots), lru2_misses(list, *slots));
+        // (LRFU whose scores halve every 4, 16 and 64 times the class's slots of its uses)
+        let lrfu: Vec<String> = [4.0, 16.0, 64.0].iter().map(|&times| percent(lrfu_misses(list, *slots, times * *slots as f64), list.len() as u64))
+            .map(|share| format!("{share:.1}")).collect();
         // (what a class's slots are worth to it: an LRU of three quarters, five quarters and three halves of them)
         let scaled: Vec<String> = [3, 5, 6].iter().map(|&quarters| percent(lru_misses(list, slots * quarters / 4), list.len() as u64))
             .map(|share| format!("{share:.1}")).collect();
@@ -265,9 +301,10 @@ pub fn replay(uses: &[Vec<Key>], missed: &[u64], classes: &[(usize, String)]) ->
         for (sum, value) in total.iter_mut().zip([used, actual, lru, best, arc, lru2]) {
             *sum += value;
         }
-        parts.push(format!("{class} ({label}, {slots} slots) {:.1} / {:.1} / {:.1} / {:.1} / {:.1}% (an LRU of 3/4, 5/4, 3/2: {}%)",
+        parts.push(format!("{class} ({label}, {slots} slots) {:.1} / {:.1} / {:.1} / {:.1} / {:.1}% (an LRU of 3/4, 5/4, 3/2: {}%; LRFU \
+                            halving every 4, 16, 64 x its slots: {}%)",
                            percent(actual, used), percent(lru, used), percent(arc, used), percent(lru2, used), percent(best, used),
-                           scaled.join(" / ")));
+                           scaled.join(" / "), lrfu.join(" / ")));
     }
     format!("Straydog expert reuse: {} uses of decode and verify passes on the first GPU; VRAM missed {:.1}%, an LRU store of the same \
              slots would miss {:.1}%, ARC {:.1}%, LRU-2 {:.1}%, the best possible {:.1}%; by class (missed / LRU / ARC / LRU-2 / best): {}",
@@ -360,6 +397,19 @@ mod tests {
     }
 
     #[test]
+    fn lrfu_is_lru_with_a_short_half_life_and_keeps_the_frequent_with_a_long_one() {
+        let uses = keys(&[1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]);
+        assert_eq!(lrfu_misses(&uses, 3, 0.01), lru_misses(&uses, 3));
+        // (1 used three times, then each of 2..=40 once, then 1 again: an LFU keeps 1, an LRU of 3 slots has let it go)
+        let mut uses = keys(&[1, 1, 1]);
+        uses.extend((2..=40).map(|expert| (0, expert)));
+        uses.push((0, 1));
+        assert_eq!(lrfu_misses(&uses, 3, 1e9), 40);
+        assert_eq!(lru_misses(&uses, 3), 41);
+        assert!(lrfu_misses(&uses, 3, 1e9) >= best_misses(&uses, 3));
+    }
+
+    #[test]
     fn layers_are_labelled_by_runs() {
         assert_eq!(layer_label(&[0, 1, 2, 3]), "layers 0-3");
         assert_eq!(layer_label(&[10, 11, 12, 20, 22, 23]), "layers 10-12, 20, 22-23");
@@ -373,7 +423,7 @@ mod tests {
         assert!(line.contains("VRAM missed 75.0%, an LRU store of the same slots would miss 83.3%, ARC "), "{line}");
         assert!(line.contains(", the best possible 58.3%; by class (missed / LRU / ARC / LRU-2 / best): 0 (layers 0-9, 3 slots) 75.0 / 83.3 / "), "{line}");
         // (an LRU of 2, 3 and 4 slots: 12, 10 and 8 of the 12 uses missed)
-        assert!(line.contains("58.3% (an LRU of 3/4, 5/4, 3/2: 100.0 / 83.3 / 66.7%)"), "{line}");
+        assert!(line.contains("58.3% (an LRU of 3/4, 5/4, 3/2: 100.0 / 83.3 / 66.7%; LRFU halving every 4, 16, 64 x its slots: "), "{line}");
         assert!(!line.contains("layers 10-19"), "{line}");
     }
 }
