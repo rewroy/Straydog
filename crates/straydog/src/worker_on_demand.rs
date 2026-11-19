@@ -58,6 +58,19 @@ enum Job {
 const WARM_STEP: usize = 64;
 const WARM_IN_FLIGHT: usize = 64;
 
+/// Where a span of a warm-up (`elapsed`, from the readers' totals `at` to now) spent its time: the readers' bytes and their rate, the drive's
+/// reads in flight on average (of the sixteen the shared readers admit) and the checks', and the time it stood `paused` for requests and for
+/// making room. A start's warm-up reads ~138 GB back from the drive (the 101 GiB host tier lives in the process alone): 39-57 s at 2.4-3.5
+/// GB/s where the drive's direct reads give 4.3-4.5 (two R9700s, 2026-11-19), and requests meanwhile read their misses from the drive too.
+fn reads_note(at: (u64, u64, u64, u64), elapsed: std::time::Duration, paused: std::time::Duration) -> String {
+    let now = straydog_engine::experts::reader_totals();
+    let (reads, bytes, read_ns, verify_ns) = (now.0 - at.0, now.1 - at.1, now.2 - at.2, now.3 - at.3);
+    let seconds = elapsed.as_secs_f64().max(1e-9);
+    format!("the readers {reads} reads, {:.1} GB, {:.2} GB/s; the drive's reads in flight {:.1} on average, the checks {:.1}; paused {:.1} s for \
+             requests and making room", bytes as f64 / 1e9, bytes as f64 / 1e9 / seconds, read_ns as f64 / 1e9 / seconds,
+            verify_ns as f64 / 1e9 / seconds, paused.as_secs_f64())
+}
+
 /// The request loop's side: each request runs on the model's thread.
 struct Handle(mpsc::Sender<Job>);
 
@@ -146,13 +159,22 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
             let mut warming: Option<Instant> = None;
             let mut listed: Option<Instant> = None;
             let mut rooming = false;
+            // (where a warm-up's time went: the readers' totals at its start and at its last line, and the time it stood paused for requests
+            // and for making room, which it does not run beside)
+            let mut reads_at = straydog_engine::experts::reader_totals();
+            let mut paused = std::time::Duration::ZERO;
             loop {
                 let job = if warming.is_some() || rooming {
                     match queue.recv_timeout(std::time::Duration::from_millis(1)) {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             if rooming {
-                                match served.model.make_room() {
+                                let rooming_began = Instant::now();
+                                let made = served.model.make_room();
+                                if warming.is_some() {
+                                    paused += rooming_began.elapsed();
+                                }
+                                match made {
                                     Ok(done) => rooming = !done,
                                     Err(error) => {
                                         eprintln!("Straydog stopped making room for the next prefill: {error}");
@@ -163,14 +185,18 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                                 match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
                                     Ok(Warmed::Going) => {}
                                     Ok(Warmed::Listed) => {
-                                        eprintln!("Straydog warmed up in {:.1} s", since.elapsed().as_secs_f64());
+                                        eprintln!("Straydog warmed up in {:.1} s; {}", since.elapsed().as_secs_f64(),
+                                                  reads_note(reads_at, since.elapsed(), paused));
                                         listed = Some(Instant::now());
+                                        reads_at = straydog_engine::experts::reader_totals();
+                                        paused = std::time::Duration::ZERO;
                                     }
                                     Ok(Warmed::Done) => {
                                         let (vram, host, bytes) = served.model.filled();
                                         eprintln!("Straydog filled its free slots with {vram} experts for VRAM, {host} for the host tier \
-                                                   ({:.1} GiB from the drive) in {:.1} s", bytes as f64 / (1u64 << 30) as f64,
-                                                  listed.map_or(0.0, |listed| listed.elapsed().as_secs_f64()));
+                                                   ({:.1} GiB from the drive) in {:.1} s; {}", bytes as f64 / (1u64 << 30) as f64,
+                                                  listed.map_or(0.0, |listed| listed.elapsed().as_secs_f64()),
+                                                  reads_note(reads_at, listed.map_or(std::time::Duration::ZERO, |listed| listed.elapsed()), paused));
                                         warming = None;
                                         rooming = true;
                                     }
@@ -192,7 +218,11 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                 };
                 match job {
                     Job::Run { body, id, output, cancel, started, text, reply } => {
+                        let running = Instant::now();
                         let _ = reply.send(served.run(&text, &output, &id, &body, &cancel, started));
+                        if warming.is_some() {
+                            paused += running.elapsed();
+                        }
                         rooming = true;
                     }
                     Job::Reset(reply) => {
@@ -207,6 +237,8 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                             eprintln!("Straydog warming up with {vram} experts for VRAM, {host} for the host tier");
                             warming = Some(Instant::now());
                             listed = None;
+                            reads_at = straydog_engine::experts::reader_totals();
+                            paused = std::time::Duration::ZERO;
                         }
                         Err(error) => eprintln!("Straydog cannot warm up: {error}"),
                     },

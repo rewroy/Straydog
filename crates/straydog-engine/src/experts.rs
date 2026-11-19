@@ -415,12 +415,32 @@ impl Drop for Reader {
     }
 }
 
+/// What the readers did since the process began, for a log line to say where a span of reads spent its time ([`reader_totals`]): reads done,
+/// their bytes, the nanoseconds spent in the drive's reads (summed over the readers: over a span, divided by its length, the reads in flight on
+/// average) and in their checks, and the nanoseconds a read waited in the queue before a reader took it.
+static READS: AtomicU64 = AtomicU64::new(0);
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static READ_NS: AtomicU64 = AtomicU64::new(0);
+static VERIFY_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The readers' totals so far: (reads, bytes, ns in the drive's reads, ns in their checks). Two of them a span apart tell its reads' rate, how
+/// many were in flight on average, and the share of the checks: what a start's warm-up of the stores was held by.
+pub fn reader_totals() -> (u64, u64, u64, u64) {
+    (READS.load(Ordering::Relaxed), READ_BYTES.load(Ordering::Relaxed), READ_NS.load(Ordering::Relaxed), VERIFY_NS.load(Ordering::Relaxed))
+}
+
 fn run_read(job: &ReadJob, permit: Option<ReadPermit>) -> std::result::Result<(), String> {
     // SAFETY: the target is `len` bytes of a host slot reserved for this read (see HostPointer).
     let target = unsafe { std::slice::from_raw_parts_mut(job.target.0, job.len as usize) };
+    let began = std::time::Instant::now();
     read_expert(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
+    let read = began.elapsed();
     drop(permit); // Hashing and proof checks do not consume one of the sixteen data-read admits.
     if let Some((verify, file)) = &job.verifier { verify(*file, job.offset, target)?; }
+    READS.fetch_add(1, Ordering::Relaxed);
+    READ_BYTES.fetch_add(job.len, Ordering::Relaxed);
+    READ_NS.fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
+    VERIFY_NS.fetch_add((began.elapsed() - read).as_nanos() as u64, Ordering::Relaxed);
     Ok(())
 }
 
