@@ -1438,6 +1438,9 @@ pub struct Model {
     /// Whether a prompt's last checkpoint may be taken inside a batch ([`Model::capture_possible`]; STRAYDOG_CAPTURE=0 says no).
     capture: bool,
     checkpoints: IndexMap<&'static str, Checkpoint>,
+    /// Where the running request resumed (the tokens it reused) and the slots of the checkpoints it found there or below, on its own
+    /// tokens: what a GPU wait timeout leaves as it was ([`Model::recover_hybrid_wait`]).
+    recoverable: (usize, Vec<usize>),
     /// The length of the held sequence from which the reply being written is marked next ([`MARK_EVERY`]); `usize::MAX` for a reply that
     /// is not marked.
     mark_at: usize,
@@ -1748,6 +1751,7 @@ impl Model {
             tier_chosen: None,
             capture: std::env::var("STRAYDOG_CAPTURE").map_or(true, |value| value.trim() != "0"),
             checkpoints: IndexMap::new(),
+            recoverable: (0, Vec::new()),
             mark_at: usize::MAX,
             reply_marks: true,
             parked: None,
@@ -2932,10 +2936,20 @@ impl Model {
         self.group.reset_state()
     }
 
-    /// Discard every saved sequence state after a pass whose native wait was recovered.
+    /// After a pass whose native wait was recovered. Past where the request resumed, the live sequence's state may be anything, and so may every
+    /// checkpoint the request took and the parked sequence's copies: those are discarded. The checkpoints it found at or below where it resumed
+    /// are as it found them (a request's passes write the K/V from where it resumed on, and a checkpoint's slot only when they take it), so they
+    /// stay, and the longest is the live sequence again: the next request reads from there, not from its first token. On an RTX 4060 (8 GB), each
+    /// timeout's next request read its whole conversation again, 22,452 to 65,379 tokens in 199 to 512 s.
     fn recover_hybrid_wait(&mut self) -> Result<()> {
+        let (reused, slots) = std::mem::take(&mut self.recoverable);
         let mut recovered = Ok(());
-        for (_, checkpoint) in std::mem::take(&mut self.checkpoints) {
+        let mut kept = IndexMap::new();
+        for (kind, checkpoint) in std::mem::take(&mut self.checkpoints) {
+            if checkpoint.tokens.len() <= reused && slots.contains(&checkpoint.slot) {
+                kept.insert(kind, checkpoint);
+                continue;
+            }
             let released = self.release_checkpoint(checkpoint);
             recovered = recovered.and(released);
         }
@@ -2949,6 +2963,24 @@ impl Model {
         for token in self.draft_pending.drain(..) { self.draft_extras.remove(&token); }
         let reset = self.reset();
         recovered = recovered.and(reset);
+        let longest = kept.iter().max_by_key(|(_, checkpoint)| checkpoint.tokens.len()).map(|(kind, _)| *kind);
+        self.checkpoints = kept;
+        if let (Ok(()), Some(kind)) = (&recovered, longest) {
+            match self.resume_checkpoint(kind) {
+                Ok(length) => eprintln!("Straydog: after the GPU wait timed out, the conversation is kept up to {length} tokens (its {kind} checkpoint)"),
+                Err(error) => {
+                    eprintln!("WARN Straydog: after the GPU wait timed out, the {kind} checkpoint could not be resumed ({error}); nothing is kept");
+                    let reset = self.reset();
+                    recovered = recovered.and(reset);
+                }
+            }
+        }
+        if recovered.is_err() || self.history.is_empty() {
+            for (_, checkpoint) in std::mem::take(&mut self.checkpoints) {
+                let released = self.release_checkpoint(checkpoint);
+                recovered = recovered.and(released);
+            }
+        }
         if let Err(error) = recovered {
             let failure = format!("could not reset the GPU after its wait timed out: {error}; model state is unusable");
             self.recovery_failure = Some(failure.clone());
@@ -3330,7 +3362,12 @@ impl Model {
             self.reset()?;
             return Ok((0, "none"));
         };
-        let checkpoint = self.checkpoints.get_mut(kind).unwrap();
+        Ok((self.resume_checkpoint(kind)?, kind))
+    }
+
+    /// Make the checkpoint `kind` the live sequence: its recurrent state, its indexers' history, its tokens. The length it resumes at.
+    fn resume_checkpoint(&mut self, kind: &'static str) -> Result<usize> {
+        let checkpoint = self.checkpoints.get_mut(kind).ok_or_else(|| format!("no {kind} checkpoint to resume"))?;
         let (slot, saved, hidden) = (checkpoint.slot, checkpoint.tokens.clone(), checkpoint.final_hidden.clone());
         self.group.checkpoint(slot, false)?;
         if let Some(history) = checkpoint.history.as_mut() {
@@ -3340,7 +3377,7 @@ impl Model {
         self.draft_note(&saved);
         self.history = saved;
         root_resumed(&mut self.checkpoints, kind);
-        Ok((self.history.len(), kind))
+        Ok(self.history.len())
     }
 
     /// Positions (multiples of four) this prefill checkpoints at, with their kinds. A request
@@ -6436,6 +6473,7 @@ impl Model {
                         -> Result<()> {
         let started = Instant::now();
         self.last_metrics = Map::new();
+        self.recoverable = (0, Vec::new());
         if tokens.is_empty() || max_new == 0 || max_new > self.context || tokens.len() + max_new > self.context {
             return Err("Straydog prompt plus output exceeds the allocated context".into());
         }
@@ -6455,6 +6493,9 @@ impl Model {
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
+        self.recoverable = (reused, self.checkpoints.values()
+            .filter(|checkpoint| checkpoint.tokens.len() <= reused && checkpoint.tokens[..] == tokens[..checkpoint.tokens.len()])
+            .map(|checkpoint| checkpoint.slot).collect());
         // The PLE rows of the first two batches are asked for as soon as the new tokens are known: their reads run behind what comes
         // before the first layer (the parked positions' copies, a K/V growth), where the first batch waited for them after it.
         if reused < tokens.len() {
@@ -6711,7 +6752,7 @@ mod wait_recovery_gpu {
 
     #[test]
     #[ignore = "requires model files and an exclusive GPU"]
-    fn a_recovered_hybrid_wait_discards_saved_sequences_and_serves_the_next_request() {
+    fn a_recovered_hybrid_wait_keeps_the_checkpoints_below_the_request_and_serves_the_next_one_from_there() {
         let root = std::env::var_os("STRAYDOG_MODEL").expect("STRAYDOG_MODEL must name the model directory");
         let quant = std::env::var("STRAYDOG_MODEL_QUANT").unwrap_or_else(|_| "UD-IQ1_S".into());
         let drafter = std::env::var_os("STRAYDOG_DRAFTER").map(std::path::PathBuf::from);
@@ -6731,17 +6772,22 @@ mod wait_recovery_gpu {
         // A display GPU prelaunches waits only for spans containing mapped banks.
         assert!(model.lock_layers_for_test(&[0]).unwrap() > 0);
         let prompt = text.encode("<|im_start|>user\nCount from one to thirty in English.<|im_end|>\n<|im_start|>assistant\n").unwrap();
-        let generate = |model: &mut Model, tokens: &[u32]| {
-            model.generate(tokens, 32, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |_| {})
+        let written = |model: &mut Model, tokens: &[u32]| {
+            let mut out = Vec::new();
+            model.generate(tokens, 32, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| out.push(token)).map(|()| out)
         };
+        let generate = |model: &mut Model, tokens: &[u32]| written(model, tokens).map(drop);
         generate(&mut model, &prompt).unwrap();
         assert!(!model.history.is_empty());
+        let held = model.history.clone();
         model.save_checkpoint("root").unwrap();
         model.save_checkpoint("turn").unwrap();
         if let Some(old) = model.parked.take() { model.discard(old).unwrap(); }
         model.parked = Some(model.park(0, PARK_SLOTS[0]).unwrap());
-        let mut next = model.history.clone();
+        let mut next = held.clone();
         next.extend(text.encode("\nContinue counting: ").unwrap());
+        // What `next` writes from the turn's state with no timeout: the request after the timeout must write the same.
+        let expected = written(&mut model, &next).unwrap();
         struct ClearFault;
         impl Drop for ClearFault {
             fn drop(&mut self) { unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); } }
@@ -6752,10 +6798,24 @@ mod wait_recovery_gpu {
         let error = generate(&mut model, &next).unwrap_err();
         unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); }
         assert!(error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED), "{error}");
-        assert!(model.history.is_empty() && model.final_hidden.is_none());
-        assert!(model.checkpoints.is_empty() && model.parked.is_none());
+        // (the request resumed from the checkpoints at `held`: they stay, and the live sequence is theirs again)
+        assert_eq!(model.history, held);
+        assert!(model.checkpoints.contains_key("root") && model.checkpoints.contains_key("turn"));
+        assert!(model.parked.is_none());
         assert_eq!(model.mtp_kept, 0);
         assert!(model.draft_pending.is_empty() && model.recovery_failure.is_none());
+        assert_eq!(model.recoverable, (0, Vec::new()));
+        let after = written(&mut model, &next).unwrap();
+        assert_eq!(model.last_metrics["cached_tokens"], json!(held.len()));
+        assert_eq!(after, expected, "after the timeout {:?}, without {:?}", text.decode(&after), text.decode(&expected));
+        // A request that resumed from nothing keeps nothing.
+        model.reset().unwrap();
+        for (_, checkpoint) in std::mem::take(&mut model.checkpoints) { model.release_checkpoint(checkpoint).unwrap(); }
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(1); }
+        let error = generate(&mut model, &prompt).unwrap_err();
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); }
+        assert!(error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED), "{error}");
+        assert!(model.history.is_empty() && model.final_hidden.is_none() && model.checkpoints.is_empty());
         generate(&mut model, &prompt).unwrap();
         assert!(model.history.starts_with(&prompt));
         let before = model.vram_budgets().unwrap()[0].2;
