@@ -210,7 +210,7 @@ pub struct Options {
     #[arg(long = "no-prefix-cache")]
     #[serde(skip)]
     pub no_prefix_cache: bool,
-    /// Windows: when the server stops on purpose (Ctrl+C, Windows ending the session, or a stop asked for with --stop-on-stdin), keep the state of the conversation the engine held last, sealed for the user, in the data directory, and take the next start's first request that goes on from it from there, instead of reading it all again [default: off; `keep_conversation = true` in the config file, or --keep-conversation]
+    /// Windows and Linux: when the server stops on purpose (Ctrl+C, SIGTERM, Windows ending the session, or a stop asked for with --stop-on-stdin), keep the state of the conversation the engine held last, sealed for the user (Linux: under a key the kernel's keyring holds until the next boot), in the data directory, and take the next start's first request that goes on from it from there, instead of reading it all again [default: off; `keep_conversation = true` in the config file, or --keep-conversation]
     #[arg(long)]
     #[serde(default)]
     pub keep_conversation: bool,

@@ -1555,6 +1555,7 @@ dependencies = [
  "clap",
  "futures",
  "http-body-util",
+ "libc",
  "nvml-wrapper",
  "ring",
  "serde",

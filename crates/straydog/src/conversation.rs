@@ -4,7 +4,8 @@
 //! all of it again, a few minutes at the speed of a small card. With the option on, the server asks its worker, once, when it stops on purpose (a
 //! stop the app asked for, Ctrl+C, Windows ending the session), for the state of the conversation the worker held last: the sequence at the place its
 //! last reply began, with the recurrent state, K/V and indexer's blocks of its positions ([`straydog_engine::model::Model::export_conversation`]).
-//! The server seals it for the user ([`crate::conversation_store`], DPAPI and AES-256-GCM) in `<data dir>/conversation`, one file for a bundle, written
+//! The server seals it for the user ([`crate::conversation_store`], AES-256-GCM under a key DPAPI or the kernel's keyring keeps) in
+//! `<data dir>/conversation`, one file for a bundle, written
 //! whole at the stop and at no other time: the drive sees one write a stop, and nothing is written while requests run.
 //!
 //! At the next start the file is opened lazily. The server reads its tokens, a part of their own, and tells the worker; the state stays on the drive.
@@ -15,9 +16,10 @@
 //! build, and everything the worker's placement decided that changes the state's layout or its numbers. A start with another bundle, build or placement
 //! never takes it; the file is deleted, as it is when the option is off at the start, or when it does not open.
 //!
-//! The state is sealed for the Windows account, so this is Windows's alone; elsewhere the option is accepted and keeps nothing.
+//! The state is sealed for the user: on Windows by DPAPI, on Linux under a key the kernel's keyring holds for the user, which lasts the boot (a
+//! state kept before a reboot no longer opens, and is deleted). Elsewhere the option is accepted and keeps nothing.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -27,11 +29,11 @@ use crate::config::Settings;
 /// What the server keeps of a run's conversation: where the file is and how it is keyed.
 #[derive(Clone)]
 pub struct Keeper {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     on: Option<Arc<On>>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct On {
     settings: Settings,
     store: crate::conversation_store::Store,
@@ -45,7 +47,7 @@ pub struct Saved {
     pub bytes: u64,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl On {
     /// The key of this start's file and the layout of the states it may take. None when the worker offers no states (it is not a model that keeps
     /// them), or the executable could not be read.
@@ -66,7 +68,7 @@ impl On {
 impl Keeper {
     /// The keeper of this run. With the option off the file an earlier run kept is deleted, at once: nothing of a conversation stays on the drive that
     /// the person has not asked to keep.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn new(settings: &Settings) -> Keeper {
         let label = format!("{}-{}-{}", settings.bundle.model, settings.bundle.provider, settings.bundle.quant);
         let store = crate::conversation_store::Store::new(&settings.data_dir.join("conversation"), &label);
@@ -83,21 +85,21 @@ impl Keeper {
         Keeper { on: Some(Arc::new(On { settings: settings.clone(), store, build: crate::prefix_store::shared_build() })) }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     pub fn new(settings: &Settings) -> Keeper {
         if settings.keep_conversation {
-            tracing::warn!("Straydog conversation: the state can be sealed for the user on Windows only; none is kept");
+            tracing::warn!("Straydog conversation: the state can be sealed for the user on Windows and Linux only; none is kept");
         }
         Keeper {}
     }
 
     /// Whether this run keeps the conversation at its stop.
     pub fn is_on(&self) -> bool {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             self.on.is_some()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             false
         }
@@ -106,20 +108,20 @@ impl Keeper {
     /// Open the file an earlier run kept as far as a start needs, on a thread of its own: its tokens. A file that does not open, for whatever is wrong
     /// with it, is deleted with one line in the log, and the start goes on as without it.
     pub fn restore(&self, ready: &Value) -> Option<tokio::task::JoinHandle<Option<Vec<u32>>>> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let (on, ready) = (self.on.clone()?, ready.clone());
             Some(tokio::task::spawn_blocking(move || {
                 let (key, layout) = on.key(&ready)?;
                 let started = std::time::Instant::now();
-                let tokens = on.store.tokens_or_delete(&crate::prefix_store::Dpapi, &key, layout)?;
+                let tokens = on.store.tokens_or_delete(crate::prefix_store::user_wrap(), &key, layout)?;
                 let bytes = std::fs::metadata(on.store.path()).map_or(0, |meta| meta.len());
                 tracing::info!("Straydog conversation: {} tokens kept by the last run ({} MB on the drive, opened in {:.2} s); the first request that begins with them goes on from there",
                                tokens.len(), bytes >> 20, started.elapsed().as_secs_f64());
                 Some(tokens)
             }))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = ready;
             None
@@ -129,15 +131,15 @@ impl Keeper {
     /// The kept state, read and opened (blocking): for the request that begins with the kept tokens. A file that no longer opens is deleted, as at the
     /// start. The seconds it took.
     pub fn state(&self, ready: &Value) -> Result<(Vec<u8>, f64), String> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let on = self.on.as_ref().ok_or("the option is off")?;
             let (key, layout) = on.key(ready).ok_or("this engine keeps no conversation")?;
             let started = std::time::Instant::now();
-            let state = on.store.state_or_delete(&crate::prefix_store::Dpapi, &key, layout)?;
+            let state = on.store.state_or_delete(crate::prefix_store::user_wrap(), &key, layout)?;
             Ok((state, started.elapsed().as_secs_f64()))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = ready;
             Err("the option keeps nothing here".into())
@@ -147,15 +149,15 @@ impl Keeper {
     /// The most bytes a state may take to be kept now: what the drive of the data directory has free less a margin, and the commit that is left
     /// for the copy the server holds while it seals it (the worker's own copy is in the worker's commit, which it asked for first).
     pub fn room(&self) -> u64 {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let Some(on) = self.on.as_ref() else { return 0 };
             let drive = free_on_drive(on.store.path());
-            let memory = straydog_engine::host::commit_left().map_or(u64::MAX, |(_, left)| left.saturating_sub(MEMORY_MARGIN));
+            let memory = memory_left().map_or(u64::MAX, |left| left.saturating_sub(MEMORY_MARGIN));
             // (a file that is there is replaced when the new one is whole: both are on the drive for a moment)
             drive.saturating_sub(DRIVE_MARGIN).min(memory).min(crate::frames::BODY_LIMIT)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             0
         }
@@ -163,7 +165,7 @@ impl Keeper {
 
     /// Seal `state` (the engine's, which holds its own tokens) and write the file over the one an earlier run kept (blocking); what it took.
     pub fn save(&self, ready: &Value, state: Vec<u8>) -> Result<Saved, String> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let on = self.on.as_ref().ok_or("the option is off")?;
             let (key, layout) = on.key(ready).ok_or("this engine keeps no conversation")?;
@@ -172,10 +174,10 @@ impl Keeper {
                 straydog_engine::prefix::tokens_of(parsed.payload, parsed.tokens)
             };
             let count = tokens.len();
-            let (_, bytes) = on.store.save(&crate::prefix_store::Dpapi, layout, &key, &tokens, state)?;
+            let (_, bytes) = on.store.save(crate::prefix_store::user_wrap(), layout, &key, &tokens, state)?;
             Ok(Saved { tokens: count, bytes })
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (ready, state);
             Err("the option keeps nothing here".into())
@@ -184,15 +186,30 @@ impl Keeper {
 }
 
 /// The drive keeps this much free beyond a file: a drive filled to its last byte stops everything else on it.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const DRIVE_MARGIN: u64 = 2 << 30;
 /// The commit a copy of the state in the server leaves free.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const MEMORY_MARGIN: u64 = 1 << 30;
+
+/// The memory the server may still take for its copy of a state: the commit left (Windows), the memory available (Linux).
+#[cfg(any(windows, target_os = "linux"))]
+fn memory_left() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        straydog_engine::host::commit_left().map(|(_, left)| left)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        Some(system.available_memory()).filter(|&bytes| bytes > 0)
+    }
+}
 
 /// The bytes free on the drive that holds `path` (the longest mount point that begins it); the whole of a drive that cannot be found, so that
 /// nothing is refused for it.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn free_on_drive(path: &std::path::Path) -> u64 {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let target = path.canonicalize().ok().or_else(|| path.ancestors().find_map(|ancestor| ancestor.canonicalize().ok())).unwrap_or_else(|| path.to_path_buf());

@@ -52,9 +52,15 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# The system block's state sealed on the drive (Windows alone): AES-256-GCM, whose key DPAPI keeps.
-[target.'cfg(windows)'.dependencies]
+# The system block's state and the kept conversation sealed on the drive: AES-256-GCM, whose key DPAPI (Windows) or the kernel's keyring
+# (Linux) keeps.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 ring = "0.17"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
 # (and the line a process that dies of an exception says first: crash.rs)
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console",
                                              "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_LibraryLoader",

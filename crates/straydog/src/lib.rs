@@ -2,14 +2,14 @@
 
 pub mod config;
 pub mod conversation;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod conversation_store;
 pub mod crash;
 pub mod dashboard;
 pub mod frames;
 pub mod monitor;
 pub mod prefix;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod prefix_store;
 pub mod progress;
 pub mod runtime;

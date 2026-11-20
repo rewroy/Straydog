@@ -586,16 +586,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// DPAPI seals a whole file for this user and opens it again.
+    /// The user's wrap (DPAPI on Windows, the kernel's keyring on Linux) seals a whole file for this user and opens it again.
     #[test]
-    fn a_file_sealed_with_dpapi_opens() {
-        let dir = directory("dpapi");
+    fn a_file_sealed_for_the_user_opens() {
+        let dir = directory("wrap");
         let store = Store::new(&dir, "Q");
         let key = key_of("d");
         let (kept, plain) = (tokens(4_000), state(300_000));
-        store.save(&crate::prefix_store::Dpapi, 1, &key, &kept, plain.clone()).unwrap();
-        assert_eq!(store.open_tokens(&crate::prefix_store::Dpapi, &key, 1).unwrap(), Some(kept));
-        assert_eq!(store.open_state(&crate::prefix_store::Dpapi, &key, 1).unwrap(), plain);
+        store.save(crate::prefix_store::user_wrap(), 1, &key, &kept, plain.clone()).unwrap();
+        assert_eq!(store.open_tokens(crate::prefix_store::user_wrap(), &key, 1).unwrap(), Some(kept));
+        assert_eq!(store.open_state(crate::prefix_store::user_wrap(), &key, 1).unwrap(), plain);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
