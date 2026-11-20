@@ -475,6 +475,10 @@ impl served::Engines for Engines {
         self.saved.get(slot).is_some_and(Option::is_some)
     }
 
+    fn checkpoint_bytes(&self, slot: usize) -> u64 {
+        self.saved.get(slot).into_iter().flatten().flatten().map(Snapshot::bytes).sum()
+    }
+
     /// Every engine's snapshot in checkpoint `slot` (its copy finished first), as [the engines' count, then each one's bytes' length and bytes].
     fn export_checkpoint(&mut self, slot: usize) -> Result<Vec<u8>, String> {
         if !self.holds(slot) {

@@ -173,6 +173,10 @@ pub trait Engines {
     fn whole_checkpoints(&self) -> bool {
         false
     }
+    /// About the bytes [`Engines::export_checkpoint`] gives for `slot` (what its copies hold in host memory).
+    fn checkpoint_bytes(&self, _slot: usize) -> u64 {
+        0
+    }
     /// Checkpoint `slot`'s state as bytes, for a later start ([`Engines::import_checkpoint`]): the kept conversation.
     fn export_checkpoint(&mut self, _slot: usize) -> Result<Vec<u8>, String> {
         Err("these engines keep no conversation".into())
@@ -327,6 +331,10 @@ struct Checkpoint {
 
 /// The new tokens of a prompt from which its progress is told before its first pass (a shorter one's pass ends about as soon).
 const PROGRESS_AT_ONCE: usize = 4096;
+
+/// A kept conversation's sections ([`Session::export_conversation`]): its tokens, then the engines' checkpoint.
+const KEPT_TOKENS: u64 = u64::from_le_bytes(*b"KEPTTOKS");
+const KEPT_CHECKPOINT: u64 = u64::from_le_bytes(*b"KEPTSNAP");
 
 /// The fewest tokens a system prompt has to be checkpointed as a conversation's root (a shorter
 /// one prefills in about a second).
@@ -1056,6 +1064,63 @@ impl<E: Engines> Session<E> {
         let kept = self.checkpoints.iter().rev().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
         self.engines.keep_checkpoint(kept);
         Ok(())
+    }
+
+    /// The kept conversation (`--keep-conversation`, [`Engines::export_checkpoint`]): the latest turn's checkpoint, where the last reply
+    /// began, as a prefix state's bytes ([`crate::prefix::header`]: the tokens, then the engines' checkpoint) and its tokens. None without such a
+    /// checkpoint, or with one holding image tokens (as a resident model keeps none of those).
+    pub fn export_conversation(&mut self) -> Result<Option<(Vec<u32>, Vec<u8>)>, String> {
+        let engines = &self.engines;
+        let Some(checkpoint) = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && engines.holds(checkpoint.slot)) else {
+            return Ok(None);
+        };
+        if checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+            return Ok(None);
+        }
+        let (slot, tokens) = (checkpoint.slot, checkpoint.tokens.clone());
+        let state = self.engines.export_checkpoint(slot)?;
+        let mut bytes = crate::prefix::header(tokens.len(), 0, &[(KEPT_TOKENS, 4 * tokens.len() as u64), (KEPT_CHECKPOINT, state.len() as u64)]);
+        bytes.extend_from_slice(&crate::prefix::token_bytes(&tokens));
+        bytes.extend_from_slice(&state);
+        Ok(Some((tokens, bytes)))
+    }
+
+    /// The bytes [`export_conversation`](Self::export_conversation) would give now (the latest turn's tokens with them); None as it gives none.
+    pub fn conversation_size(&self) -> Option<(usize, u64)> {
+        let checkpoint = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && self.engines.holds(checkpoint.slot))?;
+        (!checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary)).then_some(())?;
+        // (an estimate before the copy: the state grows with its tokens about as the engines' snapshots do)
+        Some((checkpoint.tokens.len(), self.engines.checkpoint_bytes(checkpoint.slot)))
+    }
+
+    /// Take another start's [`export_conversation`](Self::export_conversation) as a checkpoint of its tokens (a free slot, or one
+    /// [`evicted`] gives up): the next request that begins with them goes on from there. Refused with nothing changed if the bytes are not
+    /// such a state or do not fit these engines to the byte. The tokens it holds.
+    pub fn import_conversation(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let parsed = crate::prefix::parse(bytes)?;
+        let expected = parsed.sections.first().map(|&(_, held)| held);
+        if parsed.sections.len() != 2 || parsed.sections[0].0 != KEPT_TOKENS || parsed.sections[1].0 != KEPT_CHECKPOINT
+            || expected != Some(4 * parsed.tokens as u64) {
+            return Err("not a kept conversation of these engines".into());
+        }
+        let tokens = crate::prefix::tokens_of(parsed.payload, parsed.tokens);
+        let engines = &self.engines;
+        self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
+        let slots = self.engines.checkpoints();
+        if slots == 0 {
+            return Err("these engines keep no checkpoints".into());
+        }
+        if self.checkpoints.len() >= slots {
+            let given_up = evicted(&self.checkpoints, &tokens);
+            self.checkpoints.remove(given_up);
+        }
+        let slot = (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot)).ok_or("no free Straydog checkpoint")?;
+        let held = self.engines.import_checkpoint(slot, &parsed.payload[4 * tokens.len()..])?;
+        if held != tokens.len() {
+            return Err(format!("a kept conversation of {} tokens whose state holds {held}", tokens.len()));
+        }
+        self.checkpoints.push(Checkpoint { slot, tokens, root: false });
+        Ok(held)
     }
 
     /// What a later start warms up with ([`Warm::state`]).
