@@ -173,6 +173,15 @@ pub trait Engines {
     fn whole_checkpoints(&self) -> bool {
         false
     }
+    /// Checkpoint `slot`'s state as bytes, for a later start ([`Engines::import_checkpoint`]): the kept conversation.
+    fn export_checkpoint(&mut self, _slot: usize) -> Result<Vec<u8>, String> {
+        Err("these engines keep no conversation".into())
+    }
+    /// Take [`Engines::export_checkpoint`]'s bytes (another start's) into checkpoint `slot`, checked to the byte against these engines:
+    /// the tokens its sequence holds. Refused with nothing changed if they differ.
+    fn import_checkpoint(&mut self, _slot: usize, _bytes: &[u8]) -> Result<usize, String> {
+        Err("these engines keep no conversation".into())
+    }
     /// Save a mark of the sequence state where it is, in the place of the oldest of the [`MARKS`] kept (None), or go back to
     /// the mark taken when the sequence was this long: whether one is now held, or the sequence is back at it. A mark is
     /// light (no copy of what a longer sequence only adds to) and is good only while the held sequence extends it; engines

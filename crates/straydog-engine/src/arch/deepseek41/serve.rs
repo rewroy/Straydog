@@ -474,6 +474,69 @@ impl served::Engines for Engines {
     fn holds(&self, slot: usize) -> bool {
         self.saved.get(slot).is_some_and(Option::is_some)
     }
+
+    /// Every engine's snapshot in checkpoint `slot` (its copy finished first), as [the engines' count, then each one's bytes' length and bytes].
+    fn export_checkpoint(&mut self, slot: usize) -> Result<Vec<u8>, String> {
+        if !self.holds(slot) {
+            return Err("the Straydog checkpoint was given up".into());
+        }
+        self.finish_checkpoints(usize::MAX)?;
+        let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
+        let mut out = (snapshots.len() as u64).to_le_bytes().to_vec();
+        for snapshot in snapshots {
+            let bytes = snapshot.to_bytes()?;
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    }
+
+    /// Another start's [`export_checkpoint`](Self::export_checkpoint) into checkpoint `slot`: each engine's snapshot checked against it
+    /// (Engine::check_snapshot), the budget making room as a save does. Without its drafter's rings: drafting starts cold.
+    fn import_checkpoint(&mut self, slot: usize, bytes: &[u8]) -> Result<usize, String> {
+        if slot >= CHECKPOINTS {
+            return Err("no such Straydog checkpoint".into());
+        }
+        let cut = || "a kept conversation cut short".to_string();
+        let count = u64::from_le_bytes(bytes.get(..8).ok_or_else(cut)?.try_into().unwrap()) as usize;
+        if count != self.engines.len() {
+            return Err(format!("a kept conversation of {count} engines, against {}", self.engines.len()));
+        }
+        let (mut at, mut snapshots) = (8, Vec::with_capacity(count));
+        for engine in &self.engines {
+            let len = u64::from_le_bytes(bytes.get(at..at + 8).ok_or_else(cut)?.try_into().unwrap()) as usize;
+            let part = bytes.get(at + 8..(at + 8).checked_add(len).ok_or_else(cut)?).ok_or_else(cut)?;
+            let snapshot = Snapshot::from_bytes(part)?;
+            engine.check_snapshot(&snapshot)?;
+            snapshots.push(snapshot);
+            at += 8 + len;
+        }
+        if at != bytes.len() {
+            return Err("a kept conversation with bytes after its end".into());
+        }
+        let position = snapshots[0].position();
+        if snapshots.iter().any(|snapshot| snapshot.position() != position) {
+            return Err("a kept conversation whose engines differ in position".into());
+        }
+        // (room as a save makes it: the oldest give theirs up, the kept slot last)
+        self.saved[slot] = None;
+        self.order.retain(|&held| held != slot);
+        let required: u64 = snapshots.iter().map(Snapshot::bytes).sum();
+        let kept = self.kept.filter(|&kept| kept != slot);
+        let held: Vec<(usize, u64)> = self.order.iter().filter(|&&held| Some(held) != kept).chain(kept.iter().filter(|kept| self.order.contains(kept)))
+            .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
+        let given_up = evictions(&held, required, self.budget).ok_or("a kept conversation larger than the checkpoints' budget")?;
+        for oldest in given_up {
+            self.saved[oldest] = None;
+            self.order.retain(|&held| held != oldest);
+        }
+        if let Some(drafting) = self.drafting.as_mut() {
+            drafting.rings[slot] = None;
+        }
+        self.saved[slot] = Some(snapshots);
+        self.order.push(slot);
+        Ok(position)
+    }
 }
 
 /// The checkpoints (slots with their bytes, oldest first) that give theirs up so one of `required`
