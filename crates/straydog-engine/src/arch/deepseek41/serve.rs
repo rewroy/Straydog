@@ -742,11 +742,20 @@ const AUTO_BATCHES: [usize; 6] = [8192, 4096, 2048, 1024, 512, 256];
 /// R9700s, which take 16384: 6064 -> 6059 slots; a 45K prompt's first token 30.8 -> 27.5 s, a 20K one's 14.6 -> 11.9 s, the same replies.
 const WIDE_BATCHES: [usize; 2] = [32768, 16384];
 const WIDE_BUDGET: u64 = 24 << 30;
+/// From this budget, the widest batch may take half of it: two R9700s (30.5 GiB a GPU), whose buffers of 32768 rows outgrow a third,
+/// read a cold 94,851-token document in 58.3 s against 60.6 s in passes of 16384 and a 79,160-token one in 44.7 against 52.3 s
+/// (expert reads from VRAM and the host tier halved: 125K against 249K and 125K against 209K), with 5076 slots between passes
+/// against 5106 (2026-11-21).
+const WIDEST_BUDGET: u64 = 28 << 30;
 
 /// The largest batch whose pass buffers (`per_row` bytes a row, and a few rows of a pass's own) take no more than a third of a GPU's
-/// `budget` ([`WIDE_BATCHES`]) or an eighth of it ([`AUTO_BATCHES`]); the least when none does.
+/// `budget` ([`WIDE_BATCHES`]; the widest half of it from [`WIDEST_BUDGET`]) or an eighth of it ([`AUTO_BATCHES`]); the least when
+/// none does.
 fn auto_batch(budget: u64, per_row: u64) -> usize {
     let bytes = |batch: usize| (batch + OWN_ROWS.min(batch)) as u64 * per_row.max(1);
+    if budget >= WIDEST_BUDGET && bytes(WIDE_BATCHES[0]) <= budget / 2 {
+        return WIDE_BATCHES[0];
+    }
     if budget >= WIDE_BUDGET {
         if let Some(batch) = WIDE_BATCHES.into_iter().find(|&batch| bytes(batch) <= budget / 3) {
             return batch;
@@ -1114,10 +1123,13 @@ mod tests {
     }
 
     /// With 0.32 MB a row, 32768 rows are chosen for a 31 GiB budget, 16384 for 24 GiB, 8192 below that,
-    /// fewer on a 16 GiB card, and the least where nothing fits.
+    /// fewer on a 16 GiB card, and the least where nothing fits; with 0.4 MB a row, 32768 for an R9700's 30.5 GiB (half of
+    /// it) but not for 27 GiB (a third).
     #[test]
     fn the_prefill_batch_is_the_largest_whose_buffers_fit_their_share_of_the_budget() {
         const GIB: u64 = 1 << 30;
+        assert_eq!(auto_batch(61 * GIB / 2, 400_000), 32768);
+        assert_eq!(auto_batch(27 * GIB, 400_000), 16384);
         let per_row = 320_000;
         assert_eq!(auto_batch(31 * GIB, per_row), 32768);
         assert_eq!(auto_batch(24 * GIB, per_row), 16384);
