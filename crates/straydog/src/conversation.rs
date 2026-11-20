@@ -78,10 +78,6 @@ impl Keeper {
         if !settings.keep_conversation {
             return Keeper { on: None };
         }
-        if settings.bundle.is_on_demand() {
-            tracing::info!("Straydog conversation: this model keeps none");
-            return Keeper { on: None };
-        }
         Keeper { on: Some(Arc::new(On { settings: settings.clone(), store, build: crate::prefix_store::shared_build() })) }
     }
 

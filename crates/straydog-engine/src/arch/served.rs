@@ -1085,6 +1085,13 @@ impl<E: Engines> Session<E> {
         Ok(Some((tokens, bytes)))
     }
 
+    /// How many of `tokens` the session can go on from without a kept state: the held sequence, or a checkpoint, that they begin with.
+    pub fn held_prefix(&self, tokens: &[u32]) -> usize {
+        let live = if !self.history.is_empty() && tokens.starts_with(&self.history) { self.history.len() } else { 0 };
+        self.checkpoints.iter().filter(|checkpoint| self.engines.holds(checkpoint.slot) && tokens.starts_with(&checkpoint.tokens))
+            .map(|checkpoint| checkpoint.tokens.len()).chain([live]).max().unwrap_or(0)
+    }
+
     /// The bytes [`export_conversation`](Self::export_conversation) would give now (the latest turn's tokens with them); None as it gives none.
     pub fn conversation_size(&self) -> Option<(usize, u64)> {
         let checkpoint = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && self.engines.holds(checkpoint.slot))?;

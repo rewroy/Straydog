@@ -50,6 +50,8 @@ enum Job {
     Reset(mpsc::Sender<Result<(), String>>),
     WarmState(mpsc::Sender<Value>),
     Warm(Value),
+    /// The kept conversation's state at a stop (`--keep-conversation`), within so many bytes.
+    ConversationState(u64, mpsc::Sender<Result<Option<(Value, Vec<u8>)>, String>>),
 }
 
 /// Warm-up experts started per step while the model is idle (a step every millisecond), and
@@ -101,6 +103,12 @@ impl Served for Handle {
 
     fn warm(&mut self, state: &Value) -> Result<(), String> {
         self.0.send(Job::Warm(state.clone())).map_err(|_| "the Straydog model thread has stopped".to_string())
+    }
+
+    fn conversation_state(&mut self, limit: u64) -> Result<Option<(Value, Vec<u8>)>, String> {
+        let (reply, result) = mpsc::channel();
+        self.0.send(Job::ConversationState(limit, reply)).map_err(|_| "the Straydog model thread has stopped".to_string())?;
+        result.recv().map_err(|_| "the Straydog model thread has stopped".to_string())?
     }
 }
 
@@ -232,6 +240,9 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                     Job::WarmState(reply) => {
                         let _ = reply.send(served.model.warm_state());
                     }
+                    Job::ConversationState(limit, reply) => {
+                        let _ = reply.send(served.conversation_state(limit));
+                    }
                     Job::Warm(state) => match served.model.warm(&state) {
                         Ok((vram, host)) => {
                             eprintln!("Straydog warming up with {vram} experts for VRAM, {host} for the host tier");
@@ -304,6 +315,8 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "load_seconds": seconds,
         "gpu": model.info()?,
         "vision": model.engines.vision(),
+        // (what the kept conversation's file is keyed on beside the bundle and the build: Session::export_conversation's layout)
+        "prefix": {"version": straydog_engine::prefix::VERSION, "layout": KEPT_LAYOUT},
     });
     Ok((Loaded { model, template, efforts, encoded: Vec::new() }, frame, Arc::new(text)))
 }
@@ -321,7 +334,33 @@ fn speculation(placement: &Value) -> Value {
     Value::Array(kinds)
 }
 
+/// The layout of a kept conversation's state ([`Session::export_conversation`]: its tokens, then each engine's snapshot).
+const KEPT_LAYOUT: &str = "deepseek41 checkpoint 1";
+
+impl<E: Engines> crate::worker::KeepsConversation for Session<E> {
+    fn held_prefix(&self, prompt: &[u32]) -> usize {
+        Session::held_prefix(self, prompt)
+    }
+    fn state_size(&self, _tokens: usize) -> u64 {
+        0
+    }
+    fn import_conversation(&mut self, bytes: &[u8], _positions: usize) -> Result<usize, String> {
+        Session::import_conversation(self, bytes)
+    }
+}
+
 impl<E: Engines> Loaded<E> {
+    /// The kept conversation's state, within `limit` bytes: the session's latest turn ([`Session::export_conversation`]).
+    fn conversation_state(&mut self, limit: u64) -> Result<Option<(Value, Vec<u8>)>, String> {
+        let Some((tokens, size)) = self.model.conversation_size() else { return Ok(None) };
+        if size > limit {
+            return Err(format!("the state of {tokens} tokens is {} MB, and there is room for {} MB", size >> 20, limit >> 20));
+        }
+        Ok(self.model.export_conversation()?.map(|(tokens, bytes)| {
+            (json!({"tokens": tokens.len(), "digest": straydog_engine::prefix::tokens_digest(&tokens)}), bytes)
+        }))
+    }
+
     fn run(&mut self, text: &Text, output: &Output, id: &str, body: &pyjson::Value, cancel: &AtomicBool, started: Instant)
            -> Result<Value, Failure> {
         use pyjson::Value as Py;
@@ -443,6 +482,8 @@ impl<E: Engines> Loaded<E> {
         // go without it and a reasoning_end event marks the place. The same text otherwise written (the
         // reasoning quoting a tag) stays the reasoning's.
         let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
+        // (a conversation an earlier run kept, which this prompt goes on from: not one with images)
+        let kept_seconds = if images.is_empty() { crate::worker::take_kept(&mut self.model, output, id, cancel, &ids) } else { None };
         let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -490,6 +531,9 @@ impl<E: Engines> Loaded<E> {
             timings.insert("image_seconds".into(), json!(image_seconds));
         }
         timings.insert("first_text_seconds".into(), json!(first_text));
+        if let Some(seconds) = kept_seconds {
+            timings.insert("kept_seconds".into(), json!(seconds));
+        }
         timings.insert("request_seconds".into(), json!(started.elapsed().as_secs_f64()));
         let cached = timings.get("cached_tokens").and_then(Value::as_u64).unwrap_or(0);
         Ok(json!({

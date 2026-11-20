@@ -622,7 +622,27 @@ fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
 /// The kept conversation's state, if the prompt begins with the tokens it is held at and the model holds no more of it than they: asked of the
 /// server, which reads it from the drive, and handed to the model, which takes the request from there. The seconds it took, or None when the prompt
 /// does not begin with them, or the state could not be had (one line in the log says why, and the file is left as it is for a later request).
-fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
+/// What [`take_kept`] asks of a model: how much of a prompt it holds already, about the bytes a state of so many tokens takes (0: not
+/// known), and the import of a kept state for a prompt of `positions`.
+pub(crate) trait KeepsConversation {
+    fn held_prefix(&self, prompt: &[u32]) -> usize;
+    fn state_size(&self, tokens: usize) -> u64;
+    fn import_conversation(&mut self, bytes: &[u8], positions: usize) -> Result<usize, String>;
+}
+
+impl KeepsConversation for straydog_engine::model::Model {
+    fn held_prefix(&self, prompt: &[u32]) -> usize {
+        straydog_engine::model::Model::held_prefix(self, prompt)
+    }
+    fn state_size(&self, tokens: usize) -> u64 {
+        straydog_engine::model::Model::state_size(self, tokens, straydog_engine::gpu::WIDTH)
+    }
+    fn import_conversation(&mut self, bytes: &[u8], positions: usize) -> Result<usize, String> {
+        straydog_engine::model::Model::import_conversation(self, bytes, positions).map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
     let wanted = {
         let kept = kept();
         let tokens = kept.tokens.as_ref()?;
@@ -630,14 +650,14 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
         (prompt.len() > tokens.len() && prompt[..tokens.len()] == tokens[..]).then_some(tokens.len())?
     };
     let not_loaded = |why: String| eprintln!("Straydog conversation: not loaded ({why})");
-    if engine.model.held_prefix(prompt) >= wanted {
+    if model.held_prefix(prompt) >= wanted {
         // (the model holds this much of it already: the state would add nothing)
         kept().tokens = None;
         return None;
     }
     // (the file's bytes in the server, the same in this process, and the copies of its parts: three of the state's size at once)
-    let size = engine.model.state_size(wanted, straydog_engine::gpu::WIDTH);
-    if let Some((_, left)) = straydog_engine::host::commit_left() {
+    let size = model.state_size(wanted);
+    if let Some((_, left)) = straydog_engine::host::commit_left().filter(|_| size > 0) {
         if left < 3 * size + KEPT_MARGIN {
             not_loaded(format!("the state of {wanted} tokens is {} MB, and the host memory left for it is {} MB", size >> 20, left >> 20));
             return None;
@@ -673,7 +693,7 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
         }
     };
     let importing = Instant::now();
-    match engine.model.import_conversation(&state, prompt.len() + 1) {
+    match model.import_conversation(&state, prompt.len() + 1) {
         Ok(tokens) => {
             kept().tokens = None;
             let seconds = started.elapsed().as_secs_f64();
@@ -2065,7 +2085,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     }).collect());
     let max_new = max_new.min(context - agreed.len());
     // (a conversation an earlier run kept, which this prompt goes on from)
-    let kept_seconds = take_kept(engine, output, id, cancel, &agreed);
+    let kept_seconds = take_kept(&mut engine.model, output, id, cancel, &agreed);
     // A token's text and frame are made on a thread of their own, which the thread that drives the GPUs hands each token to and goes
     // on: a token is two decodes of the detokenizer's window, a frame's serialization and a write to the server's pipe, and they stood
     // between two passes (a tenth of the tokens-out and bookkeeping share of a pass on a host whose cores are shared and slow: 0.8 ms of
