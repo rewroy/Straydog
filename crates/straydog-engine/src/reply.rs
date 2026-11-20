@@ -1348,7 +1348,7 @@ mod tests {
         let text = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"now\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
         let (_, answer, calls) = split_dsml(&[text], false, Some(&tools));
         assert_eq!((answer.as_str(), calls.len(), calls[0].arguments.as_str()), ("", 1, "{}"));
-        // A call with no parameters as the template writes one, and so as the model learned it: a blank line inside the invoke. DeepSeek Harness's
+        // A call with no parameters as the template writes one, and so as the model learned it: a blank line inside the invoke. A client's
         // load_workspace_dependencies came back as answer text this way, which ended its turn.
         let blank = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"load_workspace_dependencies\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
         let (_, answer, calls) = split_dsml(&[blank], false, Some(&tools));
