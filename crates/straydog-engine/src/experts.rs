@@ -942,6 +942,20 @@ fn probation() -> usize {
 }
 
 /// Development: the probation's depth from here on, for a comparison of depths in one process (ds41_quality --probation).
+/// The LRFU half-life a store orders its VRAM slots by, in times a class's slots of uses: [`LRFU_HALF_LIFE`], or
+/// STRAYDOG_EXPERT_LRFU=H; =0 orders them by the last use (with probation).
+fn lrfu_half_life() -> Option<f64> {
+    match std::env::var("STRAYDOG_EXPERT_LRFU") {
+        Ok(value) => value.parse::<f64>().ok().filter(|&times| times > 0.0),
+        Err(_) => Some(LRFU_HALF_LIFE),
+    }
+}
+
+/// The default LRFU half-life (times a class's slots of uses). Served on 2 x R9700 (UD-IQ2_XXS, Dogmind agent turns to 120K
+/// tokens, 2026-11-20), the store with it missed 10.60% of decode and verify uses where an LRU of the same slots would have missed 11.12%
+/// (six windows of 2^20 uses); the replay put 2 and 4 ahead of 1 and 16.
+pub const LRFU_HALF_LIFE: f64 = 2.0;
+
 pub fn set_probation(thousandths: usize) {
     PROBATION.store(thousandths.min(1000), std::sync::atomic::Ordering::Relaxed);
 }
@@ -1204,8 +1218,7 @@ impl DeviceExperts {
             done_tx, done_rx, clock: 0, in_use: Vec::new(), touched: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
             uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None, reuse: None,
-            lrfu: std::env::var("STRAYDOG_EXPERT_LRFU").ok().and_then(|value| value.parse::<f64>().ok()).filter(|&times| times > 0.0)
-                .map(|times| Lrfu { times, scores: HashMap::new(), uses: vec![0; distinct.len()] }),
+            lrfu: lrfu_half_life().map(|times| Lrfu { times, scores: HashMap::new(), uses: vec![0; distinct.len()] }),
         })
     }
 
@@ -1861,7 +1874,8 @@ impl DeviceExperts {
     /// 4.1%; 2Q and ARC with their histories 0.5% to 1.8%; least use count among the coldest more misses; the optimum 58.8% fewer).
     /// Which experts are computed does not change, nor a logit. `STRAYDOG_EXPERT_PROBATION=0` keeps plain LRU order.
     fn settle_touches(&mut self) {
-        let probation = self.probation.unwrap_or_else(probation);
+        // (LRFU keeps a new expert's place by its score: no probation unless asked)
+        let probation = self.probation.unwrap_or_else(|| if self.lrfu.is_some() && std::env::var_os("STRAYDOG_EXPERT_PROBATION").is_none() { 0 } else { probation() });
         let mut depth: Vec<Option<Option<u64>>> = vec![None; self.classes.len()];
         let mut raised: Vec<usize> = Vec::new();
         for (slot, mut used) in std::mem::take(&mut self.touched) {
@@ -2423,6 +2437,12 @@ impl DeviceExperts {
     /// [`settle_touches`](Self::settle_touches)).
     pub fn set_probation(&mut self, thousandths: usize) {
         self.probation = Some(thousandths.min(1000));
+    }
+
+    /// Order each class's VRAM slots by LRFU scores halving every `half_life` times its slots of uses, or (None) by the last use.
+    pub fn set_lrfu(&mut self, half_life: Option<f64>) {
+        self.lrfu = half_life.filter(|&times| times > 0.0)
+            .map(|times| Lrfu { times, scores: HashMap::new(), uses: vec![0; self.classes.len()] });
     }
 
     fn victim(&self, class: usize) -> Result<usize> {

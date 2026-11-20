@@ -368,7 +368,7 @@ The expert store (`experts.rs`) has three tiers:
 - **VRAM slots per device.** Slots are grouped by size class (a model's layers may use several
   expert types). The VRAM left after everything else is counted in units of the largest
   expert's share, and each class gets its layers' share of the bytes. Each class replaces its
-  least recently used slot.
+  slot of the lowest LRFU score (below).
   - VRAM idle between passes holds slots too: the prefill rows' arena, each kv source's
     compressed rows and index keys past what the sequence has reached, and the batch buffers
     (the index scores, the queries, the attended rows, Engram's values) past the rows a pass fills
@@ -413,6 +413,15 @@ IQ2_XXS with DSpark, 2026-10-28):
   misses; moving them to the warm end of the probation alone saves 1.6% (served trace with the
   scores, 2026-11-16).
 - So capacity is the lever: 10% more slots cut misses by 16%.
+- Each class orders its slots by an LRFU score: every pass that uses an expert adds one to its
+  score, and scores halve every twice the class's slots of uses (`STRAYDOG_EXPERT_LRFU`, the
+  half-life in those units, 2; `=0` keeps the order of the last use, with the probation above). A
+  streaming prefill's uses add nothing: it takes nearly every expert of a layer, which made all
+  scores alike. The store logs every 2^20 uses of decode and verify passes what VRAM missed beside
+  an LRU of the same slots and uses, ARC, LRU-2, LRFU at several half-lives and the optimum, by
+  class (`reuse.rs`). Served on two R9700s (UD-IQ2_XXS, agent turns of Dogmind to 120K tokens,
+  2026-11-20): the probation store missed 1.2% fewer than that LRU, LRFU at 2 with no probation
+  4.7% fewer (10.60% against 11.12% of uses); the optimum, 5.2%.
 
 ## 6. Generation
 

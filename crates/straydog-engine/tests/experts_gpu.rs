@@ -189,13 +189,14 @@ fn a_fill_waits_for_a_write_back_behind_the_pass() {
     std::fs::remove_file(&path).unwrap();
 }
 
-/// A newly filled expert goes in near the cold end of the LRU order and is given up before the experts a later pass used again.
+/// In LRU order (STRAYDOG_EXPERT_LRFU=0), a newly filled expert goes in near the cold end and is given up before the experts a later pass used again.
 #[test]
 fn a_new_expert_leaves_before_the_ones_a_later_pass_used_again() {
     let layers = roles();
     let roles = layers[0].clone().unwrap();
     // 16 slots and a reserve of 4; a host tier for every expert
     let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    store.set_lrfu(None);
     store.set_probation(100);
     let pass = |store: &mut DeviceExperts, gpu: &mut Backend, experts: std::ops::Range<usize>, what: &str| {
         let experts: Vec<usize> = experts.collect();
@@ -218,6 +219,7 @@ fn a_new_expert_leaves_before_the_ones_a_later_pass_used_again() {
     drop(store);
     std::fs::remove_file(&path).unwrap();
     let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    store.set_lrfu(None);
     store.set_probation(0);
     pass(&mut store, &mut gpu, 0..8, "the first eight");
     pass(&mut store, &mut gpu, 0..8, "the first eight again");
@@ -225,6 +227,33 @@ fn a_new_expert_leaves_before_the_ones_a_later_pass_used_again() {
     pass(&mut store, &mut gpu, 12..16, "four more");
     store.settle(&mut gpu).unwrap();
     assert_eq!((held(&store, 0..4), held(&store, 4..16)), (0, 12));
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// In LRFU order (the default), experts used by two passes outlast newer ones used by one, with no probation: the four that must leave
+/// are of those used once.
+#[test]
+fn lrfu_keeps_the_experts_used_more_often() {
+    let layers = roles();
+    let roles = layers[0].clone().unwrap();
+    let (path, mut gpu, mut store, _) = open(&layers, 16, EXPERTS as u64);
+    store.set_lrfu(Some(straydog_engine::experts::LRFU_HALF_LIFE));
+    store.set_probation(0);
+    let pass = |store: &mut DeviceExperts, gpu: &mut Backend, experts: std::ops::Range<usize>, what: &str| {
+        let experts: Vec<usize> = experts.collect();
+        let slots = store.acquire(gpu, 0, &experts).unwrap();
+        check_slots(gpu, &roles, &experts, &slots, what);
+        store.release(gpu).unwrap();
+    };
+    pass(&mut store, &mut gpu, 0..8, "the first eight");
+    pass(&mut store, &mut gpu, 0..8, "the first eight again");
+    pass(&mut store, &mut gpu, 8..12, "four used once");
+    pass(&mut store, &mut gpu, 12..16, "four more");
+    store.settle(&mut gpu).unwrap();
+    let held = |store: &DeviceExperts, experts: std::ops::Range<usize>| experts.filter(|&expert| store.in_vram(0, expert)).count();
+    assert_eq!(held(&store, 0..8), 8, "the experts used twice stay");
+    assert_eq!(held(&store, 8..16), 4, "four of those used once leave");
     drop(store);
     std::fs::remove_file(&path).unwrap();
 }
