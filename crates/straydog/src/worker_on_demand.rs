@@ -341,8 +341,8 @@ impl<E: Engines> crate::worker::KeepsConversation for Session<E> {
     fn held_prefix(&self, prompt: &[u32]) -> usize {
         Session::held_prefix(self, prompt)
     }
-    fn state_size(&self, _tokens: usize) -> u64 {
-        0
+    fn state_size(&self, tokens: usize) -> u64 {
+        Session::state_size(self, tokens)
     }
     fn import_conversation(&mut self, bytes: &[u8], _positions: usize) -> Result<usize, String> {
         Session::import_conversation(self, bytes)

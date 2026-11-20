@@ -475,6 +475,10 @@ impl served::Engines for Engines {
         self.saved.get(slot).is_some_and(Option::is_some)
     }
 
+    fn state_bytes(&self, tokens: usize) -> u64 {
+        self.engines.iter().map(|engine| engine.snapshot_bytes_at(tokens)).sum()
+    }
+
     fn checkpoint_bytes(&self, slot: usize) -> u64 {
         self.saved.get(slot).into_iter().flatten().flatten().map(Snapshot::bytes).sum()
     }

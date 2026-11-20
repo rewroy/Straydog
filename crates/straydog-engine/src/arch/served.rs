@@ -177,6 +177,10 @@ pub trait Engines {
     fn checkpoint_bytes(&self, _slot: usize) -> u64 {
         0
     }
+    /// About the host bytes a checkpoint of a sequence of `tokens` takes (0: not known).
+    fn state_bytes(&self, _tokens: usize) -> u64 {
+        0
+    }
     /// Checkpoint `slot`'s state as bytes, for a later start ([`Engines::import_checkpoint`]): the kept conversation.
     fn export_checkpoint(&mut self, _slot: usize) -> Result<Vec<u8>, String> {
         Err("these engines keep no conversation".into())
@@ -1083,6 +1087,11 @@ impl<E: Engines> Session<E> {
         bytes.extend_from_slice(&crate::prefix::token_bytes(&tokens));
         bytes.extend_from_slice(&state);
         Ok(Some((tokens, bytes)))
+    }
+
+    /// About the host bytes a kept conversation of `tokens` takes once read ([`Engines::state_bytes`]; 0: not known).
+    pub fn state_size(&self, tokens: usize) -> u64 {
+        self.engines.state_bytes(tokens)
     }
 
     /// How many of `tokens` the session can go on from without a kept state: the held sequence, or a checkpoint, that they begin with.

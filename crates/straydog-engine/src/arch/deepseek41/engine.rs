@@ -1769,6 +1769,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// Host bytes [`Engine::snapshot`] would take now.
+    /// The host bytes a [`Snapshot`] of a sequence of `tokens` takes on this engine (a kept conversation's, before it is read).
+    pub fn snapshot_bytes_at(&self, tokens: usize) -> u64 {
+        let groups: Vec<usize> = self.sources.keys().map(|&layer| tokens / self.hp.layers[layer].compressed.map_or(1, |c| c.ratio)).collect();
+        snapshot_bytes(tokens, self.hp.window, self.shards[0].rings.len(), self.hp.head_dim, self.hp.index_dim, &groups, tokens)
+    }
+
     pub fn snapshot_bytes(&self) -> u64 {
         let groups: Vec<usize> = self.sources.values().map(|source| source.groups).collect();
         snapshot_bytes(self.position, self.hp.window, self.shards[0].rings.len(), self.hp.head_dim, self.hp.index_dim, &groups,
