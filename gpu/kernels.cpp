@@ -3655,6 +3655,29 @@ void* sd_upload(void* handle, const void* data, uint64_t bytes) {
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
 }
 
+int sd_expansions_at(void* handle, void* pointer, uint64_t bytes) {
+    try {
+        auto& value = device(handle);
+        if (value.expansions) throw std::runtime_error("Straydog expansions are kept already");
+        if (!pointer || !bytes) throw std::runtime_error("invalid Straydog expansion ring");
+        op_span(value, pointer, size_t(bytes), "the expansion ring");
+        value.expansions = static_cast<uint8_t*>(pointer);
+        value.expansions_bytes = size_t(bytes);
+        value.expansions_at = 0;
+        value.expanded_weights.clear();
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_expansions_forget(void* handle) {
+    try {
+        auto& value = device(handle);
+        value.expanded_weights.clear();
+        value.expansions_at = 0;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_expansions(void* handle, uint64_t bytes) {
     try {
         auto& value = device(handle);

@@ -49,6 +49,11 @@ void* sd_allocate(void* handle, uint64_t bytes);
  * pass's GEMMs take, in a ring of `bytes` (an allocation within the budget; 0 keeps none), for the
  * pass's next batches. Once only. */
 int sd_expansions(void* handle, uint64_t bytes);
+/* The ring of kept FP16 expansions in `pointer` (a buffer of this device's, `bytes`), in place of one sd_expansions allocates: its
+   owner may lend it out between the passes that expand (sd_expansions_forget first, before any expansion is read again). */
+int sd_expansions_at(void* handle, void* pointer, uint64_t bytes);
+/* Forget every kept expansion: the ring's bytes are another's until the next prompt pass expands into it again. */
+int sd_expansions_forget(void* handle);
 int sd_write(void* handle, void* pointer, const void* data, uint64_t bytes);
 void* sd_filler_create(void* handle);
 void sd_filler_destroy(void* filler);

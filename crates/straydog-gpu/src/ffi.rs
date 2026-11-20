@@ -99,6 +99,16 @@ unsafe extern "C" {
     pub fn sd_expansions(handle: *mut ::std::os::raw::c_void, bytes: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_expansions_at(
+        handle: *mut ::std::os::raw::c_void,
+        pointer: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expansions_forget(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_write(
         handle: *mut ::std::os::raw::c_void,
         pointer: *mut ::std::os::raw::c_void,

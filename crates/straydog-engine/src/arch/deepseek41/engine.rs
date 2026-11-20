@@ -404,6 +404,11 @@ struct Shard {
     /// the store's region `arena` is (none: not lent).
     reclaimed: u64,
     arena_region: Option<usize>,
+    /// The ring of a prompt pass's FP16 expansions (the native side's: [`EXPANSIONS`]), the store's region it is lent to between
+    /// prompt passes (none: not lent), and whether a prompt pass has it back.
+    expansions: Option<Buffer>,
+    expansion_region: Option<usize>,
+    expansions_back: bool,
     /// The kv sources' buffers lent to the store too.
     state_regions: Vec<StateRegion>,
     /// And the batch buffers a pass fills only as far as its rows (the index scores, queries, attended rows).
@@ -835,9 +840,13 @@ impl Shard {
         let initialized = started.elapsed().as_secs_f64();
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         // (a prompt pass's attention weights expanded once a layer, not a batch: ATTENTION_ROWS)
-        if settings.half_gemm && settings.rows >= HALF_ROWS {
-            gpu.keep_expansions(std::env::var("DS41_EXPANSIONS").map_or(EXPANSIONS, |value| if value == "0" { 0 } else { EXPANSIONS }))?;
-        }
+        let expansions = if settings.half_gemm && settings.rows >= HALF_ROWS && std::env::var("DS41_EXPANSIONS").map_or(true, |value| value != "0") {
+            let ring = gpu.buffer_unset(EXPANSIONS)?;
+            gpu.keep_expansions_in(&ring)?;
+            Some(ring)
+        } else {
+            None
+        };
         // The normal four-token warm takes GEMV; move BLAS's lazy setup ahead of requests. Initialize both policies: batches below 32 still use F32.
         // Synthetic zero matrices touch no model, expert store or sequence state. Release
         // them before the long-lived buffers/cache are allocated (no residency change).
@@ -985,6 +994,12 @@ impl Shard {
             Some(arena) => Some(experts.lend_region(arena)?.0),
             None => None,
         };
+        // The expansions' ring holds experts too between prompt passes (DS41_LEND_EXPANSIONS=0: not lent): a decode pass expands
+        // nothing, and the ring is 512 MiB a device, ~110 slots of UD-IQ2_XXS's ~5000.
+        let expansion_region = match expansions.filter(|_| std::env::var("DS41_LEND_EXPANSIONS").map_or(true, |value| value != "0")) {
+            Some(ring) => Some(experts.lend_region(ring)?.0),
+            None => None,
+        };
         // The kv sources' compressed rows and index keys past the sequence's reach hold experts
         // too (DS41_LEND_STATE=0: not lent): a pass takes back what it reaches, a shorter sequence
         // gives the rest back. Sized for the whole context, they sit mostly unused (a 75K-token
@@ -1021,7 +1036,8 @@ impl Shard {
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, staging, plain: plain_buffer,
-            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, arena_region, state_regions, row_regions, experts,
+            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, arena_region, expansions, expansion_region,
+            expansions_back: false, state_regions, row_regions, experts,
             image_bias: None,
         })
     }
@@ -2114,6 +2130,20 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // alone held each device ~6 of a 10.7K-token prompt's 36 s (F32 GEMMs and their weights
         // expanded to F32, every 256 rows).
         let half = self.settings.half_gemm && n >= HALF_ROWS;
+        // A prompt pass takes the expansions' ring back from the store (its experts go to the host tier) and forgets what was
+        // expanded in it before; the first pass of a few rows after lends it again, once the prompt pass's products are done.
+        for shard in &mut self.shards {
+            let (Some(region), Some(ring)) = (shard.expansion_region, shard.expansions) else { continue };
+            if half && !shard.expansions_back {
+                shard.experts.reclaim_region(&mut shard.gpu, region, ring.bytes)?;
+                shard.gpu.forget_expansions()?;
+                shard.expansions_back = true;
+            } else if !half && shard.expansions_back {
+                let after = shard.gpu.mark(Stream::Compute)?;
+                shard.experts.restore_region(region, after, 0);
+                shard.expansions_back = false;
+            }
+        }
         if self.half_policy != Some(half) {
             for shard in &self.shards {
                 shard.gpu.configure_gemm(GEMM_MIN_BATCH, half)?;

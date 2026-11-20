@@ -903,6 +903,19 @@ impl Backend {
         check(unsafe { ffi::sd_expansions(self.handle, bytes) }).map(drop)
     }
 
+    /// Keep the FP16 expansions of a prompt pass's weights in `ring` (a buffer of this device's), which its owner may lend out
+    /// between the passes that expand once it has [`forget_expansions`](Self::forget_expansions)ed them.
+    pub fn keep_expansions_in(&self, ring: &crate::ops::Buffer) -> Result<()> {
+        // SAFETY: a live handle; the native side checks the range against this device's allocations.
+        check(unsafe { ffi::sd_expansions_at(self.handle, ring.base(), ring.bytes) }).map(drop)
+    }
+
+    /// Forget every kept expansion (the ring's bytes are another's until a prompt pass expands into it again).
+    pub fn forget_expansions(&self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_expansions_forget(self.handle) }).map(drop)
+    }
+
     pub fn configure_decode(&self, q8: bool) -> Result<()> {
         self.decode_options(q8, false)
     }
