@@ -556,7 +556,7 @@ fn check_slots(shard: &mut Shard, layer: usize, experts: &[usize], slots: &[Buff
 /// The sequence state a later pass continues, in host memory ([`Engine::snapshot`]): the window
 /// rings' rows of the last `window` positions (oldest first), each kv source's compressed rows,
 /// index keys and tail rows, and the counters.
-#[derive(Default)]
+#[derive(Default, Debug, PartialEq)]
 pub struct Snapshot {
     position: usize,
     history: Vec<u32>,
@@ -585,6 +585,100 @@ impl Snapshot {
         let floats: usize = self.windows.iter().map(|(_, rows)| rows.capacity()).sum::<usize>()
             + self.rows.iter().flat_map(|(_, kept)| kept.iter().map(Vec::capacity)).sum::<usize>();
         (floats * 4 + self.history.capacity() * 4) as u64
+    }
+}
+
+/// The bytes a [`Snapshot`] is kept in ([`Snapshot::to_bytes`]): this tag and format, then the position, the history's tokens, each kv
+/// source's (layer, groups, tail), each window's (layer, rows) and each source's four arrays (layer, compressed rows, index keys, tail kv,
+/// tail gate), every count before what it counts, little-endian.
+const SNAPSHOT_TAG: &[u8; 8] = b"SDS41SNP";
+const SNAPSHOT_FORMAT: u64 = 1;
+
+impl Snapshot {
+    /// The snapshot as bytes, for a later start ([`Snapshot::from_bytes`]); refused while its copy is pending.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        if self.pending {
+            return Err("a snapshot written before its copy finished".into());
+        }
+        fn put(out: &mut Vec<u8>, value: usize) {
+            out.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+        fn floats(out: &mut Vec<u8>, values: &[f32]) {
+            put(out, values.len());
+            out.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        }
+        let mut out = Vec::with_capacity(self.bytes() as usize + 4096);
+        out.extend_from_slice(SNAPSHOT_TAG);
+        put(&mut out, SNAPSHOT_FORMAT as usize);
+        put(&mut out, self.position);
+        put(&mut out, self.history.len());
+        out.extend(self.history.iter().flat_map(|token| token.to_le_bytes()));
+        put(&mut out, self.sources.len());
+        for &(layer, groups, tail) in &self.sources {
+            [layer, groups, tail].into_iter().for_each(|value| put(&mut out, value));
+        }
+        put(&mut out, self.windows.len());
+        for (layer, rows) in &self.windows {
+            put(&mut out, *layer);
+            floats(&mut out, rows);
+        }
+        put(&mut out, self.rows.len());
+        for (layer, kept) in &self.rows {
+            put(&mut out, *layer);
+            kept.iter().for_each(|values| floats(&mut out, values));
+        }
+        Ok(out)
+    }
+
+    /// A snapshot from [`Snapshot::to_bytes`]'s bytes: refused if they are not whole, of another format, or longer than it. Whether it fits
+    /// an engine is [`Engine::check_snapshot`]'s to say.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Snapshot> {
+        struct Reader<'a>(&'a [u8]);
+        impl Reader<'_> {
+            fn take(&mut self, len: usize) -> Result<&[u8]> {
+                if self.0.len() < len {
+                    return Err("a kept snapshot cut short".into());
+                }
+                let (taken, rest) = self.0.split_at(len);
+                self.0 = rest;
+                Ok(taken)
+            }
+            fn count(&mut self) -> Result<usize> {
+                let value = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
+                usize::try_from(value).ok().filter(|&value| value <= self.0.len()).ok_or_else(|| "a kept snapshot's count beyond its bytes".into())
+            }
+            fn value(&mut self) -> Result<usize> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()) as usize)
+            }
+            fn floats(&mut self) -> Result<Vec<f32>> {
+                let count = self.count()?;
+                Ok(self.take(count.checked_mul(4).ok_or("a kept snapshot's count beyond its bytes")?)?.chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect())
+            }
+        }
+        let mut reader = Reader(bytes);
+        if reader.take(8)? != SNAPSHOT_TAG || reader.value()? as u64 != SNAPSHOT_FORMAT {
+            return Err("not a kept snapshot of this format".into());
+        }
+        let mut snapshot = Snapshot { position: reader.value()?, ..Default::default() };
+        let tokens = reader.count()?;
+        snapshot.history = reader.take(tokens.checked_mul(4).ok_or("a kept snapshot's count beyond its bytes")?)?.chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).collect();
+        for _ in 0..reader.count()? {
+            snapshot.sources.push((reader.value()?, reader.value()?, reader.value()?));
+        }
+        for _ in 0..reader.count()? {
+            let layer = reader.value()?;
+            snapshot.windows.push((layer, reader.floats()?));
+        }
+        for _ in 0..reader.count()? {
+            let layer = reader.value()?;
+            snapshot.rows.push((layer, [reader.floats()?, reader.floats()?, reader.floats()?, reader.floats()?]));
+        }
+        if !reader.0.is_empty() {
+            return Err("a kept snapshot with bytes after its end".into());
+        }
+        Ok(snapshot)
     }
 }
 
@@ -1800,6 +1894,35 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         snapshot.pending = pending;
+        Ok(())
+    }
+
+    /// Whether `snapshot` (from another start: [`Snapshot::from_bytes`]) fits this engine to the byte: its layers' windows, kv sources and
+    /// arrays as this engine's would be at its position, within its context and with the history its position says.
+    pub fn check_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        let refused = |why: &str| Err(format!("a kept snapshot refused: {why}").into());
+        let (dim, index_dim, position) = (self.hp.head_dim, self.hp.index_dim, snapshot.position);
+        if position == 0 || position + 1 >= self.settings.context || snapshot.history.len() != position || snapshot.pending {
+            return refused("its position and history");
+        }
+        let rings: Vec<usize> = self.shards[0].rings.keys().copied().collect();
+        let windows: Vec<usize> = snapshot.windows.iter().map(|(layer, _)| *layer).collect();
+        let first = position.saturating_sub(self.hp.window);
+        if windows != rings || snapshot.windows.iter().any(|(_, rows)| rows.len() != (position - first) * dim) {
+            return refused("its windows");
+        }
+        let sources: Vec<usize> = self.shards[0].sources.keys().copied().collect();
+        if snapshot.sources.iter().map(|source| source.0).collect::<Vec<_>>() != sources
+            || snapshot.rows.iter().map(|(layer, _)| *layer).collect::<Vec<_>>() != sources {
+            return refused("its kv sources");
+        }
+        for (&(layer, groups, tail), (_, kept)) in snapshot.sources.iter().zip(&snapshot.rows) {
+            let ratio = self.hp.layers[layer].compressed.map_or(1, |c| c.ratio);
+            if groups != position / ratio || tail != position % ratio || kept[0].len() != groups * dim / 2 || kept[1].len() != groups * index_dim / 2
+                || kept[2].len() != dim || kept[3].len() != dim {
+                return refused("a kv source's rows");
+            }
+        }
         Ok(())
     }
 
@@ -3961,6 +4084,25 @@ impl Work {
 #[cfg(test)]
 mod tests {
     use super::divided;
+
+    /// A snapshot's bytes give it back whole; bytes cut short, of another format or with more after their end are refused.
+    #[test]
+    fn a_snapshot_comes_back_from_its_bytes() {
+        let snapshot = super::Snapshot {
+            position: 9, history: (0..9).collect(), sources: vec![(2, 2, 1), (5, 9, 0)],
+            windows: vec![(0, vec![1.5; 8]), (1, vec![-2.0, 3.25])],
+            rows: vec![(2, [vec![0.5; 4], vec![1.0; 2], vec![7.0; 3], vec![]]), (5, [vec![], vec![9.0], vec![-1.0; 2], vec![2.5]])],
+            pending: false,
+        };
+        let bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(super::Snapshot::from_bytes(&bytes).unwrap(), snapshot);
+        assert!(super::Snapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        assert!(super::Snapshot::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_err());
+        let mut other = bytes.clone();
+        other[8] ^= 1;
+        assert!(super::Snapshot::from_bytes(&other).is_err());
+        assert!(super::Snapshot { pending: true, ..Default::default() }.to_bytes().is_err());
+    }
 
     #[test]
     fn a_view_count_stays_off_until_a_replay_is_counted() {
