@@ -5362,6 +5362,34 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         }
         const dim3 score_grid{unsigned(wmma_chunks), unsigned(rows)}, weight_grid{1, unsigned(rows)}, out_grid{unsigned(dim / 64), unsigned(rows)};
         const size_t keys_bytes = size_t(stride) * sizeof(float*);
+        // Where the scratch holds them past the scores: the rows' queries in FP16, made once a row (ds_attention_query_rows), the
+        // operands each scores block made of q again (some ten blocks a row, the rotated columns in double, from F32): the same bits.
+        // (A 16,384-row pass on an R9700: scores 381 -> 292 us a batch of 256 rows, the queries 47 us; the weights in FP16 too, the
+        // output kernel's operands, saved it nothing: 415 -> 428 us. 2026-11-21.)
+        const size_t queries_at = (wmma_need + 255) / 256 * 256, query_bytes = size_t(rows * heads * dim) * 2;
+        // (DS41_PREPARED_QUERIES=0, development: each scores block makes its queries, as before)
+        const char* prepared = std::getenv("DS41_PREPARED_QUERIES");
+        if (scratch_bytes >= queries_at + query_bytes && !(prepared && prepared[0] == '0' && !prepared[1])) {
+            op_span(value, scratch, queries_at + query_bytes, "attention scratch");
+            auto* queries = reinterpret_cast<_Float16*>(reinterpret_cast<uint8_t*>(scratch) + queries_at);
+            ds_attention_query_rows<<<unsigned(rows), 256, 0, value.stream>>>(q, size_t(heads), size_t(dim), pairs, forward, queries);
+            check(hipGetLastError());
+            #define SD_DS_ATTENTION_PREPARED(HM) \
+                ds_attention_scores_wmma<HM, true><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, size_t(window), \
+                    compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, scores, partial, \
+                    queries); \
+                check(hipGetLastError()); \
+                ds_attention_weights_wmma<HM><<<weight_grid, 256, 0, value.stream>>>(scores, partial, wmma_chunks, positions, size_t(window), \
+                    size_t(selections), sinks, size_t(heads), stride); \
+                check(hipGetLastError()); \
+                ds_attention_output_wmma<HM><<<out_grid, 128, keys_bytes, value.stream>>>(scores, partial, wmma_chunks, raw, size_t(raw_rows), \
+                    positions, size_t(window), compressed, selected, size_t(selections), size_t(heads), size_t(dim), pairs, inverse, \
+                    stride, out);
+            if (heads == 32) { SD_DS_ATTENTION_PREPARED(2) } else { SD_DS_ATTENTION_PREPARED(4) }
+            #undef SD_DS_ATTENTION_PREPARED
+            check(hipGetLastError());
+            return 0;
+        }
         #define SD_DS_ATTENTION(HM) \
             ds_attention_scores_wmma<HM><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, size_t(window), \
                 compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, scores, partial); \

@@ -20,11 +20,12 @@ __device__ __forceinline__ moe_half8 ds_half8(float4 a, float4 b) {
 // Scores: grid (chunks of ds_attention_chunk keys, rows), 128 threads; HM tiles of 16 heads (all a
 // row's). Wave w takes keys 16w.. of the chunk for every head. The next 64 columns of q and of the
 // keys load into registers while the current ones' products run (LDS in two buffers).
-template<int HM>
+// With PREPARED, the queries are ds_attention_query_rows's FP16 rows (`prepared`), not q's: the same values.
+template<int HM, bool PREPARED = false>
 __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
         const float* q, const float* raw, size_t raw_rows, const int32_t* positions, size_t window, const float* compressed,
         const int32_t* selected, size_t selections, size_t heads, size_t dim, float scale, size_t pairs, const double2* forward,
-        size_t stride, float* scores, float2* partial) {
+        size_t stride, float* scores, float2* partial, const _Float16* prepared = nullptr) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     constexpr int S = 64, L = ds_attention_lds, H = HM * 16, QG = H * 8 / 128, KG = ds_attention_chunk * 8 / 128;
     const size_t row = blockIdx.y, chunk = blockIdx.x, chunks = gridDim.x;
@@ -37,11 +38,12 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
     __shared__ const float* keys[ds_attention_chunk];
     __shared__ double turns[64][2];   // the row's rotation per rope pair
     __shared__ float2 reduce[4][H];
-    for (size_t pair = t; pair < pairs; pair += blockDim.x) {
-        const double2 g = forward[row * pairs + pair];
-        turns[pair][0] = g.x;
-        turns[pair][1] = g.y;
-    }
+    if (!PREPARED)
+        for (size_t pair = t; pair < pairs; pair += blockDim.x) {
+            const double2 g = forward[row * pairs + pair];
+            turns[pair][0] = g.x;
+            turns[pair][1] = g.y;
+        }
     if (t < ds_attention_chunk)
         keys[t] = attention_key(chunk * ds_attention_chunk + t, raw_count, first, raw, raw_rows, compressed, selected + row * selections,
                                 total, dim);
@@ -50,10 +52,15 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
     const float* row_q = q + row * heads * dim;
     // A thread's eight q values of a head (rotated past `rotated`) and eight values of a key.
     float4 qa[QG][2], ka[KG][2];
+    moe_half8 qh[QG];
     auto load = [&](size_t d0) {
         #pragma unroll
         for (int g = 0; g < QG; ++g) {
             const unsigned at = t + g * 128, h = at / 8, c0 = (at % 8) * 8;
+            if (PREPARED) {
+                qh[g] = h < heads ? *reinterpret_cast<const moe_half8*>(prepared + (row * heads + h) * dim + d0 + c0) : moe_half8{};
+                continue;
+            }
             qa[g][0] = qa[g][1] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (h >= heads) continue;
             const float* source = row_q + h * dim + d0 + c0;
@@ -87,7 +94,7 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
         #pragma unroll
         for (int g = 0; g < QG; ++g) {
             const unsigned at = t + g * 128;
-            *reinterpret_cast<moe_half8*>(&qs[buffer][at / 8][(at % 8) * 8]) = ds_half8(qa[g][0], qa[g][1]);
+            *reinterpret_cast<moe_half8*>(&qs[buffer][at / 8][(at % 8) * 8]) = PREPARED ? qh[g] : ds_half8(qa[g][0], qa[g][1]);
         }
         #pragma unroll
         for (int g = 0; g < KG; ++g) {
@@ -273,6 +280,31 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
             }
             if (head < heads) out[(row * heads + head) * dim + col] = o;
         }
+#endif
+}
+
+// A row's attention queries as ds_attention_scores_wmma<HM, true> reads them: FP16, every head's `dim` columns, the last 2 * pairs
+// turned by the row's angle (`forward`), with the scores kernel's own arithmetic. Every scores block of a row made them again (some
+// ten a row, the rotated ones in double) from twice the bytes. Grid (rows), 256 threads.
+__global__ void __launch_bounds__(256) ds_attention_query_rows(const float* q, size_t heads, size_t dim, size_t pairs, const double2* forward,
+                                                              _Float16* out) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const size_t row = blockIdx.x, rotated = dim - 2 * pairs;
+    const float* row_q = q + row * heads * dim;
+    for (size_t at = threadIdx.x; at < heads * dim; at += blockDim.x) {
+        const size_t h = at / dim, c = at % dim;
+        float x;
+        if (c < rotated) {
+            x = row_q[at];
+        } else {
+            const size_t pair = (c - rotated) / 2;
+            const double a = row_q[h * dim + rotated + 2 * pair], b = row_q[h * dim + rotated + 2 * pair + 1];
+            const double2 g = forward[row * pairs + pair];
+            const double cs = g.x, sn = g.y;
+            x = (c - rotated) % 2 == 0 ? float(a * cs - b * sn) : float(a * sn + b * cs);
+        }
+        out[row * heads * dim + at] = _Float16(x);
+    }
 #endif
 }
 
