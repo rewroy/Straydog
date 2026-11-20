@@ -800,6 +800,9 @@ struct Device {
     size_t inline_routes_count = 0;
     hipEvent_t parts_ready = nullptr;   // sd_op_sum_devices: this device's part is written
     hipEvent_t parts_read = nullptr;    // sd_op_sum_devices: this device has read the others' parts
+    hipStream_t sum_stream = nullptr;   // sd_op_sum_devices_start: the copies of the other devices' parts into this one's inbox
+    hipEvent_t sum_queued = nullptr;    // sd_op_sum_devices_start: the work queued on the device's stream before the copies
+    hipEvent_t sum_copied = nullptr;    // sd_op_sum_devices_start: the copies into this device's inbox
     bool op_recording = false;   // between sd_graph_begin and sd_graph_end
     uint8_t* readback = nullptr;
     bool readback_pinned = true;   // false: pageable (the system refused to page-lock it), held in readback_pageable
@@ -999,6 +1002,7 @@ struct Device {
         if (side_stream) cleanup(hipStreamSynchronize(side_stream));
         if (stage_stream) cleanup(hipStreamSynchronize(stage_stream));
         if (send_stream) cleanup(hipStreamSynchronize(send_stream));
+        if (sum_stream) cleanup(hipStreamSynchronize(sum_stream));
         for (auto& entry : graphs) {
             cleanup(hipGraphExecDestroy(entry.second.executable));
             cleanup(hipGraphDestroy(entry.second.graph));
@@ -1025,6 +1029,8 @@ struct Device {
         if (readback_done) cleanup(hipEventDestroy(readback_done));
         if (parts_ready) cleanup(hipEventDestroy(parts_ready));
         if (parts_read) cleanup(hipEventDestroy(parts_read));
+        if (sum_queued) cleanup(hipEventDestroy(sum_queued));
+        if (sum_copied) cleanup(hipEventDestroy(sum_copied));
         if (cpu_partial) cleanup(hipFree(cpu_partial));
         if (expert_q8_scratch) cleanup(hipFree(expert_q8_scratch));
         if (draft_extras) cleanup(hipFree(draft_extras));
@@ -1070,6 +1076,7 @@ struct Device {
         if (side_stream) cleanup(hipStreamDestroy(side_stream));
         if (stage_stream) cleanup(hipStreamDestroy(stage_stream));
         if (send_stream) cleanup(hipStreamDestroy(send_stream));
+        if (sum_stream) cleanup(hipStreamDestroy(sum_stream));
         for (auto event : {kv_released, kv_prefetched, side_fork, side_join, stage_fork, stage_join, send_fork, send_done}) if (event) cleanup(hipEventDestroy(event));
     }
 };

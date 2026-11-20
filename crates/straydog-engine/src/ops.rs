@@ -116,6 +116,34 @@ pub fn sum_devices(devices: &[&Backend], outs: &[M], parts: &[P], count: u64) ->
     check(unsafe { ffi::sd_op_sum_devices(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), handles.len() as u64, count) })
 }
 
+/// [`sum_devices`] of two devices in two halves: the start copies each device's `parts` (`count` values) into the other's `inboxes`
+/// on a copy engine, behind the work queued so far on both, while the devices compute on; the finish makes each device wait for
+/// the copies and sums its part and its inbox in device order into `outs` (the same bits as [`sum_devices`]). A start is finished
+/// before the next; parts and inboxes stay unchanged in between.
+pub fn sum_devices_start(devices: &[&Backend], parts: &[P], inboxes: &[M], count: u64) -> Result<()> {
+    if devices.len() != 2 || parts.len() != 2 || inboxes.len() != 2 {
+        return Err("a device sum in halves takes two devices, two parts and two inboxes".into());
+    }
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    let parts: Vec<*const f32> = parts.iter().map(|part| part.cast()).collect();
+    let inboxes: Vec<*mut f32> = inboxes.iter().map(|inbox| inbox.cast()).collect();
+    // SAFETY: live handles; the library checks every range against its device's allocations.
+    check(unsafe { ffi::sd_op_sum_devices_start(handles.as_ptr(), parts.as_ptr(), inboxes.as_ptr(), 2, count) })
+}
+
+/// The finish of [`sum_devices_start`] (the same parts and inboxes).
+pub fn sum_devices_finish(devices: &[&Backend], outs: &[M], parts: &[P], inboxes: &[M], count: u64) -> Result<()> {
+    if devices.len() != 2 || outs.len() != 2 || parts.len() != 2 || inboxes.len() != 2 {
+        return Err("a device sum in halves takes two devices, two outs, two parts and two inboxes".into());
+    }
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    let outs: Vec<*mut f32> = outs.iter().map(|out| out.cast()).collect();
+    let parts: Vec<*const f32> = parts.iter().map(|part| part.cast()).collect();
+    let inboxes: Vec<*const f32> = inboxes.iter().map(|inbox| inbox.cast_const().cast()).collect();
+    // SAFETY: live handles; the library checks every range against its device's allocations.
+    check(unsafe { ffi::sd_op_sum_devices_finish(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), inboxes.as_ptr(), 2, count) })
+}
+
 /// Submit each device's queued work after both sides of a peer wait have been queued.
 pub fn flush_devices(devices: &[&Backend]) -> Result<()> {
     let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();

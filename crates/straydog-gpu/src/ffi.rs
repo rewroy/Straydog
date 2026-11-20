@@ -1202,6 +1202,25 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_sum_devices_start(
+        handles: *const *mut ::std::os::raw::c_void,
+        parts: *const *const f32,
+        inboxes: *const *mut f32,
+        devices: u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_sum_devices_finish(
+        handles: *const *mut ::std::os::raw::c_void,
+        outs: *const *mut f32,
+        parts: *const *const f32,
+        inboxes: *const *const f32,
+        devices: u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_devices_settle(
         handles: *const *mut ::std::os::raw::c_void,
         devices: u64,

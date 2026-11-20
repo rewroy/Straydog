@@ -242,6 +242,13 @@ impl RowRegion {
     }
 }
 
+/// DS41_SUM_OVERLAP=0 (development): a long pass's attention sums on the devices' streams, a batch at a time, as before the copies
+/// beside the compute (Engine::sum_parts_start).
+fn sum_overlap() -> bool {
+    static OVERLAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OVERLAP.get_or_init(|| std::env::var("DS41_SUM_OVERLAP").map_or(true, |value| value != "0"))
+}
+
 /// Tokens past a pass's reach its kv source buffers are taken back for (the next passes'
 /// groups), and past which, the sequence shorter, they go back to the expert store.
 const STATE_AHEAD: usize = 4096;
@@ -324,6 +331,8 @@ struct Work {
     head: Buffer,
     /// hc_step's partial sums and counters.
     hc_workspace: Buffer,
+    /// With two devices, the other's part of a batch's attention output, copied over (ops::sum_devices_start).
+    inbox: Buffer,
     /// The experts of a few rows over their slots: with several devices, this device's share of
     /// the experts' activations (per route a row of the expert width, its share filled; two, used
     /// by waves in turn) and their sum; on one device, the activations.
@@ -955,6 +964,7 @@ impl Shard {
             // (and a part link status after the logits)
             head: floats(&mut gpu, if range.end == hp.layers.len() { VERIFY_ROWS * hp.vocabulary / parts + 1 } else { 1 })?,
             hc_workspace: floats(&mut gpu, b * w.div_ceil(64) * ((2 + hc) * hc + 2) + b)?,
+            inbox: floats(&mut gpu, if parts == 2 { b * w } else { 0 })?,
             products: [floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?, floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?],
             product: floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?,
             hidden: floats(&mut gpu, SLOT_ROWS * k * ff)?,
@@ -1934,6 +1944,48 @@ impl<'a, T: Tensors> Engine<'a, T> {
         ops::sum_devices(&devices, &outs, &parts, (rows * w) as u64)
     }
 
+    /// [`Engine::sum_parts`] of the attention's part of the rows `first..first + rows` (a batch's), in two halves
+    /// ([`ops::sum_devices_start`]): the copies run while the devices go on.
+    fn sum_parts_start(&mut self, first: usize, rows: usize) -> Result<()> {
+        let w = self.hp.width;
+        let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+        let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.parts[0].at(first * w) as P).collect();
+        let inboxes: Vec<M> = self.shards.iter().map(|shard| shard.work.inbox.base()).collect();
+        ops::sum_devices_start(&devices, &parts, &inboxes, (rows * w) as u64)
+    }
+
+    fn sum_parts_finish(&mut self, first: usize, rows: usize) -> Result<()> {
+        let w = self.hp.width;
+        let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+        let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.out.at(first * w)).collect();
+        let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.parts[0].at(first * w) as P).collect();
+        let inboxes: Vec<M> = self.shards.iter().map(|shard| shard.work.inbox.base()).collect();
+        ops::sum_devices_finish(&devices, &outs, &parts, &inboxes, (rows * w) as u64)
+    }
+
+    /// An overlapped batch's (rows `attending..end`) way into the FFN once its attention's sum started: the sum's finish, the FFN's
+    /// hyper-connection step and the router, as a batch of a pass without graphs takes them.
+    fn ffn_entry(&mut self, layer: usize, n: usize, attending: usize, end: usize, predict: bool) -> Result<()> {
+        let hp = self.hp.clone();
+        let attended = end - attending;
+        self.sum_parts_finish(attending, attended)?;
+        let publish = self.publishes(layer, n, predict);
+        if publish {
+            self.shards[0].gpu.route_mailbox_clear()?;
+        }
+        for shard in &mut self.shards {
+            let work = shard.work.view(attending);
+            hc_ffn(shard, &work, &hp, layer, attended, false)?;
+        }
+        self.mark("hyper-connections")?;
+        for (index, shard) in self.shards.iter_mut().enumerate() {
+            let work = shard.work.view(attending);
+            router_ops(shard, &work, &hp, layer, attended, predict && index == 0, publish && index == 0)?;
+        }
+        self.route_images(layer, attending, end)?;
+        self.mark("router")
+    }
+
     fn flush_peers(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
         if self.shards.len() > 1 {
@@ -2566,6 +2618,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
             None => false,
         };
         let engram_values = hp.engram_columns() * hp.engram.as_ref().map_or(0, |engram| engram.head_dim);
+        // (a pass of one batch has nothing to run its sum beside; DS41_SUM_OVERLAP=0 sums each batch on the devices' streams)
+        let overlapped = !record && !link && self.shards.len() == 2 && n - from > self.settings.batch && sum_overlap();
+        // the batch whose sum has started and whose FFN's step and router wait for it
+        let mut pending: Option<(usize, usize)> = None;
         for first in (from..n).step_by(self.settings.batch) {
             let end = (first + self.settings.batch).min(n);
             let rows = (end - first) as u64;
@@ -2667,6 +2723,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 continue;
             }
             let attended = end - attending;
+            // A pass of several batches on two devices: this batch's sum starts on the copy engines, and the previous batch's
+            // finishes now, its FFN's step and router after it, while the copies run beside this batch's attention.
+            if overlapped {
+                if let Some((from, to)) = pending.take() {
+                    self.ffn_entry(layer, n, from, to, predict)?;
+                }
+                self.sum_parts_start(attending, attended)?;
+                pending = Some((attending, end));
+                self.stamp(layer, n, Stamp::AttentionDone)?;
+                self.mark("attention")?;
+                continue;
+            }
             if !link && !merged {
                 self.sum_parts(0, attending, attended)?;
             }
@@ -2711,6 +2779,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             self.route_images(layer, attending, end)?;
             self.mark("router")?;
+        }
+        if let Some((from, to)) = pending.take() {
+            self.ffn_entry(layer, n, from, to, predict)?;
         }
         self.engram_values = gathered;
         if full_from < n {

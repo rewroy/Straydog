@@ -412,7 +412,7 @@ void expert_cache_quiesce(Device& d) {
             attempt([&]() { hybrid_settle(*side,true); });
             attempt([&]() { check(hipStreamSynchronize(side->stream)); });
             for (hipStream_t stream : {side->copy_stream,side->kv_stream,side->helper_stream,side->side_stream,
-                                      side->send_stream,side->stage_stream,side->rows_stream})
+                                      side->send_stream,side->stage_stream,side->rows_stream, side->sum_stream})
                 if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
             if (side->transfers) for (auto stream : side->transfers->streams)
                 if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
@@ -466,7 +466,7 @@ int recover_hybrid_wait(void* handle) {
         check(hipStreamSynchronize(d.stream));
         hybrid_settle(d, true);
         check(hipStreamSynchronize(d.stream));
-        for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream, d.stage_stream, d.rows_stream})
+        for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream, d.stage_stream, d.rows_stream, d.sum_stream})
             if (stream) check(hipStreamSynchronize(stream));
         if (d.transfers)
             for (hipStream_t stream : d.transfers->streams)
@@ -520,7 +520,7 @@ std::string drain_drafting(Device& d, bool shared_head) {
                 attempt([&]() { hybrid_settle(*side, true); });
                 attempt([&]() { check(hipStreamSynchronize(side->stream)); });
                 for (hipStream_t stream : {side->copy_stream, side->kv_stream, side->helper_stream, side->side_stream,
-                                          side->send_stream, side->stage_stream, side->rows_stream})
+                                          side->send_stream, side->stage_stream, side->rows_stream, side->sum_stream})
                     if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
                 if (side->transfers)
                     for (hipStream_t stream : side->transfers->streams)
@@ -5727,6 +5727,83 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
                 check(hipGetLastError());
                 if (!list[i]->parts_read) check(hipEventCreateWithFlags(&list[i]->parts_read, hipEventDisableTiming));
                 check(hipEventRecord(list[i]->parts_read, list[i]->stream));
+            });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+// sd_op_sum_devices in two halves, for a prompt pass's batches: the other device's part comes over on a copy engine while the
+// device computes on, and the sum is then of local values. (sd_op_sum_devices's kernel read the other's part over PCIe on the
+// device's stream: 234 us of each batch of 256 rows on each R9700, 0.64 s of a 16,384-row pass's 10.1 s of kernels, 2026-11-21.)
+// Start: on each device's sum stream, behind the work queued so far on both devices, the other's `count` values of its part into
+// the device's inbox. Finish: each device's stream waits for both copies (its inbox's, and the other's read of its part), then adds
+// the parts in device order with sd_op_sum_devices's kernel: the same bits. A start is finished before the next start; an inbox
+// is not touched between the two.
+int sd_op_sum_devices_start(void* const* handles, const float* const* parts, float* const* inboxes, uint64_t devices, uint64_t count) {
+    try {
+        if (!handles || !parts || !inboxes || devices != 2 || !count) throw std::runtime_error("invalid Straydog device sum start");
+        Device* list[2] = {&device(handles[0]), &device(handles[1])};
+        if (list[0] == list[1]) throw std::runtime_error("a device twice in a Straydog device sum");
+        for (size_t i = 0; i < 2; ++i) {
+            op_span(*list[i], parts[i], size_t(count) * 4, "a device's part");
+            op_span(*list[i], inboxes[i], size_t(count) * 4, "a device's inbox");
+        }
+        link_peers(std::vector<Device*>{list[0], list[1]});
+        for (Device* d : list)
+            on_device(d->ordinal, [&]() {
+                if (!d->sum_stream) {
+                    check(hipStreamCreateWithFlags(&d->sum_stream, hipStreamNonBlocking));
+                    check(hipEventCreateWithFlags(&d->sum_queued, hipEventDisableTiming));
+                    check(hipEventCreateWithFlags(&d->sum_copied, hipEventDisableTiming));
+                }
+                check(hipEventRecord(d->sum_queued, d->stream));
+            });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
+        for (size_t i = 0; i < 2; ++i)
+            on_device(list[i]->ordinal, [&]() {
+                Device& d = *list[i];
+                const size_t j = 1 - i;
+                // (its own queued work: the inbox's last reader, the previous finish, is on the device's stream)
+                check(hipStreamWaitEvent(d.sum_stream, d.sum_queued, 0));
+                check(hipStreamWaitEvent(d.sum_stream, list[j]->sum_queued, 0));
+                check(hipMemcpyPeerAsync(inboxes[i], d.ordinal, parts[j], list[j]->ordinal, size_t(count) * 4, d.sum_stream));
+                check(hipEventRecord(d.sum_copied, d.sum_stream));
+            });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_sum_devices_finish(void* const* handles, float* const* outs, const float* const* parts, const float* const* inboxes,
+                             uint64_t devices, uint64_t count) {
+    try {
+        if (!handles || !outs || !parts || !inboxes || devices != 2 || !count) throw std::runtime_error("invalid Straydog device sum finish");
+        Device* list[2] = {&device(handles[0]), &device(handles[1])};
+        if (list[0] == list[1] || !list[0]->sum_copied || !list[1]->sum_copied)
+            throw std::runtime_error("a Straydog device sum finished without its start");
+        for (size_t i = 0; i < 2; ++i) {
+            op_span(*list[i], parts[i], size_t(count) * 4, "a device's part");
+            op_span(*list[i], inboxes[i], size_t(count) * 4, "a device's inbox");
+            op_span(*list[i], outs[i], size_t(count) * 4, "a device's sum");
+            if (static_cast<const void*>(outs[i]) == static_cast<const void*>(parts[i]) ||
+                static_cast<const void*>(outs[i]) == static_cast<const void*>(inboxes[i]))
+                throw std::runtime_error("a device sum cannot overwrite a part");
+        }
+        for (size_t i = 0; i < 2; ++i)
+            on_device(list[i]->ordinal, [&]() {
+                Device& d = *list[i];
+                // (the other's copy read this device's part: the part's rows may be written again after this)
+                check(hipStreamWaitEvent(d.stream, list[0]->sum_copied, 0));
+                check(hipStreamWaitEvent(d.stream, list[1]->sum_copied, 0));
+                DeviceParts all{};
+                all.parts[i] = parts[i];
+                all.parts[1 - i] = inboxes[i];
+                sum_devices_kernel<<<unsigned((count + 255) / 256), 256, 0, d.stream>>>(all, 2u, size_t(count), outs[i]);
+                check(hipGetLastError());
             });
 #if !defined(__HIPCC__)
         for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
