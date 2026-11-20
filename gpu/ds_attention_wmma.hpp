@@ -20,8 +20,9 @@ __device__ __forceinline__ moe_half8 ds_half8(float4 a, float4 b) {
 // Scores: grid (chunks of ds_attention_chunk keys, rows), 128 threads; HM tiles of 16 heads (all a
 // row's). Wave w takes keys 16w.. of the chunk for every head. The next 64 columns of q and of the
 // keys load into registers while the current ones' products run (LDS in two buffers).
-// With PREPARED, the queries are ds_attention_query_rows's FP16 rows (`prepared`), not q's: the same values.
-template<int HM, bool PREPARED = false>
+// With PREPARED, the queries are ds_attention_query_rows's FP16 rows (`prepared`), not q's: the same values. With BUFFERS 1, the
+// LDS holds one stage (the next waits in registers until every wave has read the current one): half the LDS, more blocks a WGP.
+template<int HM, bool PREPARED = false, int BUFFERS = 2>
 __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
         const float* q, const float* raw, size_t raw_rows, const int32_t* positions, size_t window, const float* compressed,
         const int32_t* selected, size_t selections, size_t heads, size_t dim, float scale, size_t pairs, const double2* forward,
@@ -33,8 +34,8 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
     const int64_t first = p - int64_t(window) + 1 < 0 ? 0 : p - int64_t(window) + 1;
     const size_t raw_count = size_t(p - first + 1), total = raw_count + selections;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32, half = lane / 16;
-    __shared__ __attribute__((aligned(16))) _Float16 qs[2][H][L];
-    __shared__ __attribute__((aligned(16))) _Float16 ks[2][ds_attention_chunk][L];
+    __shared__ __attribute__((aligned(16))) _Float16 qs[BUFFERS][H][L];
+    __shared__ __attribute__((aligned(16))) _Float16 ks[BUFFERS][ds_attention_chunk][L];
     __shared__ const float* keys[ds_attention_chunk];
     __shared__ double turns[64][2];   // the row's rotation per rope pair
     __shared__ float2 reduce[4][H];
@@ -108,7 +109,7 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
     __syncthreads();
     const size_t steps = dim / S;
     for (size_t step = 0; step < steps; ++step) {
-        const int buffer = int(step & 1);
+        const int buffer = BUFFERS == 2 ? int(step & 1) : 0;
         if (step + 1 < steps) load((step + 1) * S);
         #pragma unroll
         for (int kk = 0; kk < S; kk += 16) {
@@ -119,7 +120,15 @@ __global__ void __launch_bounds__(128) ds_attention_scores_wmma(
                 acc[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, acc[m]);
             }
         }
-        if (step + 1 < steps) store(buffer ^ 1);
+        if (BUFFERS == 1) {
+            // (every wave past its reads of the stage before it is overwritten)
+            if (step + 1 < steps) {
+                __syncthreads();
+                store(0);
+            }
+        } else if (step + 1 < steps) {
+            store(buffer ^ 1);
+        }
         __syncthreads();
     }
     // acc[m][i]: head m * 16 + half * 8 + i, this lane's key. Each half of the wave reduces its 16
@@ -191,7 +200,8 @@ __global__ void __launch_bounds__(256) ds_attention_weights_wmma(
 // takes columns d0 + 16w ... Keys go 64 a stage: the next stage's weights and values load into
 // registers while the current one's products run (LDS in two buffers). Dynamic LDS: the row's key
 // addresses. `weights` and `partial` as ds_attention_weights_wmma leaves them.
-template<int HM>
+// With BUFFERS 1, the LDS holds one stage, as ds_attention_scores_wmma's.
+template<int HM, int BUFFERS = 2>
 __global__ void __launch_bounds__(128) ds_attention_output_wmma(
         const float* weights, const float2* partial, size_t chunks, const float* raw, size_t raw_rows, const int32_t* positions,
         size_t window, const float* compressed, const int32_t* selected, size_t selections, size_t heads,
@@ -204,8 +214,8 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
     const size_t raw_count = size_t(p - first + 1), total = raw_count + selections;
     const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32, half = lane / 16;
     __shared__ float denominators[H];
-    __shared__ __attribute__((aligned(16))) _Float16 ps[2][H][L];
-    __shared__ __attribute__((aligned(16))) _Float16 vt[2][64][L];
+    __shared__ __attribute__((aligned(16))) _Float16 ps[BUFFERS][H][L];
+    __shared__ __attribute__((aligned(16))) _Float16 vt[BUFFERS][64][L];
     extern __shared__ const float* keys[];
     for (size_t index = t; index < total; index += blockDim.x)
         keys[index] = attention_key(index, raw_count, first, raw, raw_rows, compressed, selected + row * selections, total, dim);
@@ -247,7 +257,7 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
     store(0);
     __syncthreads();
     for (size_t k0 = 0, step = 0; k0 < total; k0 += KS, ++step) {
-        const int buffer = int(step & 1);
+        const int buffer = BUFFERS == 2 ? int(step & 1) : 0;
         const bool more = k0 + KS < total;
         if (more) load(k0 + KS);
         #pragma unroll
@@ -259,7 +269,14 @@ __global__ void __launch_bounds__(128) ds_attention_output_wmma(
                 acc[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, acc[m]);
             }
         }
-        if (more) store(buffer ^ 1);
+        if (BUFFERS == 1) {
+            if (more) {
+                __syncthreads();
+                store(0);
+            }
+        } else if (more) {
+            store(buffer ^ 1);
+        }
         __syncthreads();
     }
     // acc[m][i]: head m * 16 + half * 8 + i, column d0 + 16 * wave + lane % 16; a rope pair's two

@@ -5369,23 +5369,30 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         const size_t queries_at = (wmma_need + 255) / 256 * 256, query_bytes = size_t(rows * heads * dim) * 2;
         // (DS41_PREPARED_QUERIES=0, development: each scores block makes its queries, as before)
         const char* prepared = std::getenv("DS41_PREPARED_QUERIES");
+        // (DS41_ATTENTION_BUFFERS=2, development: two stages of LDS a block, as before)
+        const char* buffers = std::getenv("DS41_ATTENTION_BUFFERS");
+        const bool single = !(buffers && buffers[0] == '2' && !buffers[1]);
         if (scratch_bytes >= queries_at + query_bytes && !(prepared && prepared[0] == '0' && !prepared[1])) {
             op_span(value, scratch, queries_at + query_bytes, "attention scratch");
             auto* queries = reinterpret_cast<_Float16*>(reinterpret_cast<uint8_t*>(scratch) + queries_at);
             ds_attention_query_rows<<<unsigned(rows), 256, 0, value.stream>>>(q, size_t(heads), size_t(dim), pairs, forward, queries);
             check(hipGetLastError());
-            #define SD_DS_ATTENTION_PREPARED(HM) \
-                ds_attention_scores_wmma<HM, true><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, size_t(window), \
-                    compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, scores, partial, \
-                    queries); \
+            #define SD_DS_ATTENTION_PREPARED(HM, B) \
+                ds_attention_scores_wmma<HM, true, B><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, \
+                    size_t(window), compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, \
+                    scores, partial, queries); \
                 check(hipGetLastError()); \
                 ds_attention_weights_wmma<HM><<<weight_grid, 256, 0, value.stream>>>(scores, partial, wmma_chunks, positions, size_t(window), \
                     size_t(selections), sinks, size_t(heads), stride); \
                 check(hipGetLastError()); \
-                ds_attention_output_wmma<HM><<<out_grid, 128, keys_bytes, value.stream>>>(scores, partial, wmma_chunks, raw, size_t(raw_rows), \
-                    positions, size_t(window), compressed, selected, size_t(selections), size_t(heads), size_t(dim), pairs, inverse, \
-                    stride, out);
-            if (heads == 32) { SD_DS_ATTENTION_PREPARED(2) } else { SD_DS_ATTENTION_PREPARED(4) }
+                ds_attention_output_wmma<HM, B><<<out_grid, 128, keys_bytes, value.stream>>>(scores, partial, wmma_chunks, raw, \
+                    size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections), size_t(heads), size_t(dim), pairs, \
+                    inverse, stride, out);
+            if (heads == 32) {
+                if (single) { SD_DS_ATTENTION_PREPARED(2, 1) } else { SD_DS_ATTENTION_PREPARED(2, 2) }
+            } else {
+                if (single) { SD_DS_ATTENTION_PREPARED(4, 1) } else { SD_DS_ATTENTION_PREPARED(4, 2) }
+            }
             #undef SD_DS_ATTENTION_PREPARED
             check(hipGetLastError());
             return 0;
