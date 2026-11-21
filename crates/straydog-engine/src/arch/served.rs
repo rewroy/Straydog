@@ -1112,15 +1112,21 @@ impl<E: Engines> Session<E> {
         Ok(())
     }
 
+    /// A token a kept conversation may hold: the vocabulary's, and an image position's where the engines read images (its id from the
+    /// image's digest, as the next request's prompt gives it again: an agent's conversation holds the pages it checked, and none was kept).
+    fn keeps(&self, token: u32) -> bool {
+        (token as usize) < self.vocabulary || (token >= crate::vision::IMAGE_TOKEN && self.engines.vision())
+    }
+
     /// The kept conversation (`--keep-conversation`, [`Engines::export_checkpoint`]): the latest turn's checkpoint, where the last reply
     /// began, as a prefix state's bytes ([`crate::prefix::header`]: the tokens, then the engines' checkpoint) and its tokens. None without such a
-    /// checkpoint, or with one holding image tokens (as a resident model keeps none of those).
+    /// checkpoint, or with one holding tokens [`keeps`](Self::keeps) refuses.
     pub fn export_conversation(&mut self) -> Result<Option<(Vec<u32>, Vec<u8>)>, String> {
         let engines = &self.engines;
         let Some(checkpoint) = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && engines.holds(checkpoint.slot)) else {
             return Ok(None);
         };
-        if checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+        if !checkpoint.tokens.iter().all(|&token| self.keeps(token)) {
             return Ok(None);
         }
         let (slot, tokens) = (checkpoint.slot, checkpoint.tokens.clone());
@@ -1146,7 +1152,7 @@ impl<E: Engines> Session<E> {
     /// The bytes [`export_conversation`](Self::export_conversation) would give now (the latest turn's tokens with them); None as it gives none.
     pub fn conversation_size(&self) -> Option<(usize, u64)> {
         let checkpoint = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && self.engines.holds(checkpoint.slot))?;
-        (!checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary)).then_some(())?;
+        checkpoint.tokens.iter().all(|&token| self.keeps(token)).then_some(())?;
         // (an estimate before the copy: the state grows with its tokens about as the engines' snapshots do)
         Some((checkpoint.tokens.len(), self.engines.checkpoint_bytes(checkpoint.slot)))
     }
@@ -1162,7 +1168,7 @@ impl<E: Engines> Session<E> {
             return Err("not a kept conversation of these engines".into());
         }
         let tokens = crate::prefix::tokens_of(parsed.payload, parsed.tokens);
-        if tokens.is_empty() || tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+        if tokens.is_empty() || !tokens.iter().all(|&token| self.keeps(token)) {
             return Err("a kept conversation with tokens outside the vocabulary".into());
         }
         let engines = &self.engines;

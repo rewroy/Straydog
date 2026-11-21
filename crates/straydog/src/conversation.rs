@@ -12,9 +12,10 @@
 //! The first request whose prompt begins with those tokens asks for the state (the worker's `conversation_wanted` event), the server reads and opens it
 //! and sends it, and the worker continues the request from it. A request that does not begin with them leaves the file as it is, for a later one.
 //!
-//! Which file a start takes is decided by a key made as the system block's is ([`crate::prefix::description`]): the bundle, the engine's version and
-//! build, and everything the worker's placement decided that changes the state's layout or its numbers. A start with another bundle, build or placement
-//! never takes it; the file is deleted, as it is when the option is off at the start, or when it does not open.
+//! Which file a start takes is decided by a key made as the system block's is, but without the engine's version and build
+//! ([`crate::prefix::lasting_description`]): the bundle and everything the worker's placement decided that changes the state's layout or its
+//! numbers. A conversation goes on across a deploy; a start with another bundle or placement never takes it, and the file is deleted, as it is
+//! when the option is off at the start, or when it does not open. A state whose bytes do not fit the engines is refused at import.
 //!
 //! The state is sealed for the user: on Windows by DPAPI, on Linux under a key the kernel's keyring holds for the user, which lasts the boot (a
 //! state kept before a reboot no longer opens, and is deleted). Elsewhere the option is accepted and keeps nothing.
@@ -37,8 +38,6 @@ pub struct Keeper {
 struct On {
     settings: Settings,
     store: crate::conversation_store::Store,
-    /// The executable's hash, made by a thread of its own.
-    build: Arc<crate::prefix_store::Build>,
 }
 
 /// What the state saved at a stop took, for the line in the log.
@@ -52,15 +51,7 @@ impl On {
     /// The key of this start's file and the layout of the states it may take. None when the worker offers no states (it is not a model that keeps
     /// them), or the executable could not be read.
     fn key(&self, ready: &Value) -> Option<([u8; 32], u32)> {
-        let build = match self.build.get() {
-            Ok(build) => *build,
-            Err(message) => {
-                tracing::debug!("Straydog conversation: none kept, the executable cannot be read ({message})");
-                return None;
-            }
-        };
-        let text: String = build.iter().map(|byte| format!("{byte:02x}")).collect();
-        let description = crate::prefix::description(&self.settings, ready, &text)?;
+        let description = crate::prefix::lasting_description(&self.settings, ready)?;
         Some((crate::conversation_store::key_of(&description), straydog_engine::prefix::VERSION))
     }
 }
@@ -81,7 +72,7 @@ impl Keeper {
         // (where the runtime directory and the home are not the server's to write, as under a service, the keyring's lock goes beside the file)
         #[cfg(target_os = "linux")]
         crate::prefix_store::keyring_lock_beside(&settings.data_dir.join("conversation"));
-        Keeper { on: Some(Arc::new(On { settings: settings.clone(), store, build: crate::prefix_store::shared_build() })) }
+        Keeper { on: Some(Arc::new(On { settings: settings.clone(), store })) }
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]

@@ -497,8 +497,8 @@ impl<E: Engines> Loaded<E> {
         // go without it and a reasoning_end event marks the place. The same text otherwise written (the
         // reasoning quoting a tag) stays the reasoning's.
         let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
-        // (a conversation an earlier run kept, which this prompt goes on from: not one with images)
-        let kept_seconds = if images.is_empty() { crate::worker::take_kept(&mut self.model, output, id, cancel, &ids) } else { None };
+        // (a conversation an earlier run kept, which this prompt goes on from: its images' positions are in the state, by their digests' ids)
+        let kept_seconds = crate::worker::take_kept(&mut self.model, output, id, cancel, &ids);
         let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),

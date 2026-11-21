@@ -35,6 +35,11 @@ struct Facts<'a> {
 
 #[cfg(any(windows, target_os = "linux", test))]
 impl Facts<'_> {
+    /// The facts without the engine's version and build ([`lasting_description`]).
+    fn lasting(self) -> Self {
+        Facts { version: "", build: "", ..self }
+    }
+
     fn description(&self) -> String {
         format!("bundle {}\nversion {}\nbuild {}\nlayout {}\ncontext {}\nplacement {}\ndevices {}\ndrafts {}\nnumerics {}\n",
                 self.bundle, self.version, self.build, self.layout, self.context, self.placement, self.devices, self.drafts, self.numerics)
@@ -67,6 +72,14 @@ fn facts<'a>(settings: &Settings, ready: &'a Value, build: &'a str) -> Option<Fa
 #[cfg(any(windows, target_os = "linux", test))]
 pub fn description(settings: &Settings, ready: &Value, build: &str) -> Option<String> {
     facts(settings, ready, build).map(|facts| facts.description())
+}
+
+/// [`description`] for a conversation kept across a stop: without the engine's version and build, which every deploy changes. What the
+/// state's bytes must fit stays in it (the layout, the context, the placement, the numerics), and a state that does not fit the engines
+/// to the byte is refused at import all the same. On Homelab, every start after a deploy deleted the kept conversation as another build's.
+#[cfg(any(windows, target_os = "linux", test))]
+pub fn lasting_description(settings: &Settings, ready: &Value) -> Option<String> {
+    facts(settings, ready, "").map(|facts| facts.lasting().description())
 }
 
 /// A state saved, opened: what the worker is to be handed.
@@ -306,5 +319,18 @@ mod tests {
             assert_ne!(base, facts_of(change), "{name} does not change the key's text");
         }
         assert_eq!(base, facts_of(|ready| ready["placement"]["vram_budgets"] = json!([4_000_000_000u64])), "the budget a start was given is not a fact");
+    }
+
+    /// A kept conversation's key leaves out the version and the build, which a deploy changes, and keeps every fact of the state's own.
+    #[test]
+    fn a_kept_conversations_key_outlasts_a_deploy() {
+        let facts = |version: &'static str, build: &'static str, context: &str| Facts {
+            bundle: "deepseek41/unsloth/UD-IQ2_XXS".into(), version, build, layout: "aa", context: context.into(), placement: "p".into(),
+            devices: "0,1 split experts".into(), drafts: "0".into(), numerics: "gemm Fp16".into() };
+        assert_ne!(facts("0.1.15", "b", "262144").description(), facts("0.1.16", "c", "262144").description());
+        let lasting = facts("0.1.15", "b", "262144").lasting().description();
+        assert_eq!(lasting, facts("0.1.16", "c", "262144").lasting().description());
+        assert!(lasting.contains("\nversion \nbuild \n"), "{lasting}");
+        assert_ne!(lasting, facts("0.1.15", "b", "131072").lasting().description());
     }
 }
