@@ -856,7 +856,7 @@ and a 102.2 GiB host tier (12,629 experts' worth, of 15,360).
   - A fresh long prompt on UD-IQ2_XXS (284 GB, beyond the VRAM and the 101 GiB host tier) reads
     ~80 GB of experts from the drive (~20 s of waits at ~4 GB/s): its passes are bound by those
     reads, not by their kernels. Reading the next layers' drive experts into the host tier ahead
-    of time read 28-47% more and saved nothing (plan/reject).
+    of time read 28-47% more and saved nothing (2026-11-21).
   - The lent arena (§5) covers the larger buffers: the slot count between passes barely changes
     (6064 to 6059), and a long pass writes back the few hundred experts its buffers take.
   - Engram decodes a batch at a time, so a wide pass's Engram rows no longer outgrow the row cache.
