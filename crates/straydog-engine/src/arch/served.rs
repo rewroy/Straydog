@@ -504,6 +504,40 @@ struct Decoded {
     marked: Vec<usize>,
     marks: usize,
     mark_seconds: f64,
+    /// Long lookup matches seen ([`WIDE_PROBE`]): how many, the tokens a pass of [`WIDE_PROBE`] drafts would have
+    /// emitted for them (its accepted drafts and the token after), and the passes those tokens took.
+    wide: (usize, usize, usize),
+}
+
+/// The drafts a long lookup match is measured against (not verified): what a verify pass of eight rows would take of
+/// a copy, against the engines' rows now (a diagnostic of whether wider verify passes would pay).
+const WIDE_PROBE: usize = 7;
+
+/// A long lookup match being followed: its drafts, the tokens emitted since it was proposed, the passes they took.
+struct Probe {
+    drafts: Vec<u32>,
+    after: Vec<u32>,
+    passes: usize,
+}
+
+impl Probe {
+    /// The match's run once known: (its drafts' accepted count + the token after, the passes the sequence took to
+    /// emit that many), or None while the emitted tokens still agree with the drafts.
+    fn settled(&self) -> Option<(usize, usize)> {
+        let agreed = self.drafts.iter().zip(&self.after).take_while(|(draft, token)| draft == token).count();
+        (self.after.len() > agreed).then_some((agreed + 1, self.passes))
+    }
+
+    /// One more pass, which emitted `tokens` after those before: into `done` once the run is known (and the probe ends).
+    fn passed(probe: &mut Option<Probe>, tokens: &[u32], done: &mut Decoded) {
+        let Some(followed) = probe.as_mut() else { return };
+        followed.passes += 1;
+        followed.after.extend_from_slice(tokens);
+        if let Some((tokens, passes)) = followed.settled() {
+            (done.wide.0, done.wide.1, done.wide.2) = (done.wide.0 + 1, done.wide.1 + tokens, done.wide.2 + passes);
+            *probe = None;
+        }
+    }
 }
 
 /// How a drafter is to choose its tokens for a request with this sampling: drawn from its own distribution when
@@ -563,6 +597,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
     }
     let mut policy = Policy::new(rows);
     let mut done = Decoded::default();
+    let mut probe: Option<Probe> = None;
     let mut mark_at = history.len() + MARK_EVERY;
     let mut next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
     loop {
@@ -584,6 +619,10 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             let mut lookup = None;
             if matched >= LONG_MATCH {
                 lookup = Some(policy.width(matched).min(proposal.len()));
+                if probe.is_none() {
+                    let (drafts, _) = ngrams.propose(WIDE_PROBE);
+                    probe = (!drafts.is_empty()).then_some(Probe { drafts, after: Vec::new(), passes: 0 });
+                }
             }
             match lookup.filter(|&width| width > 0) {
                 Some(width) => (proposal[..width.min(max_new - done.emitted)].to_vec(), false),
@@ -618,6 +657,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             (done.passes, done.fed) = (done.passes + 1, done.fed + 1);
             mark(engines, history, &mut mark_at, &mut done)?;
             next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
+            Probe::passed(&mut probe, &[next], &mut done);
             continue;
         }
         let fed: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
@@ -661,6 +701,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         history.push(next);
         history.extend_from_slice(&drafts[..kept]);
         ngrams.extend(&drafts[..kept]);
+        Probe::passed(&mut probe, &drafts[..kept].iter().copied().chain([token]).collect::<Vec<_>>(), &mut done);
         if stop {
             break;
         }
@@ -939,6 +980,7 @@ impl<E: Engines> Session<E> {
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,
             "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
             "engine_draft_tokens": decoded.engine_drafted, "accepted_engine_drafts": decoded.engine_accepted,
+            "wide_lookup": [decoded.wide.0, decoded.wide.1, decoded.wide.2],
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
             "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
             "decode_profile": decode_profile,
@@ -1593,6 +1635,27 @@ mod tests {
         assert_eq!(done, plain_done);
         assert_eq!(empty.draft_calls.len(), 7);
         assert!(empty.verified.is_empty() && empty.rewinds.is_empty());
+    }
+
+    /// A long lookup match is followed: the toy's reply repeats itself, so a pass of eight rows would take each run in one pass
+    /// where the engine's rows of four take two or more; nothing of what is decoded changes.
+    #[test]
+    fn long_lookup_matches_say_what_a_wider_pass_would_take() {
+        // (a reply that copies seven tokens over and over: each run is eight tokens, two passes of four rows)
+        let copied = [1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6, 7, 1];
+        let (plain, _) = run(1, &copied, &[], 80, &Sampling::GREEDY, 1);
+        let (out, done) = run(4, &copied, &[], 80, &Sampling::GREEDY, 1);
+        assert_eq!(out, plain);
+        let (matches, tokens, passes) = done.wide;
+        // (the last run may end at max_new)
+        assert!(matches > 1 && tokens > (matches - 1) * (WIDE_PROBE + 1) && tokens <= matches * (WIDE_PROBE + 1) && passes == 2 * matches,
+                "{:?}", done.wide);
+        // (a reply whose matches are short ones: each run a pass, as wide as now)
+        let (out, done) = run(4, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
+        assert_eq!(out, run(1, &PROMPT, &[], 80, &Sampling::GREEDY, 1).0);
+        assert!(done.wide.0 > 0 && done.wide.2 == done.wide.0, "{:?}", done.wide);
+        // (one row a pass has no lookup)
+        assert_eq!(run(1, &copied, &[], 80, &Sampling::GREEDY, 1).1.wide, (0, 0, 0));
     }
 
     /// A lookup match of [`LONG_MATCH`] tokens is verified without asking the engine for a draft,

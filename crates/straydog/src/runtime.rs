@@ -740,6 +740,10 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
                                                        _ => String::new(),
                                                    }),
             _ => String::new(),
+        } + &match timings["wide_lookup"].as_array().map(|wide| wide.iter().map(|value| value.as_u64().unwrap_or(0)).collect::<Vec<_>>()).as_deref() {
+            // (long lookup matches, followed: the tokens a verify pass of eight rows would have emitted for them, against the passes they took)
+            Some(&[matches, tokens, passes]) if matches > 0 => format!("; long lookup matches {matches}: {tokens} tokens in {passes} passes, a pass of 8 each"),
+            _ => String::new(),
         } + &match (timings["penalty_top_passes"].as_u64(), timings["penalty_top_fallback_passes"].as_u64()) {
             (Some(passes), Some(retries)) => format!("; penalized top: {passes} passes, {retries} full-logit retries"),
             _ => String::new(),
