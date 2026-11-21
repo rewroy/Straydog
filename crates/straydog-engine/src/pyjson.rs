@@ -339,22 +339,45 @@ fn write_value(out: &mut String, value: &Value) {
     }
 }
 
-/// A JSON string as Python writes it without ASCII escaping: only `"`, `\` and control characters.
+/// A JSON string as Python writes it without ASCII escaping: only `"`, `\` and control characters. The text between them is copied
+/// whole: a request's images are megabytes of base64 with none, and a character at a time took 30 ms of a 14.6 MB body.
 pub fn write_string(out: &mut String, text: &str) {
+    out.reserve(text.len() + 2);
     out.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            control if (control as u32) < 0x20 => write!(out, "\\u{:04x}", control as u32).unwrap(),
-            other => out.push(other),
+    let (bytes, mut plain, mut at) = (text.as_bytes(), 0, 0);
+    while at < bytes.len() {
+        // (32 bytes at a time where none is to be escaped: a test of every byte without a branch, which the compiler makes wide)
+        if at + 32 <= bytes.len() && !bytes[at..at + 32].iter().fold(false, |any, &byte| any | (byte == b'"') | (byte == b'\\') | (byte < 0x20)) {
+            at += 32;
+            continue;
         }
+        // (each of these is one byte that is a whole character: no byte of a longer UTF-8 character is below 0x80)
+        let escaped = match bytes[at] {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            control if control < 0x20 => {
+                out.push_str(&text[plain..at]);
+                write!(out, "\\u{control:04x}").unwrap();
+                at += 1;
+                plain = at;
+                continue;
+            }
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        out.push_str(&text[plain..at]);
+        out.push_str(escaped);
+        at += 1;
+        plain = at;
     }
+    out.push_str(&text[plain..]);
     out.push('"');
 }
 
@@ -400,4 +423,46 @@ pub fn float_repr(number: f64) -> String {
         write!(out, "e{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.abs()).unwrap();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writer that copies plain runs whole writes what one character at a time wrote, for text with every escape, multi-byte characters
+    /// and runs of every length about the 32 bytes it tests at a time, and what it writes parses back.
+    #[test]
+    fn strings_are_written_as_one_character_at_a_time() {
+        fn one_at_a_time(text: &str) -> String {
+            let mut out = String::from('"');
+            for character in text.chars() {
+                match character {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\u{8}' => out.push_str("\\b"),
+                    '\u{c}' => out.push_str("\\f"),
+                    control if (control as u32) < 0x20 => write!(out, "\\u{:04x}", control as u32).unwrap(),
+                    other => out.push(other),
+                }
+            }
+            out.push('"');
+            out
+        }
+        let characters = ['a', 'Z', '0', ' ', '"', '\\', '\n', '\r', '\t', '\u{8}', '\u{c}', '\u{1}', '\u{1f}', '\u{7f}', 'é', '日', '😀', '\u{e001}'];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for length in 0..200 {
+            for plain in [0u64, 1, 8, 64] {
+                let text: String = (0..length).map(|_| if next() % 64 < plain { 'x' } else { characters[(next() % characters.len() as u64) as usize] })
+                    .collect();
+                let mut written = String::new();
+                write_string(&mut written, &text);
+                assert_eq!(written, one_at_a_time(&text), "{text:?}");
+                assert_eq!(parse(&written).unwrap(), Value::Str(text));
+            }
+        }
+    }
 }

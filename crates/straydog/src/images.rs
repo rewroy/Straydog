@@ -115,19 +115,54 @@ fn data_url(url: &str) -> Result<Vec<u8>, String> {
     base64(payload)
 }
 
+/// What each byte is to [`base64`]: its six bits, [`SKIPPED`] or [`INVALID`].
+const BASE64: [u8; 256] = {
+    let mut table = [INVALID; 256];
+    let mut at = 0;
+    while at < 26 {
+        table[b'A' as usize + at] = at as u8;
+        table[b'a' as usize + at] = 26 + at as u8;
+        at += 1;
+    }
+    let mut digit = 0;
+    while digit < 10 {
+        table[b'0' as usize + digit] = 52 + digit as u8;
+        digit += 1;
+    }
+    (table[b'+' as usize], table[b'-' as usize], table[b'/' as usize], table[b'_' as usize]) = (62, 62, 63, 63);
+    (table[b'=' as usize], table[b'\n' as usize], table[b'\r' as usize], table[b' ' as usize]) = (SKIPPED, SKIPPED, SKIPPED, SKIPPED);
+    table
+};
+const SKIPPED: u8 = 64;
+const INVALID: u8 = 128;
+
+/// Either alphabet, padding and line breaks left out. Four characters at a time where they are all data: a conversation sends all its
+/// images with every request, and a character at a time took 63 ms of a request with 26 screenshots of 400 KB.
 fn base64(text: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let (mut bits, mut count) = (0u32, 0u32);
-    for byte in text.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' | b'\n' | b'\r' | b' ' => continue,
-            _ => return Err("invalid base64 image data".into()),
-        };
+    let too_large = || format!("an image of more than {} MB", vision::MAX_BYTES >> 20);
+    let input = text.as_bytes();
+    let mut out = Vec::with_capacity((input.len() / 4 * 3).min(vision::MAX_BYTES + 3));
+    let (mut bits, mut count, mut at) = (0u32, 0u32, 0);
+    while at < input.len() {
+        if count == 0 && at + 4 <= input.len() {
+            let [a, b, c, d] = [0, 1, 2, 3].map(|offset| BASE64[input[at + offset] as usize]);
+            if (a | b | c | d) < SKIPPED {
+                let group = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
+                out.extend_from_slice(&[(group >> 16) as u8, (group >> 8) as u8, group as u8]);
+                if out.len() > vision::MAX_BYTES {
+                    return Err(too_large());
+                }
+                at += 4;
+                continue;
+            }
+        }
+        let value = BASE64[input[at] as usize];
+        at += 1;
+        match value {
+            SKIPPED => continue,
+            INVALID => return Err("invalid base64 image data".into()),
+            _ => {}
+        }
         bits = (bits << 6) | u32::from(value);
         count += 6;
         if count >= 8 {
@@ -135,7 +170,7 @@ fn base64(text: &str) -> Result<Vec<u8>, String> {
             out.push((bits >> count) as u8);
         }
         if out.len() > vision::MAX_BYTES {
-            return Err(format!("an image of more than {} MB", vision::MAX_BYTES >> 20));
+            return Err(too_large());
         }
     }
     Ok(out)
@@ -264,6 +299,49 @@ pub fn ids(text: &Text, pieces: &[Piece<'_>], images: &[Image]) -> Result<(Vec<u
 mod tests {
     use super::*;
     use straydog_engine::pyjson;
+
+    /// The four-at-a-time decoder gives what one character at a time gave, for either alphabet, with padding and line breaks anywhere,
+    /// and refuses what it refused.
+    #[test]
+    fn base64_decodes_as_one_character_at_a_time() {
+        fn one_at_a_time(text: &str) -> Result<Vec<u8>, String> {
+            let mut out = Vec::new();
+            let (mut bits, mut count) = (0u32, 0u32);
+            for byte in text.bytes() {
+                let value = match byte {
+                    b'A'..=b'Z' => byte - b'A',
+                    b'a'..=b'z' => byte - b'a' + 26,
+                    b'0'..=b'9' => byte - b'0' + 52,
+                    b'+' | b'-' => 62,
+                    b'/' | b'_' => 63,
+                    b'=' | b'\n' | b'\r' | b' ' => continue,
+                    _ => return Err("invalid base64 image data".into()),
+                };
+                bits = (bits << 6) | u32::from(value);
+                count += 6;
+                if count >= 8 {
+                    count -= 8;
+                    out.push((bits >> count) as u8);
+                }
+            }
+            Ok(out)
+        }
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_= \r\n";
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for length in 0..300 {
+            for _ in 0..8 {
+                let text: String = (0..length).map(|_| alphabet[(next() % alphabet.len() as u64) as usize] as char).collect();
+                assert_eq!(base64(&text), one_at_a_time(&text), "{text:?}");
+                let mut bad = text.clone();
+                bad.insert((next() % (length as u64 + 1)) as usize, ['!', '.', '\t', '\u{e9}'][(next() % 4) as usize]);
+                assert_eq!(base64(&bad), one_at_a_time(&bad), "{bad:?}");
+            }
+        }
+        assert_eq!(base64("AAEC").unwrap(), [0, 1, 2]);
+        assert_eq!(base64("/w==").unwrap(), [255]);
+        assert!(base64(&"A".repeat((vision::MAX_BYTES + 3) / 3 * 4 + 8)).unwrap_err().contains("more than"));
+    }
 
     #[test]
     fn image_parts_become_markers() {
