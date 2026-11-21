@@ -167,10 +167,14 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
         }
         policy.reset();
         let mut logits = Vec::new();
+        let prefilled = std::time::Instant::now();
         for piece in prompt.chunks(settings.chunk) {
             logits = forward_split(engines, piece)?;
             inject(engines, drafter, piece.len())?;
         }
+        let seconds = prefilled.elapsed().as_secs_f64();
+        println!("prefill prompt {index} run {}: {} tokens in {seconds:.3} s, {:.0} tokens a second", settings.run, prompt.len(),
+                 prompt.len() as f64 / seconds);
         let mut emitted = vec![argmax(&logits) as u32];
         let (mut passes, mut rounds, mut drafted, mut widths, mut accepted_all, mut drafting) = (0, 0, 0, [0usize; 4], 0, 0.0);
         let mut verified = false;

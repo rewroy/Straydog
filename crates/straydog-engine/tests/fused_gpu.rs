@@ -7,6 +7,9 @@
 //! - sd_op_norm_linears_rope (DeepSeek-V4.1's decode q_a norm and q_b on one of two GPUs, with
 //!   the kv row's norm and rope into a ring row beside them) against sd_op_rms_norm, sd_op_linears
 //!   and sd_op_norm_rope: the same bits (Q8_0 rows on the F32 and on the Q8 decode kernels);
+//! - sd_op_linears_norm_rope_rows (a verify pass's 2 to 4 rows of q_a and kv, q's norm in place, kv's
+//!   norm and rope into scattered ring rows) against sd_op_linears, sd_op_rms_norm and sd_op_norm_rope:
+//!   the same bits (Q8_0 and Q6_K on both kernels; and one row of Q6_K on the Q8 kernels);
 //! - sd_op_top_k against a reference of its rule (ties keep the lower index, -inf never kept, -1 for
 //!   empty slots) on scores with many ties, 511 to 131072 groups, top 512: the same indices;
 //! - sd_op_index_select (DeepSeek-V4.1's indexer: 32 heads of 128, 64 rotated, top 512 of a few
@@ -680,13 +683,20 @@ fn linears_norm_tail_graph_matches_separate_ops() {
     let mut gpu = Backend::new(0, 1 << 30).unwrap();
     let mut random = Random(0x3c6e_f372_fe94_f82b);
     let (rank, dim, rope, context) = (1280usize, 512usize, 64usize, 16usize);
-    // (Q8_0 rows also on the Q8 decode kernels: the same rows in either launch)
-    for (kind, cols, q8) in [(0u32, 128usize, false), (8, 5120, false), (8, 5120, true)] {
+    // (Q8_0 rows also on the Q8 decode kernels: the same rows in either launch; Q6_K's on them)
+    for (kind, cols, q8) in [(0u32, 128usize, false), (8, 5120, false), (8, 5120, true), (14, 5120, true)] {
         gpu.configure_decode(q8).unwrap();
-        let key = 121 + u64::from(q8);
+        let key = 121 + u64::from(q8) + 2 * u64::from(kind == 14);
         let matrices: Vec<Buffer> = [rank, dim].into_iter().map(|rows| {
             if kind == 0 { upload(&mut gpu, &random.floats(rows * cols, 0.02)) }
-            else {
+            else if kind == 14 {
+                let mut bytes = Vec::new();
+                for _ in 0..rows * cols / 256 {
+                    for _ in 0..208 { bytes.push(random.next() as u8); }
+                    bytes.extend_from_slice(&0x1c00u16.to_le_bytes());
+                }
+                gpu.upload_bytes(&bytes).unwrap()
+            } else {
                 let mut bytes = Vec::new();
                 for _ in 0..rows * cols / 32 {
                     bytes.extend_from_slice(&0x2000u16.to_le_bytes());
@@ -730,6 +740,75 @@ fn linears_norm_tail_graph_matches_separate_ops() {
             }
         }
     }
+}
+
+#[test]
+fn linears_norm_rope_of_a_verify_pass_gives_each_row_its_own_bits() {
+    let _one_at_a_time = one_at_a_time();
+    // (DeepSeek-V4.1's verify rows: q_a and kv of 2 to 4 rows, each row's q normed in place and its kv normed and rotated into a
+    // scattered ring row, in one launch, against the linears, the norm and the norm and rope apart, as the engine ran them)
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x6a09_e667_f3bc_c908);
+    let (rank, dim, rope, context, width) = (1280usize, 512usize, 64usize, 16usize, 5120usize);
+    let scratch = gpu.buffer(16 << 20).unwrap();
+    let frequencies = upload(&mut gpu, &(0..rope / 2).map(|i| 1e4f32.powf(-(2.0 * i as f32) / rope as f32)).collect::<Vec<_>>());
+    let qweight = upload(&mut gpu, &random.floats(rank, 1.0));
+    let kvweight = upload(&mut gpu, &random.floats(dim, 1.0));
+    // (Q8_0 and Q6_K, the attention's formats of Unsloth's UD-IQ2_XXS, on the F32 and on the Q8 decode kernels)
+    for (kind, q8) in [(8u32, false), (8, true), (14, false), (14, true)] {
+        gpu.configure_decode(q8).unwrap();
+        let matrices: Vec<Buffer> = [rank, dim].into_iter().map(|rows| {
+            let mut bytes = Vec::new();
+            if kind == 8 {
+                for _ in 0..rows * width / 32 {
+                    bytes.extend_from_slice(&0x2000u16.to_le_bytes());
+                    for _ in 0..32 { bytes.push(random.next() as u8); }
+                }
+            } else {
+                for _ in 0..rows * width / 256 {
+                    for _ in 0..208 { bytes.push(random.next() as u8); }
+                    bytes.extend_from_slice(&0x1c00u16.to_le_bytes());
+                }
+            }
+            gpu.upload_bytes(&bytes).unwrap()
+        }).collect();
+        for rows in 2..=4usize {
+            let input = upload(&mut gpu, &random.floats(rows * width, 2.0));
+            let positions = gpu.buffer((rows * 4) as u64).unwrap();
+            let out_rows = gpu.buffer((rows * 4) as u64).unwrap();
+            gpu.write_buffer(&positions, 0, &(0..rows as i32).map(|row| 70_001 + row).collect::<Vec<_>>()).unwrap();
+            gpu.write_buffer(&out_rows, 0, &(0..rows as i32).map(|row| 5 + 2 * row).collect::<Vec<_>>()).unwrap();
+            let items = |q: &Buffer, kv: &Buffer| vec![
+                Linear { weights: matrices[0], kind, rows: rank as u64, cols: width as u64, first_row: 0, input: input.base(), output: q.base() },
+                Linear { weights: matrices[1], kind, rows: dim as u64, cols: width as u64, first_row: 0, input: input.base(), output: kv.base() },
+            ];
+            // apart: q's and kv's rows packed
+            let (q_a, kv_a, ring_a) = (gpu.buffer((rows * rank * 4) as u64).unwrap(), gpu.buffer((rows * dim * 4) as u64).unwrap(),
+                                       upload(&mut gpu, &vec![0.0; context * dim]));
+            gpu.linears(&items(&q_a, &kv_a), rows as u64, 0, 0, &scratch).unwrap();
+            gpu.rms_norm(q_a.base(), &qweight, rows as u64, rank as u64, 1e-6, q_a.base()).unwrap();
+            gpu.norm_rope(kv_a.base(), &kvweight, rows as u64, dim as u64, 1e-6, Some((rope as u64, &positions, &frequencies)),
+                          Some(out_rows.base()), ring_a.base(), context as u64).unwrap();
+            // in one launch: both rows rank apart
+            let (q_b, kv_b, ring_b) = (gpu.buffer((rows * rank * 4) as u64).unwrap(), gpu.buffer((rows * rank * 4) as u64).unwrap(),
+                                       upload(&mut gpu, &vec![0.0; context * dim]));
+            let side = NormRope { input: kv_b.base(), weight: &kvweight, width: dim as u64, eps: 1e-6,
+                rope: Some((rope as u64, &positions, &frequencies)), out_rows: Some(out_rows.base()), out: ring_b.base(),
+                out_count: context as u64 };
+            gpu.linears_norm_rope_rows(&items(&q_b, &kv_b), rows as u64, width as u64, rank as u64, q_b.base(), &qweight, rank as u64, 1e-6,
+                                       q_b.base(), &side).unwrap();
+            let what = format!("kind {kind}, Q8 {q8}, {rows} rows");
+            assert_eq!(read(&mut gpu, &q_a, rows * rank), read(&mut gpu, &q_b, rows * rank), "{what}: q normed");
+            assert_eq!(read(&mut gpu, &ring_a, context * dim), read(&mut gpu, &ring_b, context * dim), "{what}: the ring");
+            let (kv_apart, kv_together) = (read(&mut gpu, &kv_a, rows * dim), read(&mut gpu, &kv_b, rows * rank));
+            for row in 0..rows {
+                assert_eq!(kv_apart[row * dim..(row + 1) * dim], kv_together[row * rank..row * rank + dim], "{what}: kv row {row}");
+            }
+            // (the rows differ: a row that took row 0's would show here)
+            assert_ne!(read(&mut gpu, &q_b, rank)[..], read(&mut gpu, &q_b, 2 * rank)[rank..], "{what}");
+        }
+    }
+    gpu.configure_decode(false).unwrap();
 }
 
 /// DeepSeek-V4.1's routing (384 experts, square-root softplus, a bias, top 6), whose tail runs in

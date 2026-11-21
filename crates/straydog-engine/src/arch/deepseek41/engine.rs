@@ -242,6 +242,13 @@ impl RowRegion {
     }
 }
 
+/// DS41_SUM_OVERLAP=0 (development): a long pass's attention sums on the devices' streams, a batch at a time, as before the copies
+/// beside the compute (Engine::sum_parts_start).
+fn sum_overlap() -> bool {
+    static OVERLAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OVERLAP.get_or_init(|| std::env::var("DS41_SUM_OVERLAP").map_or(true, |value| value != "0"))
+}
+
 /// Tokens past a pass's reach its kv source buffers are taken back for (the next passes'
 /// groups), and past which, the sequence shorter, they go back to the expert store.
 const STATE_AHEAD: usize = 4096;
@@ -324,6 +331,8 @@ struct Work {
     head: Buffer,
     /// hc_step's partial sums and counters.
     hc_workspace: Buffer,
+    /// With two devices, the other's part of a batch's attention output, copied over (ops::sum_devices_start).
+    inbox: Buffer,
     /// The experts of a few rows over their slots: with several devices, this device's share of
     /// the experts' activations (per route a row of the expert width, its share filled; two, used
     /// by waves in turn) and their sum; on one device, the activations.
@@ -404,6 +413,11 @@ struct Shard {
     /// the store's region `arena` is (none: not lent).
     reclaimed: u64,
     arena_region: Option<usize>,
+    /// The ring of a prompt pass's FP16 expansions (the native side's: [`EXPANSIONS`]), the store's region it is lent to between
+    /// prompt passes (none: not lent), and whether a prompt pass has it back.
+    expansions: Option<Buffer>,
+    expansion_region: Option<usize>,
+    expansions_back: bool,
     /// The kv sources' buffers lent to the store too.
     state_regions: Vec<StateRegion>,
     /// And the batch buffers a pass fills only as far as its rows (the index scores, queries, attended rows).
@@ -542,7 +556,7 @@ fn check_slots(shard: &mut Shard, layer: usize, experts: &[usize], slots: &[Buff
 /// The sequence state a later pass continues, in host memory ([`Engine::snapshot`]): the window
 /// rings' rows of the last `window` positions (oldest first), each kv source's compressed rows,
 /// index keys and tail rows, and the counters.
-#[derive(Default)]
+#[derive(Default, Debug, PartialEq)]
 pub struct Snapshot {
     position: usize,
     history: Vec<u32>,
@@ -566,11 +580,110 @@ impl Snapshot {
         self.position
     }
 
+    /// The sequence's tokens.
+    pub fn history(&self) -> &[u32] {
+        &self.history
+    }
+
     /// Host bytes it holds (pending ones too: their room is taken).
     pub fn bytes(&self) -> u64 {
         let floats: usize = self.windows.iter().map(|(_, rows)| rows.capacity()).sum::<usize>()
             + self.rows.iter().flat_map(|(_, kept)| kept.iter().map(Vec::capacity)).sum::<usize>();
         (floats * 4 + self.history.capacity() * 4) as u64
+    }
+}
+
+/// The bytes a [`Snapshot`] is kept in ([`Snapshot::to_bytes`]): this tag and format, then the position, the history's tokens, each kv
+/// source's (layer, groups, tail), each window's (layer, rows) and each source's four arrays (layer, compressed rows, index keys, tail kv,
+/// tail gate), every count before what it counts, little-endian.
+const SNAPSHOT_TAG: &[u8; 8] = b"SDS41SNP";
+const SNAPSHOT_FORMAT: u64 = 1;
+
+impl Snapshot {
+    /// The snapshot as bytes, for a later start ([`Snapshot::from_bytes`]); refused while its copy is pending.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        if self.pending {
+            return Err("a snapshot written before its copy finished".into());
+        }
+        fn put(out: &mut Vec<u8>, value: usize) {
+            out.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+        fn floats(out: &mut Vec<u8>, values: &[f32]) {
+            put(out, values.len());
+            out.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        }
+        let mut out = Vec::with_capacity(self.bytes() as usize + 4096);
+        out.extend_from_slice(SNAPSHOT_TAG);
+        put(&mut out, SNAPSHOT_FORMAT as usize);
+        put(&mut out, self.position);
+        put(&mut out, self.history.len());
+        out.extend(self.history.iter().flat_map(|token| token.to_le_bytes()));
+        put(&mut out, self.sources.len());
+        for &(layer, groups, tail) in &self.sources {
+            [layer, groups, tail].into_iter().for_each(|value| put(&mut out, value));
+        }
+        put(&mut out, self.windows.len());
+        for (layer, rows) in &self.windows {
+            put(&mut out, *layer);
+            floats(&mut out, rows);
+        }
+        put(&mut out, self.rows.len());
+        for (layer, kept) in &self.rows {
+            put(&mut out, *layer);
+            kept.iter().for_each(|values| floats(&mut out, values));
+        }
+        Ok(out)
+    }
+
+    /// A snapshot from [`Snapshot::to_bytes`]'s bytes: refused if they are not whole, of another format, or longer than it. Whether it fits
+    /// an engine is [`Engine::check_snapshot`]'s to say.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Snapshot> {
+        struct Reader<'a>(&'a [u8]);
+        impl Reader<'_> {
+            fn take(&mut self, len: usize) -> Result<&[u8]> {
+                if self.0.len() < len {
+                    return Err("a kept snapshot cut short".into());
+                }
+                let (taken, rest) = self.0.split_at(len);
+                self.0 = rest;
+                Ok(taken)
+            }
+            fn count(&mut self) -> Result<usize> {
+                let value = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
+                usize::try_from(value).ok().filter(|&value| value <= self.0.len()).ok_or_else(|| "a kept snapshot's count beyond its bytes".into())
+            }
+            fn value(&mut self) -> Result<usize> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()) as usize)
+            }
+            fn floats(&mut self) -> Result<Vec<f32>> {
+                let count = self.count()?;
+                Ok(self.take(count.checked_mul(4).ok_or("a kept snapshot's count beyond its bytes")?)?.chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect())
+            }
+        }
+        let mut reader = Reader(bytes);
+        if reader.take(8)? != SNAPSHOT_TAG || reader.value()? as u64 != SNAPSHOT_FORMAT {
+            return Err("not a kept snapshot of this format".into());
+        }
+        let mut snapshot = Snapshot { position: reader.value()?, ..Default::default() };
+        let tokens = reader.count()?;
+        snapshot.history = reader.take(tokens.checked_mul(4).ok_or("a kept snapshot's count beyond its bytes")?)?.chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).collect();
+        for _ in 0..reader.count()? {
+            snapshot.sources.push((reader.value()?, reader.value()?, reader.value()?));
+        }
+        for _ in 0..reader.count()? {
+            let layer = reader.value()?;
+            snapshot.windows.push((layer, reader.floats()?));
+        }
+        for _ in 0..reader.count()? {
+            let layer = reader.value()?;
+            snapshot.rows.push((layer, [reader.floats()?, reader.floats()?, reader.floats()?, reader.floats()?]));
+        }
+        if !reader.0.is_empty() {
+            return Err("a kept snapshot with bytes after its end".into());
+        }
+        Ok(snapshot)
     }
 }
 
@@ -835,9 +948,13 @@ impl Shard {
         let initialized = started.elapsed().as_secs_f64();
         let scratch = gpu.buffer(settings.scratch_bytes)?;
         // (a prompt pass's attention weights expanded once a layer, not a batch: ATTENTION_ROWS)
-        if settings.half_gemm && settings.rows >= HALF_ROWS {
-            gpu.keep_expansions(std::env::var("DS41_EXPANSIONS").map_or(EXPANSIONS, |value| if value == "0" { 0 } else { EXPANSIONS }))?;
-        }
+        let expansions = if settings.half_gemm && settings.rows >= HALF_ROWS && std::env::var("DS41_EXPANSIONS").map_or(true, |value| value != "0") {
+            let ring = gpu.buffer_unset(EXPANSIONS)?;
+            gpu.keep_expansions_in(&ring)?;
+            Some(ring)
+        } else {
+            None
+        };
         // The normal four-token warm takes GEMV; move BLAS's lazy setup ahead of requests. Initialize both policies: batches below 32 still use F32.
         // Synthetic zero matrices touch no model, expert store or sequence state. Release
         // them before the long-lived buffers/cache are allocated (no residency change).
@@ -946,6 +1063,7 @@ impl Shard {
             // (and a part link status after the logits)
             head: floats(&mut gpu, if range.end == hp.layers.len() { VERIFY_ROWS * hp.vocabulary / parts + 1 } else { 1 })?,
             hc_workspace: floats(&mut gpu, b * w.div_ceil(64) * ((2 + hc) * hc + 2) + b)?,
+            inbox: floats(&mut gpu, if parts == 2 { b * w } else { 0 })?,
             products: [floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?, floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?],
             product: floats(&mut gpu, SLOT_ROWS * (k + 1) * ff)?,
             hidden: floats(&mut gpu, SLOT_ROWS * k * ff)?,
@@ -985,6 +1103,12 @@ impl Shard {
             Some(arena) => Some(experts.lend_region(arena)?.0),
             None => None,
         };
+        // The expansions' ring holds experts too between prompt passes (DS41_LEND_EXPANSIONS=0: not lent): a decode pass expands
+        // nothing, and the ring is 512 MiB a device, ~110 slots of UD-IQ2_XXS's ~5000.
+        let expansion_region = match expansions.filter(|_| std::env::var("DS41_LEND_EXPANSIONS").map_or(true, |value| value != "0")) {
+            Some(ring) => Some(experts.lend_region(ring)?.0),
+            None => None,
+        };
         // The kv sources' compressed rows and index keys past the sequence's reach hold experts
         // too (DS41_LEND_STATE=0: not lent): a pass takes back what it reaches, a shorter sequence
         // gives the rest back. Sized for the whole context, they sit mostly unused (a 75K-token
@@ -1021,7 +1145,8 @@ impl Shard {
             checks,
             rows,
             gpu, dense: HashMap::new(), shared: HashMap::new(), scratch, rings, sources, staging, plain: plain_buffer,
-            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, arena_region, state_regions, row_regions, experts,
+            compressed_rope: compressed_buffer, own: work.clone(), work, arena, shape, reclaimed: 0, arena_region, expansions, expansion_region,
+            expansions_back: false, state_regions, row_regions, experts,
             image_bias: None,
         })
     }
@@ -1142,7 +1267,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
             let laying = std::time::Instant::now();
             let layout = Arc::new(Layout::new(&files, roles, tensors.verifier())?.with_experts(hp.experts));
             let laid = laying.elapsed().as_secs_f64();
-            let shard = Shard::new(&hp, &settings, device, budget, layout, rows, parts)?;
+            let mut shard = Shard::new(&hp, &settings, device, budget, layout, rows, parts)?;
+            if part == 0 {
+                // (how far the store's evictions are from an LRU's and the best possible ones, on the uses it sees: a log line every
+                // window of uses)
+                shard.experts.observe_reuse();
+            }
             let [init, buffers, store, f32_warm, f16_warm] = shard.startup;
             // (the wait before a server starts, by step: T161)
             startup.extend([(format!("GPU {device} expert layout"), laid), (format!("GPU {device} init"), init),
@@ -1644,6 +1774,12 @@ impl<'a, T: Tensors> Engine<'a, T> {
     }
 
     /// Host bytes [`Engine::snapshot`] would take now.
+    /// The host bytes a [`Snapshot`] of a sequence of `tokens` takes on this engine (a kept conversation's, before it is read).
+    pub fn snapshot_bytes_at(&self, tokens: usize) -> u64 {
+        let groups: Vec<usize> = self.sources.keys().map(|&layer| tokens / self.hp.layers[layer].compressed.map_or(1, |c| c.ratio)).collect();
+        snapshot_bytes(tokens, self.hp.window, self.shards[0].rings.len(), self.hp.head_dim, self.hp.index_dim, &groups, tokens)
+    }
+
     pub fn snapshot_bytes(&self) -> u64 {
         let groups: Vec<usize> = self.sources.values().map(|source| source.groups).collect();
         snapshot_bytes(self.position, self.hp.window, self.shards[0].rings.len(), self.hp.head_dim, self.hp.index_dim, &groups,
@@ -1769,6 +1905,36 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
         }
         snapshot.pending = pending;
+        Ok(())
+    }
+
+    /// Whether `snapshot` (from another start: [`Snapshot::from_bytes`]) fits this engine to the byte: its layers' windows, kv sources and
+    /// arrays as this engine's would be at its position, within its context and with the history its position says.
+    pub fn check_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        let refused = |why: &str| Err(format!("a kept snapshot refused: {why}").into());
+        let (dim, index_dim, position) = (self.hp.head_dim, self.hp.index_dim, snapshot.position);
+        if position == 0 || position.checked_add(1).is_none_or(|next| next >= self.settings.context) || snapshot.history.len() != position
+            || snapshot.pending {
+            return refused("its position and history");
+        }
+        let rings: Vec<usize> = self.shards[0].rings.keys().copied().collect();
+        let windows: Vec<usize> = snapshot.windows.iter().map(|(layer, _)| *layer).collect();
+        let first = position.saturating_sub(self.hp.window);
+        if windows != rings || snapshot.windows.iter().any(|(_, rows)| rows.len() != (position - first) * dim) {
+            return refused("its windows");
+        }
+        let sources: Vec<usize> = self.shards[0].sources.keys().copied().collect();
+        if snapshot.sources.iter().map(|source| source.0).collect::<Vec<_>>() != sources
+            || snapshot.rows.iter().map(|(layer, _)| *layer).collect::<Vec<_>>() != sources {
+            return refused("its kv sources");
+        }
+        for (&(layer, groups, tail), (_, kept)) in snapshot.sources.iter().zip(&snapshot.rows) {
+            let ratio = self.hp.layers[layer].compressed.map_or(1, |c| c.ratio);
+            if groups != position / ratio || tail != position % ratio || kept[0].len() != groups * dim / 2 || kept[1].len() != groups * index_dim / 2
+                || kept[2].len() != dim || kept[3].len() != dim {
+                return refused("a kv source's rows");
+            }
+        }
         Ok(())
     }
 
@@ -1911,6 +2077,48 @@ impl<'a, T: Tensors> Engine<'a, T> {
             return ops::gather_owned(&devices, &outs, &parts, &firsts, rows as u64, self.shards[0].rows.hidden.1 as u64, w as u64);
         }
         ops::sum_devices(&devices, &outs, &parts, (rows * w) as u64)
+    }
+
+    /// [`Engine::sum_parts`] of the attention's part of the rows `first..first + rows` (a batch's), in two halves
+    /// ([`ops::sum_devices_start`]): the copies run while the devices go on.
+    fn sum_parts_start(&mut self, first: usize, rows: usize) -> Result<()> {
+        let w = self.hp.width;
+        let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+        let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.parts[0].at(first * w) as P).collect();
+        let inboxes: Vec<M> = self.shards.iter().map(|shard| shard.work.inbox.base()).collect();
+        ops::sum_devices_start(&devices, &parts, &inboxes, (rows * w) as u64)
+    }
+
+    fn sum_parts_finish(&mut self, first: usize, rows: usize) -> Result<()> {
+        let w = self.hp.width;
+        let devices: Vec<&Backend> = self.shards.iter().map(|shard| &shard.gpu).collect();
+        let outs: Vec<M> = self.shards.iter().map(|shard| shard.work.out.at(first * w)).collect();
+        let parts: Vec<P> = self.shards.iter().map(|shard| shard.work.parts[0].at(first * w) as P).collect();
+        let inboxes: Vec<M> = self.shards.iter().map(|shard| shard.work.inbox.base()).collect();
+        ops::sum_devices_finish(&devices, &outs, &parts, &inboxes, (rows * w) as u64)
+    }
+
+    /// An overlapped batch's (rows `attending..end`) way into the FFN once its attention's sum started: the sum's finish, the FFN's
+    /// hyper-connection step and the router, as a batch of a pass without graphs takes them.
+    fn ffn_entry(&mut self, layer: usize, n: usize, attending: usize, end: usize, predict: bool) -> Result<()> {
+        let hp = self.hp.clone();
+        let attended = end - attending;
+        self.sum_parts_finish(attending, attended)?;
+        let publish = self.publishes(layer, n, predict);
+        if publish {
+            self.shards[0].gpu.route_mailbox_clear()?;
+        }
+        for shard in &mut self.shards {
+            let work = shard.work.view(attending);
+            hc_ffn(shard, &work, &hp, layer, attended, false)?;
+        }
+        self.mark("hyper-connections")?;
+        for (index, shard) in self.shards.iter_mut().enumerate() {
+            let work = shard.work.view(attending);
+            router_ops(shard, &work, &hp, layer, attended, predict && index == 0, publish && index == 0)?;
+        }
+        self.route_images(layer, attending, end)?;
+        self.mark("router")
     }
 
     fn flush_peers(&self) -> Result<()> {
@@ -2109,6 +2317,20 @@ impl<'a, T: Tensors> Engine<'a, T> {
         // alone held each device ~6 of a 10.7K-token prompt's 36 s (F32 GEMMs and their weights
         // expanded to F32, every 256 rows).
         let half = self.settings.half_gemm && n >= HALF_ROWS;
+        // A prompt pass takes the expansions' ring back from the store (its experts go to the host tier) and forgets what was
+        // expanded in it before; the first pass of a few rows after lends it again, once the prompt pass's products are done.
+        for shard in &mut self.shards {
+            let (Some(region), Some(ring)) = (shard.expansion_region, shard.expansions) else { continue };
+            if half && !shard.expansions_back {
+                shard.experts.reclaim_region(&mut shard.gpu, region, ring.bytes)?;
+                shard.gpu.forget_expansions()?;
+                shard.expansions_back = true;
+            } else if !half && shard.expansions_back {
+                let after = shard.gpu.mark(Stream::Compute)?;
+                shard.experts.restore_region(region, after, 0);
+                shard.expansions_back = false;
+            }
+        }
         if self.half_policy != Some(half) {
             for shard in &self.shards {
                 shard.gpu.configure_gemm(GEMM_MIN_BATCH, half)?;
@@ -2531,6 +2753,10 @@ impl<'a, T: Tensors> Engine<'a, T> {
             None => false,
         };
         let engram_values = hp.engram_columns() * hp.engram.as_ref().map_or(0, |engram| engram.head_dim);
+        // (a pass of one batch has nothing to run its sum beside; DS41_SUM_OVERLAP=0 sums each batch on the devices' streams)
+        let overlapped = !record && !link && self.shards.len() == 2 && n - from > self.settings.batch && sum_overlap();
+        // the batch whose sum has started and whose FFN's step and router wait for it
+        let mut pending: Option<(usize, usize)> = None;
         for first in (from..n).step_by(self.settings.batch) {
             let end = (first + self.settings.batch).min(n);
             let rows = (end - first) as u64;
@@ -2632,6 +2858,18 @@ impl<'a, T: Tensors> Engine<'a, T> {
                 continue;
             }
             let attended = end - attending;
+            // A pass of several batches on two devices: this batch's sum starts on the copy engines, and the previous batch's
+            // finishes now, its FFN's step and router after it, while the copies run beside this batch's attention.
+            if overlapped {
+                if let Some((from, to)) = pending.take() {
+                    self.ffn_entry(layer, n, from, to, predict)?;
+                }
+                self.sum_parts_start(attending, attended)?;
+                pending = Some((attending, end));
+                self.stamp(layer, n, Stamp::AttentionDone)?;
+                self.mark("attention")?;
+                continue;
+            }
             if !link && !merged {
                 self.sum_parts(0, attending, attended)?;
             }
@@ -2676,6 +2914,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             }
             self.route_images(layer, attending, end)?;
             self.mark("router")?;
+        }
+        if let Some((from, to)) = pending.take() {
+            self.ffn_entry(layer, n, from, to, predict)?;
         }
         self.engram_values = gathered;
         if full_from < n {
@@ -3500,6 +3741,9 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
     let same_rows = plan.kv_from == plan.full_from && rope > 0 && n > 0 && kv_rows > 0;
     shard.gpu.attention_turns_arm(if same_rows { kv_rows as u64 } else { 0 })?;
     let fused = n == 1 && kv_rows == 1;
+    // A verify pass's rows (2 to 4, each with its kv row) take the same one launch, each row's q normed in place: q_a's and kv's rows
+    // q_rank floats apart (kv's in its buffer of a batch's rows). It was five: q_a, kv, q's norm, then after q_b kv's norm and rope.
+    let fused_rows = !fused && n > 1 && n <= VERIFY_ROWS && kv_rows == n && (n - 1) * hp.q_rank + dim <= (work.kv.bytes / 4) as usize;
     let normed_q = if fused { work.qn } else { work.qr };
     if fused {
         let (q_a_norm, kv_norm) = (shard.dense(&name(layer, "attn_q_a_norm"))?, shard.dense(&name(layer, "attn_kv_a_norm"))?);
@@ -3511,6 +3755,17 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
         shard.gpu.linears_norm_rope(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())],
                                     work.qr.base(), &q_a_norm.buffer, hp.q_rank as u64, hp.norm_eps, work.qn.base(), &side)?;
         shard.linear(&name(layer, "attn_q_b"), work.qn.base(), 1, work.q.base())?;
+    } else if fused_rows {
+        let (q_a_norm, kv_norm) = (shard.dense(&name(layer, "attn_q_a_norm"))?, shard.dense(&name(layer, "attn_kv_a_norm"))?);
+        let side = ops::NormRope {
+            input: work.kv.base() as P, weight: &kv_norm.buffer, width: dim as u64, eps: hp.norm_eps,
+            rope: Some((rope, &kv_work.positions, &freqs)), out_rows: Some(kv_work.ring_rows.base() as P), out: ring.base(),
+            out_count: plan.ring_rows,
+        };
+        shard.gpu.linears_norm_rope_rows(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())],
+                                         n as u64, hp.width as u64, hp.q_rank as u64, work.qr.base(), &q_a_norm.buffer, hp.q_rank as u64,
+                                         hp.norm_eps, work.qr.base(), &side)?;
+        shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
     } else if kv_rows == n {
         if n > 0 {
             shard.gpu.linears(&[whole(&q_a, q_work.x.base(), work.qr.base()), whole(&kv, q_work.x.base(), work.kv.base())], n as u64, 0,
@@ -3522,7 +3777,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
             shard.gpu.linears(&[whole(&q_a, q_work.x.base(), work.qr.base())], n as u64, 0, 0, &scratch)?;
         }
     }
-    if !fused {
+    if !fused && !fused_rows {
         if n > 0 {
             shard.norm(&name(layer, "attn_q_a_norm"), work.qr.base(), n, hp.q_rank, hp.norm_eps)?;
             shard.linear(&name(layer, "attn_q_b"), work.qr.base(), n, work.q.base())?;
@@ -3841,6 +4096,25 @@ impl Work {
 #[cfg(test)]
 mod tests {
     use super::divided;
+
+    /// A snapshot's bytes give it back whole; bytes cut short, of another format or with more after their end are refused.
+    #[test]
+    fn a_snapshot_comes_back_from_its_bytes() {
+        let snapshot = super::Snapshot {
+            position: 9, history: (0..9).collect(), sources: vec![(2, 2, 1), (5, 9, 0)],
+            windows: vec![(0, vec![1.5; 8]), (1, vec![-2.0, 3.25])],
+            rows: vec![(2, [vec![0.5; 4], vec![1.0; 2], vec![7.0; 3], vec![]]), (5, [vec![], vec![9.0], vec![-1.0; 2], vec![2.5]])],
+            pending: false,
+        };
+        let bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(super::Snapshot::from_bytes(&bytes).unwrap(), snapshot);
+        assert!(super::Snapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        assert!(super::Snapshot::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_err());
+        let mut other = bytes.clone();
+        other[8] ^= 1;
+        assert!(super::Snapshot::from_bytes(&other).is_err());
+        assert!(super::Snapshot { pending: true, ..Default::default() }.to_bytes().is_err());
+    }
 
     #[test]
     fn a_view_count_stays_off_until_a_replay_is_counted() {

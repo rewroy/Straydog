@@ -534,13 +534,15 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// placed; so does the account of the host banks a partially resident model page-locked; of the GPU memory freed after the start that the
 /// expert slots took, or could not; and of the drafts a pass offers, which the engine chooses by what its passes cost, at the first choice
 /// and at each change. When the read-ahead hint opens and shuts (Windows) is only with --verbose: it follows the drive's reads, a line every
-/// few seconds through a day of serving, and each request's line already says how many hints were taken and left.
+/// few seconds through a day of serving, and each request's line already says how many hints were taken and left. The expert store's account
+/// of its evictions against an LRU's and the best possible ones stays: a line every 2^20 uses of decode and verify passes, a few minutes
+/// of decoding. A row table's account of its cache (Engram's rows) stays too: a line every 2^20 rows asked, ~20K tokens.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
-     "Straydog assist profile:"]
+     "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -599,7 +601,17 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
             }
             _ => String::new(),
         };
-        format!("; prefill layers first,{passes} {} rows a batch{held}{moved}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
+        // (the layers' banks the pass loaded: their loads' time, of it the CPU's gathers of banks not page-locked and the waits for the staging's
+        // copies, and the time the pass waited for a layer's bank to be read: where a pass whose experts take 1.5 ms each spends it, as an RTX
+        // 4060 PC's 5,089-token prompt did, 80.8 s where another 4060 took 16.9 s for as many)
+        let banks = match (number("prefill_bank_loads"), number("prefill_bank_load_seconds")) {
+            (Some(loads), Some(load)) if loads > 0.0 => format!(", banks {loads:.0} loads in {load:.1} s (gathers {:.1} s, staging waits {:.1} s), \
+                                                             waited {:.1} s for their reads", number("prefill_bank_gather_seconds").unwrap_or(0.0),
+                                                            number("prefill_bank_staging_wait_seconds").unwrap_or(0.0),
+                                                            number("prefill_bank_wait_seconds").unwrap_or(0.0)),
+            _ => String::new(),
+        };
+        format!("; prefill layers first,{passes} {} rows a batch{held}{moved}{banks}", timings["prefill_batch_rows"].as_u64().unwrap_or(0))
     } else {
         // (a long prompt's layer order considered and not taken: the rows it could have had, the banks and the memory they had now)
         let policy = &timings["layer_prefill_policy"];
@@ -720,8 +732,11 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
                                                    count(&timings["engine_draft_tokens"]),
                                                    // (DSpark's drafts made, whatever was verified of them, and how wide)
                                                    match (timings["engine_draft_runs"].as_u64(), timings["engine_draft_widths"].as_array()) {
-                                                       (Some(runs), Some(widths)) => format!(", {runs} draft runs by width {}",
-                                                           widths.iter().map(&count).collect::<Vec<_>>().join("/")),
+                                                       (Some(runs), Some(widths)) => format!(", {runs} draft runs by width {}{}",
+                                                           widths.iter().map(&count).collect::<Vec<_>>().join("/"),
+                                                           // (what a draft took, the host's wait for it: of a drafted pass's time between passes)
+                                                           timings["engine_draft_ms"].as_f64().filter(|_| runs > 0)
+                                                               .map_or_else(String::new, |ms| format!(", {:.1} ms each", ms / runs as f64))),
                                                        _ => String::new(),
                                                    }),
             _ => String::new(),
@@ -2104,6 +2119,11 @@ mod tests {
         assert!(moved.contains("; prefill layers first, in 16 passes of up to 16384 rows, 2048 rows a batch, hidden rows up 491.2 GB in 31.0 s \
                                 and down 491.2 GB in 28.4 s"), "{moved}");
         assert_eq!(moved.lines().count(), 1);
+        // (and the banks it loaded: their loads' time, the gathers and staging waits in it, and the waits for their reads)
+        let banks = request_summary(&event(json!({"prefill_bank_loads": 96, "prefill_bank_load_seconds": 60.2, "prefill_bank_gather_seconds": 41.0,
+                                                  "prefill_bank_staging_wait_seconds": 3.1, "prefill_bank_wait_seconds": 12.4})), None);
+        assert!(banks.contains("2048 rows a batch, banks 96 loads in 60.2 s (gathers 41.0 s, staging waits 3.1 s), waited 12.4 s for their reads"), "{banks}");
+        assert!(!moved.contains(", banks "), "no loads counted: no clause");
         // (the rows held in VRAM, or on the host with why)
         let held = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536, "prefill_rows_vram": true})), None);
         assert!(held.contains("2048 rows a batch, rows held in VRAM"), "{held}");
@@ -2145,10 +2165,18 @@ mod tests {
         assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
         assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        // (why a picture was slow: the vision encoder on the CPU, as the GPU could not, and what the GPU took)
+        assert!(stays_in_the_log("Straydog vision: on the CPU, as the GPU could not: no room for 412 MB more in this device's budget"));
+        assert!(stays_in_the_log("Straydog vision: 3 image(s) on the GPU in 1.07 s (room 0.01 s, the expert pool let go, back 0.12 s)"));
         assert!(!stays_in_the_log("Straydog host paging: 4.5 GiB available; the CPU's experts are read ahead from now"));
         assert!(!stays_in_the_log("Straydog assist: 0 a layer 20.1±0.4 ms a pass, 1: 19.7±0.5; keeping 0"));
         assert!(stays_in_the_log("Straydog assist profile: decision round=2 held=0 qualified=4 chosen=4"));
         assert!(stays_in_the_log("Straydog assist profile: setter_succeeded from=0 to=4"));
+        assert!(stays_in_the_log("Straydog expert reuse: 1048576 uses of decode and verify passes on the first GPU; VRAM missed 12.6%, an LRU \
+                                  store of the same slots would miss 13.4%, the best possible 7.9%; by class (missed / LRU / best): 0 (layers 0-2, 400 \
+                                  slots) 11.0 / 11.8 / 6.5%"));
+        assert!(stays_in_the_log("Straydog row cache: 1048576 rows asked of a table of 768022850 rows of 176 B; 70.0% held, 314573 read from the \
+                                  file; the cache holds 1342177 rows (225 MiB)"));
         assert!(!stays_in_the_log("some other line"));
     }
 
@@ -2317,7 +2345,12 @@ mod tests {
                                                           "engine_draft_tokens": 25, "accepted_engine_drafts": 18,
                                                           "engine_draft_runs": 30, "engine_draft_widths": [7, 4, 12, 7]}});
         assert!(request_summary(&event, None).contains("DSpark 18 of 25, 30 draft runs by width 7/4/12/7)"), "{}", request_summary(&event, None));
-        let none = json!({"event": "done", "timings": {"draft_tokens": 0, "accepted_drafts": 0}});
+        // (and what a draft took on average, where the engine timed them)
+        let event = json!({"event": "done", "timings": {"draft_tokens": 40, "accepted_drafts": 31, "decode_passes": 120,
+                                                          "engine_draft_tokens": 25, "accepted_engine_drafts": 18,
+                                                          "engine_draft_runs": 30, "engine_draft_widths": [7, 4, 12, 7], "engine_draft_ms": 75.0}});
+        assert!(request_summary(&event, None).contains("30 draft runs by width 7/4/12/7, 2.5 ms each)"), "{}", request_summary(&event, None));
+        let none =json!({"event": "done", "timings": {"draft_tokens": 0, "accepted_drafts": 0}});
         assert!(!request_summary(&none, None).contains("drafts"));
     }
 

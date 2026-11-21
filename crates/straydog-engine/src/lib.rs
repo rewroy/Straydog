@@ -26,6 +26,7 @@ pub mod prefix;
 pub mod pyjson;
 pub mod qwen_vision;
 pub mod reply;
+pub mod reuse;
 pub mod routes;
 pub mod rows;
 pub mod sampling;

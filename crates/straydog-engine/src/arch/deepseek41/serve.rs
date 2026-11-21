@@ -165,9 +165,9 @@ impl served::Engines for Engines {
         self.engines.iter().map(Engine::cache_counts).reduce(|sum, counts| sum + counts)
     }
 
-    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>)> {
+    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>, f64)> {
         let stats = self.drafting.as_mut()?.policy.take_stats();
-        Some((stats.runs, stats.widths.to_vec()))
+        Some((stats.runs, stats.widths.to_vec(), stats.draft_ms))
     }
 
     fn take_profile(&mut self) -> Vec<(&'static str, f64)> {
@@ -474,6 +474,79 @@ impl served::Engines for Engines {
     fn holds(&self, slot: usize) -> bool {
         self.saved.get(slot).is_some_and(Option::is_some)
     }
+
+    fn state_bytes(&self, tokens: usize) -> u64 {
+        self.engines.iter().map(|engine| engine.snapshot_bytes_at(tokens)).sum()
+    }
+
+    fn checkpoint_bytes(&self, slot: usize) -> u64 {
+        self.saved.get(slot).into_iter().flatten().flatten().map(Snapshot::bytes).sum()
+    }
+
+    /// Every engine's snapshot in checkpoint `slot` (its copy finished first), as [the engines' count, then each one's bytes' length and bytes].
+    fn export_checkpoint(&mut self, slot: usize) -> Result<Vec<u8>, String> {
+        if !self.holds(slot) {
+            return Err("the Straydog checkpoint was given up".into());
+        }
+        self.finish_checkpoints(usize::MAX)?;
+        let snapshots = self.saved[slot].as_ref().ok_or("the Straydog checkpoint was given up")?;
+        let mut out = (snapshots.len() as u64).to_le_bytes().to_vec();
+        for snapshot in snapshots {
+            let bytes = snapshot.to_bytes()?;
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    }
+
+    /// Another start's [`export_checkpoint`](Self::export_checkpoint) into checkpoint `slot`: each engine's snapshot checked against it
+    /// (Engine::check_snapshot), the budget making room as a save does. Without its drafter's rings: drafting starts cold.
+    fn import_checkpoint(&mut self, slot: usize, bytes: &[u8], tokens: &[u32]) -> Result<usize, String> {
+        if slot >= CHECKPOINTS {
+            return Err("no such Straydog checkpoint".into());
+        }
+        let cut = || "a kept conversation cut short".to_string();
+        let count = u64::from_le_bytes(bytes.get(..8).ok_or_else(cut)?.try_into().unwrap()) as usize;
+        if count != self.engines.len() {
+            return Err(format!("a kept conversation of {count} engines, against {}", self.engines.len()));
+        }
+        let (mut at, mut snapshots) = (8, Vec::with_capacity(count));
+        for engine in &self.engines {
+            let len = u64::from_le_bytes(bytes.get(at..at + 8).ok_or_else(cut)?.try_into().unwrap()) as usize;
+            let part = bytes.get(at + 8..(at + 8).checked_add(len).ok_or_else(cut)?).ok_or_else(cut)?;
+            let snapshot = Snapshot::from_bytes(part)?;
+            engine.check_snapshot(&snapshot)?;
+            snapshots.push(snapshot);
+            at += 8 + len;
+        }
+        if at != bytes.len() {
+            return Err("a kept conversation with bytes after its end".into());
+        }
+        let position = snapshots[0].position();
+        if snapshots.iter().any(|snapshot| snapshot.position() != position || snapshot.history() != tokens) {
+            return Err("a kept conversation whose state is not of its tokens".into());
+        }
+        // (room as a save makes it, the slot's own state given up with it: the oldest give theirs up, the kept slot last; nothing
+        // changes until it is known to fit)
+        let required: u64 = snapshots.iter().map(Snapshot::bytes).sum();
+        let kept = self.kept.filter(|&kept| kept != slot);
+        let held: Vec<(usize, u64)> = self.order.iter().filter(|&&held| held != slot && Some(held) != kept)
+            .chain(kept.iter().filter(|kept| self.order.contains(kept)))
+            .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
+        let given_up = evictions(&held, required, self.budget).ok_or("a kept conversation larger than the checkpoints' budget")?;
+        self.saved[slot] = None;
+        self.order.retain(|&held| held != slot);
+        for oldest in given_up {
+            self.saved[oldest] = None;
+            self.order.retain(|&held| held != oldest);
+        }
+        if let Some(drafting) = self.drafting.as_mut() {
+            drafting.rings[slot] = None;
+        }
+        self.saved[slot] = Some(snapshots);
+        self.order.push(slot);
+        Ok(position)
+    }
 }
 
 /// The checkpoints (slots with their bytes, oldest first) that give theirs up so one of `required`
@@ -742,11 +815,20 @@ const AUTO_BATCHES: [usize; 6] = [8192, 4096, 2048, 1024, 512, 256];
 /// R9700s, which take 16384: 6064 -> 6059 slots; a 45K prompt's first token 30.8 -> 27.5 s, a 20K one's 14.6 -> 11.9 s, the same replies.
 const WIDE_BATCHES: [usize; 2] = [32768, 16384];
 const WIDE_BUDGET: u64 = 24 << 30;
+/// From this budget, the widest batch may take half of it: two R9700s (30.5 GiB a GPU), whose buffers of 32768 rows outgrow a third,
+/// read a cold 94,851-token document in 58.3 s against 60.6 s in passes of 16384 and a 79,160-token one in 44.7 against 52.3 s
+/// (expert reads from VRAM and the host tier halved: 125K against 249K and 125K against 209K), with 5076 slots between passes
+/// against 5106 (2026-11-21).
+const WIDEST_BUDGET: u64 = 28 << 30;
 
 /// The largest batch whose pass buffers (`per_row` bytes a row, and a few rows of a pass's own) take no more than a third of a GPU's
-/// `budget` ([`WIDE_BATCHES`]) or an eighth of it ([`AUTO_BATCHES`]); the least when none does.
+/// `budget` ([`WIDE_BATCHES`]; the widest half of it from [`WIDEST_BUDGET`]) or an eighth of it ([`AUTO_BATCHES`]); the least when
+/// none does.
 fn auto_batch(budget: u64, per_row: u64) -> usize {
     let bytes = |batch: usize| (batch + OWN_ROWS.min(batch)) as u64 * per_row.max(1);
+    if budget >= WIDEST_BUDGET && bytes(WIDE_BATCHES[0]) <= budget / 2 {
+        return WIDE_BATCHES[0];
+    }
     if budget >= WIDE_BUDGET {
         if let Some(batch) = WIDE_BATCHES.into_iter().find(|&batch| bytes(batch) <= budget / 3) {
             return batch;
@@ -1114,10 +1196,13 @@ mod tests {
     }
 
     /// With 0.32 MB a row, 32768 rows are chosen for a 31 GiB budget, 16384 for 24 GiB, 8192 below that,
-    /// fewer on a 16 GiB card, and the least where nothing fits.
+    /// fewer on a 16 GiB card, and the least where nothing fits; with 0.4 MB a row, 32768 for an R9700's 30.5 GiB (half of
+    /// it) but not for 27 GiB (a third).
     #[test]
     fn the_prefill_batch_is_the_largest_whose_buffers_fit_their_share_of_the_budget() {
         const GIB: u64 = 1 << 30;
+        assert_eq!(auto_batch(61 * GIB / 2, 400_000), 32768);
+        assert_eq!(auto_batch(27 * GIB, 400_000), 16384);
         let per_row = 320_000;
         assert_eq!(auto_batch(31 * GIB, per_row), 32768);
         assert_eq!(auto_batch(24 * GIB, per_row), 16384);

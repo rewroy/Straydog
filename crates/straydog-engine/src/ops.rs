@@ -116,6 +116,34 @@ pub fn sum_devices(devices: &[&Backend], outs: &[M], parts: &[P], count: u64) ->
     check(unsafe { ffi::sd_op_sum_devices(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), handles.len() as u64, count) })
 }
 
+/// [`sum_devices`] of two devices in two halves: the start copies each device's `parts` (`count` values) into the other's `inboxes`
+/// on a copy engine, behind the work queued so far on both, while the devices compute on; the finish makes each device wait for
+/// the copies and sums its part and its inbox in device order into `outs` (the same bits as [`sum_devices`]). A start is finished
+/// before the next; parts and inboxes stay unchanged in between.
+pub fn sum_devices_start(devices: &[&Backend], parts: &[P], inboxes: &[M], count: u64) -> Result<()> {
+    if devices.len() != 2 || parts.len() != 2 || inboxes.len() != 2 {
+        return Err("a device sum in halves takes two devices, two parts and two inboxes".into());
+    }
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    let parts: Vec<*const f32> = parts.iter().map(|part| part.cast()).collect();
+    let inboxes: Vec<*mut f32> = inboxes.iter().map(|inbox| inbox.cast()).collect();
+    // SAFETY: live handles; the library checks every range against its device's allocations.
+    check(unsafe { ffi::sd_op_sum_devices_start(handles.as_ptr(), parts.as_ptr(), inboxes.as_ptr(), 2, count) })
+}
+
+/// The finish of [`sum_devices_start`] (the same parts and inboxes).
+pub fn sum_devices_finish(devices: &[&Backend], outs: &[M], parts: &[P], inboxes: &[M], count: u64) -> Result<()> {
+    if devices.len() != 2 || outs.len() != 2 || parts.len() != 2 || inboxes.len() != 2 {
+        return Err("a device sum in halves takes two devices, two outs, two parts and two inboxes".into());
+    }
+    let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
+    let outs: Vec<*mut f32> = outs.iter().map(|out| out.cast()).collect();
+    let parts: Vec<*const f32> = parts.iter().map(|part| part.cast()).collect();
+    let inboxes: Vec<*const f32> = inboxes.iter().map(|inbox| inbox.cast_const().cast()).collect();
+    // SAFETY: live handles; the library checks every range against its device's allocations.
+    check(unsafe { ffi::sd_op_sum_devices_finish(handles.as_ptr(), outs.as_ptr(), parts.as_ptr(), inboxes.as_ptr(), 2, count) })
+}
+
 /// Submit each device's queued work after both sides of a peer wait have been queued.
 pub fn flush_devices(devices: &[&Backend]) -> Result<()> {
     let handles: Vec<*mut c_void> = devices.iter().map(|device| device.handle()).collect();
@@ -448,6 +476,30 @@ impl Backend {
         check(unsafe {
             ffi::sd_op_linears_norm_rope(self.handle(), items.as_ptr(), items.len() as u64, x.cast(), weight.pointer.cast(), width, eps,
                                          normed.cast(), &side)
+        })
+    }
+
+    /// [`linears_norm_rope`](Self::linears_norm_rope) of 2 to 4 rows (a verify pass's) in one launch: the items' input rows
+    /// `input_stride` floats apart; their output rows, `x`'s, `normed`'s and `side.input`'s `stride` apart; `side`'s positions and
+    /// output rows one a row. Each row's results are those of the row alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linears_norm_rope_rows(&mut self, items: &[Linear], rows: u64, input_stride: u64, stride: u64, x: P, weight: &Buffer, width: u64,
+                                  eps: f32, normed: M, side: &NormRope) -> Result<()> {
+        let items: Vec<ffi::sd_linear> = items.iter().map(|item| ffi::sd_linear {
+            weights: item.weights.pointer.cast_const(), kind: item.kind as i32, rows: item.rows, cols: item.cols,
+            first_row: item.first_row, input: item.input.cast(), output: item.output.cast(),
+        }).collect();
+        let (rope_dims, positions, frequencies) =
+            side.rope.map_or((0, std::ptr::null(), std::ptr::null()), |(dims, p, f)| (dims, p.pointer.cast_const().cast(), f.pointer.cast_const().cast()));
+        let side = ffi::sd_norm_rope {
+            input: side.input.cast(), weight: side.weight.pointer.cast_const().cast(), width: side.width, eps: side.eps, rope_dims,
+            positions, frequencies, out_rows: side.out_rows.map_or(std::ptr::null(), |rows| rows.cast()), out: side.out.cast(),
+            out_count: side.out_count,
+        };
+        // SAFETY: a live handle; the library checks every range against its allocations.
+        check(unsafe {
+            ffi::sd_op_linears_norm_rope_rows(self.handle(), items.as_ptr(), items.len() as u64, rows, input_stride, stride, x.cast(),
+                                              weight.pointer.cast(), width, eps, normed.cast(), &side)
         })
     }
 

@@ -303,7 +303,7 @@ async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<
     api.authorize(&headers)?;
     let config = &api.config;
     let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false, "vision": api.vision(),
-                          "suppress": [NOT_CP932_HAN], "tool_writing": true, "reasoning_off": config.markup == Markup::Dsml});
+                          "suppress": [NOT_CP932_HAN], "tool_writing": true, "reasoning_off": true});
     if let EngineState::Ready { context, placement, .. } = api.engine.state() {
         meta["n_ctx"] = context.into();
         meta["ready"] = true.into();
@@ -325,7 +325,7 @@ async fn props(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<s
         // (a streamed chat completion with tools may ask for the calls as they are written: `straydog.tool_writing`)
         "tool_writing": true,
         // (one reply may be asked with no reasoning in a conversation that thinks, its prompt unchanged: `straydog.reasoning` false)
-        "reasoning_off": api.config.markup == Markup::Dsml,
+        "reasoning_off": true,
         "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false,
     })))
 }

@@ -13,6 +13,9 @@
 //!   take whatever the decode mode;
 //! - a GEMV's row is the bits it gets in a launch of few rows, whatever the launch holds (q_b's 16384 rows
 //!   take several to a wave, a smaller launch one);
+//! - a list of one kind whose matrices read different inputs (wo_a's four groups, Q5_K and Q6_K on the Q8 kernels,
+//!   Q8_0 on the F32 ones; one to four vectors): each row the bits of its matrix's own launch, within F32 rounding of the
+//!   reference;
 //! - with the Q8 kernels off, the F32 kernels' results are the unquantized input's within F32
 //!   rounding, as before.
 //!
@@ -22,7 +25,7 @@
 
 use straydog_engine::formats;
 use straydog_engine::gpu::Backend;
-use straydog_engine::ops::{Buffer, ExpertSplit};
+use straydog_engine::ops::{Buffer, ExpertSplit, Linear};
 
 struct Random(u64);
 impl Random {
@@ -40,6 +43,7 @@ impl Random {
         let (per, bytes) = match kind {
             8 => (32, 34),
             13 => (256, 176),
+            14 => (256, 210),
             16 => (256, 66),
             17 => (256, 74),
             19 => (256, 50),
@@ -55,6 +59,11 @@ impl Random {
                 block[51] &= 0x0f;
                 block[53] = block[53] & 0x0f | 0xc0;
                 block[55] = block[55] & 0x0f | 0x20;
+                continue;
+            }
+            if kind == 14 {
+                // (Q6_K's FP16 scale is its last two bytes)
+                block[208..].copy_from_slice(&0x2400u16.to_le_bytes());
                 continue;
             }
             block[..2].copy_from_slice(&0x2c00u16.to_le_bytes());
@@ -186,6 +195,69 @@ fn a_q8_gemv_of_several_vectors_gives_each_one_alones_bits() {
             for v in 0..vectors {
                 let bits: Vec<u32> = got[v * rows..(v + 1) * rows].iter().map(|value| value.to_bits()).collect();
                 assert_eq!(bits, alone[v], "kind {kind} {rows} x {cols}: vector {v} of {vectors}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_list_whose_matrices_read_different_inputs_gives_each_row_the_same_bits_whatever_its_vectors() {
+    // (DeepSeek-V4.1's wo_a on a device: four groups, group g's 1024 rows over its own 4096 of a row's 16384 attention outputs)
+    straydog_engine::gpu::load_iq_tables().unwrap();
+    let mut gpu = Backend::new(0, 1 << 30).unwrap();
+    let mut random = Random(0x3c6e_f372_fe94_f82b);
+    let scratch = gpu.buffer(1 << 20).unwrap();
+    gpu.configure_decode(true).unwrap();
+    let (groups, rows, cols) = (4usize, 1024usize, 4096usize);
+    let (width, outputs) = (groups * cols, groups * rows);
+    // (Q5_K and Q6_K on the Q8 kernels: each row also the bits of its matrix's own launch. Q8_0's list keeps the F32 kernel, whose sums
+    // are the unquantized input's.)
+    for kind in [8u32, 13, 14] {
+        let bytes = random.blocks(kind, groups * rows * cols);
+        let matrix = gpu.upload_bytes(&bytes).unwrap();
+        let row_bytes = bytes.len() / (groups * rows);
+        let x = random.floats(4 * width, 2.0);
+        let input = upload(&mut gpu, &x);
+        let (listed, alone) = (gpu.buffer((4 * outputs * 4) as u64).unwrap(), gpu.buffer((4 * outputs * 4) as u64).unwrap());
+        let mut one = Vec::new();
+        for vectors in 1..=4usize {
+            let items: Vec<Linear> = (0..groups).map(|g| Linear {
+                weights: matrix, kind, rows: rows as u64, cols: cols as u64, first_row: (g * rows) as u64, input: input.at(g * cols) as *const _,
+                output: listed.at(g * rows),
+            }).collect();
+            gpu.linears(&items, vectors as u64, width as u64, outputs as u64, &scratch).unwrap();
+            for g in 0..groups {
+                gpu.linear(&matrix, kind, rows as u64, cols as u64, (g * rows) as u64, input.at(g * cols) as *const _, width as u64, vectors as u64,
+                           alone.at(g * rows), outputs as u64, &scratch).unwrap();
+            }
+            let (got, own) = (read(&mut gpu, &listed, vectors * outputs), read(&mut gpu, &alone, vectors * outputs));
+            if vectors == 1 {
+                // (each vector alone through the list: what every launch of more must give it)
+                for v in 0..4 {
+                    let items: Vec<Linear> = (0..groups).map(|g| Linear {
+                        weights: matrix, kind, rows: rows as u64, cols: cols as u64, first_row: (g * rows) as u64,
+                        input: input.at(v * width + g * cols) as *const _, output: listed.at(v * outputs + g * rows),
+                    }).collect();
+                    gpu.linears(&items, 1, width as u64, outputs as u64, &scratch).unwrap();
+                }
+                one = read(&mut gpu, &listed, 4 * outputs);
+            }
+            for v in 0..vectors {
+                for g in 0..groups {
+                    let group = &bytes[g * rows * row_bytes..(g + 1) * rows * row_bytes];
+                    let expected = expected_dots(kind, group, cols, &x[v * width + g * cols..v * width + (g + 1) * cols], kind != 8);
+                    for (row, &(sum, size)) in expected.iter().enumerate() {
+                        let at = v * outputs + g * rows + row;
+                        assert_eq!(got[at].to_bits(), one[at].to_bits(), "kind {kind}, {vectors} vectors: vector {v} group {g} row {row}: {} of {vectors}, {} alone",
+                                   got[at], one[at]);
+                        if kind != 8 {
+                            assert_eq!(got[at].to_bits(), own[at].to_bits(), "kind {kind}, {vectors} vectors: vector {v} group {g} row {row}: {} listed, {} by its matrix",
+                                       got[at], own[at]);
+                        }
+                        assert!((f64::from(got[at]) - sum).abs() <= 2e-6 * size + 1e-6,
+                                "kind {kind}, {vectors} vectors: vector {v} group {g} row {row}: {} against {sum} (products {size})", got[at]);
+                    }
+                }
             }
         }
     }

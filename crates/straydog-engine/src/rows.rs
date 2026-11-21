@@ -183,6 +183,19 @@ struct Counts {
     requested: AtomicU64,
     read: AtomicU64,
     blocks: AtomicU64,
+    /// (rows asked for, rows read) at the last log line ([`LINE_EVERY`]).
+    logged: std::sync::Mutex<(u64, u64)>,
+}
+
+/// Rows asked for between two log lines of a table's use of its row cache: ~20K tokens of DeepSeek-V4.1's Engram (48 rows a token).
+const LINE_EVERY: u64 = 1 << 20;
+
+/// The log line of a table's row cache: of the rows asked for since the last, the share the cache held (rows a prefetch had
+/// read count as read), and its size.
+fn row_cache_line(asked: u64, read: u64, rows: u64, width: usize, capacity: usize) -> String {
+    let held = 100.0 * asked.saturating_sub(read) as f64 / asked.max(1) as f64;
+    format!("Straydog row cache: {asked} rows asked of a table of {rows} rows of {width} B; {held:.1}% held, {read} read from the file; \
+             the cache holds {capacity} rows ({} MiB)", (capacity as u64 * width as u64) >> 20)
 }
 
 struct Table {
@@ -436,8 +449,16 @@ impl RowTable {
                 }
             }
         }
-        table.counts.requested.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        let asked = table.counts.requested.fetch_add(rows.len() as u64, Ordering::Relaxed) + rows.len() as u64;
         table.counts.read.fetch_add(missing.len() as u64, Ordering::Relaxed);
+        if asked / LINE_EVERY != (asked - rows.len() as u64) / LINE_EVERY {
+            let read = table.counts.read.load(Ordering::Relaxed);
+            let mut logged = table.counts.logged.lock().unwrap();
+            let line = row_cache_line(asked - logged.0, read.saturating_sub(logged.1), table.rows, width, self.capacity());
+            *logged = (asked, read);
+            drop(logged);
+            eprintln!("{line}");
+        }
         // Evicted before use (more distinct rows than the cache holds): read them here.
         let mut buffer = Buffer::new(width + 2 * ALIGN);
         for index in missing {
@@ -460,5 +481,17 @@ impl RowTable {
         let counts = &self.table.counts;
         (counts.requested.load(Ordering::Relaxed), counts.read.load(Ordering::Relaxed),
          counts.blocks.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_cache_line_says_the_share_held_and_the_cache_size() {
+        let line = row_cache_line(1 << 20, 314_573, 768_022_850, 176, 1_342_177);
+        assert!(line.starts_with("Straydog row cache: 1048576 rows asked of a table of 768022850 rows of 176 B; 70.0% held, 314573 read"), "{line}");
+        assert!(line.ends_with("the cache holds 1342177 rows (225 MiB)"), "{line}");
     }
 }

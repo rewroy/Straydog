@@ -85,7 +85,7 @@ pub trait Engines {
     }
     /// How often the engines' own drafter was asked for a draft since the last call, and how many
     /// tokens each verified (index 0: none, the draft thrown away), when there is one.
-    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>)> {
+    fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>, f64)> {
         None
     }
     /// Seconds per phase of the passes since the last call, when the engines profile them
@@ -172,6 +172,23 @@ pub trait Engines {
     /// other sequence (a conversation come back to after another), not only below a common prefix.
     fn whole_checkpoints(&self) -> bool {
         false
+    }
+    /// About the bytes [`Engines::export_checkpoint`] gives for `slot` (what its copies hold in host memory).
+    fn checkpoint_bytes(&self, _slot: usize) -> u64 {
+        0
+    }
+    /// About the host bytes a checkpoint of a sequence of `tokens` takes (0: not known).
+    fn state_bytes(&self, _tokens: usize) -> u64 {
+        0
+    }
+    /// Checkpoint `slot`'s state as bytes, for a later start ([`Engines::import_checkpoint`]): the kept conversation.
+    fn export_checkpoint(&mut self, _slot: usize) -> Result<Vec<u8>, String> {
+        Err("these engines keep no conversation".into())
+    }
+    /// Take [`Engines::export_checkpoint`]'s bytes (another start's) into checkpoint `slot`, checked to the byte against these engines:
+    /// the tokens its sequence holds. Refused with nothing changed if they differ.
+    fn import_checkpoint(&mut self, _slot: usize, _bytes: &[u8], _tokens: &[u32]) -> Result<usize, String> {
+        Err("these engines keep no conversation".into())
     }
     /// Save a mark of the sequence state where it is, in the place of the oldest of the [`MARKS`] kept (None), or go back to
     /// the mark taken when the sequence was this long: whether one is now held, or the sequence is back at it. A mark is
@@ -315,6 +332,13 @@ struct Checkpoint {
     tokens: Vec<u32>,
     root: bool,
 }
+
+/// The new tokens of a prompt from which its progress is told before its first pass (a shorter one's pass ends about as soon).
+const PROGRESS_AT_ONCE: usize = 4096;
+
+/// A kept conversation's sections ([`Session::export_conversation`]): its tokens, then the engines' checkpoint.
+const KEPT_TOKENS: u64 = u64::from_le_bytes(*b"KEPTTOKS");
+const KEPT_CHECKPOINT: u64 = u64::from_le_bytes(*b"KEPTSNAP");
 
 /// The fewest tokens a system prompt has to be checkpointed as a conversation's root (a shorter
 /// one prefills in about a second).
@@ -798,6 +822,11 @@ impl<E: Engines> Session<E> {
         let agreed = self.agreed.max(reused);
         let resume_seconds = started.elapsed().as_secs_f64();
         let total = tokens.len();
+        // (a long prompt's progress shows at once, where it was resumed: its first pass's report came after that pass, 7-8 s into
+        // an 87K-token prompt that read 82K)
+        if total - reused > PROGRESS_AT_ONCE {
+            progress(reused, total);
+        }
         // (where the prefill's experts came from: the wait before the first token, broken down)
         let (hits0, host0, drive0) = self.engines.counts();
         // (a profile counts from here: the time since the last request is not this prefill's)
@@ -918,9 +947,10 @@ impl<E: Engines> Session<E> {
         .as_object()
         .unwrap()
         .clone();
-        if let Some((runs, widths)) = draft_stats {
+        if let Some((runs, widths, draft_ms)) = draft_stats {
             self.last_metrics.insert("engine_draft_runs".into(), json!(runs));
             self.last_metrics.insert("engine_draft_widths".into(), json!(widths));
+            self.last_metrics.insert("engine_draft_ms".into(), json!(draft_ms));
         }
         Ok(())
     }
@@ -1038,6 +1068,82 @@ impl<E: Engines> Session<E> {
         let kept = self.checkpoints.iter().rev().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
         self.engines.keep_checkpoint(kept);
         Ok(())
+    }
+
+    /// The kept conversation (`--keep-conversation`, [`Engines::export_checkpoint`]): the latest turn's checkpoint, where the last reply
+    /// began, as a prefix state's bytes ([`crate::prefix::header`]: the tokens, then the engines' checkpoint) and its tokens. None without such a
+    /// checkpoint, or with one holding image tokens (as a resident model keeps none of those).
+    pub fn export_conversation(&mut self) -> Result<Option<(Vec<u32>, Vec<u8>)>, String> {
+        let engines = &self.engines;
+        let Some(checkpoint) = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && engines.holds(checkpoint.slot)) else {
+            return Ok(None);
+        };
+        if checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+            return Ok(None);
+        }
+        let (slot, tokens) = (checkpoint.slot, checkpoint.tokens.clone());
+        let state = self.engines.export_checkpoint(slot)?;
+        let mut bytes = crate::prefix::header(tokens.len(), 0, &[(KEPT_TOKENS, 4 * tokens.len() as u64), (KEPT_CHECKPOINT, state.len() as u64)]);
+        bytes.extend_from_slice(&crate::prefix::token_bytes(&tokens));
+        bytes.extend_from_slice(&state);
+        Ok(Some((tokens, bytes)))
+    }
+
+    /// About the host bytes a kept conversation of `tokens` takes once read ([`Engines::state_bytes`]; 0: not known).
+    pub fn state_size(&self, tokens: usize) -> u64 {
+        self.engines.state_bytes(tokens)
+    }
+
+    /// How many of `tokens` the session can go on from without a kept state: the held sequence, or a checkpoint, that they begin with.
+    pub fn held_prefix(&self, tokens: &[u32]) -> usize {
+        let live = if !self.history.is_empty() && tokens.starts_with(&self.history) { self.history.len() } else { 0 };
+        self.checkpoints.iter().filter(|checkpoint| self.engines.holds(checkpoint.slot) && tokens.starts_with(&checkpoint.tokens))
+            .map(|checkpoint| checkpoint.tokens.len()).chain([live]).max().unwrap_or(0)
+    }
+
+    /// The bytes [`export_conversation`](Self::export_conversation) would give now (the latest turn's tokens with them); None as it gives none.
+    pub fn conversation_size(&self) -> Option<(usize, u64)> {
+        let checkpoint = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && self.engines.holds(checkpoint.slot))?;
+        (!checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary)).then_some(())?;
+        // (an estimate before the copy: the state grows with its tokens about as the engines' snapshots do)
+        Some((checkpoint.tokens.len(), self.engines.checkpoint_bytes(checkpoint.slot)))
+    }
+
+    /// Take another start's [`export_conversation`](Self::export_conversation) as a checkpoint of its tokens (a free slot, or one
+    /// [`evicted`] gives up): the next request that begins with them goes on from there. Refused with nothing changed if the bytes are not
+    /// such a state or do not fit these engines to the byte. The tokens it holds.
+    pub fn import_conversation(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let parsed = crate::prefix::parse(bytes)?;
+        let expected = parsed.sections.first().map(|&(_, held)| held);
+        if parsed.sections.len() != 2 || parsed.sections[0].0 != KEPT_TOKENS || parsed.sections[1].0 != KEPT_CHECKPOINT
+            || expected != Some(4 * parsed.tokens as u64) {
+            return Err("not a kept conversation of these engines".into());
+        }
+        let tokens = crate::prefix::tokens_of(parsed.payload, parsed.tokens);
+        if tokens.is_empty() || tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+            return Err("a kept conversation with tokens outside the vocabulary".into());
+        }
+        let engines = &self.engines;
+        self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
+        let slots = self.engines.checkpoints();
+        if slots == 0 {
+            return Err("these engines keep no checkpoints".into());
+        }
+        // (a free slot, or the one evicted gives up: its checkpoint is forgotten only once the import holds)
+        let replaced = (self.checkpoints.len() >= slots).then(|| evicted(&self.checkpoints, &tokens));
+        let slot = match replaced {
+            Some(index) => self.checkpoints[index].slot,
+            None => (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot)).ok_or("no free Straydog checkpoint")?,
+        };
+        let held = self.engines.import_checkpoint(slot, &parsed.payload[4 * tokens.len()..], &tokens)?;
+        if let Some(index) = replaced {
+            self.checkpoints.remove(index);
+        }
+        // (and those whose slots the budget gave up for it)
+        let engines = &self.engines;
+        self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
+        self.checkpoints.push(Checkpoint { slot, tokens, root: false });
+        Ok(held)
     }
 
     /// What a later start warms up with ([`Warm::state`]).

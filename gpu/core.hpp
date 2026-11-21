@@ -800,6 +800,9 @@ struct Device {
     size_t inline_routes_count = 0;
     hipEvent_t parts_ready = nullptr;   // sd_op_sum_devices: this device's part is written
     hipEvent_t parts_read = nullptr;    // sd_op_sum_devices: this device has read the others' parts
+    hipStream_t sum_stream = nullptr;   // sd_op_sum_devices_start: the copies of the other devices' parts into this one's inbox
+    hipEvent_t sum_queued = nullptr;    // sd_op_sum_devices_start: the work queued on the device's stream before the copies
+    hipEvent_t sum_copied = nullptr;    // sd_op_sum_devices_start: the copies into this device's inbox
     bool op_recording = false;   // between sd_graph_begin and sd_graph_end
     uint8_t* readback = nullptr;
     bool readback_pinned = true;   // false: pageable (the system refused to page-lock it), held in readback_pageable
@@ -939,6 +942,16 @@ struct Device {
     float route_floor=0;      // speed first (sd_hybrid_route_floor): CPU routes below this weight are left out
     uint64_t dropped_experts=0;   // the routes it left out
     uint64_t hybrid_wait_ns=0, hybrid_cpu_ns=0;
+    // The host's longest steps in the hybrid span under way (from its HybridAwait on), said when a GPU wait times out (recover_hybrid_wait):
+    // a launch or a stream query (and which), a unit's CPU experts, a wait for an export; and the layer the host last took an export of.
+    uint64_t span_call_ns=0, span_cpu_ns=0, span_export_ns=0;
+    const char* span_call="none";
+    size_t span_layer=SIZE_MAX;
+    // The GPU's waits that passed their deadline and found the host's result there (hybrid_await_past_deadline): read from the exchange,
+    // told in the log at most every ten seconds (HybridAwait's start), with when they were told last.
+    uint32_t late_seen=0;
+    uint64_t late_waits=0;
+    std::chrono::steady_clock::time_point late_told{};
     uint64_t hybrid_layers=0, hybrid_timed_layers=0;   // layers decoded hybrid, and of them those with a start on the GPU clock (hybrid_clock)
     uint32_t hybrid_sequence=0;
     size_t hybrid_position=SIZE_MAX;
@@ -989,6 +1002,7 @@ struct Device {
         if (side_stream) cleanup(hipStreamSynchronize(side_stream));
         if (stage_stream) cleanup(hipStreamSynchronize(stage_stream));
         if (send_stream) cleanup(hipStreamSynchronize(send_stream));
+        if (sum_stream) cleanup(hipStreamSynchronize(sum_stream));
         for (auto& entry : graphs) {
             cleanup(hipGraphExecDestroy(entry.second.executable));
             cleanup(hipGraphDestroy(entry.second.graph));
@@ -1015,6 +1029,8 @@ struct Device {
         if (readback_done) cleanup(hipEventDestroy(readback_done));
         if (parts_ready) cleanup(hipEventDestroy(parts_ready));
         if (parts_read) cleanup(hipEventDestroy(parts_read));
+        if (sum_queued) cleanup(hipEventDestroy(sum_queued));
+        if (sum_copied) cleanup(hipEventDestroy(sum_copied));
         if (cpu_partial) cleanup(hipFree(cpu_partial));
         if (expert_q8_scratch) cleanup(hipFree(expert_q8_scratch));
         if (draft_extras) cleanup(hipFree(draft_extras));
@@ -1060,6 +1076,7 @@ struct Device {
         if (side_stream) cleanup(hipStreamDestroy(side_stream));
         if (stage_stream) cleanup(hipStreamDestroy(stage_stream));
         if (send_stream) cleanup(hipStreamDestroy(send_stream));
+        if (sum_stream) cleanup(hipStreamDestroy(sum_stream));
         for (auto event : {kv_released, kv_prefetched, side_fork, side_join, stage_fork, stage_join, send_fork, send_done}) if (event) cleanup(hipEventDestroy(event));
     }
 };

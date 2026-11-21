@@ -130,14 +130,16 @@ bool gemv_q8_launch(Device& d, const FixedGemv& list, const float* input, float*
     return true;
 }
 // gemv_q8_mixed for a list it takes (its waves padded to whole blocks); false (nothing launched) otherwise.
-// Its LDS bytes for `vectors`, else 0.
-size_t gemv_q8_mixed_input(const Device& d, const FixedGemv& list, const float* input, size_t vectors) {
-    if (!d.q8_wide || !list.count || (vectors > 1 && list.input_stride % 4)) return 0;
+// Its LDS bytes for `vectors`, else 0. With `decode`, a list of Device::q8_decode's kinds alone (no BF16 rows), on such a device.
+size_t gemv_q8_mixed_input(const Device& d, const FixedGemv& list, const float* input, size_t vectors, bool decode = false) {
+    if (!(decode ? d.q8_decode : d.q8_wide) || !list.count || (vectors > 1 && list.input_stride % 4)) return 0;
     bool wide = false;
     size_t words = 0;
     for (unsigned i = 0; i < list.count; ++i) {
         const Matrix& m = list.items[i].matrix;
-        if (!list.items[i].lanes || (!gemv_q8_wide_kind(m.kind) && m.kind != 30)) return 0;
+        // (decode: not Q8_0, whose F32 rows, a value's decode a byte, took 35.7 / 36.5 us for wo_a's one and two rows against 37.4 / 38.7 here;
+        //  Q6_K's took 38.2 / 55.6 against 32.6 / 34.9: 4 x 1024 x 4096 on an R9700, 2026-11-20)
+        if (!list.items[i].lanes || (decode ? !gemv_q8_kind_taken(m.kind) || m.kind == 8 : (!gemv_q8_wide_kind(m.kind) && m.kind != 30))) return 0;
         if (m.kind != 30) {
             if (m.cols % 256 || reinterpret_cast<uintptr_t>(input + m.input_offset) % 16) return 0;
             words = std::max(words, gemv_q8_vector_words(m.cols, m.kind));
@@ -148,8 +150,8 @@ size_t gemv_q8_mixed_input(const Device& d, const FixedGemv& list, const float* 
     return wide && lds <= gemv_q8_lds_limit ? lds : 0;
 }
 template<int V>
-bool gemv_q8_mixed_launch(Device& d, const FixedGemv& list, const float* input, float* output) {
-    const size_t lds = gemv_q8_mixed_input(d, list, input, V);
+bool gemv_q8_mixed_launch(Device& d, const FixedGemv& list, const float* input, float* output, bool decode = false) {
+    const size_t lds = gemv_q8_mixed_input(d, list, input, V, decode);
     if (!lds) return false;
     FixedGemv padded = list;
     size_t waves = 0;
@@ -214,6 +216,10 @@ void gemv_launch(Device& d, const FixedGemv& list, unsigned blocks, bool uniform
 #endif
 #if defined(__HIPCC__)
     if (uniform && gemv_q8_launch<V>(d, list, input, output, nullptr)) return;
+    // A list of one Q8 decode kind but Q8_0 whose matrices read different inputs (DeepSeek-V4.1's wo_a: a device's four groups, each its
+    // own 4096 of the attention's output) took the F32 kernel, which gemv_q8_kind's one staged input cannot replace: gemv_q8_mixed stages
+    // each block's own matrix's input. A row's sum is gemv_q8_kind's (the same staging, lanes and dots), whatever shares the launch.
+    if (uniform && gemv_q8_mixed_launch<V>(d, list, input, output, true)) return;
 #endif
     const unsigned threads = blocks < 2u * d.compute_units ? 64 : 256;
     blocks *= 256 / threads; // same logical waves, rows, lanes and reduction tree

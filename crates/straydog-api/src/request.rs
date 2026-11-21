@@ -323,9 +323,9 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
     }
     // `straydog.reasoning` false: this one reply is written with no reasoning, in a conversation that thinks. The prompt stays the
     // thinking one's (its head says the effort: asked with another effort or with none, the whole conversation is read again), and
-    // the reply begins where its reasoning ends, as the template writes a reply back that had none. Only where the template closes
-    // a reasoning by its own token (DSML); elsewhere the reply reasons as asked.
-    let unreasoned = thinking && !reasoning && markup == Markup::Dsml;
+    // the reply begins where its reasoning ends, as the template writes a reply back that had none (DSML's `</think>`, and Qwen's
+    // empty `<think>\n\n</think>\n\n`: each worker closes it so).
+    let unreasoned = thinking && !reasoning;
     if unreasoned {
         fields.push(("reasoning".into(), Value::Bool(false)));
     }

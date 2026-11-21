@@ -882,10 +882,12 @@ pub struct Policy {
 
 /// What a [`Policy`]'s rounds did: the drafts it was asked for and, of those, how many tokens each
 /// verified (index 0: none, the draft thrown away).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stats {
     pub runs: usize,
     pub widths: [usize; MAX_SLOTS],
+    /// The milliseconds the drafts took (the host's wait for each, its drafter's passes on the GPU among it).
+    pub draft_ms: f64,
 }
 
 /// What a pass of 2, 3 and 4 rows costs over one of a single row, in one-row passes, before the
@@ -959,6 +961,7 @@ impl Policy {
     /// A draft took `ms`.
     pub fn drafted(&mut self, ms: f64) {
         self.draft_ms = 0.8 * self.draft_ms + 0.2 * ms;
+        self.stats.draft_ms += ms;
     }
 
     /// A target pass of `rows` rows took `ms`. A pass of one row tells what one costs now; a pass
@@ -1205,8 +1208,12 @@ mod tests {
         assert_eq!(round(&mut policy, 1.0), 3);
         assert_eq!(round(&mut policy, 0.1), 0);
         assert_eq!(policy.width(&[1.0; 3], 2), 2);
-        assert_eq!(policy.take_stats(), Stats { runs: 3, widths: [1, 0, 1, 1] });
+        assert_eq!(policy.take_stats(), Stats { runs: 3, widths: [1, 0, 1, 1], draft_ms: 0.0 });
         assert_eq!(policy.take_stats(), Stats::default());
+        // (and the time the drafts took, summed, for the request's line)
+        policy.drafted(2.5);
+        policy.drafted(3.5);
+        assert_eq!(policy.take_stats().draft_ms, 6.0);
     }
 
     /// What the policy learns of the costs: a draft's a running mean; a one-row pass's from the

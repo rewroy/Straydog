@@ -49,6 +49,11 @@ void* sd_allocate(void* handle, uint64_t bytes);
  * pass's GEMMs take, in a ring of `bytes` (an allocation within the budget; 0 keeps none), for the
  * pass's next batches. Once only. */
 int sd_expansions(void* handle, uint64_t bytes);
+/* The ring of kept FP16 expansions in `pointer` (a buffer of this device's, `bytes`), in place of one sd_expansions allocates: its
+   owner may lend it out between the passes that expand (sd_expansions_forget first, before any expansion is read again). */
+int sd_expansions_at(void* handle, void* pointer, uint64_t bytes);
+/* Forget every kept expansion: the ring's bytes are another's until the next prompt pass expands into it again. */
+int sd_expansions_forget(void* handle);
 int sd_write(void* handle, void* pointer, const void* data, uint64_t bytes);
 void* sd_filler_create(void* handle);
 void sd_filler_destroy(void* filler);
@@ -234,6 +239,10 @@ int sd_op_norm_linears_rope(void* handle, const float* x, const float* weight, u
    of x (one of their outputs) into normed and side's row as sd_op_norm_rope forms it: the results of
    the three ops, in one launch where it can. */
 int sd_op_linears_norm_rope(void* handle, const sd_linear* items, uint64_t count, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_norm_rope* side);
+/* sd_op_linears_norm_rope of 2 to 4 rows (a verify pass's): the items' input rows `input_stride` floats apart; their output rows, x's,
+   normed's and side->input's `stride` apart; side's positions and out_rows (or out's rows) one a row. Each row's results are those of
+   the row through sd_op_linears_norm_rope alone. */
+int sd_op_linears_norm_rope_rows(void* handle, const sd_linear* items, uint64_t count, uint64_t rows, uint64_t input_stride, uint64_t stride, const float* x, const float* weight, uint64_t width, float eps, float* normed, const sd_norm_rope* side);
 int sd_op_swiglu_linear(void* handle, const void* weights, int kind, uint64_t rows, uint64_t cols, const float* gate, const float* up, const float* scale, float* hidden, float* out);
 /* sd_op_swiglu_linear, and meanwhile (one launch where the GEMV takes it) the routes of one row of
    256 router logits as sd_op_route picks them with softmax gating, normalized, no bias, scale 1:
@@ -362,6 +371,11 @@ int sd_op_experts_table(void* handle, const uint64_t* table, uint64_t count, con
    order), each device's stream waiting for the others' parts and reading them over peer access.
    A part must stay unchanged until every device's sum has run; an out is never a part. */
 int sd_op_sum_devices(void* const* handles, float* const* outs, const float* const* parts, uint64_t devices, uint64_t count);
+/* sd_op_sum_devices in two halves (two devices): start copies each other device's `count` values of its part into the device's inbox on a
+   copy engine, behind the work queued so far on both; finish makes each device's stream wait for the copies and sums the parts in
+   device order (sd_op_sum_devices's bits). A start is finished before the next one; inboxes are left alone in between. */
+int sd_op_sum_devices_start(void* const* handles, const float* const* parts, float* const* inboxes, uint64_t devices, uint64_t count);
+int sd_op_sum_devices_finish(void* const* handles, float* const* outs, const float* const* parts, const float* const* inboxes, uint64_t devices, uint64_t count);
 /* Every device's later work waits until each other device's last sd_op_sum_devices has read its
    part (that sum reads it in place): before a device writes a summed part's buffer again. */
 int sd_devices_settle(void* const* handles, uint64_t devices);
@@ -851,6 +865,42 @@ int sd_vision_encode(void* handle, const sd_vision* model, const void* patches, 
                      uint64_t scratch_bytes, float* out);
 /* `count` BF16 values in place as FP16. */
 int sd_vision_half(void* handle, void* values, uint64_t count);
+
+/* One block of Qwen3.8's vision tower (width 1152, 16 heads of 72, FFN 4304): its products FP16 ([rows][cols]), its vectors F32. */
+typedef struct sd_qwen_vision_layer {
+    const void* norm1;
+    const void* norm1_bias;
+    const void* qkv;
+    const void* qkv_bias;
+    const void* out;
+    const void* out_bias;
+    const void* norm2;
+    const void* norm2_bias;
+    const void* up;
+    const void* up_bias;
+    const void* down;
+    const void* down_bias;
+} sd_qwen_vision_layer;
+
+/* Qwen3.8's merger: the post norm, mm.0 (4608 to 4608) and mm.2 (4608 to 2560). */
+typedef struct sd_qwen_vision_merger {
+    const void* norm;
+    const void* norm_bias;
+    const void* up;
+    const void* up_bias;
+    const void* down;
+    const void* down_bias;
+} sd_qwen_vision_merger;
+
+/* The scratch bytes `patches` patches (a multiple of four) take, for a block and for the merger. */
+int sd_qwen_vision_scratch_bytes(uint64_t patches, uint64_t* bytes);
+/* One block on the device's stream over `x` ([patches][1152], F32, merge order), in place; `cosines` and `sines` are each
+ * patch's 36 angles (18 by its row, then 18 by its column). */
+int sd_qwen_vision_block(void* handle, const sd_qwen_vision_layer* layer, float* x, const float* cosines, const float* sines,
+                         uint64_t patches, void* scratch, uint64_t scratch_bytes);
+/* The merger over `x` after the last block: `out` is [patches / 4][2560], F32. */
+int sd_qwen_vision_merge(void* handle, const float* x, const sd_qwen_vision_merger* merger, uint64_t patches, void* scratch,
+                         uint64_t scratch_bytes, float* out);
 
 #ifdef __cplusplus
 }

@@ -330,6 +330,213 @@ impl Encoder {
     }
 }
 
+impl Encoder {
+    /// [`Encoder::encode`] with the blocks and the merger on `gpu`, the patches embedded here first: its products FP16 with F32 sums, where
+    /// the CPU's are F32 throughout. What it takes of the device for a while (the activations, and the weights a block at a time) comes out
+    /// of the device's budget ([`crate::gpu::Backend::make_room`], which may let the expert pool go) and goes back when it ends. Err where
+    /// the device cannot: the caller encodes on the CPU instead.
+    pub fn encode_on(&self, gpu: &mut crate::gpu::Backend, image: &Prepared, cancelled: &(dyn Fn() -> bool + Sync))
+                     -> Result<Option<Vec<f32>>, String> {
+        Ok(self.encode_all_on(gpu, &[image], cancelled)?.map(|mut all| all.remove(0)))
+    }
+
+    /// [`Encoder::encode_on`] for each of `images`, in one stay on the device: the room for the largest is taken once and given back once
+    /// (letting the expert pool go and having it back is what costs, not an image).
+    pub fn encode_all_on(&self, gpu: &mut crate::gpu::Backend, images: &[&Prepared], cancelled: &(dyn Fn() -> bool + Sync))
+                         -> Result<Option<Vec<Vec<f32>>>, String> {
+        let shown = self.path.display();
+        if signature(&self.file).map_err(|exc| format!("{shown}: {exc}"))? != self.signature {
+            return Err(format!("the vision encoder {shown} changed on disk"));
+        }
+        // SAFETY: mapped read-only; the file is pinned, checked unchanged above, and the mapping ends with this call.
+        let map = unsafe { Mmap::map(&self.file) }.map_err(|exc| format!("{shown}: {exc}"))?;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(self.threads).build().map_err(|exc| exc.to_string())?;
+        let tower = Tower::new(&map, &self.layout)?;
+        let counts: Vec<usize> = images.iter().map(|image| image.rows * image.columns).collect();
+        let places = DevicePlaces::new(&counts)?;
+        let total = places.total;
+        let started = std::time::Instant::now();
+        let let_go = gpu.make_room(total)?;
+        let made = started.elapsed();
+        let ran = gpu.buffer_unset(total).and_then(|buffer| {
+            let ran = (|| {
+                // Each image's rows and angles on the device first; then each block's weights once, for all of them.
+                for (image, (count, at)) in images.iter().zip(counts.iter().zip(&places.images)) {
+                    let order = merge_order(image.rows, image.columns);
+                    let (cosines, sines) = rope_angles(&order);
+                    let mut hidden = zeros(count * HIDDEN)?;
+                    pool.install(|| tower.embed(image, &order, &mut hidden));
+                    gpu.write_buffer(&buffer, at.rows, &hidden)?;
+                    gpu.write_buffer(&buffer, at.cosines, &cosines)?;
+                    gpu.write_buffer(&buffer, at.sines, &sines)?;
+                }
+                run_on_device(gpu, &buffer, &places, &tower, cancelled)
+            })();
+            gpu.release_buffer(buffer).and(ran)
+        });
+        let rows = ran.and_then(|rows| match rows {
+            Some(all) if all.iter().any(|rows| !rows.iter().all(|value| value.is_finite())) => Err("the vision encoder's rows are not finite".to_string()),
+            other => Ok(other),
+        });
+        let encoded = started.elapsed();
+        let back = gpu.room_back(let_go);
+        eprintln!("Straydog vision: {} image(s) on the GPU in {:.2} s (room {:.2} s{}, back {:.2} s)", images.len(), encoded.as_secs_f64(), made.as_secs_f64(),
+                  if let_go { ", the expert pool let go" } else { "" }, (started.elapsed() - encoded).as_secs_f64());
+        let rows = rows?;
+        back?;
+        Ok(rows)
+    }
+}
+
+/// Where each thing lies in the one device buffer a request's images take: each image's rows (F32) and its patches' angles, then what
+/// they share, a block's products (FP16, or the merger's), their vectors (F32), an image's rows out, the native scratch.
+struct DevicePlaces {
+    images: Vec<ImagePlaces>,
+    weights: u64,
+    vectors: u64,
+    out: u64,
+    scratch: u64,
+    scratch_bytes: u64,
+    total: u64,
+}
+
+/// An image's own places, and its patches.
+struct ImagePlaces {
+    count: usize,
+    rows: u64,
+    cosines: u64,
+    sines: u64,
+}
+
+/// A block's products in the order they lie on the device, as (rows, columns); then the merger's.
+const BLOCK_PRODUCTS: [(usize, usize); 4] = [(QKV, HIDDEN), (HIDDEN, HIDDEN), (FFN, HIDDEN), (HIDDEN, FFN)];
+const MERGER_PRODUCTS: [(usize, usize); 2] = [(MERGED, MERGED), (ROW, MERGED)];
+
+fn aligned(bytes: usize) -> u64 {
+    (bytes as u64).next_multiple_of(256)
+}
+
+/// Each product's offset in the weights' place, and the bytes they take (as FP16).
+fn product_offsets(products: &[(usize, usize)]) -> (Vec<u64>, u64) {
+    let mut at = 0;
+    let offsets = products.iter().map(|&(rows, columns)| {
+        let offset = at;
+        at += aligned(rows * columns * 2);
+        offset
+    }).collect();
+    (offsets, at)
+}
+
+impl DevicePlaces {
+    fn new(counts: &[usize]) -> Result<DevicePlaces, String> {
+        let mut at = 0u64;
+        let mut images = Vec::with_capacity(counts.len());
+        let mut scratch_bytes = 0u64;
+        for &count in counts {
+            let mut bytes = 0u64;
+            // SAFETY: an out-parameter; nothing else is read.
+            straydog_gpu::check(unsafe { straydog_gpu::ffi::sd_qwen_vision_scratch_bytes(count as u64, &mut bytes) }).map_err(|error| error.to_string())?;
+            scratch_bytes = scratch_bytes.max(bytes);
+            let rows = at;
+            let cosines = rows + aligned(count * HIDDEN * 4);
+            let sines = cosines + aligned(count * ROPE * 4);
+            at = sines + aligned(count * ROPE * 4);
+            images.push(ImagePlaces { count, rows, cosines, sines });
+        }
+        let most = counts.iter().copied().max().unwrap_or(0);
+        let weights_bytes = product_offsets(&BLOCK_PRODUCTS).1.max(product_offsets(&MERGER_PRODUCTS).1);
+        let vectors_bytes = aligned(BLOCK_VECTORS * 4).max(aligned(MERGER_VECTORS * 4));
+        let weights = at;
+        let vectors = weights + weights_bytes;
+        let out = vectors + vectors_bytes;
+        let scratch = out + aligned(most / (MERGE * MERGE) * ROW * 4);
+        Ok(DevicePlaces { images, weights, vectors, out, scratch, scratch_bytes, total: scratch + scratch_bytes })
+    }
+}
+
+/// A block's vectors as they lie on the device: norm1's weight and bias, the biases of qkv and out, norm2's weight and bias, the biases of up
+/// and down.
+const BLOCK_VECTORS: usize = 2 * HIDDEN + QKV + HIDDEN + 2 * HIDDEN + FFN + HIDDEN;
+/// The merger's: the post norm's weight and bias, mm.0's bias, mm.2's.
+const MERGER_VECTORS: usize = 2 * HIDDEN + MERGED + ROW;
+
+/// The products' BF16 values at their places, made FP16 there, and the vectors after them; the device addresses of each, in order.
+fn upload_part(gpu: &mut crate::gpu::Backend, buffer: &crate::ops::Buffer, places: &DevicePlaces, tower: &Tower<'_>, products: &[(Place, (usize, usize))],
+               vectors: &[Place]) -> Result<(Vec<*const std::ffi::c_void>, Vec<*const std::ffi::c_void>), String> {
+    let shapes: Vec<(usize, usize)> = products.iter().map(|(_, shape)| *shape).collect();
+    let (offsets, bytes) = product_offsets(&shapes);
+    let base = buffer.base();
+    let mut matrices = Vec::with_capacity(products.len());
+    for ((place, (rows, columns)), offset) in products.iter().zip(&offsets) {
+        let values = tower.halves(*place);
+        if values.len() != rows * columns {
+            return Err("a vision encoder product is not of its shape".into());
+        }
+        gpu.write_buffer(buffer, places.weights + offset, values)?;
+        matrices.push(base.wrapping_byte_add((places.weights + offset) as usize).cast_const());
+    }
+    // SAFETY: the products' BF16 values lie in the buffer's weights place, `bytes` of it (the gaps between them are the buffer's own).
+    straydog_gpu::check(unsafe { straydog_gpu::ffi::sd_vision_half(gpu.handle(), base.wrapping_byte_add(places.weights as usize), bytes / 2) })
+        .map_err(|error| error.to_string())?;
+    let mut at = places.vectors;
+    let mut addresses = Vec::with_capacity(vectors.len());
+    for place in vectors {
+        let values = tower.floats(*place);
+        gpu.write_buffer(buffer, at, values)?;
+        addresses.push(base.wrapping_byte_add(at as usize).cast_const());
+        at += (values.len() * 4) as u64;
+    }
+    Ok((matrices, addresses))
+}
+
+/// The blocks over every image (each block's weights uploaded once), then the merger over each; each image's rows, in order.
+fn run_on_device(gpu: &mut crate::gpu::Backend, buffer: &crate::ops::Buffer, places: &DevicePlaces, tower: &Tower<'_>,
+                 cancelled: &(dyn Fn() -> bool + Sync)) -> Result<Option<Vec<Vec<f32>>>, String> {
+    let base = buffer.base();
+    let address = |offset: u64| base.wrapping_byte_add(offset as usize);
+    for block in &tower.layout.blocks {
+        if cancelled() {
+            return Ok(None);
+        }
+        let products = [(block.qkv.0, BLOCK_PRODUCTS[0]), (block.out.0, BLOCK_PRODUCTS[1]), (block.up.0, BLOCK_PRODUCTS[2]), (block.down.0, BLOCK_PRODUCTS[3])];
+        let vectors = [block.norm1.0, block.norm1.1, block.qkv.1, block.out.1, block.norm2.0, block.norm2.1, block.up.1, block.down.1];
+        let (m, v) = upload_part(gpu, buffer, places, tower, &products, &vectors)?;
+        let layer = straydog_gpu::ffi::sd_qwen_vision_layer {
+            norm1: v[0], norm1_bias: v[1], qkv: m[0], qkv_bias: v[2], out: m[1], out_bias: v[3],
+            norm2: v[4], norm2_bias: v[5], up: m[2], up_bias: v[6], down: m[3], down_bias: v[7],
+        };
+        for image in &places.images {
+            // SAFETY: every address lies in the buffer, at the places DevicePlaces gave for these images; the library checks each range against
+            // its allocations.
+            straydog_gpu::check(unsafe {
+                straydog_gpu::ffi::sd_qwen_vision_block(gpu.handle(), &layer, address(image.rows).cast(), address(image.cosines).cast_const().cast(),
+                                                        address(image.sines).cast_const().cast(), image.count as u64, address(places.scratch),
+                                                        places.scratch_bytes)
+            }).map_err(|error| error.to_string())?;
+        }
+    }
+    if cancelled() {
+        return Ok(None);
+    }
+    let layout = &tower.layout;
+    let products = [(layout.merge_up.0, MERGER_PRODUCTS[0]), (layout.merge_down.0, MERGER_PRODUCTS[1])];
+    let vectors = [layout.post_norm.0, layout.post_norm.1, layout.merge_up.1, layout.merge_down.1];
+    let (m, v) = upload_part(gpu, buffer, places, tower, &products, &vectors)?;
+    let merger = straydog_gpu::ffi::sd_qwen_vision_merger { norm: v[0], norm_bias: v[1], up: m[0], up_bias: v[2], down: m[1], down_bias: v[3] };
+    let mut all = Vec::with_capacity(places.images.len());
+    for image in &places.images {
+        // SAFETY: as above.
+        straydog_gpu::check(unsafe {
+            straydog_gpu::ffi::sd_qwen_vision_merge(gpu.handle(), address(image.rows).cast_const().cast(), &merger, image.count as u64, address(places.scratch),
+                                                    places.scratch_bytes, address(places.out).cast())
+        }).map_err(|error| error.to_string())?;
+        let mut rows = zeros(image.count / (MERGE * MERGE) * ROW)?;
+        gpu.read_buffer(buffer, (places.out / 4) as usize, &mut rows)?;
+        all.push(rows);
+    }
+    Ok(Some(all))
+}
+
 /// The floats a patch takes while encoding: the hidden rows and their norms, QKV, keys by column, values by head, attention
 /// out, the branch, the feed-forward's middle.
 const WORK_FLOATS: usize = 6 * HIDDEN + QKV + FFN;

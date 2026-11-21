@@ -368,7 +368,7 @@ The expert store (`experts.rs`) has three tiers:
 - **VRAM slots per device.** Slots are grouped by size class (a model's layers may use several
   expert types). The VRAM left after everything else is counted in units of the largest
   expert's share, and each class gets its layers' share of the bytes. Each class replaces its
-  least recently used slot.
+  slot of the lowest LRFU score (below).
   - VRAM idle between passes holds slots too: the prefill rows' arena, each kv source's
     compressed rows and index keys past what the sequence has reached, and the batch buffers
     (the index scores, the queries, the attended rows, Engram's values) past the rows a pass fills
@@ -413,6 +413,15 @@ IQ2_XXS with DSpark, 2026-10-28):
   misses; moving them to the warm end of the probation alone saves 1.6% (served trace with the
   scores, 2026-11-16).
 - So capacity is the lever: 10% more slots cut misses by 16%.
+- Each class orders its slots by an LRFU score: every pass that uses an expert adds one to its
+  score, and scores halve every twice the class's slots of uses (`STRAYDOG_EXPERT_LRFU`, the
+  half-life in those units, 2; `=0` keeps the order of the last use, with the probation above). A
+  streaming prefill's uses add nothing: it takes nearly every expert of a layer, which made all
+  scores alike. The store logs every 2^20 uses of decode and verify passes what VRAM missed beside
+  an LRU of the same slots and uses, ARC, LRU-2, LRFU at several half-lives and the optimum, by
+  class (`reuse.rs`). Served on two R9700s (UD-IQ2_XXS, agent turns of Dogmind to 120K tokens,
+  2026-11-20): the probation store missed 1.2% fewer than that LRU, LRFU at 2 with no probation
+  4.7% fewer (10.60% against 11.12% of uses); the optimum, 5.2%.
 
 ## 6. Generation
 
@@ -836,11 +845,18 @@ and a 102.2 GiB host tier (12,629 experts' worth, of 15,360).
   while the host tier keeps theirs.
 - **The prefill batch,** when nothing else is asked for, is the largest whose pass buffers (~0.32 MB
   a row on each GPU) take at most an eighth of the smallest GPU budget, from 8192 down to 256; on
-  cards of 24 GiB and more, 32768 or 16384 within a third of it. `--batch-size` takes up to 32768.
+  cards of 24 GiB and more, 32768 or 16384 within a third of it, and from 28 GiB 32768 within half
+  of it. `--batch-size` takes up to 32768.
   - Every pass reads the ~35 GB a GPU of experts the VRAM does not hold over the bus (~1.5 s at
     ~24 GB/s on both GPUs), whatever its rows, so a long prompt takes fewer of those trips in wider
-    passes. Two R9700s take 16384: a 45K prompt's first token 30.8 to 27.5 s and a 20K one's 14.6 to
-    11.9 s against 8192, the same replies.
+    passes. Two R9700s took 16384 (a 45K prompt's first token 30.8 to 27.5 s and a 20K one's 14.6 to
+    11.9 s against 8192, the same replies) and take 32768 since 2026-11-21: a cold 94,851-token
+    document 60.6 to 58.3 s, a 79,160-token one 52.3 to 44.7 s, the logits of dsfix/context-30000
+    the same bits, 5106 to 5076 slots between passes.
+  - A fresh long prompt on UD-IQ2_XXS (284 GB, beyond the VRAM and the 101 GiB host tier) reads
+    ~80 GB of experts from the drive (~20 s of waits at ~4 GB/s): its passes are bound by those
+    reads, not by their kernels. Reading the next layers' drive experts into the host tier ahead
+    of time read 28-47% more and saved nothing (2026-11-21).
   - The lent arena (§5) covers the larger buffers: the slot count between passes barely changes
     (6064 to 6059), and a long pass writes back the few hundred experts its buffers take.
   - Engram decodes a batch at a time, so a wide pass's Engram rows no longer outgrow the row cache.
@@ -858,6 +874,17 @@ and a 102.2 GiB host tier (12,629 experts' worth, of 15,360).
   tool result, a short message) was found to wait longer than one that added 36 to 88: in F32 a row of such a pass cost
   about what a decode pass costs (12 tokens 358-403 ms, 28 tokens 651-682 ms, against 233-324 ms for 36 to 88; at 8 rows
   144-155 and 201-237 ms; two R9700, UD-IQ1_M).
+- **A long pass's attention sums** (two devices) come over on the copy engines: a batch's start
+  copies the other device's part into an inbox on a stream of its own, and the batch's FFN step and
+  router follow the next batch's attention, after a local add in device order (the same bits;
+  234 to 25 us a batch of 256 rows on an R9700, 2026-11-21).
+- **The WMMA attention's queries** are made in FP16 once a row (`ds_attention_query_rows`), not in
+  each of a row's ten scores blocks from F32 with the rotation in double; its scores and output
+  blocks hold one LDS stage (15 and 19 KiB), eight and six blocks a WGP where two stages allowed four
+  and three. A 16,384-row pass's scores and output took 1.94 s of each GPU's kernels before, 1.26 s
+  after, the same bits.
+- **A long prompt's progress** is reported where it was resumed before its first pass (a client
+  showed nothing for the first pass, 38 s of a 79K-token prompt in passes of 32768).
 - **What a long pass's kernels share.** The attention's output kernel splits a row into dim / 64
   blocks: a kernel before them forms each row's softmax weights and denominators once, in place. The
   HC step takes 16 rows a block, each thread holding its column's mixing weights, and forms its 26

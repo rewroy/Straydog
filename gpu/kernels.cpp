@@ -412,7 +412,7 @@ void expert_cache_quiesce(Device& d) {
             attempt([&]() { hybrid_settle(*side,true); });
             attempt([&]() { check(hipStreamSynchronize(side->stream)); });
             for (hipStream_t stream : {side->copy_stream,side->kv_stream,side->helper_stream,side->side_stream,
-                                      side->send_stream,side->stage_stream,side->rows_stream})
+                                      side->send_stream,side->stage_stream,side->rows_stream, side->sum_stream})
                 if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
             if (side->transfers) for (auto stream : side->transfers->streams)
                 if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
@@ -454,10 +454,19 @@ void* expert_cache_kv_allocate(Device& d,size_t bytes) {
 int recover_hybrid_wait(void* handle) {
     try {
         auto& d = device(handle);
+        // What held the host up in the pass the GPU gave up waiting for (Device::span_call_ns): a call, its CPU experts or an export, against
+        // the GPU's wait of ~1 s under a kernel run-time limit. Until this, a timeout said only that it happened (an RTX 4060 PC, five a day).
+        {
+            char layer[24] = "none";
+            if (d.span_layer != SIZE_MAX) std::snprintf(layer, sizeof(layer), "%zu", d.span_layer);
+            std::fprintf(stderr, "Straydog GPU wait timed out on GPU %d: in the pass, the host last took layer %s's export; its longest call %.1f ms (%s), "
+                                 "its longest CPU experts of a unit %.1f ms, its longest wait for an export %.1f ms\n",
+                         d.ordinal, layer, d.span_call_ns / 1e6, d.span_call, d.span_cpu_ns / 1e6, d.span_export_ns / 1e6);
+        }
         check(hipStreamSynchronize(d.stream));
         hybrid_settle(d, true);
         check(hipStreamSynchronize(d.stream));
-        for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream, d.stage_stream, d.rows_stream})
+        for (hipStream_t stream : {d.copy_stream, d.kv_stream, d.helper_stream, d.side_stream, d.send_stream, d.stage_stream, d.rows_stream, d.sum_stream})
             if (stream) check(hipStreamSynchronize(stream));
         if (d.transfers)
             for (hipStream_t stream : d.transfers->streams)
@@ -511,7 +520,7 @@ std::string drain_drafting(Device& d, bool shared_head) {
                 attempt([&]() { hybrid_settle(*side, true); });
                 attempt([&]() { check(hipStreamSynchronize(side->stream)); });
                 for (hipStream_t stream : {side->copy_stream, side->kv_stream, side->helper_stream, side->side_stream,
-                                          side->send_stream, side->stage_stream, side->rows_stream})
+                                          side->send_stream, side->stage_stream, side->rows_stream, side->sum_stream})
                     if (stream) attempt([&]() { check(hipStreamSynchronize(stream)); });
                 if (side->transfers)
                     for (hipStream_t stream : side->transfers->streams)
@@ -3646,6 +3655,29 @@ void* sd_upload(void* handle, const void* data, uint64_t bytes) {
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }
 }
 
+int sd_expansions_at(void* handle, void* pointer, uint64_t bytes) {
+    try {
+        auto& value = device(handle);
+        if (value.expansions) throw std::runtime_error("Straydog expansions are kept already");
+        if (!pointer || !bytes) throw std::runtime_error("invalid Straydog expansion ring");
+        op_span(value, pointer, size_t(bytes), "the expansion ring");
+        value.expansions = static_cast<uint8_t*>(pointer);
+        value.expansions_bytes = size_t(bytes);
+        value.expansions_at = 0;
+        value.expanded_weights.clear();
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_expansions_forget(void* handle) {
+    try {
+        auto& value = device(handle);
+        value.expanded_weights.clear();
+        value.expansions_at = 0;
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 int sd_expansions(void* handle, uint64_t bytes) {
     try {
         auto& value = device(handle);
@@ -5330,6 +5362,41 @@ int sd_op_sparse_attention(void* handle, const float* q, const float* raw, uint6
         }
         const dim3 score_grid{unsigned(wmma_chunks), unsigned(rows)}, weight_grid{1, unsigned(rows)}, out_grid{unsigned(dim / 64), unsigned(rows)};
         const size_t keys_bytes = size_t(stride) * sizeof(float*);
+        // Where the scratch holds them past the scores: the rows' queries in FP16, made once a row (ds_attention_query_rows), the
+        // operands each scores block made of q again (some ten blocks a row, the rotated columns in double, from F32): the same bits.
+        // (A 16,384-row pass on an R9700: scores 381 -> 292 us a batch of 256 rows, the queries 47 us; the weights in FP16 too, the
+        // output kernel's operands, saved it nothing: 415 -> 428 us. 2026-11-21.)
+        const size_t queries_at = (wmma_need + 255) / 256 * 256, query_bytes = size_t(rows * heads * dim) * 2;
+        // (DS41_PREPARED_QUERIES=0, development: each scores block makes its queries, as before)
+        const char* prepared = std::getenv("DS41_PREPARED_QUERIES");
+        // (DS41_ATTENTION_BUFFERS=2, development: two stages of LDS a block, as before)
+        const char* buffers = std::getenv("DS41_ATTENTION_BUFFERS");
+        const bool single = !(buffers && buffers[0] == '2' && !buffers[1]);
+        if (scratch_bytes >= queries_at + query_bytes && !(prepared && prepared[0] == '0' && !prepared[1])) {
+            op_span(value, scratch, queries_at + query_bytes, "attention scratch");
+            auto* queries = reinterpret_cast<_Float16*>(reinterpret_cast<uint8_t*>(scratch) + queries_at);
+            ds_attention_query_rows<<<unsigned(rows), 256, 0, value.stream>>>(q, size_t(heads), size_t(dim), pairs, forward, queries);
+            check(hipGetLastError());
+            #define SD_DS_ATTENTION_PREPARED(HM, B) \
+                ds_attention_scores_wmma<HM, true, B><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, \
+                    size_t(window), compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, \
+                    scores, partial, queries); \
+                check(hipGetLastError()); \
+                ds_attention_weights_wmma<HM><<<weight_grid, 256, 0, value.stream>>>(scores, partial, wmma_chunks, positions, size_t(window), \
+                    size_t(selections), sinks, size_t(heads), stride); \
+                check(hipGetLastError()); \
+                ds_attention_output_wmma<HM, B><<<out_grid, 128, keys_bytes, value.stream>>>(scores, partial, wmma_chunks, raw, \
+                    size_t(raw_rows), positions, size_t(window), compressed, selected, size_t(selections), size_t(heads), size_t(dim), pairs, \
+                    inverse, stride, out);
+            if (heads == 32) {
+                if (single) { SD_DS_ATTENTION_PREPARED(2, 1) } else { SD_DS_ATTENTION_PREPARED(2, 2) }
+            } else {
+                if (single) { SD_DS_ATTENTION_PREPARED(4, 1) } else { SD_DS_ATTENTION_PREPARED(4, 2) }
+            }
+            #undef SD_DS_ATTENTION_PREPARED
+            check(hipGetLastError());
+            return 0;
+        }
         #define SD_DS_ATTENTION(HM) \
             ds_attention_scores_wmma<HM><<<score_grid, 128, 0, value.stream>>>(q, raw, size_t(raw_rows), positions, size_t(window), \
                 compressed, selected, size_t(selections), size_t(heads), size_t(dim), scale, pairs, forward, stride, scores, partial); \
@@ -5703,6 +5770,83 @@ int sd_op_sum_devices(void* const* handles, float* const* outs, const float* con
     } catch (const std::exception& e) { last_error = e.what(); return -1; }
 }
 
+// sd_op_sum_devices in two halves, for a prompt pass's batches: the other device's part comes over on a copy engine while the
+// device computes on, and the sum is then of local values. (sd_op_sum_devices's kernel read the other's part over PCIe on the
+// device's stream: 234 us of each batch of 256 rows on each R9700, 0.64 s of a 16,384-row pass's 10.1 s of kernels, 2026-11-21.)
+// Start: on each device's sum stream, behind the work queued so far on both devices, the other's `count` values of its part into
+// the device's inbox. Finish: each device's stream waits for both copies (its inbox's, and the other's read of its part), then adds
+// the parts in device order with sd_op_sum_devices's kernel: the same bits. A start is finished before the next start; an inbox
+// is not touched between the two.
+int sd_op_sum_devices_start(void* const* handles, const float* const* parts, float* const* inboxes, uint64_t devices, uint64_t count) {
+    try {
+        if (!handles || !parts || !inboxes || devices != 2 || !count) throw std::runtime_error("invalid Straydog device sum start");
+        Device* list[2] = {&device(handles[0]), &device(handles[1])};
+        if (list[0] == list[1]) throw std::runtime_error("a device twice in a Straydog device sum");
+        for (size_t i = 0; i < 2; ++i) {
+            op_span(*list[i], parts[i], size_t(count) * 4, "a device's part");
+            op_span(*list[i], inboxes[i], size_t(count) * 4, "a device's inbox");
+        }
+        link_peers(std::vector<Device*>{list[0], list[1]});
+        for (Device* d : list)
+            on_device(d->ordinal, [&]() {
+                if (!d->sum_stream) {
+                    check(hipStreamCreateWithFlags(&d->sum_stream, hipStreamNonBlocking));
+                    check(hipEventCreateWithFlags(&d->sum_queued, hipEventDisableTiming));
+                    check(hipEventCreateWithFlags(&d->sum_copied, hipEventDisableTiming));
+                }
+                check(hipEventRecord(d->sum_queued, d->stream));
+            });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
+        for (size_t i = 0; i < 2; ++i)
+            on_device(list[i]->ordinal, [&]() {
+                Device& d = *list[i];
+                const size_t j = 1 - i;
+                // (its own queued work: the inbox's last reader, the previous finish, is on the device's stream)
+                check(hipStreamWaitEvent(d.sum_stream, d.sum_queued, 0));
+                check(hipStreamWaitEvent(d.sum_stream, list[j]->sum_queued, 0));
+                check(hipMemcpyPeerAsync(inboxes[i], d.ordinal, parts[j], list[j]->ordinal, size_t(count) * 4, d.sum_stream));
+                check(hipEventRecord(d.sum_copied, d.sum_stream));
+            });
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
+int sd_op_sum_devices_finish(void* const* handles, float* const* outs, const float* const* parts, const float* const* inboxes,
+                             uint64_t devices, uint64_t count) {
+    try {
+        if (!handles || !outs || !parts || !inboxes || devices != 2 || !count) throw std::runtime_error("invalid Straydog device sum finish");
+        Device* list[2] = {&device(handles[0]), &device(handles[1])};
+        if (list[0] == list[1] || !list[0]->sum_copied || !list[1]->sum_copied)
+            throw std::runtime_error("a Straydog device sum finished without its start");
+        for (size_t i = 0; i < 2; ++i) {
+            op_span(*list[i], parts[i], size_t(count) * 4, "a device's part");
+            op_span(*list[i], inboxes[i], size_t(count) * 4, "a device's inbox");
+            op_span(*list[i], outs[i], size_t(count) * 4, "a device's sum");
+            if (static_cast<const void*>(outs[i]) == static_cast<const void*>(parts[i]) ||
+                static_cast<const void*>(outs[i]) == static_cast<const void*>(inboxes[i]))
+                throw std::runtime_error("a device sum cannot overwrite a part");
+        }
+        for (size_t i = 0; i < 2; ++i)
+            on_device(list[i]->ordinal, [&]() {
+                Device& d = *list[i];
+                // (the other's copy read this device's part: the part's rows may be written again after this)
+                check(hipStreamWaitEvent(d.stream, list[0]->sum_copied, 0));
+                check(hipStreamWaitEvent(d.stream, list[1]->sum_copied, 0));
+                DeviceParts all{};
+                all.parts[i] = parts[i];
+                all.parts[1 - i] = inboxes[i];
+                sum_devices_kernel<<<unsigned((count + 255) / 256), 256, 0, d.stream>>>(all, 2u, size_t(count), outs[i]);
+                check(hipGetLastError());
+            });
+#if !defined(__HIPCC__)
+        for (Device* d : list) on_device(d->ordinal, [&]() { flush_launches(*d); });
+#endif
+        return 0;
+    } catch (const std::exception& e) { last_error = e.what(); return -1; }
+}
+
 // Every device's later work waits until each other device's last sd_op_sum_devices has read its
 // part: before a device writes a summed part's buffer again (another device's sum reads it there).
 int sd_devices_settle(void* const* handles, uint64_t devices) {
@@ -6048,4 +6192,5 @@ int sd_expert_rows(void* handle, void* const* banks, const int* kinds, uint64_t 
 #include "dspark_inject.hpp"
 #include "host_exchange.hpp"
 #include "vision.hpp"
+#include "qwen_vision.hpp"
 #include "dspark_attention.hpp"

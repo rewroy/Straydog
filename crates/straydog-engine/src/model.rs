@@ -1435,9 +1435,15 @@ pub struct Model {
     tiers: Vec<crate::banks::ExpertTier>,
     /// The experts each layer's tier was made of (by layer), for a tier a pass gave back to be made again ([`Model::pass_relock`]).
     tier_chosen: Option<Vec<Vec<usize>>>,
+    /// The mapping's pages of the tiers made since the last locking ended, given back from the working set ([`crate::host::leave_working_set`]):
+    /// the bytes asked, and the bytes the working set fell by. Said when the locking ends ([`Model::banks_lock_ended`]).
+    tier_left: (u64, u64),
     /// Whether a prompt's last checkpoint may be taken inside a batch ([`Model::capture_possible`]; STRAYDOG_CAPTURE=0 says no).
     capture: bool,
     checkpoints: IndexMap<&'static str, Checkpoint>,
+    /// Where the running request resumed (the tokens it reused) and the slots of the checkpoints it found there or below, on its own
+    /// tokens: what a GPU wait timeout leaves as it was ([`Model::recover_hybrid_wait`]).
+    recoverable: (usize, Vec<usize>),
     /// The length of the held sequence from which the reply being written is marked next ([`MARK_EVERY`]); `usize::MAX` for a reply that
     /// is not marked.
     mark_at: usize,
@@ -1596,6 +1602,11 @@ pub struct ForcedRows {
 }
 
 impl Model {
+    /// The first device's backend, for work beside the model's between requests (Qwen3.8's vision encoder).
+    pub fn first_device(&mut self) -> Option<&mut crate::gpu::Backend> {
+        self.group.backends.first_mut()
+    }
+
     /// Place the model on the group's GPUs, then read and authenticate the weights into the
     /// placement (see `crate::load`); `progress` follows the reading.
     pub fn new(weights: Weights, mut group: Group, settings: &Settings, progress: Progress) -> Result<Model> {
@@ -1746,8 +1757,10 @@ impl Model {
             tier_sizes: Vec::new(),
             tiers: Vec::new(),
             tier_chosen: None,
+            tier_left: (0, 0),
             capture: std::env::var("STRAYDOG_CAPTURE").map_or(true, |value| value.trim() != "0"),
             checkpoints: IndexMap::new(),
+            recoverable: (0, Vec::new()),
             mark_at: usize::MAX,
             reply_marks: true,
             parked: None,
@@ -2439,7 +2452,7 @@ impl Model {
             };
             planned.push((layer, [bank("gate")?, bank("up")?, bank("down")?]));
         }
-        let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::left_free(self.weights.host_memory_bytes))
+        let job = BankLocks::new(planned, self.group.host_ordinal(), crate::host::lock_kept_free(self.weights.host_memory_bytes))
             .tied_to(self.lock_halt.clone(), self.kv_ahead.clone()).remembering(self.lock_refusal.clone()).marking(self.registered.clone());
         // (a GPU that cannot register the read-only mapping is not asked to: each layer's turn copies its banks, and checks the copies)
         Ok(match self.lock_mode {
@@ -2551,9 +2564,9 @@ impl Model {
             return Some(job);
         }
         // (a host tier's layers are not locked whole behind the requests: the tier holds what the budget did, and a whole lock beside it
-        // would hold its experts twice)
+        // would hold its experts twice; what its locking left of it is made behind the requests instead)
         if self.tier_chosen.is_some() {
-            return None;
+            return self.tier_more(prior);
         }
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
@@ -2566,7 +2579,7 @@ impl Model {
         let mut budget = by_memory.min(crate::host::lockable(memory, 0)).min(self.visible_cap.saturating_sub(locked));
         let mut left: Vec<usize> = (0..48).rev().filter(|layer| sizes[*layer] > 0 && !self.locked_layers.contains(layer)).collect();
         self.refresh_kv_ahead();
-        let (margin, kv_ahead) = (crate::host::left_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
+        let (margin, kv_ahead) = (crate::host::lock_kept_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
         let available = crate::host::available_bytes();
         // (the least of them first: on most requests' ends nothing fits, and the routes are not asked for)
         let least = left.iter().map(|&layer| sizes[layer]).min()?;
@@ -2606,6 +2619,55 @@ impl Model {
         Some(job)
     }
 
+    /// Behind a request, with a host tier: the layers of it the start chose that no locking has made (it stopped short, with too little memory
+    /// available then), made now as far as the memory available leaves room beside what is kept free and the K/V still to grow, and the GPUs'
+    /// view of host memory beside what is tiered and locked ([`crate::banks::tier_more_within`]). What a layer-order pass gave back is
+    /// [`Model::pass_relock`]'s. None where nothing is left or nothing fits: the next request's end asks again. Before, a tier that stopped
+    /// short stayed so for the run (an RTX 4060 PC with 63.5 GiB, 0.1.14: 9 of the 29 layers planned, 4.4 of 19.7 GiB).
+    fn tier_more(&mut self, prior: impl FnOnce(&Model) -> Option<Routes>) -> Option<BankLocks> {
+        let chosen = self.tier_chosen.clone()?;
+        let made: HashSet<usize> = self.tiers.iter().map(crate::banks::ExpertTier::layer).collect();
+        let mut layers: Vec<usize> = (0..chosen.len())
+            .filter(|layer| !chosen[*layer].is_empty() && !made.contains(layer) && !self.pass_given.contains(layer) && !self.lock_pending.contains(layer))
+            .collect();
+        if layers.is_empty() {
+            return None;
+        }
+        if let Some(prior) = prior(self).filter(|prior| prior.total() > 0) {
+            crate::banks::order_by_host_routes(&mut layers, |layer| prior.host_routes(layer));
+        }
+        let left = layers.iter().map(|&layer| self.relock_bytes(layer).map(|bytes| (layer, bytes))).collect::<Result<Vec<_>>>().ok()?;
+        let memory = self.weights.host_memory_bytes;
+        let held = self.locked_layers.iter()
+            .map(|&layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()).unwrap_or(0))
+            .sum::<u64>() + self.tiers.iter().map(crate::banks::ExpertTier::bytes).sum::<u64>();
+        // (within the GPUs' view of host memory the start planned for, banks::visible_lock_cap, and what the commit left allows)
+        let visible = self.visible_cap.saturating_sub(held).min(crate::host::lockable(memory, 0));
+        self.refresh_kv_ahead();
+        let (margin, kv_ahead) = (crate::host::lock_kept_free(memory), self.kv_ahead.load(std::sync::atomic::Ordering::Relaxed));
+        let available = crate::host::available_bytes();
+        let layers = crate::banks::tier_more_within(&left, visible, available, margin, kv_ahead);
+        if layers.is_empty() {
+            return None;
+        }
+        let bytes = left.iter().filter(|(layer, _)| layers.contains(layer)).map(|(_, bytes)| bytes).sum::<u64>();
+        let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+        eprintln!("Straydog host tier: {} of its {} layers not made yet planned behind the requests, {}, with {} available ({} kept free, K/V to grow {}); \
+                   {} made already", layers.len(), left.len(), gib(bytes), gib(available), gib(margin), gib(kv_ahead), made.len());
+        // (a give-back's halt was for the plan it stopped)
+        self.lock_halt = Default::default();
+        let job = match self.lock_job_reading(&layers, true) {
+            Ok(job) => job.tiering(std::sync::Arc::new(PinnedMemory { ordinal: self.group.host_ordinal() }), chosen, 512),
+            Err(error) => {
+                eprintln!("WARN Straydog host tier: its layers not made yet are not made ({error})");
+                return None;
+            }
+        };
+        self.lock_pending = layers;
+        self.locking = true;
+        Some(job)
+    }
+
     /// A layer whose banks were page-locked and checked against the file's tree ([`BankLocks::lock_next`]), taken under the model's lock: its locks
     /// are the device's from here (released when the model ends), its banks are mapped for the GPU's assist, which the tuner then times anew,
     /// and a warm start no longer plans the OS's reads of its pages. The plans the GPU can read now.
@@ -2620,7 +2682,7 @@ impl Model {
         if let Some(tier) = locked.take_tier() {
             // A layer's tier (the host tier): its most routed experts' checked copies, which every device's plan of the layer reads in place of
             // the mapping for those experts. The layer is not locked: the assist, the give-back and the early launches take it as unlocked.
-            let pointers = tier.pointers(512);
+            let (pointers, held) = (tier.pointers(512), tier.held(512));
             let gate = locked.gate_address();
             // (held before any device reads it: a device that took it before another refused keeps reading it, so it is never freed here)
             self.tiers.push(tier);
@@ -2629,6 +2691,14 @@ impl Model {
             }
             self.lock_pending.retain(|pending| *pending != layer);
             self.pass_given.retain(|given| *given != layer);
+            // Nothing reads the mapping's pages of the tier's experts from here (the devices read the tier): out of the working set, where they
+            // held those experts a second time and kept the memory the tier's next layers need from being available. An RTX 4060 PC with 63.5 GiB
+            // (0.1.14, the tier made behind three requests): the CPU's routes took every bank's pages into a working set of 24.2, then 38.0 GiB,
+            // and the locking stopped at 9 of the 29 layers planned, 4.4 of 19.7 GiB, with 7.5 GiB available (7.9 kept free).
+            let ranges = crate::banks::tiered_ranges(&Self::host_banks(&self.weights, layer)?, 512, &held);
+            let asked = ranges.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>();
+            let fell = crate::host::leave_working_set(&ranges);
+            self.tier_left = (self.tier_left.0 + asked, self.tier_left.1 + fell);
             return Ok(self.assist_mapped);
         }
         let copied = locked.is_copy();
@@ -2673,6 +2743,12 @@ impl Model {
         self.locking = false;
         if failure.is_some() {
             self.bank_failure = failure;
+        }
+        let (asked, fell) = std::mem::take(&mut self.tier_left);
+        if asked > 0 && cfg!(windows) {
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            eprintln!("Straydog host tier: the mapping's pages of its new layers' experts left the working set, {:.1} GiB asked, the working set {:.1} GiB \
+                       less; {} of its layers made", gib(asked), gib(fell), self.tiers.len());
         }
         self.hold_banks();
         // (the layers left unlocked are read into memory behind the requests, before their faults would read them one at a time)
@@ -2932,10 +3008,20 @@ impl Model {
         self.group.reset_state()
     }
 
-    /// Discard every saved sequence state after a pass whose native wait was recovered.
+    /// After a pass whose native wait was recovered. Past where the request resumed, the live sequence's state may be anything, and so may every
+    /// checkpoint the request took and the parked sequence's copies: those are discarded. The checkpoints it found at or below where it resumed
+    /// are as it found them (a request's passes write the K/V from where it resumed on, and a checkpoint's slot only when they take it), so they
+    /// stay, and the longest is the live sequence again: the next request reads from there, not from its first token. On an RTX 4060 (8 GB), each
+    /// timeout's next request read its whole conversation again, 22,452 to 65,379 tokens in 199 to 512 s.
     fn recover_hybrid_wait(&mut self) -> Result<()> {
+        let (reused, slots) = std::mem::take(&mut self.recoverable);
         let mut recovered = Ok(());
-        for (_, checkpoint) in std::mem::take(&mut self.checkpoints) {
+        let mut kept = IndexMap::new();
+        for (kind, checkpoint) in std::mem::take(&mut self.checkpoints) {
+            if checkpoint.tokens.len() <= reused && slots.contains(&checkpoint.slot) {
+                kept.insert(kind, checkpoint);
+                continue;
+            }
             let released = self.release_checkpoint(checkpoint);
             recovered = recovered.and(released);
         }
@@ -2949,6 +3035,24 @@ impl Model {
         for token in self.draft_pending.drain(..) { self.draft_extras.remove(&token); }
         let reset = self.reset();
         recovered = recovered.and(reset);
+        let longest = kept.iter().max_by_key(|(_, checkpoint)| checkpoint.tokens.len()).map(|(kind, _)| *kind);
+        self.checkpoints = kept;
+        if let (Ok(()), Some(kind)) = (&recovered, longest) {
+            match self.resume_checkpoint(kind) {
+                Ok(length) => eprintln!("Straydog: after the GPU wait timed out, the conversation is kept up to {length} tokens (its {kind} checkpoint)"),
+                Err(error) => {
+                    eprintln!("WARN Straydog: after the GPU wait timed out, the {kind} checkpoint could not be resumed ({error}); nothing is kept");
+                    let reset = self.reset();
+                    recovered = recovered.and(reset);
+                }
+            }
+        }
+        if recovered.is_err() || self.history.is_empty() {
+            for (_, checkpoint) in std::mem::take(&mut self.checkpoints) {
+                let released = self.release_checkpoint(checkpoint);
+                recovered = recovered.and(released);
+            }
+        }
         if let Err(error) = recovered {
             let failure = format!("could not reset the GPU after its wait timed out: {error}; model state is unusable");
             self.recovery_failure = Some(failure.clone());
@@ -3330,7 +3434,12 @@ impl Model {
             self.reset()?;
             return Ok((0, "none"));
         };
-        let checkpoint = self.checkpoints.get_mut(kind).unwrap();
+        Ok((self.resume_checkpoint(kind)?, kind))
+    }
+
+    /// Make the checkpoint `kind` the live sequence: its recurrent state, its indexers' history, its tokens. The length it resumes at.
+    fn resume_checkpoint(&mut self, kind: &'static str) -> Result<usize> {
+        let checkpoint = self.checkpoints.get_mut(kind).ok_or_else(|| format!("no {kind} checkpoint to resume"))?;
         let (slot, saved, hidden) = (checkpoint.slot, checkpoint.tokens.clone(), checkpoint.final_hidden.clone());
         self.group.checkpoint(slot, false)?;
         if let Some(history) = checkpoint.history.as_mut() {
@@ -3340,7 +3449,7 @@ impl Model {
         self.draft_note(&saved);
         self.history = saved;
         root_resumed(&mut self.checkpoints, kind);
-        Ok((self.history.len(), kind))
+        Ok(self.history.len())
     }
 
     /// Positions (multiples of four) this prefill checkpoints at, with their kinds. A request
@@ -6436,6 +6545,7 @@ impl Model {
                         -> Result<()> {
         let started = Instant::now();
         self.last_metrics = Map::new();
+        self.recoverable = (0, Vec::new());
         if tokens.is_empty() || max_new == 0 || max_new > self.context || tokens.len() + max_new > self.context {
             return Err("Straydog prompt plus output exceeds the allocated context".into());
         }
@@ -6455,6 +6565,9 @@ impl Model {
         let parked = self.park_or_restore(tokens)?;
         let park_seconds = parking.elapsed().as_secs_f64();
         let (reused, resumed) = self.resume(tokens)?;
+        self.recoverable = (reused, self.checkpoints.values()
+            .filter(|checkpoint| checkpoint.tokens.len() <= reused && checkpoint.tokens[..] == tokens[..checkpoint.tokens.len()])
+            .map(|checkpoint| checkpoint.slot).collect());
         // The PLE rows of the first two batches are asked for as soon as the new tokens are known: their reads run behind what comes
         // before the first layer (the parked positions' copies, a K/V growth), where the first batch waited for them after it.
         if reused < tokens.len() {
@@ -6711,7 +6824,7 @@ mod wait_recovery_gpu {
 
     #[test]
     #[ignore = "requires model files and an exclusive GPU"]
-    fn a_recovered_hybrid_wait_discards_saved_sequences_and_serves_the_next_request() {
+    fn a_recovered_hybrid_wait_keeps_the_checkpoints_below_the_request_and_serves_the_next_one_from_there() {
         let root = std::env::var_os("STRAYDOG_MODEL").expect("STRAYDOG_MODEL must name the model directory");
         let quant = std::env::var("STRAYDOG_MODEL_QUANT").unwrap_or_else(|_| "UD-IQ1_S".into());
         let drafter = std::env::var_os("STRAYDOG_DRAFTER").map(std::path::PathBuf::from);
@@ -6731,17 +6844,22 @@ mod wait_recovery_gpu {
         // A display GPU prelaunches waits only for spans containing mapped banks.
         assert!(model.lock_layers_for_test(&[0]).unwrap() > 0);
         let prompt = text.encode("<|im_start|>user\nCount from one to thirty in English.<|im_end|>\n<|im_start|>assistant\n").unwrap();
-        let generate = |model: &mut Model, tokens: &[u32]| {
-            model.generate(tokens, 32, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |_| {})
+        let written = |model: &mut Model, tokens: &[u32]| {
+            let mut out = Vec::new();
+            model.generate(tokens, 32, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| out.push(token)).map(|()| out)
         };
+        let generate = |model: &mut Model, tokens: &[u32]| written(model, tokens).map(drop);
         generate(&mut model, &prompt).unwrap();
         assert!(!model.history.is_empty());
+        let held = model.history.clone();
         model.save_checkpoint("root").unwrap();
         model.save_checkpoint("turn").unwrap();
         if let Some(old) = model.parked.take() { model.discard(old).unwrap(); }
         model.parked = Some(model.park(0, PARK_SLOTS[0]).unwrap());
-        let mut next = model.history.clone();
+        let mut next = held.clone();
         next.extend(text.encode("\nContinue counting: ").unwrap());
+        // What `next` writes from the turn's state with no timeout: the request after the timeout must write the same.
+        let expected = written(&mut model, &next).unwrap();
         struct ClearFault;
         impl Drop for ClearFault {
             fn drop(&mut self) { unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); } }
@@ -6752,10 +6870,24 @@ mod wait_recovery_gpu {
         let error = generate(&mut model, &next).unwrap_err();
         unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); }
         assert!(error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED), "{error}");
-        assert!(model.history.is_empty() && model.final_hidden.is_none());
-        assert!(model.checkpoints.is_empty() && model.parked.is_none());
+        // (the request resumed from the checkpoints at `held`: they stay, and the live sequence is theirs again)
+        assert_eq!(model.history, held);
+        assert!(model.checkpoints.contains_key("root") && model.checkpoints.contains_key("turn"));
+        assert!(model.parked.is_none());
         assert_eq!(model.mtp_kept, 0);
         assert!(model.draft_pending.is_empty() && model.recovery_failure.is_none());
+        assert_eq!(model.recoverable, (0, Vec::new()));
+        let after = written(&mut model, &next).unwrap();
+        assert_eq!(model.last_metrics["cached_tokens"], json!(held.len()));
+        assert_eq!(after, expected, "after the timeout {:?}, without {:?}", text.decode(&after), text.decode(&expected));
+        // A request that resumed from nothing keeps nothing.
+        model.reset().unwrap();
+        for (_, checkpoint) in std::mem::take(&mut model.checkpoints) { model.release_checkpoint(checkpoint).unwrap(); }
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(1); }
+        let error = generate(&mut model, &prompt).unwrap_err();
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); }
+        assert!(error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED), "{error}");
+        assert!(model.history.is_empty() && model.final_hidden.is_none() && model.checkpoints.is_empty());
         generate(&mut model, &prompt).unwrap();
         assert!(model.history.starts_with(&prompt));
         let before = model.vram_budgets().unwrap()[0].2;
@@ -6765,6 +6897,60 @@ mod wait_recovery_gpu {
         generate(&mut model, &next).unwrap();
         model.raise_vram(0, before).unwrap();
         generate(&mut model, &prompt).unwrap();
+    }
+
+    /// Decides whether a request after a recovered wait that writes other tokens than one without it (one run in three on an RTX 5070 Ti)
+    /// shows a state the recovery broke or the numbers of a partially resident pass: the same request from the same checkpoint, twice with
+    /// no timeout, then once after one and once more. Where the two without differ as well, the comparison is with the numbers.
+    #[test]
+    #[ignore = "requires model files and an exclusive GPU"]
+    fn a_request_from_one_checkpoint_writes_the_same_tokens_each_time_with_or_without_a_timeout() {
+        let root = std::env::var_os("STRAYDOG_MODEL").expect("STRAYDOG_MODEL must name the model directory");
+        let quant = std::env::var("STRAYDOG_MODEL_QUANT").unwrap_or_else(|_| "UD-IQ1_S".into());
+        let drafter = std::env::var_os("STRAYDOG_DRAFTER").map(std::path::PathBuf::from);
+        let bundle = crate::bundle::Id::find(Some(crate::bundle::MODEL), None, &quant).expect("a known Qwen bundle");
+        let mut group = Group::new(&[0], &[6 << 30], crate::group::SplitMode::Experts).unwrap();
+        group.configure_gemm(2, true).unwrap();
+        let weights = Weights::open(&std::path::PathBuf::from(root), bundle, drafter.as_deref(),
+                                    crate::host::host_memory_bytes(), &|_, _, _| {}).unwrap();
+        let text = crate::text::Text::new(weights.resources.get("tokenizer.json").unwrap()).unwrap();
+        let settings = Settings { context: 65536, state_budget_bytes: 8 << 30, prefill_batch_size: 256,
+                                  speculative: if drafter.is_some() { 3 } else { 0 }, cpu_threads: 8, row_cache_bytes: None };
+        let mut model = Model::new(weights, group, &settings, &|_, _, _| {}).unwrap();
+        model.prompt_share(false).unwrap();
+        assert!(model.lock_layers_for_test(&[0]).unwrap() > 0);
+        let prompt = text.encode("<|im_start|>user\nCount from one to thirty in English.<|im_end|>\n<|im_start|>assistant\n").unwrap();
+        let written = |model: &mut Model, tokens: &[u32]| {
+            let mut out = Vec::new();
+            model.generate(tokens, 32, &Sampling::GREEDY, 0, &|| false, &mut |_, _| {}, true, true, &mut |token| out.push(token)).map(|()| out)
+        };
+        written(&mut model, &prompt).unwrap();
+        let held = model.history.clone();
+        model.save_checkpoint("root").unwrap();
+        model.save_checkpoint("turn").unwrap();
+        let mut next = held.clone();
+        next.extend(text.encode("\nContinue counting: ").unwrap());
+        let first = written(&mut model, &next).unwrap();
+        let second = written(&mut model, &next).unwrap();
+        struct ClearFault;
+        impl Drop for ClearFault {
+            fn drop(&mut self) { unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); } }
+        }
+        let _clear = ClearFault;
+        // SAFETY: a development-only counter; one GPU job holds the test's process.
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(1); }
+        let error = written(&mut model, &next).unwrap_err();
+        unsafe { straydog_gpu::ffi::sd_test_hybrid_timeout(0); }
+        assert!(error.ends_with(crate::gpu::HYBRID_WAIT_RECOVERED), "{error}");
+        assert_eq!(model.history, held);
+        let after = written(&mut model, &next).unwrap();
+        let again = written(&mut model, &next).unwrap();
+        let split = |a: &[u32], b: &[u32]| a.iter().zip(b).position(|(x, y)| x != y).map_or("same".to_string(), |at| format!("first differs at {at}"));
+        eprintln!("checkpoint runs: second against first {}; after the timeout against second {}; again against after {}",
+                  split(&second, &first), split(&after, &second), split(&again, &after));
+        assert_eq!(second, first, "the baseline: two runs with no timeout differ, {:?} against {:?}", text.decode(&second), text.decode(&first));
+        assert_eq!(after, second, "after the timeout {:?}, without {:?}", text.decode(&after), text.decode(&second));
+        assert_eq!(again, after);
     }
 }
 

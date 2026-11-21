@@ -67,7 +67,11 @@ __global__ void exchange_await_kernel(volatile uint32_t* header, const uint32_t*
         ready = 1;
         while (int32_t(header[exchange_published] - expected) < 0) {
             if (header[exchange_cancel]) { ready = 0; break; }
-            if (exchange_clock() - start > timeout) { header[exchange_failed] = 1; ready = 0; break; }
+            if (exchange_clock() - start > timeout) {
+                // (the count is read again past the deadline, as hybrid_await's: a GPU held off the device comes back past it with a count it read before)
+                if (int32_t(header[exchange_published] - expected) >= 0) break;
+                header[exchange_failed] = 1; ready = 0; break;
+            }
 #if defined(__HIPCC__)
             __builtin_amdgcn_s_sleep(2);
 #elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700

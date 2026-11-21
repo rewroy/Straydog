@@ -205,13 +205,22 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
         };
         // Counted before launching: publishing a result nobody awaits is harmless.
         if (ahead && finish) ++await.launched;
+        const auto launched=std::chrono::steady_clock::now();
         run_graph(d,ahead ? "hybrid-await" : "hybrid-layer",plan.dependencies.data(),plan.dependencies.size(),
                   layer*2+finish,submit);
+        span_call_took(d,launched,"a layer's launch");
+        const auto flushed=std::chrono::steady_clock::now();
         flush_launches(d);
+        span_call_took(d,flushed,"a stream query flushing a launch");
     };
     auto launch_after=[&](size_t layer) {
         if (layer+1<end) launch(layer+1);
-        else { ++await.launched; finish_previous(end-1); check(hipGetLastError()); flush_launches(d); }
+        else {
+            ++await.launched; finish_previous(end-1); check(hipGetLastError());
+            const auto flushed=std::chrono::steady_clock::now();
+            flush_launches(d);
+            span_call_took(d,flushed,"a stream query flushing a launch");
+        }
     };
     if (ahead) launch(begin);
     for (size_t layer=begin;layer<end;++layer) {
@@ -234,6 +243,8 @@ void hybrid_decode_span(Device& d,size_t begin,size_t end,size_t position,const 
         const auto finished=std::chrono::steady_clock::now();
         d.hybrid_wait_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed-waited).count());
         d.hybrid_cpu_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished-computed).count());
+        span_unit_took(d,layer,uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(computed-waited).count()),
+                       uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(finished-computed).count()));
         if (ahead && !before) launch_after(layer);
     }
     if (!ahead) finish_previous(end-1);

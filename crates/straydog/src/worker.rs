@@ -137,7 +137,7 @@ struct Engine {
     vision: Result<Encoder, String>,
     /// The rows of the images encoded last (by their bytes' digest), newest last: a conversation sends its images
     /// again with every turn.
-    encoded: Vec<([u8; 32], Arc<Vec<f32>>)>,
+    encoded: Vec<([u8; 32], Arc<Vec<f32>>, (usize, usize))>,
     /// The route counts of the runs before this one, from the warm-up state it started with (a partially resident model's: [`straydog_engine::routes`]).
     earlier: Option<Routes>,
     /// The draft widths that state kept, by placement, which the next state keeps beside this placement's own ([`routes::with_drafts`]).
@@ -159,6 +159,9 @@ struct Engine {
     /// Failed explicit growth attempts keep their measured headroom requirement across budget cooldowns.
     #[cfg(windows)]
     vram_growth_holds: Vec<Option<VramGrowthHold>>,
+    /// The budget a GPU wait timeout lowered each GPU to: its budget grows no further in this run ([`held_growth`]).
+    #[cfg(windows)]
+    vram_timed_out: Vec<Option<u64>>,
     #[cfg(windows)]
     vram_poison: ExplicitVramPoison,
 }
@@ -352,8 +355,8 @@ impl Engine {
             return Ok(());
         }
         #[cfg(windows)]
-        return adjust_windows_vram(&mut self.model, &mut self.vram_limits, &mut self.vram_growth_holds, self.vram_caps.as_deref(),
-                                   self.requests, allow_grow, phase);
+        return adjust_windows_vram(&mut self.model, &mut self.vram_limits, &mut self.vram_growth_holds, &self.vram_timed_out,
+                                   self.vram_caps.as_deref(), self.requests, allow_grow, phase);
         #[cfg(not(windows))]
         {
             let _ = phase;
@@ -383,6 +386,7 @@ impl Engine {
         let devices = self.model.vram_budgets()?;
         validate_vram_caps(self.vram_caps.as_deref(), devices.len())?;
         self.vram_limits.resize(devices.len(), None);
+        self.vram_timed_out.resize(devices.len(), None);
         let mut lowered = false;
         for (index, (ordinal, _, budget)) in devices.into_iter().enumerate() {
             let cap = self.vram_caps.as_ref().map(|caps| caps[index]);
@@ -393,7 +397,9 @@ impl Engine {
                 return Err(vram_refused(ordinal, "the memory budget could not be reduced after the wait timeout"));
             }
             self.vram_limits[index] = Some(VramLimit::new(actual, self.requests));
-            eprintln!("Straydog VRAM: GPU {ordinal}'s budget {budget} -> {actual} bytes after a wait timeout; expert slots {before} -> {after}");
+            self.vram_timed_out[index] = Some(self.vram_timed_out[index].map_or(actual, |held| held.min(actual)));
+            eprintln!("Straydog VRAM: GPU {ordinal}'s budget {budget} -> {actual} bytes after a wait timeout; expert slots {before} -> {after}; \
+                       it grows no further in this run");
             lowered = true;
         }
         Ok(lowered)
@@ -616,7 +622,27 @@ fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
 /// The kept conversation's state, if the prompt begins with the tokens it is held at and the model holds no more of it than they: asked of the
 /// server, which reads it from the drive, and handed to the model, which takes the request from there. The seconds it took, or None when the prompt
 /// does not begin with them, or the state could not be had (one line in the log says why, and the file is left as it is for a later request).
-fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
+/// What [`take_kept`] asks of a model: how much of a prompt it holds already, about the bytes a state of so many tokens takes (0: not
+/// known), and the import of a kept state for a prompt of `positions`.
+pub(crate) trait KeepsConversation {
+    fn held_prefix(&self, prompt: &[u32]) -> usize;
+    fn state_size(&self, tokens: usize) -> u64;
+    fn import_conversation(&mut self, bytes: &[u8], positions: usize) -> Result<usize, String>;
+}
+
+impl KeepsConversation for straydog_engine::model::Model {
+    fn held_prefix(&self, prompt: &[u32]) -> usize {
+        straydog_engine::model::Model::held_prefix(self, prompt)
+    }
+    fn state_size(&self, tokens: usize) -> u64 {
+        straydog_engine::model::Model::state_size(self, tokens, straydog_engine::gpu::WIDTH)
+    }
+    fn import_conversation(&mut self, bytes: &[u8], positions: usize) -> Result<usize, String> {
+        straydog_engine::model::Model::import_conversation(self, bytes, positions).map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
     let wanted = {
         let kept = kept();
         let tokens = kept.tokens.as_ref()?;
@@ -624,14 +650,23 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
         (prompt.len() > tokens.len() && prompt[..tokens.len()] == tokens[..]).then_some(tokens.len())?
     };
     let not_loaded = |why: String| eprintln!("Straydog conversation: not loaded ({why})");
-    if engine.model.held_prefix(prompt) >= wanted {
+    if model.held_prefix(prompt) >= wanted {
         // (the model holds this much of it already: the state would add nothing)
         kept().tokens = None;
         return None;
     }
     // (the file's bytes in the server, the same in this process, and the copies of its parts: three of the state's size at once)
-    let size = engine.model.state_size(wanted, straydog_engine::gpu::WIDTH);
-    if let Some((_, left)) = straydog_engine::host::commit_left() {
+    let size = model.state_size(wanted);
+    // (the commit left on Windows; on Linux the memory available, which no commit limit bounds)
+    #[cfg(target_os = "linux")]
+    let left = {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        Some(((), system.available_memory())).filter(|(_, bytes)| *bytes > 0)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let left = straydog_engine::host::commit_left();
+    if let Some((_, left)) = left.filter(|_| size > 0) {
         if left < 3 * size + KEPT_MARGIN {
             not_loaded(format!("the state of {wanted} tokens is {} MB, and the host memory left for it is {} MB", size >> 20, left >> 20));
             return None;
@@ -667,7 +702,7 @@ fn take_kept(engine: &mut Engine, output: &Output, id: &str, cancel: &AtomicBool
         }
     };
     let importing = Instant::now();
-    match engine.model.import_conversation(&state, prompt.len() + 1) {
+    match model.import_conversation(&state, prompt.len() + 1) {
         Ok(tokens) => {
             kept().tokens = None;
             let seconds = started.elapsed().as_secs_f64();
@@ -923,6 +958,17 @@ fn vram_target(budget: u64, wanted: u64, requests: u64, allow_grow: bool, limit:
     wanted.min(budget.saturating_add(VRAM_GROWTH)).min(ceiling)
 }
 
+/// A growth of a budget that a GPU wait timeout lowered to `held`, which stops there for the rest of the run (a shrink is not held). On an RTX 4060
+/// (8 GB) under Windows, every growth back to the budget that had timed out (4.57 -> 5.07 GiB) timed out again, 2 to 117 minutes later, three times
+/// in one afternoon: each stopped a request, and the next one read its whole conversation again (22,452 and 28,303 tokens, 199 and 252 s).
+#[cfg(any(windows, test))]
+fn held_growth(budget: u64, target: u64, held: Option<u64>) -> u64 {
+    match held {
+        Some(held) if target > budget => target.min(held).max(budget),
+        _ => target,
+    }
+}
+
 #[cfg(any(windows, test))]
 fn validate_vram_caps(caps: Option<&[u64]>, devices: usize) -> Result<(), String> {
     if let Some(caps) = caps {
@@ -942,7 +988,7 @@ fn vram_refused(ordinal: usize, why: &str) -> String {
 /// measurement: releasing the pool may change Windows' process budget as well as its usage.
 #[cfg(windows)]
 fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, growth_holds: &mut Vec<Option<VramGrowthHold>>,
-                       caps: Option<&[u64]>, requests: u64, allow_grow: bool, phase: &str) -> Result<(), String> {
+                       timed_out: &[Option<u64>], caps: Option<&[u64]>, requests: u64, allow_grow: bool, phase: &str) -> Result<(), String> {
     let devices = model.vram_budgets()?;
     validate_vram_caps(caps, devices.len())?;
     limits.resize(devices.len(), None);
@@ -960,6 +1006,7 @@ fn adjust_windows_vram(model: &mut Model, limits: &mut Vec<Option<VramLimit>>, g
                 && !explicit_growth_allowed(headroom, target - budget, total, requests, growth_holds[index]) {
                 target = budget;
             }
+            target = held_growth(budget, target, timed_out.get(index).copied().flatten());
             if std::env::var("STRAYDOG_VRAM_DIAGNOSTIC").as_deref() == Ok("1") {
                 eprintln!("Straydog VRAM diagnostic: phase={phase} GPU={ordinal} used={used} budget={budget} headroom={headroom} \
                            process_budget={} wanted={wanted} target={target}", u8::from(process_budget));
@@ -1320,7 +1367,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         let mut limits = vec![None; devices.len()];
         let mut growth_holds = vec![None; devices.len()];
         if model.partial {
-            adjust_windows_vram(&mut model, &mut limits, &mut growth_holds, caps.as_deref(), 0, false, "ready")
+            adjust_windows_vram(&mut model, &mut limits, &mut growth_holds, &[], caps.as_deref(), 0, false, "ready")
                 .map_err(|error| plan.startup_error(error))?;
         }
         let (actual, adjusted) = if model.partial {
@@ -1378,6 +1425,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
                                                        #[cfg(windows)] vram_limits,
                                                        #[cfg(windows)] vram_caps,
                                                        #[cfg(windows)] vram_growth_holds,
+                                                       #[cfg(windows)] vram_timed_out: Vec::new(),
                                                        #[cfg(windows)] vram_poison: ExplicitVramPoison::default() }));
     #[cfg(all(windows, feature = "cuda"))]
     memory_diagnostic(&args.devices, true);
@@ -1558,32 +1606,67 @@ impl Engine {
                   -> Result<Option<Vec<Option<Arc<Vec<f32>>>>>, Failure> {
         let encoder = self.vision.as_ref().map_err(|reason| refused(format!("this model reads no images: {reason}")))?;
         let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
+        // The kept ones first, all of them: encoding a new one lets the oldest kept ones go past ENCODED_BYTES, and one the prompt holds after it
+        // would then have none.
+        let mut missing: Vec<usize> = Vec::new();
         for &(index, _) in spans {
-            if rows[index].is_some() {
+            if rows[index].is_some() || missing.contains(&index) {
                 continue;
             }
             let digest = images[index].digest;
-            if let Some(at) = self.encoded.iter().position(|(kept, _)| *kept == digest) {
+            if let Some(at) = self.encoded.iter().position(|(kept, _, _)| *kept == digest) {
                 let kept = self.encoded.remove(at);
                 rows[index] = Some(kept.1.clone());
                 self.encoded.push(kept);
                 continue;
             }
-            // (a refusal: nothing of the model's state has moved, and the worker reads on)
-            // (whatever an image does in there, the worker reads on)
-            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encoder.encode(&images[index].prepared, &|| cancel.load(Ordering::SeqCst))))
-                .unwrap_or_else(|_| Err("it failed on this image".to_string()))
-                .map_err(|message| refused(format!("the vision encoder: {message}")))?;
-            let Some(encoded) = encoded else { return Ok(None) };
-            let encoded = Arc::new(encoded);
-            rows[index] = Some(encoded.clone());
-            self.encoded.push((digest, encoded));
-            while self.encoded.iter().map(|(_, values)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
-                self.encoded.remove(0);
+            missing.push(index);
+        }
+        if missing.is_empty() {
+            return Ok(Some(rows));
+        }
+        // (an image taken as known had its rows above: one with nothing to encode here would be a mistake of this worker's, said and not served)
+        let prepared: Vec<&straydog_engine::qwen_vision::Prepared> = missing.iter()
+            .map(|&index| images[index].prepared.as_ref().ok_or_else(|| refused("an image's kept rows went before they were read")))
+            .collect::<Result<_, _>>()?;
+        let cancelled = || cancel.load(Ordering::SeqCst);
+        // The first device's, all of them in one stay there, where it can (a screenshot in about half a second, against eight and a half on the
+        // CPU); else the CPU's.
+        let on_device = if vision_on_device() { self.model.first_device().map(|gpu| encoder.encode_all_on(gpu, &prepared, &cancelled)) } else { None };
+        let encoded = match on_device {
+            Some(Ok(rows)) => rows,
+            other => {
+                if let Some(Err(reason)) = other {
+                    eprintln!("Straydog vision: on the CPU, as the GPU could not: {reason}");
+                }
+                let mut all = Vec::with_capacity(prepared.len());
+                for image in &prepared {
+                    // (a refusal: nothing of the model's state has moved, and the worker reads on; whatever an image does in there, the worker reads on)
+                    let one = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encoder.encode(image, &cancelled)))
+                        .unwrap_or_else(|_| Err("it failed on this image".to_string()))
+                        .map_err(|message| refused(format!("the vision encoder: {message}")))?;
+                    let Some(one) = one else { return Ok(None) };
+                    all.push(one);
+                }
+                Some(all)
             }
+        };
+        let Some(encoded) = encoded else { return Ok(None) };
+        for (index, values) in missing.into_iter().zip(encoded) {
+            let values = Arc::new(values);
+            rows[index] = Some(values.clone());
+            self.encoded.push((images[index].digest, values, images[index].grid));
+        }
+        while self.encoded.iter().map(|(_, values, _)| values.len() * 4).sum::<usize>() > ENCODED_BYTES && self.encoded.len() > 1 {
+            self.encoded.remove(0);
         }
         Ok(Some(rows))
     }
+}
+
+/// Whether Qwen3.8's vision encoder runs on the first device (STRAYDOG_VISION_GPU=0: on the CPU, as it did before).
+fn vision_on_device() -> bool {
+    std::env::var("STRAYDOG_VISION_GPU").map_or(true, |value| value != "0")
 }
 
 /// Read bounded frames until stdin closes or `shutdown`; reject concurrent generation.
@@ -1870,6 +1953,14 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let messages = &chat::defuse_messages(messages, &|own| text.defuse(own).into_owned());
     let prompt = if images.is_empty() { engine.template.render(messages, &tools, thinking, effort) } else { engine.template.render_parts(messages, &tools, thinking, effort) }
         .map_err(|exc| refused(exc.0))?;
+    // A reply asked with no reasoning in a conversation that thinks (`"reasoning": false`): the prompt as it is, its reasoning closed empty where the
+    // generation prompt opens it. Rendered with thinking off, the template would drop its effort's words from the system message, and all of the
+    // conversation would be read again; closed so, it is what the template writes back of a reply that had none, and the next request goes on from it.
+    let unreasoned = thinking && matches!(body.get("reasoning"), Some(Py::Bool(false)));
+    let (prompt, thinking) = match unreasoned.then(|| reasoning_closed(&prompt)).flatten() {
+        Some(closed) => (closed, false),
+        None => (prompt, thinking),
+    };
     let (ids, prepared, spans) = if images.is_empty() {
         // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
         // encoded again can be split otherwise, and the model then read the reply again from the first such place.
@@ -1887,7 +1978,19 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         (ids, Vec::new(), Vec::new())
     } else {
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
-        let prepared: Vec<images::QwenImage> = images.iter().map(|bytes| images::prepare_qwen(bytes)).collect::<Result<_, _>>().map_err(refused)?;
+        // (one whose rows are kept is not decoded again: its grid says how long its span is. Decoding each again was ~15 ms an image of
+        // every request's first token, with an agent's screenshots all sent each time.)
+        let prepared: Vec<images::QwenImage> = images
+            .iter()
+            .map(|bytes| {
+                let digest = images::digest(bytes);
+                match engine.encoded.iter().find(|(kept, _, _)| *kept == digest) {
+                    Some(&(_, _, grid)) => Ok(images::known_qwen(digest, grid)),
+                    None => images::prepare_qwen(bytes),
+                }
+            })
+            .collect::<Result<_, _>>()
+            .map_err(refused)?;
         let (ids, spans) = images::qwen_ids(text, &pieces, &prepared).map_err(Failure::from)?;
         (ids, prepared, spans)
     };
@@ -1987,11 +2090,11 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         eprintln!("Straydog: a reply read back moves this request's images by {} tokens", agreed.len() as i64 - ids.len() as i64);
     }
     engine.model.set_images(placed.iter().map(|&(index, start)| ImageSpan {
-        start, grid: prepared[index].prepared.grid(), rows: image_rows[index].clone().unwrap_or_default(),
+        start, grid: prepared[index].grid, rows: image_rows[index].clone().unwrap_or_default(),
     }).collect());
     let max_new = max_new.min(context - agreed.len());
     // (a conversation an earlier run kept, which this prompt goes on from)
-    let kept_seconds = take_kept(engine, output, id, cancel, &agreed);
+    let kept_seconds = take_kept(&mut engine.model, output, id, cancel, &agreed);
     // A token's text and frame are made on a thread of their own, which the thread that drives the GPUs hands each token to and goes
     // on: a token is two decodes of the detokenizer's window, a frame's serialization and a write to the server's pipe, and they stood
     // between two passes (a tenth of the tokens-out and bookkeeping share of a pass on a host whose cores are shared and slow: 0.8 ms of
@@ -2090,8 +2193,33 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     }))
 }
 
+/// `prompt` with the reasoning its generation prompt opens closed empty, as the template writes back a reply with none (`<think>\n` reasoning
+/// `\n</think>\n\n`); none for a prompt that does not end by opening it.
+fn reasoning_closed(prompt: &str) -> Option<String> {
+    const OPENS: &str = "<think>\n";
+    prompt.ends_with(OPENS).then(|| format!("{prompt}\n{THINK_CLOSE}\n\n"))
+}
+
 #[cfg(test)]
 mod tests {
+    /// A reply without reasoning is the generation prompt with its reasoning closed empty: the text the template writes back of a reply with none, so
+    /// that the next request reads on from it.
+    #[test]
+    fn a_reply_without_reasoning_closes_it_as_the_template_writes_one_that_had_none() {
+        let template = straydog_engine::chat::ChatTemplate::new(
+            "{%- for m in messages %}<|im_start|>{{ m.role }}\n{% if m.role == 'assistant' %}<think>\n{{ m.reasoning_content|default('') }}\n</think>\n\n{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}\
+             {%- if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
+        )
+        .unwrap();
+        let parse = |text: &str| straydog_engine::pyjson::parse(text).unwrap();
+        let prompt = template.render(&parse(r#"[{"role": "user", "content": "hi"}]"#), &parse("null"), true, "medium").unwrap();
+        let closed = reasoning_closed(&prompt).unwrap();
+        let answered = parse(r#"[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]"#);
+        let next = template.render(&answered, &parse("null"), true, "medium").unwrap();
+        assert!(next.starts_with(&format!("{closed}hello")), "{closed:?} then {next:?}");
+        assert!(reasoning_closed("<|im_start|>assistant\n").is_none());
+    }
+
     use super::*;
 
     const MIB: u64 = 1 << 20;
@@ -2152,6 +2280,17 @@ mod tests {
         assert_eq!(vram_target(budget, budget + VRAM_GROWTH - 1, 10, true, None, None), budget);
         assert_eq!(vram_target(budget, budget + (4 << 30), 10, true, None, None), budget + VRAM_GROWTH);
         assert_eq!(VramLimit::new(0, u64::MAX).retry_after, u64::MAX);
+    }
+
+    #[test]
+    fn a_budget_a_wait_timeout_lowered_grows_no_further_but_still_shrinks() {
+        let held = 4909273976;
+        // (the growth that timed out again: 4.57 -> 5.07 GiB)
+        assert_eq!(held_growth(held, held + VRAM_GROWTH, Some(held)), held);
+        assert_eq!(held_growth(held, held - MIB, Some(held)), held - MIB);
+        // a budget that shrank below it under pressure grows back as far as it, no further
+        assert_eq!(held_growth(held - VRAM_GROWTH, held + VRAM_GROWTH, Some(held)), held);
+        assert_eq!(held_growth(held, held + VRAM_GROWTH, None), held + VRAM_GROWTH);
     }
 
     #[test]

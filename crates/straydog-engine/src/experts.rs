@@ -415,12 +415,32 @@ impl Drop for Reader {
     }
 }
 
+/// What the readers did since the process began, for a log line to say where a span of reads spent its time ([`reader_totals`]): reads done,
+/// their bytes, the nanoseconds spent in the drive's reads (summed over the readers: over a span, divided by its length, the reads in flight on
+/// average) and in their checks, and the nanoseconds a read waited in the queue before a reader took it.
+static READS: AtomicU64 = AtomicU64::new(0);
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static READ_NS: AtomicU64 = AtomicU64::new(0);
+static VERIFY_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The readers' totals so far: (reads, bytes, ns in the drive's reads, ns in their checks). Two of them a span apart tell its reads' rate, how
+/// many were in flight on average, and the share of the checks: what a start's warm-up of the stores was held by.
+pub fn reader_totals() -> (u64, u64, u64, u64) {
+    (READS.load(Ordering::Relaxed), READ_BYTES.load(Ordering::Relaxed), READ_NS.load(Ordering::Relaxed), VERIFY_NS.load(Ordering::Relaxed))
+}
+
 fn run_read(job: &ReadJob, permit: Option<ReadPermit>) -> std::result::Result<(), String> {
     // SAFETY: the target is `len` bytes of a host slot reserved for this read (see HostPointer).
     let target = unsafe { std::slice::from_raw_parts_mut(job.target.0, job.len as usize) };
+    let began = std::time::Instant::now();
     read_expert(&job.file, job.offset, target).map_err(|exc| format!("expert read at {}: {exc}", job.offset))?;
+    let read = began.elapsed();
     drop(permit); // Hashing and proof checks do not consume one of the sixteen data-read admits.
     if let Some((verify, file)) = &job.verifier { verify(*file, job.offset, target)?; }
+    READS.fetch_add(1, Ordering::Relaxed);
+    READ_BYTES.fetch_add(job.len, Ordering::Relaxed);
+    READ_NS.fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
+    VERIFY_NS.fetch_add((began.elapsed() - read).as_nanos() as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -922,6 +942,20 @@ fn probation() -> usize {
 }
 
 /// Development: the probation's depth from here on, for a comparison of depths in one process (ds41_quality --probation).
+/// The LRFU half-life a store orders its VRAM slots by, in times a class's slots of uses: [`LRFU_HALF_LIFE`], or
+/// STRAYDOG_EXPERT_LRFU=H; =0 orders them by the last use (with probation).
+fn lrfu_half_life() -> Option<f64> {
+    match std::env::var("STRAYDOG_EXPERT_LRFU") {
+        Ok(value) => value.parse::<f64>().ok().filter(|&times| times > 0.0),
+        Err(_) => Some(LRFU_HALF_LIFE),
+    }
+}
+
+/// The default LRFU half-life (times a class's slots of uses). Served on 2 x R9700 (UD-IQ2_XXS, Dogmind agent turns to 120K
+/// tokens, 2026-11-20), the store with it missed 10.60% of decode and verify uses where an LRU of the same slots would have missed 11.12%
+/// (six windows of 2^20 uses); the replay put 2 and 4 ahead of 1 and 16.
+pub const LRFU_HALF_LIFE: f64 = 2.0;
+
 pub fn set_probation(thousandths: usize) {
     PROBATION.store(thousandths.min(1000), std::sync::atomic::Ordering::Relaxed);
 }
@@ -1049,6 +1083,24 @@ pub struct DeviceExperts {
     /// clock value they count from.
     warm_ranks: HashMap<Key, u64>,
     warm_origin: Option<u64>,
+    /// The uses of passes of a few rows, replayed against an LRU and the best possible store ([`observe_reuse`](Self::observe_reuse)).
+    reuse: Option<crate::reuse::Reuse>,
+    /// With STRAYDOG_EXPERT_LRFU=H, each class's VRAM order is by LRFU score instead of the last use ([`crate::reuse::lrfu_misses`]):
+    /// scores that halve every H times the class's slots of its uses, the experts' scores (log2, as crate::reuse::lrfu_raise keeps
+    /// them) kept after they go, and each class's uses counted once an expert a release.
+    lrfu: Option<Lrfu>,
+}
+
+/// [`DeviceExperts::lrfu`]'s state.
+struct Lrfu {
+    times: f64,
+    scores: HashMap<Key, f64>,
+    uses: Vec<u64>,
+}
+
+/// An LRFU score as a VRAM order's key (2^-24ths of its log2; every score is at least 1, so its log2 is not negative).
+fn lrfu_order(score: f64) -> u64 {
+    (score.max(0.0) * (1u64 << 24) as f64) as u64
 }
 
 impl DeviceExperts {
@@ -1165,8 +1217,30 @@ impl DeviceExperts {
             layout, reader, classes, class_of, slots: all_slots, map: HashMap::new(), host: Vec::new(), host_map: HashMap::new(),
             done_tx, done_rx, clock: 0, in_use: Vec::new(), touched: Vec::new(), requested: Vec::new(), speculative: HashMap::new(), reading: 0,
             counts: Counts::default(), settled: false, vram_changes: 0, lent: Vec::new(), regions: 0, rest: Vec::new(),
-            uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None,
+            uses: HashMap::new(), warm_ranks: HashMap::new(), warm_origin: None, reuse: None,
+            lrfu: lrfu_half_life().map(|times| Lrfu { times, scores: HashMap::new(), uses: vec![0; distinct.len()] }),
         })
+    }
+
+    /// From here on, log every [`crate::reuse::WINDOW`] uses by passes of a few rows (decode and verify) the share VRAM
+    /// missed beside the shares a least-recently-used store and the best possible one of the same slots would have
+    /// missed, by class (a diagnostic: counts alone are kept).
+    pub fn observe_reuse(&mut self) {
+        self.reuse = Some(crate::reuse::Reuse::new(self.classes.len()));
+    }
+
+    /// A use by a pass that does not stream its experts, for [`observe_reuse`](Self::observe_reuse); `hit`: VRAM held it.
+    fn note_use(&mut self, key: Key, hit: bool) {
+        if self.streaming {
+            return;
+        }
+        let Some(class) = self.class_of.get(key.0 as usize).copied().flatten() else { return };
+        let Some(reuse) = self.reuse.as_mut() else { return };
+        let (slots, class_of, count) = (&self.slots, &self.class_of, self.classes.len());
+        reuse.note(key, class, hit, || (0..count).map(|index| {
+            let layers: Vec<usize> = class_of.iter().enumerate().filter(|(_, of)| **of == Some(index)).map(|(layer, _)| layer).collect();
+            (slots.iter().filter(|slot| slot.class == index).count(), crate::reuse::layer_label(&layers))
+        }).collect());
     }
 
     pub fn counts(&self) -> Counts {
@@ -1411,9 +1485,11 @@ impl DeviceExperts {
                 let key = (layer as u32, expert as u32);
                 if let Some(&slot) = self.map.get(&key) {
                     self.counts.hits += 1;
+                    self.note_use(key, true);
                     self.hold(slot);
                     self.requested.push(key);
                 } else {
+                    self.note_use(key, false);
                     self.unfilled.push_back(key);
                 }
             }
@@ -1477,6 +1553,7 @@ impl DeviceExperts {
             if let Some(&slot) = self.map.get(&key) {
                 if !requested.contains(&key) {
                     self.counts.hits += 1;
+                    self.note_use(key, true);
                 }
                 self.hold(slot);
                 slots[index] = slot;
@@ -1492,7 +1569,12 @@ impl DeviceExperts {
                     let key = (layer as u32, expert as u32);
                     let slot = match self.map.get(&key) {
                         Some(&slot) => slot,
-                        None => self.fill(gpu, key, true, CHUNK)?,
+                        None => {
+                            if !requested.contains(&key) {
+                                self.note_use(key, false);
+                            }
+                            self.fill(gpu, key, true, CHUNK)?
+                        }
                     };
                     self.hold(slot);
                     slots[index] = slot;
@@ -1792,10 +1874,28 @@ impl DeviceExperts {
     /// 4.1%; 2Q and ARC with their histories 0.5% to 1.8%; least use count among the coldest more misses; the optimum 58.8% fewer).
     /// Which experts are computed does not change, nor a logit. `STRAYDOG_EXPERT_PROBATION=0` keeps plain LRU order.
     fn settle_touches(&mut self) {
-        let probation = self.probation.unwrap_or_else(probation);
+        // (LRFU keeps a new expert's place by its score: no probation unless asked)
+        let probation = self.probation.unwrap_or_else(|| if self.lrfu.is_some() && std::env::var_os("STRAYDOG_EXPERT_PROBATION").is_none() { 0 } else { probation() });
         let mut depth: Vec<Option<Option<u64>>> = vec![None; self.classes.len()];
+        let mut raised: Vec<usize> = Vec::new();
         for (slot, mut used) in std::mem::take(&mut self.touched) {
             let class = self.slots[slot].class;
+            // (LRFU: the expert's score raised by one use, once a release however often it was held; a streaming prefill's uses do not
+            // raise it: one takes nearly every expert of a layer, which made every score alike, and on 2 R9700s serving the store with them
+            // missed 3.1% fewer than an LRU of the same decode uses where the replay of LRFU missed ~5% fewer, 2026-11-20)
+            if let (Some(lrfu), Some(key)) = (self.lrfu.as_mut(), self.slots[slot].key) {
+                let class_slots = self.classes[class].count.max(1) as f64;
+                if raised.contains(&slot) || self.streaming {
+                    used = lrfu_order(lrfu.scores.get(&key).copied().unwrap_or(0.0));
+                } else {
+                    raised.push(slot);
+                    let time = lrfu.uses[class];
+                    lrfu.uses[class] += 1;
+                    let score = crate::reuse::lrfu_raise(lrfu.scores.get(&key).copied(), time, crate::reuse::lrfu_rate(lrfu.times * class_slots));
+                    lrfu.scores.insert(key, score);
+                    used = lrfu_order(score);
+                }
+            }
             // (every hold of a fresh slot in this pass: a request's fill holds it, and the acquire after it again)
             if self.slots[slot].fresh && probation > 0 && self.slots[slot].key.is_some() {
                 // (the stamp of the slot at the probation's depth, found once a class a release: the fresh ones of a pass share it)
@@ -1820,13 +1920,18 @@ impl DeviceExperts {
 
     fn touch(&mut self, slot: usize) {
         self.clock += 1;
+        // (LRFU: a fill takes its expert's score as it stands; the release after its use raises it)
+        let used = match (self.lrfu.as_ref(), self.slots[slot].key) {
+            (Some(lrfu), Some(key)) => lrfu_order(lrfu.scores.get(&key).copied().unwrap_or(0.0)),
+            _ => self.clock,
+        };
         let entry = &mut self.slots[slot];
         let lru = &mut self.classes[entry.class].lru;
         if entry.key.is_some() {
             lru.remove(&(entry.used, slot));
-            lru.insert((self.clock, slot));
+            lru.insert((used, slot));
         }
-        entry.used = self.clock;
+        entry.used = used;
     }
 
     /// Keep `slot` until the next release, as just used. Its place in the LRU order moves at the
@@ -2332,6 +2437,12 @@ impl DeviceExperts {
     /// [`settle_touches`](Self::settle_touches)).
     pub fn set_probation(&mut self, thousandths: usize) {
         self.probation = Some(thousandths.min(1000));
+    }
+
+    /// Order each class's VRAM slots by LRFU scores halving every `half_life` times its slots of uses, or (None) by the last use.
+    pub fn set_lrfu(&mut self, half_life: Option<f64>) {
+        self.lrfu = half_life.filter(|&times| times > 0.0)
+            .map(|times| Lrfu { times, scores: HashMap::new(), uses: vec![0; self.classes.len()] });
     }
 
     fn victim(&self, class: usize) -> Result<usize> {

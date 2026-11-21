@@ -99,6 +99,16 @@ unsafe extern "C" {
     pub fn sd_expansions(handle: *mut ::std::os::raw::c_void, bytes: u64) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_expansions_at(
+        handle: *mut ::std::os::raw::c_void,
+        pointer: *mut ::std::os::raw::c_void,
+        bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_expansions_forget(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_write(
         handle: *mut ::std::os::raw::c_void,
         pointer: *mut ::std::os::raw::c_void,
@@ -661,6 +671,22 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn sd_op_linears_norm_rope_rows(
+        handle: *mut ::std::os::raw::c_void,
+        items: *const sd_linear,
+        count: u64,
+        rows: u64,
+        input_stride: u64,
+        stride: u64,
+        x: *const f32,
+        weight: *const f32,
+        width: u64,
+        eps: f32,
+        normed: *mut f32,
+        side: *const sd_norm_rope,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn sd_op_swiglu_linear(
         handle: *mut ::std::os::raw::c_void,
         weights: *const ::std::os::raw::c_void,
@@ -1171,6 +1197,25 @@ unsafe extern "C" {
         handles: *const *mut ::std::os::raw::c_void,
         outs: *const *mut f32,
         parts: *const *const f32,
+        devices: u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_sum_devices_start(
+        handles: *const *mut ::std::os::raw::c_void,
+        parts: *const *const f32,
+        inboxes: *const *mut f32,
+        devices: u64,
+        count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_op_sum_devices_finish(
+        handles: *const *mut ::std::os::raw::c_void,
+        outs: *const *mut f32,
+        parts: *const *const f32,
+        inboxes: *const *const f32,
         devices: u64,
         count: u64,
     ) -> ::std::os::raw::c_int;
@@ -2958,5 +3003,57 @@ unsafe extern "C" {
         handle: *mut ::std::os::raw::c_void,
         values: *mut ::std::os::raw::c_void,
         count: u64,
+    ) -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_qwen_vision_layer {
+    pub norm1: *const ::std::os::raw::c_void,
+    pub norm1_bias: *const ::std::os::raw::c_void,
+    pub qkv: *const ::std::os::raw::c_void,
+    pub qkv_bias: *const ::std::os::raw::c_void,
+    pub out: *const ::std::os::raw::c_void,
+    pub out_bias: *const ::std::os::raw::c_void,
+    pub norm2: *const ::std::os::raw::c_void,
+    pub norm2_bias: *const ::std::os::raw::c_void,
+    pub up: *const ::std::os::raw::c_void,
+    pub up_bias: *const ::std::os::raw::c_void,
+    pub down: *const ::std::os::raw::c_void,
+    pub down_bias: *const ::std::os::raw::c_void,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct sd_qwen_vision_merger {
+    pub norm: *const ::std::os::raw::c_void,
+    pub norm_bias: *const ::std::os::raw::c_void,
+    pub up: *const ::std::os::raw::c_void,
+    pub up_bias: *const ::std::os::raw::c_void,
+    pub down: *const ::std::os::raw::c_void,
+    pub down_bias: *const ::std::os::raw::c_void,
+}
+unsafe extern "C" {
+    pub fn sd_qwen_vision_scratch_bytes(patches: u64, bytes: *mut u64) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_qwen_vision_block(
+        handle: *mut ::std::os::raw::c_void,
+        layer: *const sd_qwen_vision_layer,
+        x: *mut f32,
+        cosines: *const f32,
+        sines: *const f32,
+        patches: u64,
+        scratch: *mut ::std::os::raw::c_void,
+        scratch_bytes: u64,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn sd_qwen_vision_merge(
+        handle: *mut ::std::os::raw::c_void,
+        x: *const f32,
+        merger: *const sd_qwen_vision_merger,
+        patches: u64,
+        scratch: *mut ::std::os::raw::c_void,
+        scratch_bytes: u64,
+        out: *mut f32,
     ) -> ::std::os::raw::c_int;
 }

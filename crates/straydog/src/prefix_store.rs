@@ -42,18 +42,20 @@ const WRAPPED_LIMIT: usize = 4096;
 /// A `.part` file older than this is what a killed write left.
 const STALE_PART: Duration = Duration::from_secs(600);
 
-/// What keeps the file's key: DPAPI, or in a test something that does not need a user.
+/// What keeps the file's key: DPAPI (Windows) or the kernel's keyring (Linux), or in a test something that does not need a user.
 pub trait Wrap {
     fn wrap(&self, key: &[u8]) -> Result<Vec<u8>, String>;
     fn unwrap(&self, blob: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 /// DPAPI for the current user (no entropy of the caller's: any process of the user may unwrap what it wrapped, nobody else).
+#[cfg(windows)]
 pub struct Dpapi;
 
-/// What DPAPI mixes into a wrapped key so that another program's blob is not ours.
+/// What DPAPI mixes into a wrapped key (and the kernel's keyring's wrap takes as its associated data) so that another program's blob is not ours.
 const ENTROPY: &[u8] = b"straydog prefix state 1";
 
+#[cfg(windows)]
 impl Dpapi {
     fn call(data: &[u8], protect: bool) -> Result<Vec<u8>, String> {
         use windows_sys::Win32::Foundation::LocalFree;
@@ -83,6 +85,7 @@ impl Dpapi {
     }
 }
 
+#[cfg(windows)]
 impl Wrap for Dpapi {
     fn wrap(&self, key: &[u8]) -> Result<Vec<u8>, String> {
         Dpapi::call(key, true)
@@ -90,6 +93,146 @@ impl Wrap for Dpapi {
 
     fn unwrap(&self, blob: &[u8]) -> Result<Vec<u8>, String> {
         Dpapi::call(blob, false)
+    }
+}
+
+/// The kernel's keyring for the current user (Linux): a random 256-bit key kept in the user's persistent keyring (`KEYCTL_GET_PERSISTENT`), never
+/// on the drive, wraps a file's key with AES-256-GCM (a random nonce, [`ENTROPY`] as the associated data). As DPAPI, any process of the user may
+/// unwrap what it wrapped, nobody else. The key lasts the boot (and the keyring's idle expiry, three days by default): a file kept before then no
+/// longer opens, and is deleted as any file that does not open.
+#[cfg(target_os = "linux")]
+pub struct KernelKeyring;
+
+#[cfg(target_os = "linux")]
+impl KernelKeyring {
+    /// The key's description in the keyring.
+    const NAME: &'static [u8] = b"straydog:state-wrap-1\0";
+
+    /// The key: found in the user's persistent keyring, or made and put there, under a lock of the user's: an `add_key` of a description
+    /// the keyring has replaces that key's bytes, so two starts that both found none would each wrap under a key the other then replaced.
+    fn key() -> Result<[u8; 32], String> {
+        let _lock = Self::lock()?;
+        const KEYCTL_GET_PERSISTENT: libc::c_long = 22;
+        const KEYCTL_SEARCH: libc::c_long = 10;
+        const KEYCTL_READ: libc::c_long = 11;
+        const KEY_SPEC_PROCESS_KEYRING: libc::c_long = -2;
+        const USER: &[u8] = b"user\0";
+        let failed = |what: &str| format!("the kernel's keyring: {what} failed ({})", std::io::Error::last_os_error());
+        // SAFETY: keyctl and add_key with their documented arguments: NUL-terminated strings, and buffers of the lengths given.
+        let persistent = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_GET_PERSISTENT, -1 as libc::c_long, KEY_SPEC_PROCESS_KEYRING) };
+        if persistent < 0 {
+            return Err(failed("the persistent keyring"));
+        }
+        let mut id = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_SEARCH, persistent, USER.as_ptr(), Self::NAME.as_ptr(), 0 as libc::c_long) };
+        if id < 0 {
+            let mut key = [0u8; 32];
+            SystemRandom::new().fill(&mut key).map_err(|_| "no random key".to_string())?;
+            id = unsafe { libc::syscall(libc::SYS_add_key, USER.as_ptr(), Self::NAME.as_ptr(), key.as_ptr(), key.len(), persistent) };
+            wipe(&mut key);
+            if id < 0 {
+                return Err(failed("adding the key"));
+            }
+        }
+        let mut key = [0u8; 32];
+        let read = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_READ, id, key.as_mut_ptr(), key.len()) };
+        if read != key.len() as libc::c_long {
+            wipe(&mut key);
+            return Err(failed("reading the key"));
+        }
+        Ok(key)
+    }
+
+    /// An exclusive lock of the user's, held while it lives: a file of the user's alone (mode 0600, not a link) in a directory the user owns
+    /// that no one else may write (the runtime directory, else `~/.cache/straydog`, made 0700). Never in a shared directory, where another user
+    /// could hold it or put a link in its place; and waited for ten seconds at most.
+    fn lock() -> Result<std::fs::File, String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: getuid has no failure.
+        let uid = unsafe { libc::getuid() };
+        let private = |dir: &Path| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0);
+        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| private(dir)) {
+            Some(dir) => dir,
+            None => {
+                let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("the kernel's keyring's lock: no home directory")?;
+                let dir = home.join(".cache").join("straydog");
+                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)
+                    .map_err(|error| format!("the kernel's keyring's lock {}: {error}", dir.display()))?;
+                if !private(&dir) {
+                    return Err(format!("the kernel's keyring's lock: {} is not the user's alone", dir.display()));
+                }
+                dir
+            }
+        };
+        let path = dir.join("straydog-keyring.lock");
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)
+            .map_err(|error| format!("the kernel's keyring's lock {}: {error}", path.display()))?;
+        if !file.metadata().is_ok_and(|meta| meta.uid() == uid && meta.is_file()) {
+            return Err(format!("the kernel's keyring's lock: {} is not the user's file", path.display()));
+        }
+        let started = std::time::Instant::now();
+        // SAFETY: a descriptor this function owns; the lock goes with the file.
+        while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            if started.elapsed() > Duration::from_secs(10) {
+                return Err(format!("the kernel's keyring's lock {}: held by another process for 10 s", path.display()));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(file)
+    }
+
+    fn sealing() -> Result<LessSafeKey, String> {
+        let mut key = Self::key()?;
+        let unbound = UnboundKey::new(&AES_256_GCM, &key).map_err(|_| "a bad wrapping key".to_string());
+        wipe(&mut key);
+        Ok(LessSafeKey::new(unbound?))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Wrap for KernelKeyring {
+    fn wrap(&self, key: &[u8]) -> Result<Vec<u8>, String> {
+        let sealing = Self::sealing()?;
+        let mut nonce = [0u8; NONCE];
+        SystemRandom::new().fill(&mut nonce).map_err(|_| "no random nonce".to_string())?;
+        let mut sealed = key.to_vec();
+        sealing.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(ENTROPY), &mut sealed)
+            .map_err(|_| "wrapping the key failed".to_string())?;
+        Ok([&nonce[..], &sealed].concat())
+    }
+
+    fn unwrap(&self, blob: &[u8]) -> Result<Vec<u8>, String> {
+        if blob.len() < NONCE + TAG {
+            return Err("a wrapped key too short".into());
+        }
+        let sealing = Self::sealing()?;
+        let nonce = Nonce::try_assume_unique_for_key(&blob[..NONCE]).map_err(|_| "a bad nonce".to_string())?;
+        let mut sealed = blob[NONCE..].to_vec();
+        let opened = sealing.open_in_place(nonce, Aad::from(ENTROPY), &mut sealed)
+            .map_err(|_| "the key does not open: wrapped in another boot or by another user".to_string())?;
+        Ok(opened.to_vec())
+    }
+}
+
+/// Zero `bytes` with writes the compiler keeps (a plain fill of a buffer no longer read may be left out).
+#[cfg(target_os = "linux")]
+fn wipe(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: a valid, aligned byte of the slice.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The user's wrap on this system.
+pub fn user_wrap() -> &'static (dyn Wrap + Sync) {
+    #[cfg(windows)]
+    {
+        &Dpapi
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &KernelKeyring
     }
 }
 
@@ -660,25 +803,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// DPAPI wraps a key for this user and gives it back; what it did not wrap is refused.
+    /// The user's wrap (DPAPI on Windows, the kernel's keyring on Linux) wraps a key for this user and gives it back; what it did not wrap
+    /// is refused.
     #[test]
-    fn dpapi_wraps_and_unwraps_for_this_user() {
+    fn the_users_wrap_wraps_and_unwraps_for_this_user() {
         let key = state(32);
-        let wrapped = Dpapi.wrap(&key).unwrap();
+        let wrapped = user_wrap().wrap(&key).unwrap();
         assert_ne!(wrapped, key);
         assert!(wrapped.len() > 32);
-        assert_eq!(Dpapi.unwrap(&wrapped).unwrap(), key);
+        assert_eq!(user_wrap().unwrap(&wrapped).unwrap(), key);
         let mut bad = wrapped.clone();
         bad[wrapped.len() / 2] ^= 1;
-        assert!(Dpapi.unwrap(&bad).is_err());
-        assert!(Dpapi.unwrap(&key).is_err());
+        assert!(user_wrap().unwrap(&bad).is_err());
+        assert!(user_wrap().unwrap(&key).is_err());
         // and a whole file under it
-        let dir = directory("dpapi");
+        let dir = directory("wrap");
         let store = Store::new(dir.clone(), "Q", &[1; 32]);
         let (prefix, tokens) = keys("d");
         let plain = state(300_000);
-        let (path, _) = store.save(&Dpapi, 1, &prefix, &tokens, plain.clone()).unwrap();
-        assert_eq!(open(&path, &Dpapi, &prefix, 1).unwrap().state(), &plain[..]);
+        let (path, _) = store.save(user_wrap(), 1, &prefix, &tokens, plain.clone()).unwrap();
+        assert_eq!(open(&path, user_wrap(), &prefix, 1).unwrap().state(), &plain[..]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

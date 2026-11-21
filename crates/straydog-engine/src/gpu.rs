@@ -903,6 +903,19 @@ impl Backend {
         check(unsafe { ffi::sd_expansions(self.handle, bytes) }).map(drop)
     }
 
+    /// Keep the FP16 expansions of a prompt pass's weights in `ring` (a buffer of this device's), which its owner may lend out
+    /// between the passes that expand once it has [`forget_expansions`](Self::forget_expansions)ed them.
+    pub fn keep_expansions_in(&self, ring: &crate::ops::Buffer) -> Result<()> {
+        // SAFETY: a live handle; the native side checks the range against this device's allocations.
+        check(unsafe { ffi::sd_expansions_at(self.handle, ring.base(), ring.bytes) }).map(drop)
+    }
+
+    /// Forget every kept expansion (the ring's bytes are another's until a prompt pass expands into it again).
+    pub fn forget_expansions(&self) -> Result<()> {
+        // SAFETY: a live handle.
+        check(unsafe { ffi::sd_expansions_forget(self.handle) }).map(drop)
+    }
+
     pub fn configure_decode(&self, q8: bool) -> Result<()> {
         self.decode_options(q8, false)
     }
@@ -1465,6 +1478,38 @@ impl Backend {
             }
         }
         Ok(self.prefill_capacity)
+    }
+
+    /// Room in the budget for `bytes` more, for a while (the vision encoder's, between requests): where what is free is short, the
+    /// expert pool is let go as a long prompt lets it go, and [`Backend::room_back`] puts it back. Whether it was let go; Err where
+    /// even so there would be no room (nothing is let go then).
+    pub fn make_room(&mut self, bytes: u64) -> Result<bool> {
+        let (used, budget) = self.budget_memory()?;
+        if used.saturating_add(self.slot_margin).saturating_add(bytes) <= budget {
+            return Ok(false);
+        }
+        if self.slot_stage == 0 || self.parts != 1 || self.long_prefill.is_some() {
+            return Err(format!("no room for {} MB more in this device's budget", bytes >> 20));
+        }
+        // SAFETY: a live handle, between requests.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        self.restore_slots(0)?;
+        let (used, budget) = self.budget_memory()?;
+        if used.saturating_add(self.slot_margin).saturating_add(bytes) > budget {
+            self.room_back(true)?;
+            return Err(format!("no room for {} MB more in this device's budget, even with its expert pool let go", bytes >> 20));
+        }
+        Ok(true)
+    }
+
+    /// The expert pool [`Backend::make_room`] let go, back (when it did), with the experts that use it most.
+    pub fn room_back(&mut self, let_go: bool) -> Result<()> {
+        if !let_go {
+            return Ok(());
+        }
+        // SAFETY: a live handle, between requests.
+        check(unsafe { ffi::sd_expert_slots_release(self.handle) })?;
+        self.slots_back()
     }
 
     /// Lend the vocabulary projection, whose authenticated host copy the model keeps. No decoder plan owns it.

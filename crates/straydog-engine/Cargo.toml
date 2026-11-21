@@ -47,6 +47,10 @@ name = "ds41_vision"
 required-features = ["gpu"]
 
 [[example]]
+name = "qwen_vision_gpu"
+required-features = ["gpu"]
+
+[[example]]
 name = "ds41_quality"
 required-features = ["gpu"]
 

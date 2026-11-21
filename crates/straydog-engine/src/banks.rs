@@ -1380,6 +1380,18 @@ pub fn tier_within(sizes: &[u64], expert_bytes: &[u64], experts: usize, budget: 
 /// (address, bytes) with neighbouring experts' merged: what a read back of a layer with a host tier asks for (the tier's experts are read
 /// from its copies, never from these pages).
 pub fn untiered_ranges(banks: &[&[u8]; 3], count: usize, held: &[bool]) -> Vec<(usize, usize)> {
+    expert_ranges(banks, count, held, false)
+}
+
+/// The parts of a layer's banks that hold the experts `held` does: the mapping's pages of a tier's experts, which nothing reads once the tier
+/// is made ([`crate::host::leave_working_set`] gives them back).
+pub fn tiered_ranges(banks: &[&[u8]; 3], count: usize, held: &[bool]) -> Vec<(usize, usize)> {
+    expert_ranges(banks, count, held, true)
+}
+
+/// The ranges of `banks` (address, bytes) of the experts whose `held` is `of_held`, neighbouring experts' merged, bank by bank.
+fn expert_ranges(banks: &[&[u8]; 3], count: usize, held: &[bool], of_held: bool) -> Vec<(usize, usize)> {
+    let is = |expert: usize| held.get(expert).copied().unwrap_or(false) == of_held;
     let mut ranges = Vec::new();
     for bank in banks {
         if bank.is_empty() || count == 0 {
@@ -1388,18 +1400,35 @@ pub fn untiered_ranges(banks: &[&[u8]; 3], count: usize, held: &[bool]) -> Vec<(
         let per = bank.len() / count;
         let mut expert = 0;
         while expert < count {
-            if held.get(expert).copied().unwrap_or(false) {
+            if !is(expert) {
                 expert += 1;
                 continue;
             }
             let first = expert;
-            while expert < count && !held.get(expert).copied().unwrap_or(false) {
+            while expert < count && is(expert) {
                 expert += 1;
             }
             ranges.push((bank.as_ptr() as usize + first * per, (expert - first) * per));
         }
     }
     ranges
+}
+
+/// The layers of a host tier still to make behind the requests (`left`, with their tier's bytes, in the order wanted): in order, as long as the
+/// next one fits what the GPUs' view of host memory leaves (`visible`) and the memory `available` leaves beside `margin` and the K/V still to
+/// grow (`kv_ahead`, [`locking_room`]), as whole layers behind the requests are planned. A layer that does not fit ends the list.
+pub fn tier_more_within(left: &[(usize, u64)], visible: u64, available: u64, margin: u64, kv_ahead: u64) -> Vec<usize> {
+    let (mut visible, mut room) = (visible, available);
+    let mut layers = Vec::new();
+    for &(layer, bytes) in left {
+        if bytes > visible || locking_room(room, bytes, margin, kv_ahead).is_err() {
+            break;
+        }
+        visible -= bytes;
+        room -= bytes;
+        layers.push(layer);
+    }
+    layers
 }
 
 /// The unlocked layers (`layers`, with their banks' bytes, in the order wanted) whose banks a read back takes within `budget` bytes: in order,
@@ -1950,6 +1979,34 @@ mod tests {
         assert_eq!(ranges, vec![(at(&gate, 10), 20), (at(&up, 10), 20), (at(&down, 20), 40)]);
         assert_eq!(untiered_ranges(&banks, 4, &[false; 4]).len(), 3, "nothing held: the banks whole");
         assert!(untiered_ranges(&banks, 4, &[true; 4]).is_empty(), "all held: nothing to read");
+    }
+
+    /// Decides: what leaves the working set once a tier is made is its experts' parts of the mapping and nothing of the others', the
+    /// complement of the read back's ranges.
+    #[test]
+    fn a_tiers_mapping_left_is_its_experts_alone() {
+        let (gate, up, down) = (vec![0u8; 40], vec![0u8; 40], vec![0u8; 80]);
+        let banks = [&gate[..], &up[..], &down[..]];
+        let held = [true, true, false, true];
+        let at = |bank: &[u8], offset: usize| bank.as_ptr() as usize + offset;
+        assert_eq!(tiered_ranges(&banks, 4, &held),
+                   vec![(at(&gate, 0), 20), (at(&gate, 30), 10), (at(&up, 0), 20), (at(&up, 30), 10), (at(&down, 0), 40), (at(&down, 60), 20)]);
+        let both: usize = tiered_ranges(&banks, 4, &held).iter().chain(&untiered_ranges(&banks, 4, &held)).map(|(_, bytes)| bytes).sum();
+        assert_eq!(both, 160, "the two together cover the banks once");
+        assert!(tiered_ranges(&banks, 4, &[false; 4]).is_empty(), "nothing held: nothing leaves");
+    }
+
+    /// Decides: a tier's layers left behind by a locking that stopped short are planned behind the requests in order, while the GPUs' view
+    /// and the memory available beside what is kept free hold the next; the first that does not fit ends the plan.
+    #[test]
+    fn a_tier_stopped_short_is_made_on_behind_the_requests_as_room_allows() {
+        const GIB: u64 = 1 << 30;
+        let left = [(7, GIB), (3, GIB), (12, GIB), (30, GIB)];
+        // (8 GiB kept free and 1 GiB of K/V to grow: 11.5 GiB available holds two layers, the third would leave 8.5)
+        assert_eq!(tier_more_within(&left, 10 * GIB, 11 * GIB + GIB / 2, 8 * GIB, GIB), vec![7, 3]);
+        assert_eq!(tier_more_within(&left, GIB, 30 * GIB, 8 * GIB, GIB), vec![7], "the GPUs' view leaves one");
+        assert!(tier_more_within(&left, 10 * GIB, 9 * GIB + GIB / 2, 8 * GIB, GIB).is_empty(), "no room for the first: none");
+        assert_eq!(tier_more_within(&left, 10 * GIB, 40 * GIB, 8 * GIB, GIB), vec![7, 3, 12, 30], "room for all");
     }
 
     /// Decides: a tier only where the budget cannot hold every layer; then the most routed experts of all layers, never-routed ones left out,

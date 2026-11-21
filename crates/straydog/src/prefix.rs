@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::config::Settings;
 
 /// What a key depends on (but the tokens), as text: every line a fact, in this order.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 struct Facts<'a> {
     bundle: String,
     version: &'a str,
@@ -33,7 +33,7 @@ struct Facts<'a> {
     numerics: String,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 impl Facts<'_> {
     fn description(&self) -> String {
         format!("bundle {}\nversion {}\nbuild {}\nlayout {}\ncontext {}\nplacement {}\ndevices {}\ndrafts {}\nnumerics {}\n",
@@ -42,7 +42,7 @@ impl Facts<'_> {
 }
 
 /// The facts of this start: the settings it was given and what its worker said it placed (`ready`).
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn facts<'a>(settings: &Settings, ready: &'a Value, build: &'a str) -> Option<Facts<'a>> {
     let placement = &ready["placement"];
     let layout = ready["prefix"]["layout"].as_str()?;
@@ -64,7 +64,7 @@ fn facts<'a>(settings: &Settings, ready: &'a Value, build: &'a str) -> Option<Fa
 
 /// The text a key's prefix is made of ([`crate::prefix_store::key_prefix`]), or None when the worker offers no states (it is not a model that
 /// keeps them).
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 pub fn description(settings: &Settings, ready: &Value, build: &str) -> Option<String> {
     facts(settings, ready, build).map(|facts| facts.description())
 }
