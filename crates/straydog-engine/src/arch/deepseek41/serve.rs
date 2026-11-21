@@ -92,6 +92,8 @@ pub struct Engines {
     files: &'static Pinned,
     /// DSpark, when the model's drafter is pinned and there.
     drafting: Option<Drafting>,
+    /// Whether the vision encoder's weights were read ahead of the warm-up's reads ([`Engine::read_vision`]), once.
+    vision_read: bool,
 }
 
 /// DSpark beside the engine that runs the layers it reads ([`TAP_LAYERS`]): the drafter, the policy
@@ -192,6 +194,16 @@ impl served::Engines for Engines {
     }
 
     fn warm(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize), String> {
+        // (the vision encoder first, while the drive has nothing else to read: see Engine::read_vision)
+        if !self.vision_read {
+            self.vision_read = true;
+            let started = std::time::Instant::now();
+            match self.engines[0].read_vision() {
+                Ok(0) => {}
+                Ok(bytes) => eprintln!("Straydog read the vision encoder ({:.2} GB) in {:.2} s", bytes as f64 / 1e9, started.elapsed().as_secs_f64()),
+                Err(error) => eprintln!("Straydog could not read the vision encoder ahead: {error}"),
+            }
+        }
         let (mut reading, mut placed, mut hosted) = (0, vram.len(), host.len());
         for engine in &mut self.engines {
             let (read, engine_placed, engine_hosted) = engine.warm_experts(vram, host)?;
@@ -1079,7 +1091,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
                            saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
-                           budget: checkpoints, marked: Vec::new(), step: CHECKPOINT_STEP, files, drafting },
+                           budget: checkpoints, marked: Vec::new(), step: CHECKPOINT_STEP, files, drafting, vision_read: false },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("read and place".to_string(), place_seconds)].into_iter().chain(startup).collect(),
