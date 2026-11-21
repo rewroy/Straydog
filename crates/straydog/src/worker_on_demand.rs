@@ -444,8 +444,13 @@ impl<E: Engines> Loaded<E> {
             }
         }
         let encode_seconds = started.elapsed().as_secs_f64();
+        // (a conversation an earlier run kept, which this prompt goes on from: its images' positions are in the state, by their digests' ids)
+        let kept_seconds = crate::worker::take_kept(&mut self.model, output, id, cancel, &ids);
         let image_started = Instant::now();
-        let rows = self.image_rows(&images, &spans)?;
+        // (an image the session already holds past needs no rows, as the passes embed only what they read: after a start that took a
+        // kept conversation, every screenshot of it was encoded again for the first request, a second or more each)
+        let held = self.model.held_prefix(&ids);
+        let rows = self.image_rows(&images, &spans, held)?;
         self.model.engines.set_images(spans.iter().map(|&(index, start)| (start, rows[index].clone().unwrap_or_default())).collect());
         let image_seconds = image_started.elapsed().as_secs_f64();
         let context = self.model.context;
@@ -497,8 +502,6 @@ impl<E: Engines> Loaded<E> {
         // go without it and a reasoning_end event marks the place. The same text otherwise written (the
         // reasoning quoting a tag) stays the reasoning's.
         let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
-        // (a conversation an earlier run kept, which this prompt goes on from: its images' positions are in the state, by their digests' ids)
-        let kept_seconds = crate::worker::take_kept(&mut self.model, output, id, cancel, &ids);
         let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -562,12 +565,16 @@ impl<E: Engines> Loaded<E> {
 }
 
 impl<E: Engines> Loaded<E> {
-    /// The span rows of the placed images (by index; none for an image the prompt does not hold):
-    /// those encoded lately kept, the others encoded together.
-    fn image_rows(&mut self, images: &[images::Image], spans: &[(usize, usize)]) -> Result<Vec<Option<Arc<Vec<f32>>>>, Failure> {
+    /// The span rows of the placed images (by index; none for an image the prompt does not hold, or one whose
+    /// positions all lie in the `held` prefix the session goes on from): those encoded lately kept, the others
+    /// encoded together.
+    fn image_rows(&mut self, images: &[images::Image], spans: &[(usize, usize)], held: usize) -> Result<Vec<Option<Arc<Vec<f32>>>>, Failure> {
         let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
         let mut missing = Vec::new();
-        for &(index, _) in spans {
+        for &(index, start) in spans {
+            if passed(start, images[index].plan.tokens(), held) {
+                continue;
+            }
             match self.encoded.iter().position(|(digest, _, _)| *digest == images[index].digest) {
                 Some(at) => {
                     let kept = self.encoded.remove(at);
@@ -597,5 +604,23 @@ impl<E: Engines> Loaded<E> {
             self.encoded.remove(0);
         }
         Ok(rows)
+    }
+}
+
+/// Whether an image span of `tokens` positions from `start` lies wholly in the `held` prefix, short of its last position (the one place
+/// a pass may read again): its rows are then not read.
+fn passed(start: usize, tokens: usize, held: usize) -> bool {
+    start + tokens < held
+}
+
+#[cfg(test)]
+mod tests {
+    /// An image is passed only when all of it lies before the held prefix's last position, which a pass may read again.
+    #[test]
+    fn an_image_the_session_holds_past_needs_no_rows() {
+        assert!(super::passed(100, 50, 151), "positions 100..149, held 0..150");
+        assert!(!super::passed(100, 50, 150), "its last position is the held prefix's last");
+        assert!(!super::passed(100, 50, 120), "half of it is new");
+        assert!(!super::passed(100, 50, 0), "nothing held");
     }
 }
