@@ -1883,7 +1883,8 @@ with a model of its own reads no file it was not given.
     bytes, `image_url` `sha256:` and 64 lowercase hex digits, while the worker keeps its rows: a conversation sends all its
     images with every request (an agent's day of page checks, 97% of 4.3 GB over 308 requests). A request naming one it no
     longer keeps (its rows went, or the worker started again) fails before anything runs with the error `type`
-    `image_not_held`, its conversation left as it was, and the client sends it again with the bytes;
+    `image_not_held`, its conversation left as it was, and the client sends it again with the bytes. `/props` and
+    `/v1/models`' `meta` say `image_digests: true` (another server refuses `sha256:` as an invalid request);
   - `tools`, `tool_choice` (`auto`, `none`, `required`, or a function named);
   - `response_format`: `text`, `json_object`, or `json_schema` (the structured-outputs subset;
     other keywords accepted, not enforced);
