@@ -286,6 +286,7 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool, remin
     };
 
     let messages = messages.iter().map(|item| message(item, vision, reminders)).collect::<Result<Vec<_>, _>>()?;
+    reminder_ends(&messages)?;
     // Qwen's card is the API's; another family's worker reports its own card and fills in what is
     // left null here.
     let (temperature, top_k, top_p, min_p, presence_penalty) = match markup {
@@ -395,6 +396,25 @@ fn same(value: &Value, other: &Value) -> bool {
 pub(crate) const NO_IMAGES: &str = "this model reads no images";
 /// A `latest_reminder` message to a model whose template has no such role.
 pub(crate) const NO_REMINDERS: &str = "this model's chat template has no latest_reminder role";
+/// The messages end with a `latest_reminder` that does not follow a user's message ([`reminder_ends`]).
+pub(crate) const REMINDER_LAST: &str = "a latest_reminder that ends the messages must come right after a user's message: the template \
+     begins the answer there, and after anything else the prompt would end with no answer begun";
+
+/// Messages that end with `latest_reminder` messages must have a user's message before them (or a system message after the first,
+/// as the template has it): it begins the answer after that message, and the reminders go into it. After an assistant's or a tool's
+/// message the prompt ends with no answer begun, and the model writes on from the reminder's text: a client's note after a stopped
+/// reply was written on for 3.7 and 4.7 thousand characters, minutes of a turn, before a tool was called.
+fn reminder_ends(messages: &[Value]) -> Result<(), ApiError> {
+    let role = |message: &Value| message.get("role").and_then(Value::as_str).map(str::to_string);
+    if messages.last().and_then(role).as_deref() != Some("latest_reminder") {
+        return Ok(());
+    }
+    match messages.iter().enumerate().rev().find(|(_, message)| role(message).as_deref() != Some("latest_reminder")) {
+        Some((_, message)) if role(message).as_deref() == Some("user") => Ok(()),
+        Some((at, message)) if at > 0 && role(message).as_deref() == Some("system") => Ok(()),
+        _ => Err(ApiError::invalid(REMINDER_LAST)),
+    }
+}
 
 /// A message for the template: the known fields in the client's order, a developer message
 /// as a system one, and the content as text; with `vision` (a model that reads images), a user's
@@ -479,6 +499,23 @@ fn parts(content: &Value) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reminders that end the messages follow a user's message (the template begins the answer after it), or the request is refused.
+    #[test]
+    fn a_latest_reminder_ends_the_messages_only_after_a_users() {
+        let list = |roles: &[&str]| -> Vec<Value> {
+            roles.iter().map(|role| pyjson::parse(&format!(r#"{{"role": "{role}", "content": "x"}}"#)).unwrap()).collect()
+        };
+        for fine in [&["user"][..], &["system", "user", "latest_reminder"], &["user", "latest_reminder", "latest_reminder"],
+                     &["system", "latest_reminder", "user"], &["user", "assistant", "tool", "user", "latest_reminder"],
+                     &["user", "assistant", "system", "latest_reminder"]] {
+            assert!(reminder_ends(&list(fine)).is_ok(), "{fine:?}");
+        }
+        for refused in [&["user", "assistant", "latest_reminder"][..], &["user", "assistant", "tool", "latest_reminder"],
+                        &["system", "latest_reminder"], &["latest_reminder"]] {
+            assert_eq!(reminder_ends(&list(refused)).unwrap_err().message, REMINDER_LAST, "{refused:?}");
+        }
+    }
 
     /// A `latest_reminder` message goes to a model whose template renders that role (as its text), and is refused for any other.
     #[test]
