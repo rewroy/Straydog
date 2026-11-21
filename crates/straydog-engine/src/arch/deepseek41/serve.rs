@@ -200,8 +200,8 @@ impl served::Engines for Engines {
             let started = std::time::Instant::now();
             match self.engines[0].read_vision() {
                 Ok(0) => {}
-                Ok(bytes) => eprintln!("Straydog read the vision encoder ({:.2} GB) in {:.2} s", bytes as f64 / 1e9, started.elapsed().as_secs_f64()),
-                Err(error) => eprintln!("Straydog could not read the vision encoder ahead: {error}"),
+                Ok(bytes) => eprintln!("Straydog vision encoder read ahead of the warm-up: {:.2} GB in {:.2} s", bytes as f64 / 1e9, started.elapsed().as_secs_f64()),
+                Err(error) => eprintln!("Straydog vision encoder not read ahead: {error}"),
             }
         }
         let (mut reading, mut placed, mut hosted) = (0, vram.len(), host.len());

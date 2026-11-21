@@ -78,6 +78,9 @@ impl Keeper {
         if !settings.keep_conversation {
             return Keeper { on: None };
         }
+        // (where the runtime directory and the home are not the server's to write, as under a service, the keyring's lock goes beside the file)
+        #[cfg(target_os = "linux")]
+        crate::prefix_store::keyring_lock_beside(&settings.data_dir.join("conversation"));
         Keeper { on: Some(Arc::new(On { settings: settings.clone(), store, build: crate::prefix_store::shared_build() })) }
     }
 
