@@ -1887,7 +1887,7 @@ impl Engine for Runtime {
                 processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
                                   "gpu": ready["gpu"], "sampling": ready["sampling"], "vision": ready["vision"] == true,
-                                  "vision_refusal": ready["vision_refusal"]}),
+                                  "vision_refusal": ready["vision_refusal"], "latest_reminder": ready["latest_reminder"] == true}),
             },
             Phase::Failed(message) => EngineState::Failed(message.clone()),
         }

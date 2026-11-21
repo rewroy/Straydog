@@ -109,7 +109,7 @@ pub(crate) struct Shape {
 }
 
 /// The worker request for an OpenAI chat completion request, and the shape of its answer.
-pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Result<(Value, Shape), ApiError> {
+pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool, reminders: bool) -> Result<(Value, Shape), ApiError> {
     let messages = match given(payload, "messages") {
         Some(Value::Array(messages)) if !messages.is_empty() => messages,
         _ => return Err(ApiError::invalid("messages must be a non-empty list")),
@@ -285,7 +285,7 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
         Some(_) => return Err(ApiError::invalid("stream_options must be an object")),
     };
 
-    let messages = messages.iter().map(|item| message(item, vision)).collect::<Result<Vec<_>, _>>()?;
+    let messages = messages.iter().map(|item| message(item, vision, reminders)).collect::<Result<Vec<_>, _>>()?;
     // Qwen's card is the API's; another family's worker reports its own card and fills in what is
     // left null here.
     let (temperature, top_k, top_p, min_p, presence_penalty) = match markup {
@@ -393,13 +393,19 @@ fn same(value: &Value, other: &Value) -> bool {
 
 /// What an image is refused with where the model reads none.
 pub(crate) const NO_IMAGES: &str = "this model reads no images";
+/// A `latest_reminder` message to a model whose template has no such role.
+pub(crate) const NO_REMINDERS: &str = "this model's chat template has no latest_reminder role";
 
 /// A message for the template: the known fields in the client's order, a developer message
 /// as a system one, and the content as text; with `vision` (a model that reads images), a user's
-/// or a tool's content with images as its parts.
-fn message(message: &Value, vision: bool) -> Result<Value, ApiError> {
+/// or a tool's content with images as its parts. With `reminders` (a template that renders it), a `latest_reminder` message too: a
+/// client's own notes beside a user's message, which the model reads as not the user's.
+fn message(message: &Value, vision: bool, reminders: bool) -> Result<Value, ApiError> {
     let role = message.get("role").and_then(Value::as_str);
-    let (Value::Object(fields), Some("system" | "developer" | "user" | "assistant" | "tool")) = (message, role) else {
+    if role == Some("latest_reminder") && !reminders {
+        return Err(ApiError::invalid(NO_REMINDERS));
+    }
+    let (Value::Object(fields), Some("system" | "developer" | "user" | "assistant" | "tool" | "latest_reminder")) = (message, role) else {
         return Err(ApiError::invalid("each message needs a role: system, developer, user, assistant or tool"));
     };
     let mut kept = Vec::new();
@@ -473,6 +479,18 @@ fn parts(content: &Value) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `latest_reminder` message goes to a model whose template renders that role (as its text), and is refused for any other.
+    #[test]
+    fn a_latest_reminder_is_taken_where_the_template_has_the_role() {
+        let reminder = pyjson::parse(r#"{"role": "latest_reminder", "content": [{"type": "text", "text": "Now: 19:43"}], "name": "app"}"#).unwrap();
+        let taken = message(&reminder, false, true).unwrap();
+        assert_eq!(taken.get("role"), Some(&Value::Str("latest_reminder".into())));
+        assert_eq!(taken.get("content"), Some(&Value::Str("Now: 19:43".into())));
+        assert_eq!(message(&reminder, true, false).unwrap_err().message, NO_REMINDERS);
+        let other = pyjson::parse(r#"{"role": "reminder", "content": "x"}"#).unwrap();
+        assert!(message(&other, false, true).unwrap_err().message.starts_with("each message needs a role"));
+    }
 
     /// An image part's URL is a `data:` URL or `sha256:` and the digest of one sent before (the worker checks the digest's form); the server fetches nothing.
     #[test]

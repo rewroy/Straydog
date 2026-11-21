@@ -1876,7 +1876,9 @@ with a model of its own reads no file it was not given.
   - `GET /v1/models`, and llama-server's `GET /props` and `GET /slots` (the context as `n_ctx`).
 - **`POST /v1/chat/completions`,** streaming (SSE `chat.completion.chunk`) or not:
   - messages: system (and developer), user, assistant (content, `reasoning_content`,
-    `tool_calls`) and tool;
+    `tool_calls`) and tool; and `latest_reminder` where the model's template renders it (DeepSeek-V4.1's, its
+    `<｜latest_reminder｜>`), for a client's own notes beside a user's message, which the model then reads as not the user's.
+    `/props` and `/v1/models`' `meta` say `latest_reminder: true` for such a model; any other refuses the role;
   - content as a string or text parts. For a model that reads images (`/props`
     `modalities.vision`), user and tool content may also hold `image_url` with a `data:` URL, or
     `image` with a base64 source. The server fetches nothing. An image sent before may be named by the SHA-256 of its encoded

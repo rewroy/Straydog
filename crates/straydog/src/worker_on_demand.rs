@@ -289,6 +289,8 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         None => header.metadata.get("tokenizer.chat_template").and_then(|value| value.text())
             .ok_or("the GGUF has no chat template")?.to_string(),
     };
+    // (a template that renders the latest_reminder role: the app's notes beside a user's message, apart from what the user said)
+    let reminders = source.contains("latest_reminder");
     let template = ChatTemplate::new(&source).map_err(|exc| exc.0)?;
     let efforts = architecture == "deepseek41";
     report("warm", 0, 0);
@@ -315,6 +317,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "load_seconds": seconds,
         "gpu": model.info()?,
         "vision": model.engines.vision(),
+        "latest_reminder": reminders,
         // (what the kept conversation's file is keyed on beside the bundle and the build: Session::export_conversation's layout)
         "prefix": {"version": straydog_engine::prefix::VERSION, "layout": format!("{KEPT_LAYOUT} layers {}", model.placement["layers"])},
     });

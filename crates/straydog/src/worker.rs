@@ -1332,6 +1332,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let resource = |name: &str| weights.resources.get(name).cloned().ok_or(format!("missing resource {name}"));
     let tokenizer = resource("tokenizer.json")?;
     let template = String::from_utf8(resource("chat_template.jinja")?).map_err(|exc| exc.to_string())?;
+    let reminders = template.contains("latest_reminder");
     let template = ChatTemplate::new(&template).map_err(|exc| exc.0)?;
     let settings = Settings {
         context: args.context,
@@ -1401,6 +1402,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         // (what a system block's state a start may be handed must match: its layout, to the byte)
         "prefix": {"version": straydog_engine::prefix::VERSION, "layout": model.prefix_layout()},
         "vision": vision.is_ok(),
+        "latest_reminder": reminders,
         // (the engram table read: its precision and file, Unsloth's Qwen3.8)
         "engram": straydog_engine::bundle::table_in(&args.model, id).ok().flatten()
             .map(|(table, path)| json!({"precision": table.precision, "file": path.file_name().map(|name| name.to_string_lossy().into_owned())})),
