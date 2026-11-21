@@ -108,8 +108,10 @@ impl KernelKeyring {
     /// The key's description in the keyring.
     const NAME: &'static [u8] = b"straydog:state-wrap-1\0";
 
-    /// The key: found in the user's persistent keyring, or made and put there.
+    /// The key: found in the user's persistent keyring, or made and put there, under a lock of the user's: an `add_key` of a description
+    /// the keyring has replaces that key's bytes, so two starts that both found none would each wrap under a key the other then replaced.
     fn key() -> Result<[u8; 32], String> {
+        let _lock = Self::lock()?;
         const KEYCTL_GET_PERSISTENT: libc::c_long = 22;
         const KEYCTL_SEARCH: libc::c_long = 10;
         const KEYCTL_READ: libc::c_long = 11;
@@ -126,7 +128,7 @@ impl KernelKeyring {
             let mut key = [0u8; 32];
             SystemRandom::new().fill(&mut key).map_err(|_| "no random key".to_string())?;
             id = unsafe { libc::syscall(libc::SYS_add_key, USER.as_ptr(), Self::NAME.as_ptr(), key.as_ptr(), key.len(), persistent) };
-            key.fill(0);
+            wipe(&mut key);
             if id < 0 {
                 return Err(failed("adding the key"));
             }
@@ -134,16 +136,32 @@ impl KernelKeyring {
         let mut key = [0u8; 32];
         let read = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_READ, id, key.as_mut_ptr(), key.len()) };
         if read != key.len() as libc::c_long {
-            key.fill(0);
+            wipe(&mut key);
             return Err(failed("reading the key"));
         }
         Ok(key)
     }
 
+    /// An exclusive lock of the user's (a file in the user's runtime directory, else the system's temporary one), held while it lives.
+    fn lock() -> Result<std::fs::File, String> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: getuid has no failure.
+        let uid = unsafe { libc::getuid() };
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| dir.is_dir()).unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("straydog-keyring-{uid}.lock"));
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+            .map_err(|error| format!("the kernel's keyring's lock {}: {error}", path.display()))?;
+        // SAFETY: a descriptor this function owns; the lock goes with the file.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!("the kernel's keyring's lock: {}", std::io::Error::last_os_error()));
+        }
+        Ok(file)
+    }
+
     fn sealing() -> Result<LessSafeKey, String> {
         let mut key = Self::key()?;
         let unbound = UnboundKey::new(&AES_256_GCM, &key).map_err(|_| "a bad wrapping key".to_string());
-        key.fill(0);
+        wipe(&mut key);
         Ok(LessSafeKey::new(unbound?))
     }
 }
@@ -171,6 +189,16 @@ impl Wrap for KernelKeyring {
             .map_err(|_| "the key does not open: wrapped in another boot or by another user".to_string())?;
         Ok(opened.to_vec())
     }
+}
+
+/// Zero `bytes` with writes the compiler keeps (a plain fill of a buffer no longer read may be left out).
+#[cfg(target_os = "linux")]
+fn wipe(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: a valid, aligned byte of the slice.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// The user's wrap on this system.

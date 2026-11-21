@@ -187,7 +187,7 @@ pub trait Engines {
     }
     /// Take [`Engines::export_checkpoint`]'s bytes (another start's) into checkpoint `slot`, checked to the byte against these engines:
     /// the tokens its sequence holds. Refused with nothing changed if they differ.
-    fn import_checkpoint(&mut self, _slot: usize, _bytes: &[u8]) -> Result<usize, String> {
+    fn import_checkpoint(&mut self, _slot: usize, _bytes: &[u8], _tokens: &[u32]) -> Result<usize, String> {
         Err("these engines keep no conversation".into())
     }
     /// Save a mark of the sequence state where it is, in the place of the oldest of the [`MARKS`] kept (None), or go back to
@@ -1120,21 +1120,28 @@ impl<E: Engines> Session<E> {
             return Err("not a kept conversation of these engines".into());
         }
         let tokens = crate::prefix::tokens_of(parsed.payload, parsed.tokens);
+        if tokens.is_empty() || tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+            return Err("a kept conversation with tokens outside the vocabulary".into());
+        }
         let engines = &self.engines;
         self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
         let slots = self.engines.checkpoints();
         if slots == 0 {
             return Err("these engines keep no checkpoints".into());
         }
-        if self.checkpoints.len() >= slots {
-            let given_up = evicted(&self.checkpoints, &tokens);
-            self.checkpoints.remove(given_up);
+        // (a free slot, or the one evicted gives up: its checkpoint is forgotten only once the import holds)
+        let replaced = (self.checkpoints.len() >= slots).then(|| evicted(&self.checkpoints, &tokens));
+        let slot = match replaced {
+            Some(index) => self.checkpoints[index].slot,
+            None => (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot)).ok_or("no free Straydog checkpoint")?,
+        };
+        let held = self.engines.import_checkpoint(slot, &parsed.payload[4 * tokens.len()..], &tokens)?;
+        if let Some(index) = replaced {
+            self.checkpoints.remove(index);
         }
-        let slot = (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot)).ok_or("no free Straydog checkpoint")?;
-        let held = self.engines.import_checkpoint(slot, &parsed.payload[4 * tokens.len()..])?;
-        if held != tokens.len() {
-            return Err(format!("a kept conversation of {} tokens whose state holds {held}", tokens.len()));
-        }
+        // (and those whose slots the budget gave up for it)
+        let engines = &self.engines;
+        self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
         self.checkpoints.push(Checkpoint { slot, tokens, root: false });
         Ok(held)
     }

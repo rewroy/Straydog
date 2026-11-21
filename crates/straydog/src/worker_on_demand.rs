@@ -316,7 +316,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "gpu": model.info()?,
         "vision": model.engines.vision(),
         // (what the kept conversation's file is keyed on beside the bundle and the build: Session::export_conversation's layout)
-        "prefix": {"version": straydog_engine::prefix::VERSION, "layout": KEPT_LAYOUT},
+        "prefix": {"version": straydog_engine::prefix::VERSION, "layout": format!("{KEPT_LAYOUT} layers {}", model.placement["layers"])},
     });
     Ok((Loaded { model, template, efforts, encoded: Vec::new() }, frame, Arc::new(text)))
 }

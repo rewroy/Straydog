@@ -501,7 +501,7 @@ impl served::Engines for Engines {
 
     /// Another start's [`export_checkpoint`](Self::export_checkpoint) into checkpoint `slot`: each engine's snapshot checked against it
     /// (Engine::check_snapshot), the budget making room as a save does. Without its drafter's rings: drafting starts cold.
-    fn import_checkpoint(&mut self, slot: usize, bytes: &[u8]) -> Result<usize, String> {
+    fn import_checkpoint(&mut self, slot: usize, bytes: &[u8], tokens: &[u32]) -> Result<usize, String> {
         if slot >= CHECKPOINTS {
             return Err("no such Straydog checkpoint".into());
         }
@@ -523,17 +523,19 @@ impl served::Engines for Engines {
             return Err("a kept conversation with bytes after its end".into());
         }
         let position = snapshots[0].position();
-        if snapshots.iter().any(|snapshot| snapshot.position() != position) {
-            return Err("a kept conversation whose engines differ in position".into());
+        if snapshots.iter().any(|snapshot| snapshot.position() != position || snapshot.history() != tokens) {
+            return Err("a kept conversation whose state is not of its tokens".into());
         }
-        // (room as a save makes it: the oldest give theirs up, the kept slot last)
-        self.saved[slot] = None;
-        self.order.retain(|&held| held != slot);
+        // (room as a save makes it, the slot's own state given up with it: the oldest give theirs up, the kept slot last; nothing
+        // changes until it is known to fit)
         let required: u64 = snapshots.iter().map(Snapshot::bytes).sum();
         let kept = self.kept.filter(|&kept| kept != slot);
-        let held: Vec<(usize, u64)> = self.order.iter().filter(|&&held| Some(held) != kept).chain(kept.iter().filter(|kept| self.order.contains(kept)))
+        let held: Vec<(usize, u64)> = self.order.iter().filter(|&&held| held != slot && Some(held) != kept)
+            .chain(kept.iter().filter(|kept| self.order.contains(kept)))
             .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
         let given_up = evictions(&held, required, self.budget).ok_or("a kept conversation larger than the checkpoints' budget")?;
+        self.saved[slot] = None;
+        self.order.retain(|&held| held != slot);
         for oldest in given_up {
             self.saved[oldest] = None;
             self.order.retain(|&held| held != oldest);

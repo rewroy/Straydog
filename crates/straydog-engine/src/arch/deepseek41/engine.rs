@@ -580,6 +580,11 @@ impl Snapshot {
         self.position
     }
 
+    /// The sequence's tokens.
+    pub fn history(&self) -> &[u32] {
+        &self.history
+    }
+
     /// Host bytes it holds (pending ones too: their room is taken).
     pub fn bytes(&self) -> u64 {
         let floats: usize = self.windows.iter().map(|(_, rows)| rows.capacity()).sum::<usize>()
@@ -1908,7 +1913,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
     pub fn check_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         let refused = |why: &str| Err(format!("a kept snapshot refused: {why}").into());
         let (dim, index_dim, position) = (self.hp.head_dim, self.hp.index_dim, snapshot.position);
-        if position == 0 || position + 1 >= self.settings.context || snapshot.history.len() != position || snapshot.pending {
+        if position == 0 || position.checked_add(1).is_none_or(|next| next >= self.settings.context) || snapshot.history.len() != position
+            || snapshot.pending {
             return refused("its position and history");
         }
         let rings: Vec<usize> = self.shards[0].rings.keys().copied().collect();

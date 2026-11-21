@@ -657,7 +657,16 @@ pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id:
     }
     // (the file's bytes in the server, the same in this process, and the copies of its parts: three of the state's size at once)
     let size = model.state_size(wanted);
-    if let Some((_, left)) = straydog_engine::host::commit_left().filter(|_| size > 0) {
+    // (the commit left on Windows; on Linux the memory available, which no commit limit bounds)
+    #[cfg(target_os = "linux")]
+    let left = {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        Some(((), system.available_memory())).filter(|(_, bytes)| *bytes > 0)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let left = straydog_engine::host::commit_left();
+    if let Some((_, left)) = left.filter(|_| size > 0) {
         if left < 3 * size + KEPT_MARGIN {
             not_loaded(format!("the state of {wanted} tokens is {} MB, and the host memory left for it is {} MB", size >> 20, left >> 20));
             return None;
