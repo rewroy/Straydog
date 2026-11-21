@@ -612,11 +612,17 @@ fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
         return Err(format!("{} bytes are no list of tokens", bytes.len()));
     }
     let tokens = straydog_engine::prefix::tokens_of(bytes, bytes.len() / 4);
-    if tokens.iter().any(|token| u64::from(*token) >= straydog_engine::gpu::VOCABULARY) {
-        return Err("a token outside the vocabulary".into());
+    if let Some(token) = tokens.iter().find(|&&token| !kept_token(token)) {
+        return Err(format!("a token outside the vocabulary that is no image's position ({token})"));
     }
     kept().tokens = Some(tokens);
     Ok(())
+}
+
+/// A token a kept conversation's list may hold: the vocabulary's, or an image position's (its id from the image's digest). Whether the
+/// engines read images, and so take a state with them, is theirs to say at the import.
+fn kept_token(token: u32) -> bool {
+    u64::from(token) < straydog_engine::gpu::VOCABULARY || token >= straydog_engine::vision::IMAGE_TOKEN
 }
 
 /// The kept conversation's state, if the prompt begins with the tokens it is held at and the model holds no more of it than they: asked of the
@@ -2229,6 +2235,15 @@ fn reasoning_closed(prompt: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A kept conversation's token list may hold an image's positions (their ids from its digest), and nothing else past the vocabulary.
+    #[test]
+    fn a_kept_list_may_hold_image_positions() {
+        let vocabulary = straydog_engine::gpu::VOCABULARY as u32;
+        assert!(super::kept_token(0) && super::kept_token(vocabulary - 1));
+        assert!(!super::kept_token(vocabulary) && !super::kept_token(straydog_engine::vision::IMAGE_TOKEN - 1));
+        assert!(super::kept_token(straydog_engine::vision::IMAGE_TOKEN) && super::kept_token(u32::MAX));
+    }
+
     /// A reply without reasoning is the generation prompt with its reasoning closed empty: the text the template writes back of a reply with none, so
     /// that the next request reads on from it.
     #[test]
