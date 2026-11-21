@@ -138,6 +138,9 @@ impl SamplingDefaults {
 
 /// The largest request body.
 pub const BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// The error `type` of a request that names by digest (`sha256:`) images the worker no longer keeps: the client sends it again with their bytes.
+pub const IMAGE_NOT_HELD: &str = "image_not_held";
 /// What a request sees while the model loads (llama-server's wording).
 const LOADING: &str = "Loading model";
 

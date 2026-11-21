@@ -1879,7 +1879,11 @@ with a model of its own reads no file it was not given.
     `tool_calls`) and tool;
   - content as a string or text parts. For a model that reads images (`/props`
     `modalities.vision`), user and tool content may also hold `image_url` with a `data:` URL, or
-    `image` with a base64 source. The server fetches nothing;
+    `image` with a base64 source. The server fetches nothing. An image sent before may be named by the SHA-256 of its encoded
+    bytes, `image_url` `sha256:` and 64 lowercase hex digits, while the worker keeps its rows: a conversation sends all its
+    images with every request (an agent's day of page checks, 97% of 4.3 GB over 308 requests). A request naming one it no
+    longer keeps (its rows went, or the worker started again) fails before anything runs with the error `type`
+    `image_not_held`, its conversation left as it was, and the client sends it again with the bytes;
   - `tools`, `tool_choice` (`auto`, `none`, `required`, or a function named);
   - `response_format`: `text`, `json_object`, or `json_schema` (the structured-outputs subset;
     other keywords accepted, not enforced);

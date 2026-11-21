@@ -787,6 +787,13 @@ async fn invalid_requests_are_refused() {
     assert_eq!(complete(&mock, ask(json!({}))).await, invalid("the prompt exceeds the context"));
     let streamed = ask(json!({"stream": true}));
     assert_eq!(complete(&mock, streamed).await, invalid("No user query found in messages."));
+
+    // Images named by digest that the worker does not keep: their own error type, for the client to send their bytes, streamed or not.
+    let gone = "Straydog does not hold 1 of the images named by digest (sha256:ab); send their bytes";
+    let not_held = json!({"event": "error", "message": gone, "fatal": false, "kind": "image_not_held"});
+    let mock = Mock::new(vec![Script::Events(vec![not_held.clone()]), Script::Events(vec![not_held])]);
+    assert_eq!(complete(&mock, ask(json!({}))).await, refused(400, "image_not_held", gone));
+    assert_eq!(complete(&mock, ask(json!({"stream": true}))).await, refused(400, "image_not_held", gone));
 }
 
 #[tokio::test]

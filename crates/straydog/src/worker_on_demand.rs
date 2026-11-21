@@ -402,13 +402,25 @@ impl<E: Engines> Loaded<E> {
         let thinking = thinking && !unreasoned;
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         // (one whose rows are kept is not decoded again: its plan says how long its span is)
+        // (one named by its digest is one whose rows are kept, or the request is sent again with its bytes: refused before any is decoded)
+        let kept_plan = |digest: &[u8; 32]| self.encoded.iter().find(|(kept, _, _)| kept == digest).map(|&(_, _, plan)| plan);
+        let gone: Vec<[u8; 32]> = images.iter().filter_map(|image| match image {
+            images::Taken::Held(digest) if kept_plan(digest).is_none() => Some(*digest),
+            _ => None,
+        }).collect();
+        if !gone.is_empty() {
+            return Err(crate::worker::not_held(&gone));
+        }
         let images: Vec<images::Image> = images
             .iter()
-            .map(|bytes| {
-                let digest = images::digest(bytes);
-                match self.encoded.iter().find(|(kept, _, _)| *kept == digest) {
-                    Some(&(_, _, plan)) => Ok(images::known(digest, plan)),
-                    None => images::prepare(bytes),
+            .map(|image| match image {
+                images::Taken::Held(digest) => Ok(images::known(*digest, kept_plan(digest).expect("a kept image"))),
+                images::Taken::Bytes(bytes) => {
+                    let digest = images::digest(bytes);
+                    match kept_plan(&digest) {
+                        Some(plan) => Ok(images::known(digest, plan)),
+                        None => images::prepare(bytes),
+                    }
                 }
             })
             .collect::<Result<_, _>>()

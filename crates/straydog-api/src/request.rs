@@ -440,7 +440,8 @@ fn has_images(content: &Value) -> bool {
 }
 
 /// Content with images, as its parts for the template (the worker takes the images out): text
-/// parts, and images as `image_url` parts with a `data:` URL or `image` parts with a base64 source.
+/// parts, and images as `image_url` parts with a `data:` URL (or `sha256:` and the digest of one sent before) or `image` parts with a
+/// base64 source.
 fn parts(content: &Value) -> Result<Value, ApiError> {
     let Value::Array(parts) = content else { return Err(ApiError::invalid("message content must be a list of parts")) };
     for part in parts {
@@ -452,9 +453,10 @@ fn parts(content: &Value) -> Result<Value, ApiError> {
                     Some(object) => object.get("url").and_then(Value::as_str),
                     None => None,
                 };
+                // (or `sha256:` and the digest of an image sent before, whose rows the worker keeps: it says if it does not)
                 match url {
-                    Some(url) if url.starts_with("data:") => true,
-                    Some(_) => return Err(ApiError::invalid("an image_url must be a data: URL (the server fetches nothing)")),
+                    Some(url) if url.starts_with("data:") || url.starts_with("sha256:") => true,
+                    Some(_) => return Err(ApiError::invalid("an image_url must be a data: URL, or sha256: and an image's digest (the server fetches nothing)")),
                     None => false,
                 }
             }
@@ -466,4 +468,20 @@ fn parts(content: &Value) -> Result<Value, ApiError> {
         }
     }
     Ok(content.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An image part's URL is a `data:` URL or `sha256:` and the digest of one sent before (the worker checks the digest's form); the server fetches nothing.
+    #[test]
+    fn an_image_is_its_data_or_the_digest_of_one_sent_before() {
+        let part = |url: &str| pyjson::parse(&format!(r#"[{{"type": "image_url", "image_url": {{"url": "{url}"}}}}]"#)).unwrap();
+        assert!(parts(&part("data:image/png;base64,AAEC")).is_ok());
+        assert!(parts(&part(&format!("sha256:{}", "ab".repeat(32)))).is_ok());
+        for url in ["https://example.com/a.png", "file:///a.png", "SHA256:ab"] {
+            assert!(parts(&part(url)).unwrap_err().message.contains("sha256: and an image's digest"), "{url}");
+        }
+    }
 }

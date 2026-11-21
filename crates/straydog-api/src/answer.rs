@@ -10,7 +10,7 @@
 use std::convert::Infallible;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::http::{HeaderName, HeaderValue};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use futures::stream::{self, StreamExt};
@@ -198,8 +198,10 @@ impl Completion {
                 Some("error") => {
                     let message = event["message"].as_str().filter(|message| !message.is_empty());
                     let message = message.unwrap_or("Straydog failed");
-                    return Err(match event["fatal"].as_bool() {
-                        Some(true) => ApiError::server(message),
+                    return Err(match (event["fatal"].as_bool(), event["kind"].as_str()) {
+                        (Some(true), _) => ApiError::server(message),
+                        // (images named by digest that the worker does not keep: the client sends their bytes)
+                        (_, Some(crate::IMAGE_NOT_HELD)) => ApiError::new(StatusCode::BAD_REQUEST, crate::IMAGE_NOT_HELD, message),
                         _ => ApiError::invalid(message),
                     });
                 }

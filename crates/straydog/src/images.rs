@@ -50,9 +50,23 @@ pub fn known(digest: [u8; 32], plan: Plan) -> Image {
     Image { digest, plan, patches: None }
 }
 
-/// The messages with each image part replaced by its marker, and the images' encoded bytes in
-/// marker order. Text holding a marker's prefix is refused.
-pub fn take(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String> {
+/// An image part as the request gave it: its encoded bytes, or the digest of an image sent before whose rows the worker keeps ([`HELD`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Taken {
+    Bytes(Vec<u8>),
+    Held([u8; 32]),
+}
+
+/// An `image_url` that names an image sent before by the SHA-256 of its encoded bytes, `sha256:` and 64 lowercase hex digits: a conversation
+/// sends all its images with every request, 97% of an agent's 4.3 GB over a day's 308 requests (30 MB a request at 38 screenshots). A worker
+/// that no longer keeps it refuses the request as [`NOT_HELD`], and the client sends the bytes again.
+pub const HELD: &str = "sha256:";
+
+/// The kind of the error a request whose image references the worker does not keep fails with (the API's error `type`).
+pub const NOT_HELD: &str = straydog_api::IMAGE_NOT_HELD;
+
+/// The messages with each image part replaced by its marker, and the images in marker order. Text holding a marker's prefix is refused.
+pub fn take(messages: &Value) -> Result<(Value, Vec<Taken>), String> {
     let mut images = Vec::new();
     let Value::Array(list) = messages else { return Ok((messages.clone(), images)) };
     let mut out = Vec::with_capacity(list.len());
@@ -75,22 +89,25 @@ pub fn take(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String> {
     Ok((Value::Array(out), images))
 }
 
-fn part_of(part: &Value, images: &mut Vec<Vec<u8>>) -> Result<Value, String> {
+fn part_of(part: &Value, images: &mut Vec<Taken>) -> Result<Value, String> {
     let text_part = |text: String| Value::Object(vec![("type".into(), Value::Str("text".into())), ("text".into(), Value::Str(text))]);
-    let bytes = match part.get("type").and_then(Value::as_str) {
+    let image = match part.get("type").and_then(Value::as_str) {
         Some("image_url") => {
             let url = match part.get("image_url") {
                 Some(Value::Str(url)) => url.as_str(),
                 Some(object) => object.get("url").and_then(Value::as_str).ok_or("an image_url part without a url")?,
                 None => return Err("an image_url part without a url".into()),
             };
-            data_url(url)?
+            match url.strip_prefix(HELD) {
+                Some(hex) => Taken::Held(held_digest(hex).ok_or("an image named by its digest must be sha256: and 64 lowercase hex digits")?),
+                None => Taken::Bytes(data_url(url)?),
+            }
         }
         Some("image") => {
             let source = part.get("source").ok_or("an image part without a source")?;
             match (source.get("type").and_then(Value::as_str), source.get("data").and_then(Value::as_str)) {
-                (Some("base64"), Some(data)) => base64(data)?,
-                (Some("url"), _) => data_url(source.get("url").and_then(Value::as_str).unwrap_or_default())?,
+                (Some("base64"), Some(data)) => Taken::Bytes(base64(data)?),
+                (Some("url"), _) => Taken::Bytes(data_url(source.get("url").and_then(Value::as_str).unwrap_or_default())?),
                 _ => return Err("an image source must be base64 data or a data URL".into()),
             }
         }
@@ -99,8 +116,32 @@ fn part_of(part: &Value, images: &mut Vec<Vec<u8>>) -> Result<Value, String> {
         }
         _ => return Ok(part.clone()),
     };
-    images.push(bytes);
+    images.push(image);
     Ok(text_part(marker(images.len() - 1)))
+}
+
+/// The digest `hex` spells: 64 lowercase hex digits, as [`hex_digest`] writes them.
+pub fn held_digest(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    for (at, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[at * 2..at * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
+/// A digest as an image part names it, after [`HELD`].
+pub fn hex_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A request's failure for images it names by digest that the worker does not keep (their rows went, or the worker started again): the client
+/// sends the request again with their bytes. The message names the first.
+pub fn not_held(digests: &[[u8; 32]]) -> String {
+    format!("Straydog does not hold {} of the images named by digest ({HELD}{}{}); send their bytes", digests.len(),
+            hex_digest(&digests[0]), if digests.len() > 1 { " and others" } else { "" })
 }
 
 /// A `data:` URL's bytes (base64); the server fetches no other URL.
@@ -343,13 +384,31 @@ mod tests {
         assert!(base64(&"A".repeat((vision::MAX_BYTES + 3) / 3 * 4 + 8)).unwrap_err().contains("more than"));
     }
 
+    /// An image named by its digest is taken as that digest, in its place among the others; a malformed digest is refused.
+    #[test]
+    fn an_image_named_by_its_digest_is_taken_as_held() {
+        let hex = "0123456789abcdef".repeat(4);
+        let messages = pyjson::parse(&format!(r#"[{{"role": "user", "content": [{{"type": "image_url", "image_url": {{"url": "data:image/png;base64,AAEC"}}}},
+            {{"type": "image_url", "image_url": {{"url": "sha256:{hex}"}}}}, {{"type": "image_url", "image_url": "sha256:{hex}"}}]}}]"#)).unwrap();
+        let (_, images) = take(&messages).unwrap();
+        let digest = held_digest(&hex).unwrap();
+        assert_eq!(images, [Taken::Bytes(vec![0, 1, 2]), Taken::Held(digest), Taken::Held(digest)]);
+        assert_eq!(hex_digest(&digest), hex);
+        assert_eq!(&digest[..4], &[0x01, 0x23, 0x45, 0x67]);
+        for bad in ["sha256:", "sha256:0123", &format!("sha256:{}", hex.to_uppercase()), &format!("sha256:{hex}0"), &format!("sha256:{}g", &hex[1..])] {
+            let messages = pyjson::parse(&format!(r#"[{{"role": "user", "content": [{{"type": "image_url", "image_url": {{"url": "{bad}"}}}}]}}]"#)).unwrap();
+            assert!(take(&messages).unwrap_err().contains("64 lowercase hex digits"), "{bad}");
+        }
+        assert_eq!(not_held(&[digest]), format!("Straydog does not hold 1 of the images named by digest (sha256:{hex}); send their bytes"));
+    }
+
     #[test]
     fn image_parts_become_markers() {
         let messages = pyjson::parse(r#"[{"role": "user", "content": [{"type": "text", "text": "look"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAEC"}}]},
             {"role": "tool", "tool_call_id": "a", "content": [{"type": "image", "source": {"type": "base64", "data": "/w=="}}]}]"#).unwrap();
         let (taken, images) = take(&messages).unwrap();
-        assert_eq!(images, [vec![0, 1, 2], vec![255]]);
+        assert_eq!(images, [Taken::Bytes(vec![0, 1, 2]), Taken::Bytes(vec![255])]);
         let Value::Array(list) = &taken else { panic!("messages") };
         let Some(Value::Array(parts)) = list[0].get("content") else { panic!("content") };
         assert_eq!(parts[1].get("text").and_then(Value::as_str), Some(marker(0).as_str()));

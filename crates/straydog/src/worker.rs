@@ -225,7 +225,7 @@ pub(crate) trait Served: Send {
 impl Served for Engine {
     fn run(&mut self, text: &Arc<Text>, output: &Output, id: &str, body: &pyjson::Value, cancel: &Arc<AtomicBool>,
            started: Instant) -> Result<Value, Failure> {
-        self.vram_ready().map_err(|message| Failure { message: format!("{message}. Restart the worker before retrying."), fatal: true })?;
+        self.vram_ready().map_err(|message| Failure { message: format!("{message}. Restart the worker before retrying."), fatal: true, kind: None })?;
         self.requests += 1;
         // (while it runs, the locking behind "ready" checks its banks on a quarter of the cores, not all of them)
         let _running = straydog_engine::banks::RequestRunning::begin();
@@ -1864,10 +1864,17 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
 pub(crate) struct Failure {
     pub message: String,
     pub fatal: bool,
+    /// What the client is told it is, where it can act on that: [`images::NOT_HELD`].
+    pub kind: Option<&'static str>,
 }
 
 pub(crate) fn refused(message: impl Into<String>) -> Failure {
-    Failure { message: message.into(), fatal: false }
+    Failure { message: message.into(), fatal: false, kind: None }
+}
+
+/// A request that names by digest images the worker does not keep ([`images::not_held`]), refused before anything of it ran.
+pub(crate) fn not_held(digests: &[[u8; 32]]) -> Failure {
+    Failure { message: images::not_held(digests), fatal: false, kind: Some(images::NOT_HELD) }
 }
 
 pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
@@ -1885,7 +1892,7 @@ pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
         && !message.ends_with(straydog_engine::rows::ROW_READ_REFUSED)
         && !message.ends_with(straydog_engine::model::IMAGE_REFUSED)
         && !message.ends_with("exceeds the allocated context");
-    Failure { message: format!("{site}: {message}"), fatal }
+    Failure { message: format!("{site}: {message}"), fatal, kind: None }
 }
 
 /// Telemetry must not turn a completed generation into a failed request.
@@ -1914,14 +1921,20 @@ fn generate<S: Served>(engine: &Mutex<S>, text: &Arc<Text>, output: &Output, id:
         Err(failure) => {
             let mut fatal = failure.fatal;
             let mut message = failure.message;
-            // A failed device (an illegal memory access) cannot be reset; the request still ends.
-            if let Err(exc) = engine.reset() {
-                eprintln!("Straydog could not reset after a failed generation: {exc}; original failure: {message}");
-                fatal = true;
-                message = format!("The engine could not reset after this request failed: {exc}. Restart it before retrying.");
+            // A failed device (an illegal memory access) cannot be reset; the request still ends. A request refused for images it names by
+            // digest ran nothing, and the conversation it goes on stays live for the same request with their bytes.
+            if failure.kind != Some(images::NOT_HELD) {
+                if let Err(exc) = engine.reset() {
+                    eprintln!("Straydog could not reset after a failed generation: {exc}; original failure: {message}");
+                    fatal = true;
+                    message = format!("The engine could not reset after this request failed: {exc}. Restart it before retrying.");
+                }
             }
-            json!({"id": id, "event": "error", "message": message.chars().take(500).collect::<String>(),
-                   "fatal": fatal})
+            let mut event = json!({"id": id, "event": "error", "message": message.chars().take(500).collect::<String>(), "fatal": fatal});
+            if let Some(kind) = failure.kind.filter(|_| !fatal) {
+                event["kind"] = kind.into();
+            }
+            event
         }
     }
 }
@@ -1980,13 +1993,25 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         // (one whose rows are kept is not decoded again: its grid says how long its span is. Decoding each again was ~15 ms an image of
         // every request's first token, with an agent's screenshots all sent each time.)
+        // (one named by its digest is one whose rows are kept, or the request is sent again with its bytes: refused before any is decoded)
+        let kept_grid = |digest: &[u8; 32]| engine.encoded.iter().find(|(kept, _, _)| kept == digest).map(|&(_, _, grid)| grid);
+        let gone: Vec<[u8; 32]> = images.iter().filter_map(|image| match image {
+            images::Taken::Held(digest) if kept_grid(digest).is_none() => Some(*digest),
+            _ => None,
+        }).collect();
+        if !gone.is_empty() {
+            return Err(not_held(&gone));
+        }
         let prepared: Vec<images::QwenImage> = images
             .iter()
-            .map(|bytes| {
-                let digest = images::digest(bytes);
-                match engine.encoded.iter().find(|(kept, _, _)| *kept == digest) {
-                    Some(&(_, _, grid)) => Ok(images::known_qwen(digest, grid)),
-                    None => images::prepare_qwen(bytes),
+            .map(|image| match image {
+                images::Taken::Held(digest) => Ok(images::known_qwen(*digest, kept_grid(digest).expect("a kept image"))),
+                images::Taken::Bytes(bytes) => {
+                    let digest = images::digest(bytes);
+                    match kept_grid(&digest) {
+                        Some(grid) => Ok(images::known_qwen(digest, grid)),
+                        None => images::prepare_qwen(bytes),
+                    }
                 }
             })
             .collect::<Result<_, _>>()
@@ -2612,6 +2637,9 @@ mod tests {
             if prompt == "recovered-wait" {
                 return Err(refused("The GPU wait exceeded its limit. The GPU state was reset; you can retry with the next request."));
             }
+            if prompt == "not-held" {
+                return Err(not_held(&[[0xab; 32], [1; 32]]));
+            }
             if prompt == "gpu-info-error" {
                 return Ok(json!({"id": id, "event": "done", "gpu": gpu_info_or_null(Err("injected info error".into()), "test")}));
             }
@@ -2649,6 +2677,20 @@ mod tests {
         assert_eq!(next["event"], "done");
         assert_eq!(next["id"], "second");
         assert_eq!(next["tokens"], json!([0]));
+    }
+
+    /// A request that names images by digest the worker does not keep ran nothing: the client is told which kind of error it is, to send
+    /// their bytes, and the conversation it goes on is not reset under it.
+    #[test]
+    fn images_not_held_are_said_so_and_reset_nothing() {
+        let engine = Mutex::new(TokenizerOnly { resets: 0, reset_fails: true });
+        let failed = request(&engine, &tokenizer(), "not-held", "named");
+        assert_eq!((&failed["event"], &failed["fatal"], &failed["kind"]), (&json!("error"), &json!(false), &json!(straydog_api::IMAGE_NOT_HELD)));
+        let message = failed["message"].as_str().unwrap();
+        assert!(message.contains(&format!("2 of the images named by digest (sha256:{} and others)", "ab".repeat(32))), "{message}");
+        assert_eq!(engine.lock().unwrap().resets, 0);
+        // (no other failure has a kind)
+        assert!(request(&engine, &tokenizer(), "unknown", "other").get("kind").is_none());
     }
 
     #[test]
