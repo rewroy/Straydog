@@ -316,6 +316,9 @@ struct Checkpoint {
     root: bool,
 }
 
+/// The new tokens of a prompt from which its progress is told before its first pass (a shorter one's pass ends about as soon).
+const PROGRESS_AT_ONCE: usize = 4096;
+
 /// The fewest tokens a system prompt has to be checkpointed as a conversation's root (a shorter
 /// one prefills in about a second).
 const ROOT_MINIMUM: usize = 1024;
@@ -798,6 +801,11 @@ impl<E: Engines> Session<E> {
         let agreed = self.agreed.max(reused);
         let resume_seconds = started.elapsed().as_secs_f64();
         let total = tokens.len();
+        // (a long prompt's progress shows at once, where it was resumed: its first pass's report came after that pass, 7-8 s into
+        // an 87K-token prompt that read 82K)
+        if total - reused > PROGRESS_AT_ONCE {
+            progress(reused, total);
+        }
         // (where the prefill's experts came from: the wait before the first token, broken down)
         let (hits0, host0, drive0) = self.engines.counts();
         // (a profile counts from here: the time since the last request is not this prefill's)
