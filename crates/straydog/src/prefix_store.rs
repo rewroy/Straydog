@@ -142,18 +142,41 @@ impl KernelKeyring {
         Ok(key)
     }
 
-    /// An exclusive lock of the user's (a file in the user's runtime directory, else the system's temporary one), held while it lives.
+    /// An exclusive lock of the user's, held while it lives: a file of the user's alone (mode 0600, not a link) in a directory the user owns
+    /// that no one else may write (the runtime directory, else `~/.cache/straydog`, made 0700). Never in a shared directory, where another user
+    /// could hold it or put a link in its place; and waited for ten seconds at most.
     fn lock() -> Result<std::fs::File, String> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
         use std::os::unix::io::AsRawFd;
         // SAFETY: getuid has no failure.
         let uid = unsafe { libc::getuid() };
-        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| dir.is_dir()).unwrap_or_else(std::env::temp_dir);
-        let path = dir.join(format!("straydog-keyring-{uid}.lock"));
-        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+        let private = |dir: &Path| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0);
+        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| private(dir)) {
+            Some(dir) => dir,
+            None => {
+                let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("the kernel's keyring's lock: no home directory")?;
+                let dir = home.join(".cache").join("straydog");
+                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)
+                    .map_err(|error| format!("the kernel's keyring's lock {}: {error}", dir.display()))?;
+                if !private(&dir) {
+                    return Err(format!("the kernel's keyring's lock: {} is not the user's alone", dir.display()));
+                }
+                dir
+            }
+        };
+        let path = dir.join("keyring.lock");
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)
             .map_err(|error| format!("the kernel's keyring's lock {}: {error}", path.display()))?;
+        if !file.metadata().is_ok_and(|meta| meta.uid() == uid && meta.is_file()) {
+            return Err(format!("the kernel's keyring's lock: {} is not the user's file", path.display()));
+        }
+        let started = std::time::Instant::now();
         // SAFETY: a descriptor this function owns; the lock goes with the file.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!("the kernel's keyring's lock: {}", std::io::Error::last_os_error()));
+        while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            if started.elapsed() > Duration::from_secs(10) {
+                return Err(format!("the kernel's keyring's lock {}: held by another process for 10 s", path.display()));
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
         Ok(file)
     }
