@@ -164,7 +164,7 @@ impl KernelKeyring {
                 dir
             }
         };
-        let path = dir.join("keyring.lock");
+        let path = dir.join("straydog-keyring.lock");
         let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)
             .map_err(|error| format!("the kernel's keyring's lock {}: {error}", path.display()))?;
         if !file.metadata().is_ok_and(|meta| meta.uid() == uid && meta.is_file()) {
