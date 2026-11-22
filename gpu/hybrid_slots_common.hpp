@@ -153,9 +153,10 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         // an expert, each a third of a megabyte, kept the bus at 19 GB/s (22 so) on a Radeon AI PRO R9700.
         uint8_t* regions[3] = {base, base + half * plan.host_bytes[0], base + half * (plan.host_bytes[0] + plan.host_bytes[1])};
         if (gather) {
-            for (size_t i = 0; i < count; ++i)
-                check(hipMemcpyAsync(base + i * d.slots.bytes, host + i * d.slots.bytes, expert_slot_bytes(plan), hipMemcpyHostToDevice,
-                                     d.copy_stream));
+            // The mirror holds the chunk's experts at the staging buffer's own stride: one copy takes them all (the slots' padding past each
+            // expert's bytes is the mirror's, zeroed when it was made). A copy an expert asked the host for one call each of a layer's ~130
+            // gathered experts, where each call costs the host tens of microseconds on Windows.
+            check(hipMemcpyAsync(base, host, (count - 1) * d.slots.bytes + expert_slot_bytes(plan), hipMemcpyHostToDevice, d.copy_stream));
         } else {
             for (size_t i = 0; i < count;) {
                 size_t j = i + 1;
