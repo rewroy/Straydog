@@ -383,8 +383,21 @@ fn refreshed(checkpoints: &mut Vec<Checkpoint>, index: usize) -> usize {
     checkpoints.len() - 1
 }
 
+/// Where a prompt whose generation prompt begins with `start` has its turn checkpointed ([`Session::turn_mark`]): [`TURN_BACK`]
+/// before the last `start` within its last [`TURN_REACH`] tokens, and past the `reused` tokens it resumed from.
+fn turn_at(tokens: &[u32], reused: usize, start: u32) -> Option<usize> {
+    let lowest = tokens.len().saturating_sub(TURN_REACH).max(reused + 1);
+    let begins = (lowest..tokens.len()).rev().find(|&index| tokens[index] == start)?;
+    Some(begins.saturating_sub(TURN_BACK).max(lowest))
+}
+
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
+/// How far before its reply's generation prompt a turn is checkpointed: the last tokens of the message before it are split otherwise
+/// by what follows them in the next prompt. A tool's result that ended `</tool_result>` before the generation prompt was split
+/// otherwise where an app's note followed it after a stopped reply: the next prompt agreed one token short of the checkpoint, and an
+/// agent's 48K-token conversation was read again from its system prompt (43K tokens, 23.6 s on two R9700s).
+const TURN_BACK: usize = 8;
 
 /// A stem is worth a checkpoint where it is this much longer than what the request resumed from.
 const STEM_GAIN: usize = 1024;
@@ -1062,12 +1075,11 @@ impl<E: Engines> Session<E> {
         Ok((self.history.len(), kind))
     }
 
-    /// Where the prompt's last generation prompt begins, to be checkpointed: past what is held,
-    /// within the prompt's last [`TURN_REACH`] tokens.
+    /// Where the prompt's last generation prompt begins, less [`TURN_BACK`], to be checkpointed: past
+    /// what is held, within the prompt's last [`TURN_REACH`] tokens.
     fn turn_mark(&self, tokens: &[u32], reused: usize) -> Option<usize> {
         let start = self.turn_start.filter(|_| self.engines.checkpoints() > 0)?;
-        let lowest = tokens.len().saturating_sub(TURN_REACH).max(reused + 1);
-        (lowest..tokens.len()).rev().find(|&index| tokens[index] == start)
+        turn_at(tokens, reused, start)
     }
 
     /// Where the prompt's system prompt ends (its first user message begins), to be checkpointed
@@ -1454,6 +1466,18 @@ mod tests {
         assert!(demoted(&held, &first).is_empty());
         // a third system prompt: the oldest root becomes an ordinary checkpoint
         assert_eq!(demoted(&held, &third), [0]);
+    }
+
+    /// Decides: a turn is checkpointed a few tokens before its generation prompt, where the next prompt still agrees when what
+    /// follows the last message there splits that message's last tokens otherwise; never at or before what was resumed from.
+    #[test]
+    fn a_turn_is_checkpointed_a_few_tokens_before_its_generation_prompt() {
+        let prompt: Vec<u32> = std::iter::repeat(1).take(100).chain([7, 8]).collect();
+        assert_eq!(turn_at(&prompt, 0, 7), Some(100 - TURN_BACK));
+        assert_eq!(turn_at(&prompt, 95, 7), Some(96), "past what was resumed from");
+        assert_eq!(turn_at(&prompt, 0, 9), None, "no generation prompt");
+        let far: Vec<u32> = [7].into_iter().chain(std::iter::repeat(1).take(TURN_REACH + 4)).collect();
+        assert_eq!(turn_at(&far, 0, 7), None, "only within the last tokens");
     }
 
     /// A cancel is seen before every pass, the first too: a prompt's next stretch (after a
