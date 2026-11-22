@@ -428,21 +428,30 @@ impl<E: Engines> Loaded<E> {
             })
             .collect::<Result<_, _>>()
             .map_err(refused)?;
-        let (mut ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
+        let (ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
         // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
-        // encoded again can be split otherwise, and the engines then read the reply again from the first such place.
-        if images.is_empty() {
-            let held = self.model.held();
-            let shared = ids.iter().zip(held).take_while(|(new, old)| new == old).count();
-            if shared < held.len() && shared < ids.len() {
-                let (count, at) = text.reach(held, &prompt);
-                if count > shared {
-                    let mut kept = held[..count].to_vec();
-                    kept.extend(text.encode(&prompt[at..]).map_err(Failure::from)?);
-                    ids = kept;
+        // encoded again can be split otherwise, and the engines then read the reply again from the first such place. Piece by
+        // piece, through each picture whose ids the session holds where the prompt has it: a conversation's first picture had
+        // every earlier reply encoded again, and an agent's 86K-token conversation was read again from 19K tokens in (45 s).
+        let parts: Vec<Part> = {
+            let mut placed = spans.iter();
+            pieces.iter().map(|piece| match piece {
+                images::Piece::Text(part) => Part::Text(part),
+                images::Piece::Image(_) => {
+                    let &(index, start) = placed.next().expect("a span for each picture placed");
+                    Part::Image(&ids[start..start + images[index].plan.tokens()])
                 }
-            }
-        }
+            }).collect()
+        };
+        let held = self.model.held();
+        let (kept, starts) = written(held, &parts, |held, part| text.reach(held, part), |part| text.encode(part).map_err(Failure::from))?;
+        // (only where that agrees with the session further than the prompt encoded afresh)
+        let agreed = |ids: &[u32]| ids.iter().zip(held).take_while(|(new, old)| new == old).count();
+        let (ids, spans) = if agreed(&kept) > agreed(&ids) {
+            (kept, spans.iter().zip(starts).map(|(&(index, _), start)| (index, start)).collect())
+        } else {
+            (ids.clone(), spans.clone())
+        };
         let encode_seconds = started.elapsed().as_secs_f64();
         // (a conversation an earlier run kept, which this prompt goes on from: its images' positions are in the state, by their digests' ids)
         let kept_seconds = crate::worker::take_kept(&mut self.model, output, id, cancel, &ids);
@@ -607,6 +616,44 @@ impl<E: Engines> Loaded<E> {
     }
 }
 
+/// A piece of a prompt for [`written`]: a text, or a picture's ids.
+enum Part<'a> {
+    Text(&'a str),
+    Image(&'a [u32]),
+}
+
+/// The prompt's ids, with the session's `held` ids kept as written: through each text they spell (`reach`: how many, and how far
+/// into the text) and each picture whose ids they are, in order; from the first place they part, each text encoded (`encoded`)
+/// and each picture's ids as they are. With the place each picture's ids begin.
+fn written(held: &[u32], parts: &[Part], reach: impl Fn(&[u32], &str) -> (usize, usize),
+           encoded: impl Fn(&str) -> Result<Vec<u32>, Failure>) -> Result<(Vec<u32>, Vec<usize>), Failure> {
+    let (mut ids, mut starts, mut kept) = (Vec::new(), Vec::new(), Some(0));
+    for part in parts {
+        match *part {
+            Part::Text(text) => {
+                let Some(at_held) = kept else {
+                    ids.extend(encoded(text)?);
+                    continue;
+                };
+                let (count, at) = reach(&held[at_held..], text);
+                ids.extend_from_slice(&held[at_held..at_held + count]);
+                if at == text.len() {
+                    kept = Some(at_held + count);
+                } else {
+                    ids.extend(encoded(&text[at..])?);
+                    kept = None;
+                }
+            }
+            Part::Image(image) => {
+                starts.push(ids.len());
+                kept = kept.filter(|&at_held| held[at_held..].starts_with(image)).map(|at_held| at_held + image.len());
+                ids.extend_from_slice(image);
+            }
+        }
+    }
+    Ok((ids, starts))
+}
+
 /// Whether an image span of `tokens` positions from `start` lies wholly in the `held` prefix, short of its last position (the one place
 /// a pass may read again): its rows are then not read.
 fn passed(start: usize, tokens: usize, held: usize) -> bool {
@@ -615,6 +662,38 @@ fn passed(start: usize, tokens: usize, held: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The replies held are kept as written across the pictures: each text the held ids spell keeps them, each picture whose ids
+    /// they are keeps its place; from where they part, texts are encoded and pictures are as given, and every picture's start
+    /// follows its text.
+    #[test]
+    fn replies_are_kept_as_written_across_the_pictures() {
+        use super::{written, Part};
+        // (the texts "ab" and "cd": the held reply wrote "ab" as 5, an encoder writes 6 7; "cd" is 8 either way; a picture 100 101)
+        let spell = |text: &str| -> Vec<(u32, &'static str)> { match text { "ab" => vec![(5, "ab")], "cd" => vec![(8, "cd")], _ => vec![] } };
+        let reach = |held: &[u32], text: &str| -> (usize, usize) {
+            let mut at = 0;
+            let mut count = 0;
+            for (&token, (id, piece)) in held.iter().zip(spell(text)) {
+                if token != id {
+                    break;
+                }
+                count += 1;
+                at += piece.len();
+            }
+            (count, at)
+        };
+        let encoded = |text: &str| Ok::<_, super::Failure>(match text { "ab" => vec![6, 7], "cd" => vec![8], "b" => vec![7], _ => vec![] });
+        let picture = [100, 101];
+        let parts = [Part::Text("ab"), Part::Image(&picture), Part::Text("cd")];
+        let ok = |result: Result<(Vec<u32>, Vec<usize>), super::Failure>| result.ok().unwrap();
+        // the reply before the picture as the model wrote it, the picture in place
+        assert_eq!(ok(written(&[5, 100, 101, 8, 9], &parts, reach, encoded)), (vec![5, 100, 101, 8], vec![1]));
+        // nothing held: all encoded, the picture after its text
+        assert_eq!(ok(written(&[], &parts, reach, encoded)), (vec![6, 7, 100, 101, 8], vec![2]));
+        // another picture held there: the text before it kept, the rest as given
+        assert_eq!(ok(written(&[5, 200, 201, 8], &parts, reach, encoded)), (vec![5, 100, 101, 8], vec![1]));
+    }
+
     /// An image is passed only when all of it lies before the held prefix's last position, which a pass may read again.
     #[test]
     fn an_image_the_session_holds_past_needs_no_rows() {
