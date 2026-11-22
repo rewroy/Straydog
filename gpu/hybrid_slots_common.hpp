@@ -86,6 +86,40 @@ struct PrestageUse {
     }
 };
 #endif
+// A chunk's copies from host memory to VRAM, asked for in one call where the runtime takes a batch (CUDA 12.8 on: cudaMemcpyBatchAsync),
+// else one call a copy. A call cost the host ~36 µs on Windows (an RTX 5070 Ti, CUDA 13.3), and a chunk's tiered experts are three copies
+// each, their roles in separate page-locked regions: a layer's ~740 calls kept the copy stream idle while the host asked for them.
+// STRAYDOG_COPY_BATCH=0 asks one call a copy everywhere (for a comparison).
+struct CopyBatch {
+    std::vector<void*> targets, sources;
+    std::vector<size_t> sizes;
+    void add(void* target, const void* source, size_t bytes) {
+        targets.push_back(target); sources.push_back(const_cast<void*>(source)); sizes.push_back(bytes);
+    }
+    void issue(hipStream_t stream) {
+        if (targets.empty()) return;
+#if !defined(__HIPCC__) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+        static const bool batch = [] { const char* value = std::getenv("STRAYDOG_COPY_BATCH"); return !(value && value[0] == '0' && !value[1]); }();
+        if (batch && targets.size() > 1) {
+            // (every source is page-locked host memory, read in the stream's order; the hints are for managed memory and left empty)
+            cudaMemcpyAttributes attributes{};
+            attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            attributes.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+            size_t first = 0;
+#if CUDART_VERSION >= 13000
+            check(cudaMemcpyBatchAsync(targets.data(), sources.data(), sizes.data(), targets.size(), &attributes, &first, 1, stream));
+#else
+            size_t failed = SIZE_MAX;
+            check(cudaMemcpyBatchAsync(targets.data(), sources.data(), sizes.data(), targets.size(), &attributes, &first, 1, &failed, stream));
+#endif
+            targets.clear(); sources.clear(); sizes.clear();
+            return;
+        }
+#endif
+        for (size_t i = 0; i < targets.size(); ++i) check(hipMemcpyAsync(targets[i], sources[i], sizes[i], hipMemcpyHostToDevice, stream));
+        targets.clear(); sources.clear(); sizes.clear();
+    }
+};
 // compute(first, count) launches the expert GEMMs for missing[first, first+count); meanwhile() runs on this thread while they
 // stream, before they are waited for. The GPU's time from the first copy to the last expert's GEMMs, in ns (0 with none missing).
 template<class Compute, class Meanwhile>
@@ -130,6 +164,7 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     uint64_t gathered_ns = 0;
     StreamEvents events;
     std::vector<uint8_t*> targets;
+    CopyBatch copies;
     for (size_t first = 0, chunk = 0; first < order.size(); first += half, ++chunk) {
         const size_t count = std::min(half, order.size() - first), buffer = chunk % 2;
         uint8_t* base = expert_stage_pointer(d) + buffer * half * d.slots.bytes;
@@ -162,10 +197,10 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
                 size_t j = i + 1;
                 while (j < count && order[first + j] == order[first + j - 1] + 1 && expert_host_follows(plan, order[first + j - 1], order[first + j])) ++j;
                 for (size_t role = 0; role < 3; ++role)
-                    check(hipMemcpyAsync(regions[role] + i * plan.host_bytes[role], expert_host(plan, role, order[first + i]),
-                                         (j - i) * plan.host_bytes[role], hipMemcpyHostToDevice, d.copy_stream));
+                    copies.add(regions[role] + i * plan.host_bytes[role], expert_host(plan, role, order[first + i]), (j - i) * plan.host_bytes[role]);
                 i = j;
             }
+            copies.issue(d.copy_stream);
         }
         check(hipEventRecord(events.loaded[buffer], d.copy_stream));
         check(hipStreamWaitEvent(d.stream, events.loaded[buffer], 0));
