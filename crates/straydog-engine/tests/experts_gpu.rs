@@ -531,6 +531,35 @@ fn experts_moved_for_a_decode_table() {
             "host {from_host}, drive {from_drive}, VRAM {from_vram}, promoted {promoted}, demoted {demoted}");
 }
 
+/// A tier still growing ([`DeviceExperts::give_back`] before the store has taken its arenas): what it gives back first is what holds no
+/// expert, the arenas its pinner made, and only as much as is asked while the pinner has them ready; the store then fills and reads every
+/// expert back as the file has it with what is left.
+#[test]
+fn a_growing_host_tier_gives_back_what_it_has_not_taken() {
+    let layers = roles();
+    let host_slot = (STRIDES.iter().sum::<u64>() + 4 * 4096).next_multiple_of(4096);
+    straydog_engine::experts::set_arena_limit((8 * host_slot) as usize);
+    let (path, mut gpu, mut store, _) = open(&layers, 16, 2 * EXPERTS as u64);
+    // (the pinner hands its arenas over within a moment: page-locking ten small ones is quick)
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let taken = store.host_tier_bytes();
+    let freed = store.give_back(&mut gpu, 1).unwrap();
+    assert!(freed > 0 && freed <= 8 * host_slot * 2, "one arena it had not taken, not the whole plan: {freed}");
+    assert_eq!(store.host_tier_bytes(), taken, "no arena that holds experts went");
+    for layer in [0, 2] {
+        let roles = layers[layer].clone().unwrap();
+        for batch in (0..EXPERTS).collect::<Vec<usize>>().chunks(8) {
+            let slots = store.acquire(&mut gpu, layer, batch).unwrap();
+            check_slots(&mut gpu, &roles, batch, &slots, "after a growing tier gave an arena back");
+            store.release(&mut gpu).unwrap();
+        }
+    }
+    assert!(store.host_tier_bytes() > taken, "it went on growing with the arenas left");
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// The host tier given back to the machine ([`DeviceExperts::give_back`]): its newest arenas go and the first stays, whatever they held;
 /// every expert then reads back as the file has it (those the arenas given back held come from the drive again), and the store goes on
 /// filling and evicting with the arena it has left.
@@ -557,15 +586,16 @@ fn a_host_tier_gives_its_newest_arenas_back() {
     let before = store.host_tier_bytes();
     assert!(before >= 8 * host_slot * 4, "the tier took {before} bytes");
     let freed = store.give_back(&mut gpu, before / 2).unwrap();
-    assert!(freed >= before / 2 && freed < before, "{freed} of {before} given back");
-    assert_eq!(store.host_tier_bytes(), before - freed);
+    // (what is given back may include arenas the pinner made that the store had not taken yet: they held no expert)
+    let after = store.host_tier_bytes();
+    assert!(freed >= before / 2 && after < before && after >= before.saturating_sub(freed), "{freed} given back, {before} -> {after} held");
     let drive = reads.load(Ordering::Relaxed);
     every(&mut store, &mut gpu, "after half the tier went back");
     assert!(reads.load(Ordering::Relaxed) > drive, "the experts given back are read from the drive again");
     // All of it: the first arena stays, and nothing more goes.
     store.give_back(&mut gpu, u64::MAX).unwrap();
     let kept = store.host_tier_bytes();
-    assert!(kept > 0 && kept <= before - freed, "{kept} kept");
+    assert!(kept > 0 && kept <= after, "{kept} kept");
     assert_eq!(store.give_back(&mut gpu, u64::MAX).unwrap(), 0);
     every(&mut store, &mut gpu, "with one arena left");
     every(&mut store, &mut gpu, "with one arena left, again");

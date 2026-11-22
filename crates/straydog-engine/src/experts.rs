@@ -2710,8 +2710,42 @@ impl DeviceExperts {
             return Ok(0);
         }
         self.settle(gpu)?;
-        for class in &mut self.classes {
-            if let Some(mut pinner) = class.pinner.take() {
+        // A tier still growing gives first what the store has not taken: arenas its pinner handed over that hold no expert yet, one at a time
+        // as they are needed; where the pinner has none ready, it stops, and what it made and did not hand over (allocated, some pinned)
+        // goes with it. Only then arenas that hold experts. (Arenas are taken as slots are needed: a minute after a start, two R9700s'
+        // stores had taken one arena a class of a 101.2 GiB tier.)
+        let mut freed = 0u64;
+        for class in 0..self.classes.len() {
+            let entry = &mut self.classes[class];
+            let Some(pinner) = entry.pinner.as_mut() else { continue };
+            let mut stop = false;
+            while freed < bytes {
+                match pinner.arenas.try_recv() {
+                    Ok(Ok(mut arena)) => {
+                        let size = arena.capacity() as u64;
+                        // SAFETY: pinned by the pinner, never used by a device.
+                        let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
+                        pinner.pinned_bytes.fetch_sub(size, Ordering::Relaxed);
+                        pinner.planned_bytes = pinner.planned_bytes.saturating_sub(size);
+                        entry.host_capacity = entry.host_capacity.saturating_sub(entry.per_arena);
+                        freed += size;
+                    }
+                    Ok(Err(error)) => {
+                        // (a pin that failed: the pool is sealed where it is, as take would have found)
+                        pinner.exhausted = true;
+                        pinner.failure = Some(error);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                let mut pinner = entry.pinner.take().expect("the pinner looked at above");
+                let taken: u64 = entry.arenas.iter().map(|arena| arena.capacity() as u64).sum();
                 pinner.stop.store(true, Ordering::Relaxed);
                 if let Some(thread) = pinner.thread.take() {
                     let _ = thread.join();
@@ -2720,10 +2754,10 @@ impl DeviceExperts {
                     // SAFETY: pinned by the pinner, never used by a device.
                     let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
                 }
-                class.host_capacity = class.host_capacity.min(class.arenas.len() * class.per_arena);
+                freed += pinner.planned_bytes.saturating_sub(taken);
+                entry.host_capacity = entry.host_capacity.min(entry.arenas.len() * entry.per_arena);
             }
         }
-        let mut freed = 0u64;
         while freed < bytes {
             let Some(class) = (0..self.classes.len()).filter(|&class| self.classes[class].arenas.len() > 1)
                 .max_by_key(|&class| self.classes[class].arenas.len() as u64 * self.classes[class].arenas[0].capacity() as u64) else { break };
