@@ -74,6 +74,13 @@ const CHECKPOINT_STEP: usize = 8 << 20;
 const HOST_FLOOR: u64 = 3 << 30;
 const HOST_MARGIN: u64 = 4 << 30;
 
+/// [`HOST_FLOOR`], or STRAYDOG_HOST_FLOOR GiB (for a check on the served path: a floor above the machine's memory gives the tier back at
+/// once).
+fn host_floor() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| std::env::var("STRAYDOG_HOST_FLOOR").ok().and_then(|value| value.trim().parse::<u64>().ok()).map_or(HOST_FLOOR, |gib| gib << 30))
+}
+
 /// The engines of consecutive layer ranges (one, or one per device).
 pub struct Engines {
     engines: Vec<Engine<'static, Pinned>>,
@@ -324,10 +331,11 @@ impl served::Engines for Engines {
 
     fn tend_memory(&mut self) -> Result<(), String> {
         let available = crate::host::available_bytes();
-        if available == 0 || available >= HOST_FLOOR {
+        let floor = host_floor();
+        if available == 0 || available >= floor {
             return Ok(());
         }
-        let want = (HOST_FLOOR + HOST_MARGIN - available).div_ceil(self.engines.len().max(1) as u64);
+        let want = (floor + HOST_MARGIN - available).div_ceil(self.engines.len().max(1) as u64);
         let (mut freed, mut left) = (0, 0);
         for engine in &mut self.engines {
             let (given, kept) = engine.give_back_host(want)?;
