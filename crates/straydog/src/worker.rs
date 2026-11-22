@@ -648,6 +648,12 @@ impl KeepsConversation for straydog_engine::model::Model {
     }
 }
 
+/// The tokens of the conversation an earlier run kept, while no request has taken it: the ids its replies were written in, which
+/// a prompt that goes on from it is to keep ([`take_kept`] takes it only where the prompt begins with all of them).
+pub(crate) fn kept_tokens() -> Option<Vec<u32>> {
+    kept().tokens.clone()
+}
+
 pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
     let wanted = {
         let kept = kept();

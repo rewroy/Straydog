@@ -443,15 +443,27 @@ impl<E: Engines> Loaded<E> {
                 }
             }).collect()
         };
+        let reach = |held: &[u32], part: &str| text.reach(held, part);
+        let encoded = |part: &str| text.encode(part).map_err(Failure::from);
         let held = self.model.held();
-        let (kept, starts) = written(held, &parts, |held, part| text.reach(held, part), |part| text.encode(part).map_err(Failure::from))?;
+        let (kept, starts) = written(held, &parts, reach, encoded)?;
         // (only where that agrees with the session further than the prompt encoded afresh)
         let agreed = |ids: &[u32]| ids.iter().zip(held).take_while(|(new, old)| new == old).count();
-        let (ids, spans) = if agreed(&kept) > agreed(&ids) {
-            (kept, spans.iter().zip(starts).map(|(&(index, _), start)| (index, start)).collect())
+        let (mut ids, mut spans) = if agreed(&kept) > agreed(&ids) {
+            (kept, spans.iter().zip(starts).map(|(&(index, _), start)| (index, start)).collect::<Vec<_>>())
         } else {
             (ids.clone(), spans.clone())
         };
+        // (after a start, the kept conversation's tokens are what its replies were written in: a prompt encoded afresh split one of
+        // them otherwise and never began with all of them, so a conversation of more than one turn was never taken. Kept to where
+        // the prompt then begins with all of them, and goes on from that conversation.)
+        if let Some(tokens) = crate::worker::kept_tokens() {
+            let (from_kept, kept_starts) = written(&tokens, &parts, reach, encoded)?;
+            if from_kept.len() > tokens.len() && from_kept.starts_with(&tokens) && !ids.starts_with(&tokens) {
+                spans = spans.iter().zip(kept_starts).map(|(&(index, _), start)| (index, start)).collect();
+                ids = from_kept;
+            }
+        }
         let encode_seconds = started.elapsed().as_secs_f64();
         // (a conversation an earlier run kept, which this prompt goes on from: its images' positions are in the state, by their digests' ids)
         let kept_seconds = crate::worker::take_kept(&mut self.model, output, id, cancel, &ids);
