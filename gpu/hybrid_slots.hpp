@@ -65,6 +65,9 @@ void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_
     if (plan.prefetched.size() != plan.experts) plan.prefetched.assign(plan.experts, {});
     std::vector<std::pair<const uint8_t*, size_t>> ranges;
     for (size_t i = 0; i < count; ++i) {
+        // (a tiered expert is read from the engine's page-locked copy, never the mapping: Windows' PrefetchVirtualMemory, which the host
+        // waits for, would only walk pages that cannot leave memory)
+        if (expert_tiered(plan, experts[i])) continue;
         auto& last = plan.prefetched[experts[i]];
         if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(30)) continue;
         last = now;
