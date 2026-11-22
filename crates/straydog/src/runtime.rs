@@ -725,8 +725,15 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         },
         count(&usage["completion_tokens"]),
         number(&timings["decode_tokens_per_second"], 1),
+        // (a generation that did not end of itself: what stopped it. A client that closed the stream (an agent that stopped a reply it
+        // did not want) threw those tokens away, and its next prompt goes on from before them)
+        match event["finish_reason"].as_str() {
+            Some("cancelled") => ", stopped by the client".to_string(),
+            Some("length") => ", stopped at its max_tokens".to_string(),
+            _ => String::new(),
+        } +
         // (an engine that verifies drafts says how many it checked and kept, and of those the engine's own)
-        match timings["draft_tokens"].as_u64() {
+        &match timings["draft_tokens"].as_u64() {
             Some(drafted) if drafted > 0 => format!(" ({} of {} drafts kept in {} passes; DSpark {} of {}{})", count(&timings["accepted_drafts"]), drafted,
                                                    count(&timings["decode_passes"]), count(&timings["accepted_engine_drafts"]),
                                                    count(&timings["engine_draft_tokens"]),
@@ -2033,6 +2040,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(refusal_paths(&exposure), ["m/a.gguf", "m/b.gguf", "m", "d"].map(PathBuf::from));
+    }
+
+    /// Decides: the log tells a generation the client closed, or that its max_tokens stopped, from one that ended of itself (an agent's stopped
+    /// drafts were found only from the next prompt's going on from before them: 15,401 tokens of one such request on 11-22).
+    #[test]
+    fn a_request_line_says_what_stopped_its_generation() {
+        let line = |reason: &str| request_summary(&json!({"event": "done", "finish_reason": reason, "usage": {"completion_tokens": 15401},
+                                                          "timings": {"decode_tokens_per_second": 55.7}}), None);
+        assert!(line("cancelled").contains("15401 tokens at 55.7 tok/s, stopped by the client"), "{}", line("cancelled"));
+        assert!(line("length").contains("15401 tokens at 55.7 tok/s, stopped at its max_tokens"), "{}", line("length"));
+        assert!(!line("stop").contains("stopped"), "{}", line("stop"));
     }
 
     /// A counted prefill phase reads as a count after the timed phases, not as seconds.
