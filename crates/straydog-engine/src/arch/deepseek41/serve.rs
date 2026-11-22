@@ -67,6 +67,12 @@ const ROOM_STEP: usize = 4;
 /// Floats of the checkpoints' compressed rows and index keys a step between requests copies
 /// ([`Engines::make_room`]): 32 MB, ~6 ms (~0.15 s when the host has to find the pages).
 const CHECKPOINT_STEP: usize = 8 << 20;
+/// The machine's available memory below which the expert stores give host tier arenas back between requests, and the margin above it
+/// they give back to ([`Engines::tend_memory`]): the tier is sized from the whole memory (served::HOST_SHARE), and what the other
+/// programs then take beyond the rest is the page cache's, then the swap's (Homelab, 2026-11-23: 143 MB available, the box's own pages
+/// read again and again, and a request's first token 393-469 s away).
+const HOST_FLOOR: u64 = 3 << 30;
+const HOST_MARGIN: u64 = 4 << 30;
 
 /// The engines of consecutive layer ranges (one, or one per device).
 pub struct Engines {
@@ -314,6 +320,26 @@ impl served::Engines for Engines {
             done &= engine.make_room(ROOM_STEP)?;
         }
         Ok(done)
+    }
+
+    fn tend_memory(&mut self) -> Result<(), String> {
+        let available = crate::host::available_bytes();
+        if available == 0 || available >= HOST_FLOOR {
+            return Ok(());
+        }
+        let want = (HOST_FLOOR + HOST_MARGIN - available).div_ceil(self.engines.len().max(1) as u64);
+        let (mut freed, mut left) = (0, 0);
+        for engine in &mut self.engines {
+            let (given, kept) = engine.give_back_host(want)?;
+            freed += given;
+            left += kept;
+        }
+        if freed > 0 {
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            eprintln!("Straydog host tier: gave {:.1} GiB back to the machine, which had {:.1} GiB available; it holds {:.1} GiB now",
+                      gib(freed), gib(available), gib(left));
+        }
+        Ok(())
     }
 
     fn prefetch_ahead(&mut self, tokens: &[u32], now: usize) -> Result<(), String> {

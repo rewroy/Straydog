@@ -34,6 +34,18 @@ const BULK_CHUNK: u64 = 1 << 20;
 /// from the start (page-locking costs ~0.4 s per GiB: never in a pass's way).
 const ARENA: usize = 1 << 30;
 
+thread_local! {
+    /// [`ARENA`], or what [`set_arena_limit`] set for the stores this thread makes.
+    static ARENA_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(ARENA) };
+}
+
+/// The stores this thread makes from here split their host tier into arenas of at most `bytes` (ARENA otherwise): a test's tier of a few
+/// small experts then has several arenas to give back ([`DeviceExperts::give_back`]).
+#[doc(hidden)]
+pub fn set_arena_limit(bytes: usize) {
+    ARENA_LIMIT.with(|limit| limit.set(bytes.max(1)));
+}
+
 /// A tensor of a layer's experts: expert `e`'s bytes are `bytes` bytes at `base + e * stride` of
 /// file `file` (its whole matrix, `bytes == stride`, or a device's rows of it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,7 +725,7 @@ fn host_plan(budget: u64, host_bytes: u64, reserve: usize) -> (usize, usize, usi
     if slots == 0 {
         return (0, 1, 0);
     }
-    let arenas = slots.div_ceil(((ARENA as u64 / host_bytes) as usize).max(1));
+    let arenas = slots.div_ceil(((ARENA_LIMIT.with(|limit| limit.get()) as u64 / host_bytes) as usize).max(1));
     let per_arena = slots / arenas;
     (if budget == 0 { 0 } else { arenas * per_arena }, per_arena, arenas)
 }
@@ -2685,6 +2697,80 @@ impl DeviceExperts {
         }
         self.settled = true;
         Ok(())
+    }
+
+    /// Give host tier arenas back to the machine, the newest first, until `bytes` are freed; the bytes given back. For a tier sized from
+    /// the whole memory while other programs went on growing beside it (Homelab, 2026-11-23: a monitoring service grew to 23 GB and left 143
+    /// MB available, and the next request read 1,409 tokens in 469 s). Each class keeps its first arena (its staging: prepare_staging), and
+    /// a tier still growing grows no more. The experts only the arenas given back held are let go (the drive holds every expert, and one a
+    /// VRAM slot holds stays there). Settles first: no read writes into an arena then, and no copy reads one. Nothing is given back while
+    /// a request's deferred downs wait.
+    pub fn give_back(&mut self, gpu: &mut Backend, bytes: u64) -> Result<u64> {
+        if bytes == 0 || !self.tails.is_empty() {
+            return Ok(0);
+        }
+        self.settle(gpu)?;
+        for class in &mut self.classes {
+            if let Some(mut pinner) = class.pinner.take() {
+                pinner.stop.store(true, Ordering::Relaxed);
+                if let Some(thread) = pinner.thread.take() {
+                    let _ = thread.join();
+                }
+                while let Ok(Ok(mut arena)) = pinner.arenas.try_recv() {
+                    // SAFETY: pinned by the pinner, never used by a device.
+                    let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
+                }
+                class.host_capacity = class.host_capacity.min(class.arenas.len() * class.per_arena);
+            }
+        }
+        let mut freed = 0u64;
+        while freed < bytes {
+            let Some(class) = (0..self.classes.len()).filter(|&class| self.classes[class].arenas.len() > 1)
+                .max_by_key(|&class| self.classes[class].arenas.len() as u64 * self.classes[class].arenas[0].capacity() as u64) else { break };
+            let last = self.classes[class].arenas.len() - 1;
+            let mut emptied = Vec::new();
+            for host in 0..self.host.len() {
+                let entry = &mut self.host[host];
+                if entry.class != class || entry.arena != last {
+                    continue;
+                }
+                if let Some(key) = entry.key.take() {
+                    if self.host_map.get(&key) == Some(&host) {
+                        self.host_map.remove(&key);
+                    }
+                }
+                let used = entry.used;
+                entry.content = Content::Read;
+                entry.busy = None;
+                entry.waiter = None;
+                entry.failed = None;
+                // (never resolved to a pointer again: host_pointer would fail on it)
+                entry.arena = usize::MAX;
+                let class_entry = &mut self.classes[class];
+                class_entry.host_lru.remove(&(used, host));
+                class_entry.copies.remove(&(used, host));
+                emptied.push(host);
+            }
+            if !emptied.is_empty() {
+                let class_entry = &mut self.classes[class];
+                class_entry.host_free.retain(|host| !emptied.contains(host));
+                class_entry.spare.retain(|host| !emptied.contains(host));
+            }
+            let class_entry = &mut self.classes[class];
+            let mut arena = class_entry.arenas.pop().expect("an arena past the class's first");
+            class_entry.hosts = class_entry.hosts.min(last * class_entry.per_arena);
+            class_entry.host_capacity = class_entry.host_capacity.min(last * class_entry.per_arena);
+            // SAFETY: pinned before use; the settle saw every read into it land and every copy from it finish, and no slot points into it.
+            let _ = unsafe { transfer::unpin_host(arena.as_mut_slice().as_mut_ptr()) };
+            freed += arena.capacity() as u64;
+            drop(arena);
+        }
+        Ok(freed)
+    }
+
+    /// The bytes of the host tier's arenas now.
+    pub fn host_tier_bytes(&self) -> u64 {
+        self.classes.iter().flat_map(|class| class.arenas.iter()).map(|arena| arena.capacity() as u64).sum()
     }
 
     /// The experts held, least recently used first: those in VRAM slots, and those only in the

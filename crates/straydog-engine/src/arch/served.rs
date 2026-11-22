@@ -139,6 +139,11 @@ pub trait Engines {
     fn make_room(&mut self) -> Result<bool, String> {
         Ok(true)
     }
+    /// Between requests, and every few seconds while none comes: where the machine's available memory has run short beside the
+    /// expert stores' host tier, give some of the tier back.
+    fn tend_memory(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// Start reading what passes over `tokens` (continuing the held sequence) will read from the
     /// drive (DeepSeek-V4.1's Engram rows), behind the pass before them; a pass reads them itself
     /// otherwise.
@@ -1237,6 +1242,11 @@ impl<E: Engines> Session<E> {
     /// for the next prefill (without waiting); whether that is done.
     pub fn make_room(&mut self) -> Result<bool, String> {
         self.engines.make_room()
+    }
+
+    /// Between requests: the host tier given back where the machine's memory runs short ([`Engines::tend_memory`]).
+    pub fn tend_memory(&mut self) -> Result<(), String> {
+        self.engines.tend_memory()
     }
 
     /// After the first passes: lend the expert stores the VRAM the cards still have spare

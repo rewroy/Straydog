@@ -59,6 +59,8 @@ enum Job {
 /// sixteen bulk reads busy (~300 MB queued); a request's reads go ahead of them.
 const WARM_STEP: usize = 64;
 const WARM_IN_FLIGHT: usize = 64;
+/// How often the machine's available memory is looked at while no request comes (the served model's `tend_memory`).
+const MEMORY_LOOK: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where a span of a warm-up (`elapsed`, from the readers' totals `at` to now) spent its time: the readers' bytes and their rate, the drive's
 /// reads in flight on average (of the sixteen the shared readers admit) and the checks', and the time it stood `paused` for requests and for
@@ -219,9 +221,16 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 } else {
-                    match queue.recv() {
+                    // (while no request comes, the machine's memory is looked at every few seconds: what grows beside the host tier)
+                    match queue.recv_timeout(MEMORY_LOOK) {
                         Ok(job) => job,
-                        Err(_) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Err(error) = served.model.tend_memory() {
+                                eprintln!("Straydog could not give host memory back: {error}");
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 };
                 match job {
@@ -230,6 +239,9 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                         let _ = reply.send(served.run(&text, &output, &id, &body, &cancel, started));
                         if warming.is_some() {
                             paused += running.elapsed();
+                        }
+                        if let Err(error) = served.model.tend_memory() {
+                            eprintln!("Straydog could not give host memory back: {error}");
                         }
                         rooming = true;
                     }

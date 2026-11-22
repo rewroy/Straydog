@@ -2052,6 +2052,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
         Ok(())
     }
 
+    /// Between requests: `bytes` of the expert stores' host tier given back to the machine, shared by the devices
+    /// ([`DeviceExperts::give_back`]); the bytes given back and the tier's bytes left.
+    pub fn give_back_host(&mut self, bytes: u64) -> Result<(u64, u64)> {
+        let shards = self.shards.len().max(1) as u64;
+        let mut freed = 0;
+        for shard in &mut self.shards {
+            freed += shard.experts.give_back(&mut shard.gpu, bytes.div_ceil(shards))?;
+        }
+        Ok((freed, self.shards.iter().map(|shard| shard.experts.host_tier_bytes()).sum()))
+    }
+
     /// Forget the sequence (the caches' contents stay, as warm experts do).
     pub fn reset(&mut self) {
         self.position = 0;

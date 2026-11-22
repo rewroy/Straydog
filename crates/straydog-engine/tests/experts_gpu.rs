@@ -531,6 +531,49 @@ fn experts_moved_for_a_decode_table() {
             "host {from_host}, drive {from_drive}, VRAM {from_vram}, promoted {promoted}, demoted {demoted}");
 }
 
+/// The host tier given back to the machine ([`DeviceExperts::give_back`]): its newest arenas go and the first stays, whatever they held;
+/// every expert then reads back as the file has it (those the arenas given back held come from the drive again), and the store goes on
+/// filling and evicting with the arena it has left.
+#[test]
+fn a_host_tier_gives_its_newest_arenas_back() {
+    let layers = roles();
+    // (arenas of eight host slots: the tier of every expert of both layers has ten)
+    let host_slot = (STRIDES.iter().sum::<u64>() + 4 * 4096).next_multiple_of(4096);
+    straydog_engine::experts::set_arena_limit((8 * host_slot) as usize);
+    let (path, mut gpu, mut store, reads) = open(&layers, 16, 2 * EXPERTS as u64);
+    let every = |store: &mut DeviceExperts, gpu: &mut Backend, what: &str| {
+        for layer in [0, 2] {
+            let roles = layers[layer].clone().unwrap();
+            for batch in (0..EXPERTS).collect::<Vec<usize>>().chunks(8) {
+                let slots = store.acquire(gpu, layer, batch).unwrap();
+                check_slots(gpu, &roles, batch, &slots, what);
+                store.release(gpu).unwrap();
+            }
+        }
+    };
+    // Twice through all 80 experts in 16 VRAM slots: the second time, most of them come from the host tier.
+    every(&mut store, &mut gpu, "filling the tier");
+    every(&mut store, &mut gpu, "from the tier");
+    let before = store.host_tier_bytes();
+    assert!(before >= 8 * host_slot * 4, "the tier took {before} bytes");
+    let freed = store.give_back(&mut gpu, before / 2).unwrap();
+    assert!(freed >= before / 2 && freed < before, "{freed} of {before} given back");
+    assert_eq!(store.host_tier_bytes(), before - freed);
+    let drive = reads.load(Ordering::Relaxed);
+    every(&mut store, &mut gpu, "after half the tier went back");
+    assert!(reads.load(Ordering::Relaxed) > drive, "the experts given back are read from the drive again");
+    // All of it: the first arena stays, and nothing more goes.
+    store.give_back(&mut gpu, u64::MAX).unwrap();
+    let kept = store.host_tier_bytes();
+    assert!(kept > 0 && kept <= before - freed, "{kept} kept");
+    assert_eq!(store.give_back(&mut gpu, u64::MAX).unwrap(), 0);
+    every(&mut store, &mut gpu, "with one arena left");
+    every(&mut store, &mut gpu, "with one arena left, again");
+    store.settle(&mut gpu).unwrap();
+    drop(store);
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// A region lent to the store ([`DeviceExperts::lend`]) holds experts like the store's own slots;
 /// the lender takes the region's start back between passes (the experts there go to the host
 /// tier, the compute stream waiting for their copies) and overwrites it on the compute stream;
