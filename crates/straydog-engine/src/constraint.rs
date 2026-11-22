@@ -1242,6 +1242,22 @@ mod tests {
         assert!(!either.allows(2) && either.allows(5));
     }
 
+    /// A call held to one of the request's tools: each tool's name is its own prefix, and the call goes on only as one of them.
+    #[test]
+    fn a_call_of_one_of_the_given_tools_is_held_to_their_names() {
+        let vocabulary = tokens(&["<|end|>", "<call name=\"", "read", "write", "_file\">", "_page\">", "x"]);
+        let call = |name: &str| Alternative::prefix(&format!("<call name=\"{name}\">"), 0);
+        let mut any = Constraint::new(vocabulary, &[0], false, vec![call("read_file"), call("check_page")]);
+        assert!(any.allows(1) && !any.allows(6) && !any.allows(0));
+        any.advance(1);
+        // (write_file was not given: its name does not begin)
+        assert!(any.allows(2) && !any.allows(3));
+        any.advance(2);
+        assert!(any.allows(4) && !any.allows(5), "read_page is no tool");
+        any.advance(4);
+        assert!(any.allows(6) && any.allows(0), "free after the name");
+    }
+
     /// A vocabulary of raw byte strings; the first is a control token that ends a reply.
     fn raw_tokens(pieces: &[&[u8]]) -> Arc<TokenBytes> {
         let special = (0..pieces.len()).map(|index| index == 0).collect();

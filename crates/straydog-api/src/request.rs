@@ -175,7 +175,11 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool, remin
             _ => return Err(ApiError::invalid("response_format type must be text, json_object or json_schema")),
         },
     };
-    let constraint = constraint(config.markup, json, tools.is_some(), forced);
+    let names: Vec<String> = match &tools {
+        Some(Value::Array(list)) => list.iter().filter_map(|tool| tool.get("function")?.get("name")?.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    };
+    let constraint = constraint(config.markup, json, &names, forced);
     let suppress = match given(payload, "suppress") {
         None => None,
         Some(Value::Str(kind)) if kind == NOT_CP932_HAN => Some(Value::Str(kind.clone())),
@@ -336,34 +340,31 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool, remin
 }
 
 /// What the worker holds the answer to ([`straydog_engine::constraint`]), as its request's
-/// `constraint`: a forced tool call's opening (the markup's, with the named function's name), or
-/// the JSON `response_format` asks for (`true`: any object), racing a tool call's opening when
-/// the model may call one. Null: nothing.
-fn constraint(markup: Markup, json: Option<Value>, tools: bool, forced: Option<Option<String>>) -> Value {
-    // A named function is called once: its invoke's close, then the block's, then the end.
-    let call = |name: Option<&str>| {
+/// `constraint`: a forced tool call's opening (the markup's, with the named function's name, or
+/// with one of `names`, the request's tools, where any is required), or the JSON `response_format`
+/// asks for (`true`: any object), racing the opening of a call of one of `names` when the model
+/// may call one. Null: nothing.
+fn constraint(markup: Markup, json: Option<Value>, names: &[String], forced: Option<Option<String>>) -> Value {
+    // A call's opening with its function's name; a named function is called once: its invoke's close, then the block's, then the end.
+    let call = |name: &str, once: bool| {
         let (open, whitespace, until, close) = match markup {
-            Markup::Dsml => (format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{}", name.map_or(String::new(), |name| format!("{name}\">\n"))),
-                             0, "</｜DSML｜ invoke>", "\n</｜DSML｜ calls>"),
-            Markup::Qwen => (format!("<tool_call>\n<function={}", name.map_or(String::new(), |name| format!("{name}>\n"))), 4,
-                             "</function>", "\n</tool_call>"),
+            Markup::Dsml => (format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{name}\">\n"), 0, "</｜DSML｜ invoke>", "\n</｜DSML｜ calls>"),
+            Markup::Qwen => (format!("<tool_call>\n<function={name}>\n"), 4, "</function>", "\n</tool_call>"),
         };
         let mut fields = vec![("prefix".into(), Value::Str(open)), ("whitespace".into(), Value::Int(whitespace))];
-        if name.is_some() {
+        if once {
             fields.push(("until".into(), Value::Str(until.into())));
             fields.push(("close".into(), Value::Str(close.into())));
         }
         Value::Object(fields)
     };
+    // (a call the model must make, or may make in place of the JSON, is of a tool the request gave: held to the opening alone, a
+    // model told a call was required called write_file, which no request had offered, and wrote "test" over the page it had made)
+    let any_of = || names.iter().map(|name| call(name, false)).collect::<Vec<_>>();
     let alternatives = match (forced, json) {
-        (Some(name), _) => vec![call(name.as_deref())],
-        (None, Some(schema)) => {
-            let mut alternatives = vec![Value::Object(vec![("json".into(), schema)])];
-            if tools {
-                alternatives.push(call(None));
-            }
-            alternatives
-        }
+        (Some(Some(name)), _) => vec![call(&name, true)],
+        (Some(None), _) => any_of(),
+        (None, Some(schema)) => std::iter::once(Value::Object(vec![("json".into(), schema)])).chain(any_of()).collect(),
         (None, None) => return Value::Null,
     };
     Value::Object(vec![("alternatives".into(), Value::Array(alternatives))])

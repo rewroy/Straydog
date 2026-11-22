@@ -476,11 +476,15 @@ async fn response_format_and_tool_choice_reach_the_worker_as_a_constraint() {
         (json!({"response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}}}),
          Markup::Qwen, r#"{"alternatives": [{"json": {"type": "object"}}]}"#.to_string()),
         (json!({"response_format": {"type": "json_object"}, "tools": read_file()}), Markup::Qwen,
-         r#"{"alternatives": [{"json": true}, {"prefix": "<tool_call>\n<function=", "whitespace": 4}]}"#.to_string()),
+         r#"{"alternatives": [{"json": true}, {"prefix": "<tool_call>\n<function=read_file>\n", "whitespace": 4}]}"#.to_string()),
         (json!({"response_format": {"type": "json_object"}, "tools": read_file(), "tool_choice": "none"}), Markup::Qwen,
          r#"{"alternatives": [{"json": true}]}"#.to_string()),
         (json!({"tools": read_file(), "tool_choice": "required"}), Markup::Dsml,
-         format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}", "whitespace": 0}}]}}"#)),
+         format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}read_file\">\n", "whitespace": 0}}]}}"#)),
+        // (a required call is of one of the tools given, each its own opening)
+        (json!({"tools": [read_file()[0].clone(), {"type": "function", "function": {"name": "check_page", "parameters": {"type": "object"}}}],
+                "tool_choice": "required"}), Markup::Dsml,
+         format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}read_file\">\n", "whitespace": 0}}, {{"prefix": "{dsml_call}check_page\">\n", "whitespace": 0}}]}}"#)),
         (json!({"tools": read_file(), "tool_choice": {"type": "function", "function": {"name": "read_file"}}}), Markup::Qwen,
          r#"{"alternatives": [{"prefix": "<tool_call>\n<function=read_file>\n", "whitespace": 4, "until": "</function>", "close": "\n</tool_call>"}]}"#.to_string()),
     ];
