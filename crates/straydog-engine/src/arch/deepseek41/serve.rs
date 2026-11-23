@@ -181,7 +181,11 @@ impl served::Engines for Engines {
     }
 
     fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>, f64)> {
-        let stats = self.drafting.as_mut()?.policy.take_stats();
+        let policy = &mut self.drafting.as_mut()?.policy;
+        if let Some(line) = policy.calibration_line() {
+            eprintln!("{line}");
+        }
+        let stats = policy.take_stats();
         Some((stats.runs, stats.widths.to_vec(), stats.draft_ms))
     }
 

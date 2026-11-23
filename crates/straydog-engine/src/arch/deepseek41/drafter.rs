@@ -889,7 +889,17 @@ pub struct Policy {
     paused: usize,
     /// What the rounds since [`Policy::take_stats`] did.
     stats: Stats,
+    /// The confidences of the last round's drafts that were verified.
+    last: Vec<f32>,
+    /// Since the start, per slot and per tenth of DSpark's confidence (rounded): the drafts tried (every one before it
+    /// matched) and of them matched: the served traffic's own [`CALIBRATION`], logged every [`CALIBRATION_LINE`] tries.
+    seen: [[(u32, u32); 11]; MAX_SLOTS - 1],
+    /// Tries since the last line of them.
+    since_line: u32,
 }
+
+/// The drafts tried between two lines of what DSpark's confidences met on served traffic ([`Policy::calibration_line`]).
+pub const CALIBRATION_LINE: u32 = 4096;
 
 /// What a [`Policy`]'s rounds did: the drafts it was asked for and, of those, how many tokens each
 /// verified (index 0: none, the draft thrown away).
@@ -947,7 +957,8 @@ impl Default for Policy {
 impl Policy {
     /// With a first guess at a one-row pass's and a draft's milliseconds.
     pub fn new(pass_ms: f64, draft_ms: f64) -> Policy {
-        Policy { unit_ms: pass_ms, extra: 1.0, draft_ms, skill: 1.0, chosen: (0, 0.0), saved: 1.0, pass_ms, paused: 0, stats: Stats::default() }
+        Policy { unit_ms: pass_ms, extra: 1.0, draft_ms, skill: 1.0, chosen: (0, 0.0), saved: 1.0, pass_ms, paused: 0, stats: Stats::default(),
+                 last: Vec::new(), seen: [[(0, 0); 11]; MAX_SLOTS - 1], since_line: 0 }
     }
 
     /// A pass of `rows` rows (1 to 4) in one-row passes now.
@@ -996,6 +1007,12 @@ impl Policy {
     /// what decoding its tokens one at a time would have cost over what it did.
     pub fn verified(&mut self, accepted: usize) {
         let (width, expected) = std::mem::take(&mut self.chosen);
+        // (a slot was tried when every draft before it matched; the last round's confidences are those of its verified drafts)
+        for (slot, &confidence) in std::mem::take(&mut self.last).iter().enumerate().take(accepted + 1) {
+            let cell = &mut self.seen[slot.min(MAX_SLOTS - 2)][(confidence.clamp(0.0, 1.0) * 10.0).round() as usize];
+            (cell.0, cell.1) = (cell.0 + 1, cell.1 + u32::from(slot < accepted));
+            self.since_line += 1;
+        }
         if width == 0 {
             return;
         }
@@ -1014,6 +1031,22 @@ impl Policy {
     /// (a prompt where it read badly may be followed by one where it reads well).
     fn forgive(&mut self) {
         self.skill += (1.0 - self.skill) * 0.01;
+    }
+
+    /// Every [`CALIBRATION_LINE`] drafts tried, a line of what DSpark's confidences met since the start, per slot: at each
+    /// tenth of confidence the drafts matched of those tried (where [`CALIBRATION`] puts them from six probe prompts), and
+    /// the policy's skill and pass costs now.
+    pub fn calibration_line(&mut self) -> Option<String> {
+        if self.since_line < CALIBRATION_LINE {
+            return None;
+        }
+        self.since_line = 0;
+        let slots: Vec<String> = self.seen.iter().enumerate().map(|(slot, cells)| {
+            let cells: Vec<String> = cells.iter().enumerate().filter(|(_, cell)| cell.0 > 0)
+                .map(|(tenth, cell)| format!("{:.1} {}/{} ({:.2} by calibration)", tenth as f64 / 10.0, cell.1, cell.0, CALIBRATION[slot][tenth])).collect();
+            format!("slot {}: {}", slot + 1, cells.join(", "))
+        }).collect();
+        Some(format!("Straydog DSpark calibration on served drafts (skill {:.2}, extra {:.2}): {}", self.skill, self.extra, slots.join("; ")))
     }
 
     /// What the rounds did since the last call.
@@ -1043,6 +1076,7 @@ impl Policy {
             }
         }
         self.chosen = (best.0, best.2);
+        self.last = confidences[..best.0].to_vec();
         self.stats.runs += 1;
         self.stats.widths[best.0] += 1;
         if best.0 == 0 {
@@ -1057,6 +1091,27 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verified draft's slots count where its confidences put them: tried while every draft before matched, matched
+    /// below the accepted count; a line once enough were tried.
+    #[test]
+    fn served_drafts_count_against_their_confidences() {
+        let mut policy = Policy::new(20.0, 1.0);
+        assert_eq!(policy.width(&[0.99, 0.9, 0.3], 3), 2, "the third draft is not worth its row");
+        policy.verified(1);
+        assert_eq!(policy.seen[0][10], (1, 1));
+        assert_eq!(policy.seen[1][9], (1, 0));
+        assert!(policy.seen[2].iter().all(|cell| cell.0 == 0), "a draft not verified was not tried");
+        // (a round that missed at its first draft tries its first slot alone)
+        assert_eq!(policy.width(&[0.99, 0.9, 0.3], 3), 2);
+        policy.verified(0);
+        assert_eq!((policy.seen[0][10], policy.seen[1][9]), ((2, 1), (1, 0)));
+        assert!(policy.calibration_line().is_none());
+        policy.since_line = CALIBRATION_LINE;
+        let line = policy.calibration_line().unwrap();
+        assert!(line.contains("slot 1: 1.0 1/2") && line.contains("slot 2: 0.9 0/1"), "{line}");
+        assert_eq!(policy.since_line, 0);
+    }
 
     fn noted(positions: std::ops::Range<usize>) -> History {
         let mut history = History::new();

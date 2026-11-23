@@ -990,6 +990,11 @@ expected tokens a millisecond:
 A draft costs its milliseconds whatever the round makes of it, so the policy also keeps a running
 mean of what its rounds saved. When that mean falls below nothing, drafting pauses for 16 rounds.
 
+The calibration was fitted on 2026-10-24 to six probe prompts. Served drafts are counted against it:
+every 4096 drafts tried, the server logs a line "DSpark calibration on served drafts". Per slot and
+per tenth of confidence it gives the drafts accepted of those tried, beside the calibration's rate,
+with the policy's skill and pass costs then.
+
 ### 7.5 Images
 
 The official checkpoint's vision tower and its other image tensors make an optional file beside
