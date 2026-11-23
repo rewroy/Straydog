@@ -372,13 +372,6 @@ fn main() -> Result<(), String> {
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
     }
-    if let Some(keep) = spare {
-        for engine in &mut engines {
-            let before = engine.expert_capacity().0;
-            let (bytes, made) = engine.lend_spare(keep)?;
-            println!("spare: {} MiB a GPU lent as {made} expert slots ({before} before)", bytes >> 20);
-        }
-    }
     let dspark_files = dspark_dir.as_ref().map(|dir| files::Files::open(Path::new(dir))).transpose()?;
     let mut drafter = match &dspark_files {
         Some(draft) => {
@@ -396,6 +389,15 @@ fn main() -> Result<(), String> {
         }
         None => None,
     };
+    // (lent after DSpark is beside the engine, as the server lends what its first passes leave: lent before, the VRAM
+    // its 87/50/29 resident experts take was given to slots, and its load ran out of room)
+    if let Some(keep) = spare {
+        for engine in &mut engines {
+            let before = engine.expert_capacity().0;
+            let (bytes, made) = engine.lend_spare(keep)?;
+            println!("spare: {} MiB a GPU lent as {made} expert slots ({before} before)", bytes >> 20);
+        }
+    }
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     for tokens_file in tokens_files.split(',') {
         let raw = std::fs::read(tokens_file).map_err(|exc| format!("{tokens_file}: {exc}"))?;
