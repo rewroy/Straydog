@@ -796,7 +796,7 @@ fn off(name: &str) -> bool {
 /// DSpark's file, opened and authenticated, when the model's drafter is pinned, lies in its directory
 /// ([`bundle::dspark_in`]) and can sit beside an engine: DS41_DSPARK=0 leaves it out, and so does
 /// DS41_DRAFTS=0 (no verify passes to draft for). Its layout is checked against the model's.
-fn open_dspark(root: &Path, id: bundle::Id, data_dir: &Path, target: &Pinned, groups: &[(Vec<usize>, std::ops::Range<usize>)])
+fn open_dspark(root: &Path, id: bundle::Id, data_dir: &Path, target: &Pinned, groups: &[(Vec<usize>, std::ops::Range<usize>)], vram: &dyn Fn(usize) -> u64)
                -> Result<Option<(Pinned, DsparkPlan)>, String> {
     if off("DS41_DSPARK") || off("DS41_DRAFTS") {
         return Ok(None);
@@ -814,7 +814,7 @@ fn open_dspark(root: &Path, id: bundle::Id, data_dir: &Path, target: &Pinned, gr
     let directory = path.parent().ok_or("the DSpark drafter has no directory")?;
     let files = Pinned::open(directory, data_dir, &source.pins()).map_err(|error| format!("DSpark drafter: {error}"))?;
     Dspark::from_headers(&files.header, &target.header).map_err(|error| format!("DSpark drafter: {error}"))?;
-    let resident = drafter::resident_counts()?;
+    let resident = drafter::resident_counts(groups[engine].0.iter().map(|&device| vram(device)).sum())?;
     Ok(Some((files, DsparkPlan { engine, resident })))
 }
 
@@ -828,7 +828,7 @@ fn load_dspark(draft: &Pinned, plan: &DsparkPlan, engine: &mut Engine<'static, P
     let started = Instant::now();
     let before = allocated(engine)?;
     engine.enable_tap()?;
-    let drafter = Drafter::load(&mut engine.beside()?, draft, target, vocabulary)?;
+    let drafter = Drafter::load(&mut engine.beside()?, draft, target, vocabulary, plan.resident)?;
     let used: Vec<u64> = allocated(engine)?.iter().zip(&before).map(|(after, before)| after - before).collect();
     let planned: Vec<u64> = (0..used.len()).map(|index| drafter::footprint(index, used.len(), vocabulary, plan.resident)).collect();
     let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
@@ -970,7 +970,8 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     };
     // DSpark, when its file is there: opened (and its layout checked against the model's), and
     // the VRAM it takes counted with the engine it sits beside.
-    let (dspark_files, dspark_plan) = match open_dspark(root, id, data_dir, &files, &groups)? {
+    let device_vram = |device: usize| settings.devices.iter().position(|&other| other == device).map_or(0, |at| settings.vram_bytes[at]);
+    let (dspark_files, dspark_plan) = match open_dspark(root, id, data_dir, &files, &groups, &device_vram)? {
         Some((files, plan)) => (Some(files), Some(plan)),
         None => (None, None),
     };

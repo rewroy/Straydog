@@ -62,14 +62,26 @@ const RANKING: [[u8; EXPERTS]; 3] = [
 /// UD-IQ1_M's were the same within their spread (code 76.7 and 78.5, the turns 18.9 and 19.3 s).
 pub const RESIDENT: [usize; 3] = [48, 28, 16];
 
-/// How many of each stage's routed experts are kept: [`RESIDENT`], or with DS41_DSPARK_RESIDENT=A,B,C
-/// each stage's first A, B, C of [`RANKING`], or `all` for all of them.
-pub fn resident_counts() -> Result<[usize; 3]> {
-    parse_counts(std::env::var_os("DS41_DSPARK_RESIDENT").as_deref().map(|value| value.to_string_lossy()).as_deref())
+/// The counts kept where the engine DSpark sits beside has [`ROOMY_BYTES`] of VRAM or more: the first 87, 50 and
+/// 29 again. There the 1.4 GB more they take is some 3% of the target's expert slots, and on both R9700s
+/// (2026-11-23, UD-IQ2_XXS, the 11-07 scenarios) they kept an agent turn's drafts at 2.78 tokens a pass
+/// where 48/28/16 kept 2.13 and 1.83: a token's decode 10-24% quicker on all but prose, a prompt's
+/// reading 0-5% slower (32K +0.8 s, 93K +0.6 s).
+pub const RESIDENT_ROOMY: [usize; 3] = [87, 50, 29];
+
+/// The VRAM of an engine (its devices' budgets together) from which DSpark keeps [`RESIDENT_ROOMY`].
+pub const ROOMY_BYTES: u64 = 40 << 30;
+
+/// How many of each stage's routed experts are kept beside an engine of `engine_vram` bytes of VRAM:
+/// [`RESIDENT_ROOMY`] from [`ROOMY_BYTES`], [`RESIDENT`] below, or with DS41_DSPARK_RESIDENT=A,B,C each
+/// stage's first A, B, C of [`RANKING`], or `all` for all of them.
+pub fn resident_counts(engine_vram: u64) -> Result<[usize; 3]> {
+    let setting = std::env::var_os("DS41_DSPARK_RESIDENT");
+    parse_counts(setting.as_deref().map(|value| value.to_string_lossy()).as_deref(), engine_vram)
 }
 
-fn parse_counts(setting: Option<&str>) -> Result<[usize; 3]> {
-    let Some(setting) = setting else { return Ok(RESIDENT) };
+fn parse_counts(setting: Option<&str>, engine_vram: u64) -> Result<[usize; 3]> {
+    let Some(setting) = setting else { return Ok(if engine_vram >= ROOMY_BYTES { RESIDENT_ROOMY } else { RESIDENT }) };
     if setting.trim() == "all" {
         return Ok([EXPERTS; 3]);
     }
@@ -546,8 +558,8 @@ pub fn footprint(index: usize, devices: usize, vocabulary: usize, resident: [usi
 
 impl Drafter {
     /// Load DSpark (`draft`, checked by [`super::dspark::Dspark`]) onto a target engine's devices,
-    /// split among them; its head is theirs ([`Beside`]).
-    pub fn load(devices: &mut [Beside<'_>], draft: &impl Tensors, target: &impl Tensors, vocabulary: usize) -> Result<Drafter> {
+    /// split among them, keeping `counts` of each stage's routed experts ([`resident_counts`]); its head is theirs ([`Beside`]).
+    pub fn load(devices: &mut [Beside<'_>], draft: &impl Tensors, target: &impl Tensors, vocabulary: usize, counts: [usize; 3]) -> Result<Drafter> {
         let count = devices.len();
         if count == 0 || !HEADS.is_multiple_of(count) || !GROUPS.is_multiple_of(count) || !FFN.is_multiple_of(32 * count) {
             return Err(format!("DSpark does not split among {count} devices"));
@@ -562,7 +574,6 @@ impl Drafter {
         if first_row != vocabulary {
             return Err(format!("the target's head has {first_row} rows, not {vocabulary}"));
         }
-        let counts = resident_counts()?;
         let mut parts = Vec::new();
         for (index, device) in devices.iter_mut().enumerate() {
             parts.push(Part::load(device.gpu, draft, index, count, device.head_rows, counts)?);
@@ -1097,11 +1108,17 @@ mod tests {
 
     #[test]
     fn the_resident_experts_are_a_default_a_list_or_all() {
-        assert_eq!(parse_counts(None).unwrap(), [48, 28, 16]);
-        assert_eq!(parse_counts(Some("all")).unwrap(), [128; 3]);
-        assert_eq!(parse_counts(Some(" 128, 3 ,10")).unwrap(), [128, 3, 10]);
+        // by the engine's VRAM: one R9700's budget, or a small one, keeps 48/28/16; both R9700s' 87/50/29
+        assert_eq!(parse_counts(None, 30 << 30).unwrap(), [48, 28, 16]);
+        assert_eq!(parse_counts(None, 5 << 30).unwrap(), [48, 28, 16]);
+        assert_eq!(parse_counts(None, 60 << 30).unwrap(), [87, 50, 29]);
+        assert_eq!(parse_counts(None, ROOMY_BYTES).unwrap(), RESIDENT_ROOMY);
+        // and what is set is kept, whatever the VRAM
+        assert_eq!(parse_counts(Some("48,28,16"), 60 << 30).unwrap(), [48, 28, 16]);
+        assert_eq!(parse_counts(Some("all"), 5 << 30).unwrap(), [128; 3]);
+        assert_eq!(parse_counts(Some(" 128, 3 ,10"), 60 << 30).unwrap(), [128, 3, 10]);
         for wrong in ["", "87,50", "87,50,29,1", "2,50,29", "87,50,129", "a,b,c", "-1,50,29"] {
-            assert!(parse_counts(Some(wrong)).is_err(), "{wrong}");
+            assert!(parse_counts(Some(wrong), 60 << 30).is_err(), "{wrong}");
         }
         // every stage ranks each of its experts once, and the default keeps the ones most used
         for ranking in RANKING {

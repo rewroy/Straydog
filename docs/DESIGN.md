@@ -973,7 +973,11 @@ file beside the bundle.
 its routes) left its acceptance as it was, but what the drafter keeps is the target's expert slots: with
 48/28/16 a draft's tokens are kept a little less often (a code reply's 81-82% where 85-89%), and a bundle
 short of slots runs faster (UD-IQ2_XXS: code 51.7 to 55.7 tokens/s, five agent turns 26.6 to 25.5 s;
-UD-IQ1_M the same within its spread). `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
+UD-IQ1_M the same within its spread). Where the engine DSpark sits beside has 40 GiB of VRAM or more
+(both R9700s), the 1.4 GB more of 87/50/29 is some 3% of the target's slots, and they are kept: on
+2026-11-23 (UD-IQ2_XXS, the 11-07 scenarios) an agent turn's drafts gave 2.78 tokens a pass where
+48/28/16 gave 2.13 and 1.83, a token's decode 10-24% quicker on all scenes but prose, a prompt's reading
+0-5% slower. `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
 
 **The width policy** (`drafter::Policy`). After each sampled token the drafter drafts three tokens
 (~2.3 ms), and the policy picks how many a verify pass checks. It picks the width with the most
