@@ -793,6 +793,12 @@ fn off(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| value == "0")
 }
 
+/// DS41_DSPARK_WIDTH=N (1 to 3): every DSpark draft verifies N of its tokens, not as many as its policy picks, and
+/// drafts on through what would be the policy's pauses (to measure the policy against a fixed width on a served model).
+fn fixed_width() -> Option<usize> {
+    std::env::var("DS41_DSPARK_WIDTH").ok().and_then(|value| value.trim().parse().ok()).filter(|width| (1..MAX_SLOTS).contains(width))
+}
+
 /// DSpark's file, opened and authenticated, when the model's drafter is pinned, lies in its directory
 /// ([`bundle::dspark_in`]) and can sit beside an engine: DS41_DSPARK=0 leaves it out, and so does
 /// DS41_DRAFTS=0 (no verify passes to draft for). Its layout is checked against the model's.
@@ -1084,7 +1090,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     })?;
     let drafting = match (dspark_files, dspark_plan, drafter) {
         (Some(files), Some(plan), Some(drafter)) => Some(Drafting {
-            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, fixed_width: None, rings: (0..CHECKPOINTS).map(|_| None).collect(),
+            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, fixed_width: fixed_width(), rings: (0..CHECKPOINTS).map(|_| None).collect(),
             _files: files,
         }),
         _ => None,
