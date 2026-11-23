@@ -596,8 +596,9 @@ fn feed<E: Engines>(engines: &mut E, history: &mut Vec<u32>, batch: usize, token
 /// tokens, each to `emit`; an end token ends the reply unsent. With engines that verify drafts,
 /// each token is fed with engine drafts, else prompt-lookup drafts (drafts::Ngrams), in one pass;
 /// the drafts the target distribution accepts (sampling::accept: exact for any sampling) are
-/// emitted after it and kept, the rest rewound. A `constraint` chooses every token itself (no
-/// drafts); one that only suppresses keeps them, masking the rows they are accepted on.
+/// emitted after it and kept, the rest rewound. A `constraint` keeps them where it takes any token
+/// ([`Constraint::takes_drafts`]: one that only suppresses, a reasoning, a forced call past its
+/// opening), masking the rows they are accepted on; elsewhere it chooses every token itself.
 #[allow(clippy::too_many_arguments)]
 fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>, vocabulary: usize, end: &[u32], max_new: usize,
                       sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32),
@@ -608,7 +609,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
     // drafter that draws nothing)
     let mut draws = Rng::new(seed ^ 0x6472_6177_5eed_d5a2);
     let mut generated = Generated::new(vocabulary);
-    let rows = if constraint.as_deref().is_some_and(Constraint::chooses_every_token) { 1 } else { engines.verify_rows() };
+    let rows = engines.verify_rows();
     let mut ngrams = Ngrams::new();
     if rows > 1 {
         ngrams.extend(history);
@@ -629,8 +630,10 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             break;
         }
         let mut probabilities = Vec::new();
-        let (mut drafts, engine_draft) = if rows > 1 {
+        if rows > 1 {
             ngrams.push(next);
+        }
+        let (mut drafts, engine_draft) = if rows > 1 && constraint.as_deref().is_none_or(Constraint::takes_drafts) {
             // A long match is verified as it is: those drafts are accepted nearly always (an edit
             // repeats its source), and an engine's draft costs milliseconds to be no better.
             let (proposal, matched) = ngrams.propose(rows - 1);
@@ -664,10 +667,13 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         } else {
             (Vec::new(), false)
         };
-        // A suppressed point proposal could only be rejected, and the draw after it is that row's all the same: no row is spent
+        // A refused point proposal could only be rejected, and the draw after it is that row's all the same: no row is spent
         // on it. (A drawn one is left for the accept rule, whose replacement of it makes the tokens follow the target's distribution.)
-        if let Some(held) = constraint.as_deref().filter(|_| probabilities.is_empty() && !drafts.is_empty()) {
-            drafts.truncate(held.allowed_prefix(&drafts));
+        // Neither goes past where the reply stops taking drafts.
+        if let Some(held) = constraint.as_deref().filter(|_| !drafts.is_empty()) {
+            let taken = if probabilities.is_empty() { held.allowed_prefix(&drafts) } else { held.open_prefix(&drafts) };
+            drafts.truncate(taken);
+            probabilities.truncate(taken);
         }
         if drafts.is_empty() {
             let logits = engines.forward(&[next])?;
@@ -1601,6 +1607,51 @@ mod tests {
         assert_eq!((done.engine_drafted, toy.verified[0].len()), (1, 2), "{:?}", toy.verified);
     }
 
+    /// A reply held to a forced call takes drafts past the call's opening and while it reasons, with the tokens of one that takes
+    /// none (greedy), and, free from its start, the very decode of a reply held to nothing, drafts, draws and all, sampled or not.
+    #[test]
+    fn a_forced_call_takes_drafts_past_its_opening() {
+        use std::sync::Arc;
+
+        use crate::constraint::{Alternative, TokenBytes};
+        // 0 end, 1 "</think>", 2 "a", 3 "b", then letters
+        let pieces = ["<e>", "</think>", "a", "b", "c", "d", "e", "f"];
+        let tokens = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; 8]).with_think_close(Some(1)));
+        let decoding = |rows: usize, constraint: Option<Constraint>, sampling: &Sampling, seed: u64| {
+            let mut constraint = constraint;
+            let mut toy = Toy { vocabulary: 8, rows, ..Toy::default() };
+            let mut history = PROMPT.to_vec();
+            let logits = toy.forward(&PROMPT).unwrap();
+            let mut out = Vec::new();
+            let done = decode(&mut toy, &mut history, logits, 8, &[0], 160, sampling, seed, &|| false, &mut |token| out.push(token),
+                              constraint.as_mut()).unwrap();
+            assert_eq!(toy.held, history);
+            (out, done)
+        };
+        let samplings = [Sampling::GREEDY, Sampling { temperature: 1.0, ..Sampling::GREEDY }, Sampling::recommended(true), Sampling::recommended(false)];
+        for thinking in [false, true] {
+            let call = || Some(Constraint::new(Arc::clone(&tokens), &[0], thinking, vec![Alternative::prefix("ab", 0), Alternative::prefix("ac", 0)]));
+            let (one, _) = decoding(1, call(), &Sampling::GREEDY, 1);
+            let (out, done) = decoding(4, call(), &Sampling::GREEDY, 1);
+            assert_eq!(out, one, "thinking {thinking}");
+            assert!(done.drafted > 0, "thinking {thinking}: {done:?}");
+            for sampling in &samplings {
+                for seed in 0..6 {
+                    let (out, _) = decoding(4, call(), sampling, seed);
+                    let answer = if thinking { out.iter().position(|&token| token == 1).map_or(&[][..], |at| &out[at + 1..]) } else { &out[..] };
+                    let text: String = answer.iter().map(|&token| pieces[token as usize]).collect();
+                    assert!(text.starts_with("ab") || text.starts_with("ac") || text == "a" || text.is_empty(), "{sampling:?} {seed} thinking {thinking}: {text}");
+                }
+            }
+        }
+        for sampling in &samplings {
+            for seed in 0..4 {
+                let free = || Some(Constraint::new(Arc::clone(&tokens), &[0], false, vec![Alternative::Free]));
+                assert_eq!(decoding(4, free(), sampling, seed), decoding(4, None, sampling, seed), "{sampling:?} {seed}");
+            }
+        }
+    }
+
     /// Whether the engines are asked to draw their drafts: when the request samples plainly (a temperature, nothing cut,
     /// no penalty), at its temperature and with a seed of each round's own; never for a greedy reply or a cut one, whose
     /// drafts are point proposals.
@@ -1799,6 +1850,50 @@ mod tests {
         // every position's token frequencies agree within sampling noise
         for (position, (plain, drafted)) in counts[0].iter().zip(&counts[1]).enumerate() {
             for (token, (&a, &b)) in plain.iter().zip(drafted).enumerate() {
+                let (a, b) = (a as f64 / trials as f64, b as f64 / trials as f64);
+                assert!((a - b).abs() < 0.03, "position {position}, token {token}: {a:.3} vs {b:.3}");
+            }
+        }
+    }
+
+    /// Drafts in a reasoning held to a forced call, whose rows refuse the end and an id no token has, and whose `</think>` is the
+    /// last draft a pass takes before the call's opening, which is chosen token by token: the tokens come as often as without drafts.
+    #[test]
+    fn sampled_drafts_in_a_held_reasoning_keep_the_target_distribution() {
+        use std::sync::Arc;
+
+        use crate::constraint::{Alternative, TokenBytes};
+        // 0 end, 1 "</think>", 2 "b" (the call's opening), 7 no token
+        let pieces = ["<e>", "</think>", "b", "c", "d", "e", "f", ""];
+        let tokens = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; 8]).with_think_close(Some(1)));
+        let sampling = Sampling { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, presence_penalty: 0.0 };
+        let trials = 6000;
+        let mut counts = [[[0usize; 8]; 6]; 2];
+        let mut drafted = 0;
+        for (side, rows) in [1, 4].into_iter().enumerate() {
+            for seed in 0..trials {
+                let mut held = Constraint::new(Arc::clone(&tokens), &[0], true, vec![Alternative::prefix("b", 0)]);
+                let mut toy = Toy { vocabulary: 8, rows, ..Toy::default() };
+                let mut history = PROMPT.to_vec();
+                let logits = toy.forward(&PROMPT).unwrap();
+                let mut out = Vec::new();
+                let done = decode(&mut toy, &mut history, logits, 8, &[0], 6, &sampling, seed as u64 * 7919 + 13, &|| false,
+                                  &mut |token| out.push(token), Some(&mut held)).unwrap();
+                assert_eq!(toy.held, history);
+                drafted += done.drafted;
+                let close = out.iter().position(|&token| token == 1);
+                assert!(!out.contains(&7), "{out:?}");
+                if let Some(at) = close {
+                    assert!(out.get(at + 1).is_none_or(|&token| token == 2), "the call's opening after the close: {out:?}");
+                }
+                for (position, &token) in out.iter().enumerate() {
+                    counts[side][position][token as usize] += 1;
+                }
+            }
+        }
+        assert!(drafted > trials / 10, "drafts were taken ({drafted})");
+        for (position, (plain, drafts)) in counts[0].iter().zip(&counts[1]).enumerate() {
+            for (token, (&a, &b)) in plain.iter().zip(drafts).enumerate() {
                 let (a, b) = (a as f64 / trials as f64, b as f64 / trials as f64);
                 assert!((a - b).abs() < 0.03, "position {position}, token {token}: {a:.3} vs {b:.3}");
             }

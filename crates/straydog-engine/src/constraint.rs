@@ -181,6 +181,8 @@ pub struct TokenBytes {
     think_close: Option<u32>,
     /// [`TokenBytes::suppressed`], built on first use.
     suppressed: OnceLock<SuppressedTokens>,
+    /// [`TokenBytes::void`], built on first use.
+    void: OnceLock<Vec<u32>>,
 }
 
 impl TokenBytes {
@@ -207,7 +209,7 @@ impl TokenBytes {
 
     pub fn new(bytes: Vec<Vec<u8>>, special: Vec<bool>) -> TokenBytes {
         assert_eq!(bytes.len(), special.len());
-        TokenBytes { bytes, special, think_close: None, suppressed: OnceLock::new() }
+        TokenBytes { bytes, special, think_close: None, suppressed: OnceLock::new(), void: OnceLock::new() }
     }
 
     /// The tokens a suppression refuses, read off the vocabulary once, by the first request that asks.
@@ -220,6 +222,11 @@ impl TokenBytes {
     pub fn with_think_close(mut self, token: Option<u32>) -> TokenBytes {
         self.think_close = token;
         self
+    }
+
+    /// The ids in the table that no token has (no bytes), read off it once.
+    fn void(&self) -> &[u32] {
+        self.void.get_or_init(|| (0..self.bytes.len()).filter(|&at| self.bytes[at].is_empty()).map(|at| at as u32).collect())
     }
 
     /// A token's bytes and whether it is a control token; None for an id no token has.
@@ -919,6 +926,43 @@ impl Constraint {
         !self.alternatives.is_empty()
     }
 
+    /// Whether the reply, as it stands, takes drafts ([`Constraint::allowed_prefix`], [`Constraint::mask_rows`]): held by a
+    /// suppression alone; else while it reasons (to the template's `</think>` token), and once a way it may go is free, past a
+    /// forced call's opening. There it may take any token there is (an end token where it may end), which a row's mask says as
+    /// cheaply as a suppression's refusals. Elsewhere (a call's opening, JSON, a named call's close) every token is chosen against
+    /// the alternatives one by one. A forced call took no drafts at all before: Dogmind's file written right after a reasoning it
+    /// had stopped (`tool_choice` required, 18,792 tokens in one call) came at one token a pass, 44.9 tok/s on two R9700 with
+    /// DeepSeek-V4.1, where the replies around it drafted 2.3 to 3.0 tokens a pass, at 55 to 64 tok/s.
+    pub fn takes_drafts(&self) -> bool {
+        self.open().is_some()
+    }
+
+    /// Where the reply takes drafts ([`Constraint::takes_drafts`]), whether an end token may come; None elsewhere.
+    fn open(&self) -> Option<bool> {
+        if self.alternatives.is_empty() {
+            return Some(true);
+        }
+        if self.thinking.is_some() {
+            // (a `</think>` written as text can end the reasoning in the middle of a token: each is chosen against the alternatives)
+            return self.tokens.think_close.map(|_| false);
+        }
+        self.alternatives.iter().any(|alternative| matches!(alternative, Alternative::Free)).then_some(true)
+    }
+
+    /// In a row of a reply that takes drafts and is held to alternatives: what it refuses at negative infinity, the ids no token
+    /// has, and the end tokens unless it may end (`ends`).
+    fn mask_open(&self, row: &mut [f32], ends: bool) {
+        let refused = self.tokens.void().iter().chain(if ends { &[][..] } else { &self.end[..] });
+        for &token in refused {
+            if let Some(logit) = row.get_mut(token as usize) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        for logit in row.iter_mut().skip(self.tokens.len()) {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+
     /// The reply's suppression, if it has one.
     pub fn suppression(&self) -> Option<&Suppression> {
         self.suppression.as_ref()
@@ -943,26 +987,49 @@ impl Constraint {
         }
     }
 
-    /// How many of `drafts`, in order from where the reply is, the reply may take.
+    /// How many of `drafts`, in order from where the reply is, the reply may take while it takes drafts: the one with which it
+    /// stops (a `</think>`) is the last, the row after it then chosen from against the alternatives ([`Constraint::settle`]).
     pub fn allowed_prefix(&self, drafts: &[u32]) -> usize {
         let mut held = self.clone();
         drafts.iter().take_while(|&&draft| {
-            let allowed = held.allows(draft);
+            let allowed = held.takes_drafts() && held.allows(draft);
             held.advance(draft);
             allowed
         }).count()
     }
 
-    /// A verification's rows (`vocabulary` wide) for the accept rule: each with what its suppression refuses masked, row `i`'s
-    /// as the reply stands after the first `i` of `drafts`. (A row is read only when the drafts before it were kept.) A draft
-    /// masked has probability 0 under its row, so the rule rejects it; the token is drawn from the row without it.
+    /// How many of `drafts` drawn from a drafter's distribution a verification takes: as [`Constraint::allowed_prefix`], but one
+    /// the reply refuses is left to the accept rule, masked to nothing in its row ([`Constraint::mask_rows`]), whose replacement
+    /// of it keeps the tokens' distribution the target's. (Cut where the reply stops taking drafts, after the draft that stops
+    /// it: a place the drafts before it decide.)
+    pub fn open_prefix(&self, drafts: &[u32]) -> usize {
+        let mut held = self.clone();
+        drafts.iter().take_while(|&&draft| {
+            let open = held.takes_drafts();
+            held.advance(draft);
+            open
+        }).count()
+    }
+
+    /// A verification's rows (`vocabulary` wide) for the accept rule: each with what the reply refuses masked, row `i`'s as the
+    /// reply stands after the first `i` of `drafts` (its suppression's refusals, and where it is held to alternatives and takes
+    /// drafts, [`Constraint::mask_open`]'s). (A row is read only when the drafts before it were kept.) A draft masked has
+    /// probability 0 under its row, so the rule rejects it; the token is drawn from the row without it. The row after a draft
+    /// with which the reply stops taking drafts, the last ([`Constraint::allowed_prefix`]), is left to [`Constraint::settle`].
     pub fn mask_rows(&self, rows: &mut [f32], vocabulary: usize, drafts: &[u32]) {
-        let Some(suppression) = &self.suppression else { return };
-        let mut suppression = suppression.clone();
+        if self.suppression.is_none() && self.alternatives.is_empty() {
+            return;
+        }
+        let mut held = self.clone();
         for (index, row) in rows.chunks_exact_mut(vocabulary).enumerate() {
-            suppression.mask(row);
+            if let Some(suppression) = &held.suppression {
+                suppression.mask(row);
+            }
+            if let (false, Some(ends)) = (held.alternatives.is_empty(), held.open()) {
+                held.mask_open(row, ends);
+            }
             if let Some(&draft) = drafts.get(index) {
-                suppression.advance(draft);
+                held.advance(draft);
             }
         }
     }
@@ -1213,6 +1280,50 @@ mod tests {
         constraint.advance(1);
         // the answer is held to JSON
         assert!(!constraint.allows(5) && constraint.allows(4));
+    }
+
+    /// A reply takes drafts while it reasons to the `</think>` token and once a forced call's opening is written, not in the
+    /// opening: the draft that closes the reasoning is the last a verification takes, and the rows refuse what the reply would
+    /// (the end while it reasons, an id no token has), as `allows` does.
+    #[test]
+    fn drafts_are_taken_in_a_reasoning_and_past_a_call_opening() {
+        // 0 end, 1 "</think>", 2 "ab" (a call's opening), 3 "a", 4 "b", 5 "x", 6 no token
+        let pieces = ["<|end|>", "</think>", "ab", "a", "b", "x", ""];
+        let vocabulary = TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; pieces.len()]);
+        let tokens = Arc::new(vocabulary.with_think_close(Some(1)));
+        let call = Constraint::new(Arc::clone(&tokens), &[0], true, vec![Alternative::prefix("ab", 0), Alternative::prefix("ay", 0)]);
+        let masked = |held: &Constraint, drafts: &[u32]| {
+            let mut rows = vec![0.0f32; 8 * (drafts.len() + 1)];
+            held.mask_rows(&mut rows, 8, drafts);
+            rows.chunks_exact(8).map(|row| (0..8).filter(|&token| row[token] == f32::NEG_INFINITY).collect::<Vec<_>>()).collect::<Vec<_>>()
+        };
+        assert!(call.takes_drafts());
+        // (reasoning: the end and the void refused, the ids past the table too; the close is the last draft taken)
+        assert_eq!(call.allowed_prefix(&[5, 3, 1, 2, 5]), 3);
+        assert_eq!(call.open_prefix(&[5, 0, 1, 2, 5]), 3, "a refused drawn draft is left to its row");
+        assert_eq!(masked(&call, &[5, 1]), vec![vec![0, 6, 7], vec![0, 6, 7], vec![]], "the row after the close is settled");
+        for token in 0..8 {
+            assert_eq!(!masked(&call, &[])[0].contains(&(token as usize)), call.allows(token), "{token}");
+        }
+        // (the opening: one by one)
+        let mut held = call.clone();
+        held.advance(1);
+        assert!(!held.takes_drafts());
+        assert_eq!(held.allowed_prefix(&[3, 4]), 0);
+        held.advance(3);
+        assert!(!held.takes_drafts(), "\"a\" opens both calls");
+        held.advance(4);
+        // (past it: anything there is, and the end)
+        assert!(held.takes_drafts());
+        assert_eq!(held.allowed_prefix(&[5, 0, 3]), 3);
+        assert_eq!(masked(&held, &[5]), vec![vec![6, 7], vec![6, 7]]);
+        for token in 0..7 {
+            assert_eq!(held.allows(token), token != 6, "{token}");
+        }
+        // (JSON, and a reasoning whose close is only text: one by one)
+        assert!(!Constraint::new(Arc::clone(&tokens), &[0], false, vec![Alternative::json(Schema::any_object())]).takes_drafts());
+        let text_close = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; pieces.len()]));
+        assert!(!Constraint::new(text_close, &[0], true, vec![Alternative::prefix("ab", 0)]).takes_drafts());
     }
 
     #[test]

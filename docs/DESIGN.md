@@ -545,7 +545,8 @@ Three drafters:
   without asking a drafter. A resident Qwen3.8 verifies up to eight rows a pass for such copies
   (three for its MTP drafts): a long match is checked seven tokens at a time.
 
-A constrained reply takes no drafts.
+A constrained reply takes drafts only where it may take any token: in its reasoning (to the template's `</think>`
+token) and past a forced call's opening (§6.3). Qwen3.8's decode takes none in a constrained reply.
 
 ### 6.3 Sampling and constraints
 
@@ -576,6 +577,13 @@ A constrained reply takes no drafts.
 
   Each token is drawn from the model's distribution, and drawn again without a refused one
   (masked after 32), so allowed tokens keep their relative probabilities.
+  - Where the reply may take any token (its reasoning, held to nothing but the end, and a forced call past its opening),
+    DeepSeek-V4.1's decode takes drafts as without a constraint: the rows they are verified on are masked as a
+    suppression's are (the end where it may not come, an id no token has), and a draft of the `</think>` token is the last
+    a pass takes, the token after it then chosen against the call's opening. The opening itself, JSON and a named call's
+    close are chosen token by token. Dogmind asks for a call (`tool_choice` `required`) right after it stops a reasoning
+    that writes out a program; that request writes the program, and it came at one token a pass before (6,111 to 18,792
+    tokens of `create_file` at 44.7-44.9 tok/s on two R9700, where the replies around it drafted 2.3-3.0 tokens a pass).
 - **Suppression** (`constraint.rs`). A request's `suppress: "not_cp932_han"` refuses every token that would write a Han
   letter in U+3400-U+9FFF with no CP932 form (a simplified 员, 约, 叠 in a Japanese reply), reasoning and tool arguments
   included. 塡剝頰噓俱繫鷗醬 are real Japanese with no CP932 form, and stay.
