@@ -396,6 +396,15 @@ fn turn_at(tokens: &[u32], reused: usize, start: u32) -> Option<usize> {
     Some(begins.saturating_sub(TURN_BACK).max(lowest))
 }
 
+/// Whether a turn is checkpointed at `start` where the request has just checkpointed its root at `root` (if it has): not within
+/// [`TURN_BACK`] past the root, which holds all but those few tokens. A first message shorter than that put the turn one token past
+/// the root (the turn is never at or before what was fed), and the next conversation resumed from that copy as the longest match
+/// rather than from the root, so the root it started from was never the one last used ([`refreshed`]): from two other system
+/// prompts on (a team's test, a read-only turn's tools), the root in use was the one demoted, then given up.
+fn turn_after_root(start: usize, root: Option<usize>) -> bool {
+    root.is_none_or(|root| start >= root + TURN_BACK)
+}
+
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
 /// How far before its reply's generation prompt a turn is checkpointed: the last tokens of the message before it are split otherwise
@@ -905,6 +914,7 @@ impl<E: Engines> Session<E> {
         let mut fed = reused;
         // (the seconds the checkpoints took: copies of the whole state, made before the first token)
         let mut checkpoint_seconds = 0.0;
+        let mut rooted = None;
         if let Some(root) = self.root_mark(tokens, reused) {
             // (the beginning this system prompt shares with one read before, where it ends otherwise: a root of its own)
             if let Some(stem) = stem(agreed, fed, root) {
@@ -923,8 +933,9 @@ impl<E: Engines> Session<E> {
             self.save_checkpoint(true)?;
             checkpoint_seconds += saving.elapsed().as_secs_f64();
             fed = root;
+            rooted = Some(root);
         }
-        if let Some(start) = self.turn_mark(tokens, fed) {
+        if let Some(start) = self.turn_mark(tokens, fed).filter(|&start| turn_after_root(start, rooted)) {
             if self.feed(&tokens[fed..start], cancelled, &mut |done| progress(done, total))?.is_none() {
                 return Ok(());
             }
@@ -1494,6 +1505,19 @@ mod tests {
         assert_eq!(turn_at(&prompt, 0, 9), None, "no generation prompt");
         let far: Vec<u32> = [7].into_iter().chain(std::iter::repeat(1).take(TURN_REACH + 4)).collect();
         assert_eq!(turn_at(&far, 0, 7), None, "only within the last tokens");
+    }
+
+    /// Decides: a turn that would be checkpointed just past the root the same request saved is left to the root, so the next
+    /// conversation resumes from the root (kept fresh as the one last used) and reads the few tokens again.
+    #[test]
+    fn a_turn_just_past_the_root_is_left_to_it() {
+        // (a 5,920-token system prompt, then a short first message: the turn would be the root's next token)
+        let prompt: Vec<u32> = std::iter::repeat_n(1, 5920).chain([3, 4, 5, 7, 8]).collect();
+        let start = turn_at(&prompt, 5920, 7).unwrap();
+        assert_eq!(start, 5921);
+        assert!(!turn_after_root(start, Some(5920)));
+        assert!(turn_after_root(5920 + TURN_BACK, Some(5920)), "a message as long as the turn's margin keeps its turn");
+        assert!(turn_after_root(start, None), "no root saved: the turn is the request's only checkpoint");
     }
 
     /// A cancel is seen before every pass, the first too: a prompt's next stretch (after a

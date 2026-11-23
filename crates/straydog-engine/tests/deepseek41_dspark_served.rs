@@ -80,7 +80,8 @@ fn greedy_tokens_are_those_without_the_drafter_and_its_history_follows_the_seque
     assert!(model.placement["expert_slots"][0].as_u64() > slots[0].as_u64(), "the spare VRAM made slots: {slots} before, {} after", model.placement["expert_slots"]);
     model.prompt_logits = Some(Vec::new());
     assert!(model.engines.draft_with_dspark(true), "the DSpark drafter is not loaded: its file is not beside the model");
-    assert_eq!(model.placement["dspark"]["resident"], serde_json::json!(straydog_engine::arch::deepseek41::drafter::RESIDENT));
+    // (two 28 GiB budgets make an engine of 40 GiB or more: DSpark keeps the roomy counts, drafter::resident_counts)
+    assert_eq!(model.placement["dspark"]["resident"], serde_json::json!(straydog_engine::arch::deepseek41::drafter::RESIDENT_ROOMY));
     let text = Text::from_gguf(model.header()).unwrap();
     let template = ChatTemplate::new(straydog_engine::arch::deepseek41::CHAT_TEMPLATE).unwrap();
     let render = |content: &str| -> Vec<u32> {
