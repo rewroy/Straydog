@@ -920,12 +920,6 @@ impl Constraint {
         Constraint { tokens, end: end.to_vec(), thinking: thinking.then(Vec::new), alternatives, suppression: None }
     }
 
-    /// Whether every token must be chosen against this one by one, so no draft is taken: not when only a suppression holds the
-    /// reply, which refuses a draft from its table.
-    pub fn chooses_every_token(&self) -> bool {
-        !self.alternatives.is_empty()
-    }
-
     /// Whether the reply, as it stands, takes drafts ([`Constraint::allowed_prefix`], [`Constraint::mask_rows`]): held by a
     /// suppression alone; else while it reasons (to the template's `</think>` token), and once a way it may go is free, past a
     /// forced call's opening. There it may take any token there is (an end token where it may end), which a row's mask says as
@@ -1488,11 +1482,11 @@ mod tests {
         let vocabulary = raw_tokens(&pieces);
         let tool = Constraint::new(Arc::clone(&vocabulary), &[0], false, vec![Alternative::prefix("<tool>", 0)]);
         let mut held = Constraint::suppressing(Some(tool), &Value::Str(NOT_CP932_HAN.into()), Arc::clone(&vocabulary)).unwrap().unwrap();
-        assert!(held.chooses_every_token());
+        assert!(!held.takes_drafts());
         assert!(!held.allows(3) && held.allows(1), "the grammar first");
         held.advance(1);
         assert!(!held.allows(2) && held.allows(3) && held.allows(4), "free after the prefix, but not of the letter");
-        assert!(!suppressing(&vocabulary).chooses_every_token());
+        assert!(held.takes_drafts() && suppressing(&vocabulary).takes_drafts());
     }
 
     #[test]
