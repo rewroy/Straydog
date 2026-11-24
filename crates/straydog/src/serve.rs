@@ -142,7 +142,20 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
                 .ok_or("no reply markup for this model")?,
         };
         let monitor = Arc::new(Dashboard::new(engine.clone(), logs, &settings));
-        let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor.clone()));
+        // (without a key, a web page of a site on the internet, and a host name that is not local, are refused before any route:
+        // straydog_api::foreign_request)
+        let keyed = api.api_key.is_some();
+        let router = straydog_api::router(engine.clone(), api).merge(dashboard::router(monitor.clone())).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                match straydog_api::foreign_request(request.headers(), keyed) {
+                    Some(why) => {
+                        tracing::debug!("Straydog refused a request: {why}");
+                        straydog_api::forbidden(why)
+                    }
+                    None => next.run(request).await,
+                }
+            },
+        ));
         tracing::info!("Straydog listening on http://{address}");
         // A worker that fails (to start or later) leaves nothing to serve: the server ends with
         // its failure, so that whatever runs it can start it again.

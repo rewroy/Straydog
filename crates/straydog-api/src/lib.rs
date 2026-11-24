@@ -238,6 +238,49 @@ pub fn authorized(key: Option<&str>, headers: &HeaderMap) -> bool {
         .is_some_and(|(_, token)| bool::from(token.trim().as_bytes().ct_eq(key.as_bytes())))
 }
 
+/// Why a request is refused before any route, where the server has no API key (an app's own engine is started so): a web page's request from a site
+/// on the internet (a browser sends `Origin` with it, its own site's), and a request that names a host that is not this machine or its local network
+/// (a public name made to lead here, DNS rebinding, whose page could read even the routes a browser sends no `Origin` to). Otherwise any page the person
+/// had open could have the engine generate, holding the GPU and taking the place of the conversation it keeps, and a rebound one could read what it
+/// wrote and the logs. This machine and its local network are loopback, `*.localhost`, `*.local` and private or link-local IPv4 addresses: a proxy on
+/// the network (Caddy) passes on its client's host, `doggybox.local` or `192.168.0.100`. With a key, the key is the test, and neither is looked at.
+pub fn foreign_request(headers: &HeaderMap, keyed: bool) -> Option<&'static str> {
+    if keyed {
+        return None;
+    }
+    let named_local = |header| headers.get(header).map(|value| value.to_str().ok().map(host_name).is_some_and(local_name));
+    if named_local(axum::http::header::HOST) == Some(false) {
+        return Some("a host name that is not this machine or its local network");
+    }
+    let origin = headers.get(axum::http::header::ORIGIN)?;
+    let local = origin.to_str().ok().and_then(|origin| origin.split_once("://")).map(|(_, rest)| host_name(rest)).is_some_and(local_name);
+    (!local).then_some("a web page's request from a site that is not on this machine or its local network")
+}
+
+/// The host of `host[:port][/...]`, an IPv6 one with its brackets.
+fn host_name(authority: &str) -> &str {
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    if authority.starts_with('[') {
+        return authority.find(']').map_or(authority, |end| &authority[..=end]);
+    }
+    authority.split(':').next().unwrap_or(authority)
+}
+
+/// A name of this machine or its local network: `localhost` and names under it, a `.local` name (mDNS), `[::1]`, and an IPv4 address that is
+/// loopback, private or link-local. A public name never is, whatever address it is made to lead to.
+fn local_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local") || name == "[::1]" {
+        return true;
+    }
+    name.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback() || ip.is_private() || ip.is_link_local())
+}
+
+/// The answer to a request [`foreign_request`] refuses.
+pub fn forbidden(why: &str) -> Response {
+    ApiError::new(StatusCode::FORBIDDEN, "permission_error", why).into_response()
+}
+
 /// The answer to a request without the key.
 pub fn unauthorized() -> Response {
     ApiError::new(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key").into_response()
@@ -410,4 +453,38 @@ async fn read_payload(headers: &HeaderMap, body: Body) -> Result<pyjson::Value, 
         return Err(ApiError::invalid("the request body must be a JSON object"));
     }
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decides: without a key, a browser's request from a site on the internet, a null origin and a public host name (a rebound one) are refused; a
+    /// request with no Origin naming a local host (a native client, a proxy's own request, Caddy passing `doggybox.local` on) and a page of this machine
+    /// or the local network are let through. With a key, nothing is refused here.
+    #[test]
+    fn a_request_from_a_site_on_the_internet_is_refused() {
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().unwrap());
+            }
+            map
+        };
+        for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "192.168.0.100:8080", "doggybox.local", "172.17.0.1:8080"] {
+            assert_eq!(foreign_request(&headers(&[("host", host)]), false), None, "{host}");
+        }
+        assert_eq!(foreign_request(&headers(&[]), false), None, "no host at all (HTTP/1.0)");
+        for origin in ["http://localhost:3000", "http://127.0.0.1:8080", "http://[::1]:5173", "http://app.localhost", "http://doggybox.local",
+                       "http://192.168.0.100", "http://10.0.0.7:8080", "http://169.254.1.1"] {
+            assert_eq!(foreign_request(&headers(&[("host", "doggybox.local"), ("origin", origin)]), false), None, "{origin}");
+        }
+        for origin in ["https://evil.example", "null", "http://localhost.evil.example", "http://8.8.8.8"] {
+            assert!(foreign_request(&headers(&[("host", "127.0.0.1:8080"), ("origin", origin)]), false).is_some(), "{origin}");
+        }
+        for host in ["rebound.example:8080", "8.8.8.8", "localhost.evil.example"] {
+            assert!(foreign_request(&headers(&[("host", host)]), false).is_some(), "{host}: a rebound name, with no Origin on a GET");
+        }
+        assert_eq!(foreign_request(&headers(&[("host", "rebound.example:8080"), ("origin", "https://evil.example")]), true), None, "with a key");
+    }
 }
