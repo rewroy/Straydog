@@ -544,6 +544,7 @@ impl<E: Engines> Loaded<E> {
         // go without it and a reasoning_end event marks the place. The same text otherwise written (the
         // reasoning quoting a tag) stays the reasoning's.
         let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
+        let any_close = text.added_token(THINK_CLOSE);
         let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -552,7 +553,7 @@ impl<E: Engines> Loaded<E> {
                 match stream.push(token) {
                     Ok(delta) => {
                         let ended = think_close == Some(token);
-                        let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                        let delta = crate::worker::reply_text(delta, token, any_close);
                         if !delta.is_empty() {
                             first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
                             output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));

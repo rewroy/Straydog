@@ -28,6 +28,14 @@ use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
 
+/// A token's text for the reply: the template's `</think>` (its one added token, `close`) is never the reply's text. The first of a
+/// reply that reasons ends the reasoning (the caller marks the place); one the model writes again after that, or in a reply that does
+/// not reason, is dropped as well, where it went out as text ("Hello! It's great to meet you.</think>He", DeepSeek-V4.1, 11-24). The same characters
+/// written as ordinary tokens (a reasoning that quotes the tag) are other tokens and stay.
+pub(crate) fn reply_text(delta: String, token: u32, close: Option<u32>) -> String {
+    if close == Some(token) { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta }
+}
+
 /// The largest frame either way: any request body the API takes ([`straydog_api::BODY_LIMIT`])
 /// with room for the frame around it. At 16 MiB a conversation's tenth screenshot (a 64 MiB body
 /// was taken) failed the runtime, and the server stopped serving.
@@ -2116,6 +2124,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     // without it and a reasoning_end event marks the place. The same text otherwise written (the
     // reasoning quoting a tag) stays the reasoning's.
     let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
+    let any_close = text.added_token(THINK_CLOSE);
     // The held tokens can be more than the tokenizer's for the same text, and with no `max_tokens` the reply's room was all that `ids` left: a
     // client that sends none, as some do, ended the worker on "exceeds the allocated context" on the first such reply.
     let agreed = engine.model.agree_with_held(&ids, &text.token_bytes());
@@ -2164,7 +2173,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
                 match stream.push(token) {
                     Ok(delta) => {
                         let ended = *think_close == Some(token);
-                        let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                        let delta = reply_text(delta, token, any_close);
                         if !delta.is_empty() {
                             first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
                             output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": *generated}));
@@ -2241,6 +2250,16 @@ fn reasoning_closed(prompt: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The template's `</think>` token is never a reply's text: dropped from its delta wherever it comes (the reasoning's end, or again
+    /// after it), while another token's text that holds the same characters stays.
+    #[test]
+    fn the_think_close_token_is_never_reply_text() {
+        let close = Some(7u32);
+        assert_eq!(super::reply_text("you.</think>".to_string(), 7, close), "you.");
+        assert_eq!(super::reply_text("</think>".to_string(), 7, close), "");
+        assert_eq!(super::reply_text("a </think> b".to_string(), 8, close), "a </think> b");
+        assert_eq!(super::reply_text("</think>".to_string(), 7, None), "</think>");
+    }
     /// A kept conversation's token list may hold an image's positions (their ids from its digest), and nothing else past the vocabulary.
     #[test]
     fn a_kept_list_may_hold_image_positions() {
