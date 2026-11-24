@@ -659,14 +659,25 @@ void pregather_start(Device& d) {
     if (pg.capacity < experts.size()) {
         if (pg.read_pending) { check(hipEventSynchronize(pg.read)); pg.read_pending = false; }
         if (pg.mirror) { check(hipHostFree(pg.mirror)); pg.mirror = nullptr; pg.capacity = 0; }
+        // Room for the layer that gathers the most, once: allocated layer by layer as wider ones came, the page-locked mirror and its zeroing
+        // fall in the middle of a prompt (on an R9700, two 2,127-token batches with the gather ahead had a moe_combine of 264 ms, 30 ms at
+        // most without).
+        size_t room = experts.size();
+        for (const auto& entry : d.resident) {
+            const ResidentMoe& plan = *entry.second;
+            if (!plan.hybrid || plan.host_copy || plan.mapped[0]) continue;
+            size_t gathered = 0;
+            for (size_t expert = 0; expert < plan.experts; ++expert) gathered += plan.slot_of[expert] < 0 && !expert_tiered(plan, expert);
+            room = std::max(room, gathered);
+        }
         // (a machine that refuses this much page-locked memory goes on without gathering ahead)
-        if (hipHostMalloc(reinterpret_cast<void**>(&pg.mirror), experts.size() * d.slots.bytes, hipHostMallocDefault) != hipSuccess) {
+        if (hipHostMalloc(reinterpret_cast<void**>(&pg.mirror), room * d.slots.bytes, hipHostMallocDefault) != hipSuccess) {
             (void)hipGetLastError();
             pg.mirror = nullptr; pg.disabled = true;
             return;
         }
-        std::memset(pg.mirror, 0, experts.size() * d.slots.bytes);   // (the slots' padding past each expert's bytes, as the staging mirror's)
-        pg.capacity = experts.size();
+        std::memset(pg.mirror, 0, room * d.slots.bytes);   // (the slots' padding past each expert's bytes, as the staging mirror's)
+        pg.capacity = room;
     }
     if (!pg.read) check(hipEventCreateWithFlags(&pg.read, hipEventDisableTiming));
     if (!pg.worker) pg.worker = std::make_unique<Background>(d.ordinal);
