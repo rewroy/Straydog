@@ -1054,7 +1054,7 @@ impl Runtime {
             refusal,
             prefix: Cache::new(settings),
             keeper: Keeper::new(settings),
-            unclaimed: AtomicUsize::new(0),
+            kept: Default::default(),
             saves: Mutex::new(Vec::new()),
             restarts: Mutex::new(Vec::new()),
         };
@@ -1123,8 +1123,8 @@ struct Driver {
     prefix: Cache,
     /// What the run keeps of the conversation's state, for the next start, when the person asked for it (Windows).
     keeper: Keeper,
-    /// The tokens of the conversation an earlier run kept while no request of this run has gone on from it (0: there is none, or one did).
-    unclaimed: AtomicUsize,
+    /// The conversations earlier runs kept, by slot, with when each was last written or taken: which file a stop writes ([`crate::conversation::slot_for`]).
+    kept: std::sync::Mutex<Vec<crate::conversation::Kept>>,
     /// The saves under way, each on a thread of its own: the server waits for them before it ends.
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// When the worker was started again after it failed ([`RESTARTS`] within [`RESTART_WINDOW`] at the most).
@@ -1360,22 +1360,28 @@ impl Driver {
     /// stays on the drive until a request that begins with them asks for it ([`Driver::hand_conversation`]).
     async fn tell_kept_tokens(&self, process: &mut Process) {
         let Some(opening) = self.ready_frame().and_then(|ready| self.keeper.restore(&ready)) else { return };
-        let Ok(Some(tokens)) = opening.await else { return };
-        self.unclaimed.store(tokens.len(), Ordering::Relaxed);
-        let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into()))]);
-        if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&tokens)).await {
-            tracing::warn!("Straydog could not tell its worker the conversation the last run kept: {message}");
+        let Ok(kept) = opening.await else { return };
+        for one in &kept {
+            let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into())),
+                                    ("slot", pyjson::Value::Int(one.slot as i128))]);
+            if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&one.tokens)).await {
+                tracing::warn!("Straydog could not tell its worker a conversation an earlier run kept: {message}");
+            }
         }
+        *self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = kept;
     }
 
     /// A request begins with the tokens of the kept conversation, and its worker asks for the state: read from the drive, opened, and sent. The worker
     /// is told why when it cannot be (the request then goes on without it). Err only when the worker is unusable.
-    async fn hand_conversation(&self, process: &mut Process) -> Result<(), String> {
-        self.unclaimed.store(0, Ordering::Relaxed);
+    async fn hand_conversation(&self, process: &mut Process, slot: usize) -> Result<(), String> {
+        // (a conversation taken is one the person is in: the last a full set of slots gives up)
+        for one in self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter_mut().filter(|one| one.slot == slot) {
+            one.at = std::time::SystemTime::now();
+        }
         let state = match self.ready_frame() {
             Some(ready) => {
                 let keeper = self.keeper.clone();
-                tokio::task::spawn_blocking(move || keeper.state(&ready)).await.map_err(|error| error.to_string()).and_then(|state| state)
+                tokio::task::spawn_blocking(move || keeper.state(&ready, slot)).await.map_err(|error| error.to_string()).and_then(|state| state)
             }
             None => Err("the engine is not ready".to_string()),
         };
@@ -1420,12 +1426,21 @@ impl Driver {
         }.await;
         let state = match given {
             Ok(Ok((state, held))) => {
-                let unclaimed = self.unclaimed.load(Ordering::Relaxed);
-                if !replaces_kept(held, unclaimed) {
-                    tracing::info!("Straydog conversation: the {unclaimed} tokens the last run kept stay kept (this run's {held} did not go on from them)");
-                    return;
+                let tokens = match crate::conversation::state_tokens(&state) {
+                    Ok(tokens) => tokens,
+                    Err(message) => {
+                        tracing::warn!("Straydog conversation: not kept ({message})");
+                        return;
+                    }
+                };
+                let kept = self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                match crate::conversation::slot_for(&tokens, &kept, crate::conversation::KEPT_SLOTS) {
+                    Some(slot) => (state, slot),
+                    None => {
+                        tracing::info!("Straydog conversation: this run's {held} tokens are all in a conversation kept already; the kept ones stay");
+                        return;
+                    }
                 }
-                state
             }
             Ok(Err(reason)) => {
                 // (the memory or the drive it would take is the only thing a person may want to know of; a worker that holds none is the usual case)
@@ -1441,8 +1456,9 @@ impl Driver {
                 return;
             }
         };
+        let (state, slot) = state;
         let keeper = self.keeper.clone();
-        match tokio::task::spawn_blocking(move || keeper.save(&ready, state)).await {
+        match tokio::task::spawn_blocking(move || keeper.save(&ready, slot, state)).await {
             Ok(Ok(saved)) => tracing::info!("{}", crate::conversation::saved_line(&saved, started.elapsed().as_secs_f64())),
             Ok(Err(message)) => tracing::warn!("Straydog conversation: not kept ({message})"),
             Err(error) => tracing::warn!("Straydog conversation: not kept ({error})"),
@@ -1781,7 +1797,8 @@ impl Driver {
                     let kind = event["event"].as_str().unwrap_or("").to_string();
                     if kind == "conversation_wanted" {
                         // (the request waits for it: the kept conversation is read from the drive and sent, and the events go on)
-                        self.hand_conversation(process).await?;
+                        let slot = event["slot"].as_u64().unwrap_or(0) as usize;
+                        self.hand_conversation(process, slot).await?;
                         continue;
                     }
                     if kind == "done" {
@@ -1951,14 +1968,6 @@ impl Engine for Runtime {
     }
 }
 
-/// Whether the conversation a worker holds at a stop (`held` tokens) takes the place of the file an earlier run kept, of `unclaimed` tokens
-/// that no request of this run went on from (0 when there is none, or one did). The latest conversation is the one taken back, unless it is
-/// shorter than the earlier one it never touched: a server's health check after a start, or an app's warm-up of its system prompt, is the last
-/// thing such a run did, and the conversation the person was in is the one they come back to.
-fn replaces_kept(held: usize, unclaimed: usize) -> bool {
-    held >= unclaimed
-}
-
 /// The tokens of the conversation a worker's `conversation_state` header gives (a count: Qwen3.8's and DeepSeek-V4.1's workers both send one).
 fn held_tokens(header: &Value) -> usize {
     header["tokens"].as_u64().map_or(0, |tokens| tokens as usize)
@@ -1968,17 +1977,11 @@ fn held_tokens(header: &Value) -> usize {
 mod tests {
     use super::*;
 
-    /// Decides: a stop keeps the latest conversation unless it is shorter than an earlier run's that this run never went on from.
+    /// Decides: the count of a worker's conversation is read from its header, as it sends it.
     #[test]
-    fn a_shorter_conversation_does_not_take_the_place_of_one_never_taken() {
-        assert!(replaces_kept(5924, 0), "nothing kept, or the kept one was taken: the latest is kept");
-        assert!(!replaces_kept(5924, 61_004), "a warm-up's system prompt after a start leaves the conversation the run never touched");
-        assert!(replaces_kept(70_000, 61_004), "a longer conversation of this run is the latest");
-        assert!(replaces_kept(61_004, 61_004));
-        // (as a worker sends it: the count of the tokens)
+    fn the_held_tokens_are_the_headers_count() {
         let header = json!({"id": "kept-state", "event": "conversation_state", "tokens": 1360, "digest": "ab", "bytes": 9 << 20});
         assert_eq!(held_tokens(&header), 1360);
-        assert!(!replaces_kept(held_tokens(&header), 2560));
     }
 
     /// Decides: the log line of a worker that stopped carries its last stderr lines (Rust's "memory allocation of N bytes failed" among

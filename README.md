@@ -164,12 +164,15 @@ does not.
   starts the server and has no console to send Ctrl+C to). Nothing is written while requests run or
   per request: the drive sees one write a stop. A state larger than the memory or the drive has room
   for is not written, and the log says so in one line.
-- **Where, and sealed how.** `<data dir>/conversation`, one file a bundle, a new one replacing the
-  old. The state is sealed with AES-256-GCM under a random key that DPAPI wraps for your Windows
+- **How many.** Up to four conversations a bundle, a file each. A stop writes the conversation it held
+  over the one it went on from, else into an empty file, else over the one used longest ago, and
+  writes nothing when it adds nothing to a kept one (a health check, an app's warm-up of its system
+  prompt). A request takes back the one it goes on from.
+- **Where, and sealed how.** `<data dir>/conversation`, up to four files a bundle. The state is sealed with AES-256-GCM under a random key that DPAPI wraps for your Windows
   account, as the engine's other saved state is (the system block's, `prefix`): another user cannot
   open it, and a changed byte refuses it. Its tokens are a sealed part of their own.
-- **At the next start** the file is opened lazily: its tokens are read, and the state stays on the
-  drive until the first request whose prompt begins with them. That request reads it from the file
+- **At the next start** the files are opened lazily: their tokens are read, and each state stays on
+  the drive until the first request whose prompt begins with its tokens. That request reads it from the file
   and goes on from there; the request line says `reused 38968 from kept, loaded in 1.8 s`. A
   request that does not begin with them leaves the file as it is, for a later one. A file of
   another build, bundle or placement of the engine is deleted, as is one that does not open, and

@@ -704,12 +704,17 @@ the request that goes on from it.
   events `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN`, which tokio holds off the process's end
   for), or a line `stop` on standard input with `--stop-on-stdin`. A program that starts the server
   with no console has nothing else to send: that pipe is held by the program alone, which is why it
-  needs no address, no key and no console. Nothing is written per request. A state shorter than the
-  file an earlier run kept, when no request of this run went on from that file, leaves the file as it
-  is: a health check after a start, or an app's warm-up of its system prompt, is not the conversation
-  the person comes back to. DeepSeek-V4.1 keeps no conversation under 1024 tokens either, as Qwen3.8.
-- **The file.** `<data dir>/conversation/<bundle>.sdconv`, one a bundle, replaced whole (a `.part`
-  file, synced, then renamed over the old one). As the system block's (6.4) with two sealed parts:
+  needs no address, no key and no console. Nothing is written per request. DeepSeek-V4.1 keeps no
+  conversation under 1024 tokens, as Qwen3.8.
+- **Which file** (`conversation::slot_for`). A bundle keeps up to four conversations. A stop writes the
+  one it held into the file of the kept conversation it went on from (the longest), else an empty
+  one, else the one written or taken longest ago; and writes nothing when all of it is the start of a
+  kept one (a health check after a start, an app's warm-up of its system prompt). One file did not
+  do: an app's tests on the same server are often the last thing before a stop, and on 11-24 a
+  107,795-token test conversation kept in the single file stood in for every later one, a person's
+  64K conversation among them (a shorter state did not replace a file no request had taken).
+- **The file.** `<data dir>/conversation/<bundle>.sdconv`, and `<bundle>.<slot>.sdconv` for the
+  slots after the first, each replaced whole (a `.part` file, synced, then renamed over the old one). As the system block's (6.4) with two sealed parts:
 
   ```
   0    8   STRAYCNV         56   8   the state's bytes, S

@@ -478,11 +478,12 @@ impl<E: Engines> Loaded<E> {
         // (after a start, the kept conversation's tokens are what its replies were written in: a prompt encoded afresh split one of
         // them otherwise and never began with all of them, so a conversation of more than one turn was never taken. Kept to where
         // the prompt then begins with all of them, and goes on from that conversation.)
-        if let Some(tokens) = crate::worker::kept_tokens() {
+        for tokens in crate::worker::kept_tokens() {
             let (from_kept, kept_starts) = written(&tokens, &parts, reach, encoded)?;
             if from_kept.len() > tokens.len() && from_kept.starts_with(&tokens) && !ids.starts_with(&tokens) {
                 spans = spans.iter().zip(kept_starts).map(|(&(index, _), start)| (index, start)).collect();
                 ids = from_kept;
+                break;
             }
         }
         let encode_seconds = started.elapsed().as_secs_f64();

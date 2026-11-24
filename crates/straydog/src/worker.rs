@@ -598,12 +598,13 @@ fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64,
 /// file without the state, and where the state will arrive if a request has asked for it. A static, for the request loop that reads the frames and the
 /// request that waits for one are different threads, and the engine is behind the lock the request holds.
 struct KeptConversation {
-    tokens: Option<Vec<u32>>,
+    /// The conversations earlier runs kept that no request of this one has taken: each by the server's slot of its file, with its tokens.
+    tokens: Vec<(usize, Vec<u32>)>,
     /// Where the state arrives, with the seconds the server took to read and open it.
     waiting: Option<std::sync::mpsc::Sender<Result<(Vec<u8>, f64), String>>>,
 }
 
-static KEPT: Mutex<KeptConversation> = Mutex::new(KeptConversation { tokens: None, waiting: None });
+static KEPT: Mutex<KeptConversation> = Mutex::new(KeptConversation { tokens: Vec::new(), waiting: None });
 
 fn kept() -> std::sync::MutexGuard<'static, KeptConversation> {
     KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -614,8 +615,9 @@ const KEPT_PATIENCE: Duration = Duration::from_secs(120);
 /// The host memory a load of the kept state leaves free besides its copies: the commit the rest of the engine asks for as it goes.
 const KEPT_MARGIN: u64 = 2 << 30;
 
-/// The server named the tokens of the conversation its last run kept: this run takes the first request that begins with them from there.
-fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
+/// The server named the tokens of a conversation an earlier run kept, in the file of `slot`: this run takes the first request that begins with them
+/// from there.
+fn keep_tokens(bytes: &[u8], slot: usize) -> Result<(), String> {
     if bytes.is_empty() || bytes.len() % 4 != 0 {
         return Err(format!("{} bytes are no list of tokens", bytes.len()));
     }
@@ -623,7 +625,9 @@ fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
     if let Some(token) = tokens.iter().find(|&&token| !kept_token(token)) {
         return Err(format!("a token outside the vocabulary that is no image's position ({token})"));
     }
-    kept().tokens = Some(tokens);
+    let mut kept = kept();
+    kept.tokens.retain(|(held, _)| *held != slot);
+    kept.tokens.push((slot, tokens));
     Ok(())
 }
 
@@ -656,23 +660,28 @@ impl KeepsConversation for straydog_engine::model::Model {
     }
 }
 
-/// The tokens of the conversation an earlier run kept, while no request has taken it: the ids its replies were written in, which
-/// a prompt that goes on from it is to keep ([`take_kept`] takes it only where the prompt begins with all of them).
-pub(crate) fn kept_tokens() -> Option<Vec<u32>> {
-    kept().tokens.clone()
+/// The tokens of the conversations earlier runs kept, while no request has taken them: the ids their replies were written in, which
+/// a prompt that goes on from one is to keep ([`take_kept`] takes one only where the prompt begins with all of them).
+pub(crate) fn kept_tokens() -> Vec<Vec<u32>> {
+    kept().tokens.iter().map(|(_, tokens)| tokens.clone()).collect()
+}
+
+/// The kept conversation a prompt goes on from: the slot and length of the longest whose tokens the prompt begins with, a token left to run.
+fn kept_for(kept: &[(usize, Vec<u32>)], prompt: &[u32]) -> Option<(usize, usize)> {
+    kept.iter()
+        .filter(|(_, tokens)| prompt.len() > tokens.len() && prompt[..tokens.len()] == tokens[..])
+        .max_by_key(|(_, tokens)| tokens.len())
+        .map(|(slot, tokens)| (*slot, tokens.len()))
 }
 
 pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
-    let wanted = {
-        let kept = kept();
-        let tokens = kept.tokens.as_ref()?;
-        // (the prompt begins with all of them, and a token is left to run)
-        (prompt.len() > tokens.len() && prompt[..tokens.len()] == tokens[..]).then_some(tokens.len())?
-    };
+    // (the prompt begins with all of a kept conversation's tokens, and a token is left to run)
+    let (slot, wanted) = kept_for(&kept().tokens, prompt)?;
+    let drop_kept = || kept().tokens.retain(|(held, _)| *held != slot);
     let not_loaded = |why: String| eprintln!("Straydog conversation: not loaded ({why})");
     if model.held_prefix(prompt) >= wanted {
         // (the model holds this much of it already: the state would add nothing)
-        kept().tokens = None;
+        drop_kept();
         return None;
     }
     // (the file's bytes in the server, the same in this process, and the copies of its parts: three of the state's size at once)
@@ -695,7 +704,7 @@ pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id:
     let started = Instant::now();
     let (sender, receiver) = std::sync::mpsc::channel();
     kept().waiting = Some(sender);
-    output.send(&json!({"id": id, "event": "conversation_wanted", "tokens": wanted}));
+    output.send(&json!({"id": id, "event": "conversation_wanted", "tokens": wanted, "slot": slot}));
     let arrived = loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(arrived) => break arrived,
@@ -716,7 +725,7 @@ pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id:
         Ok(arrived) => arrived,
         Err(why) => {
             // (the file is gone or cannot be read: asking again would only ask the same)
-            kept().tokens = None;
+            drop_kept();
             not_loaded(why);
             return None;
         }
@@ -724,14 +733,14 @@ pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id:
     let importing = Instant::now();
     match model.import_conversation(&state, prompt.len() + 1) {
         Ok(tokens) => {
-            kept().tokens = None;
+            drop_kept();
             let seconds = started.elapsed().as_secs_f64();
             eprintln!("Straydog conversation: loaded {tokens} tokens ({} MB) in {seconds:.1} s (the server read it in {read_seconds:.1} s, it came in {:.1} s, the import took {:.1} s)",
                       state.len() >> 20, (arrived_at - read_seconds).max(0.0), importing.elapsed().as_secs_f64());
             Some(seconds)
         }
         Err(why) => {
-            kept().tokens = None;
+            drop_kept();
             not_loaded(why);
             None
         }
@@ -1801,7 +1810,11 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                     Ok(body) => body,
                     Err(message) => break Err(message),
                 };
-                if let Err(message) = keep_tokens(&body) {
+                let slot = match request.get("slot") {
+                    Some(pyjson::Value::Int(slot)) if *slot >= 0 => *slot as usize,
+                    _ => 0,
+                };
+                if let Err(message) = keep_tokens(&body, slot) {
                     eprintln!("Straydog conversation: not kept ({message})");
                 }
             }
@@ -2250,6 +2263,17 @@ fn reasoning_closed(prompt: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Decides: a prompt goes on from the longest kept conversation it begins with, with a token left to run; none when it begins with none.
+    #[test]
+    fn a_prompt_takes_the_longest_kept_conversation_it_begins_with() {
+        let kept = vec![(0, vec![1, 2, 3]), (2, vec![1, 2, 3, 4, 5]), (3, vec![1, 9])];
+        assert_eq!(super::kept_for(&kept, &[1, 2, 3, 4, 5, 6]), Some((2, 5)));
+        assert_eq!(super::kept_for(&kept, &[1, 2, 3, 4, 5]), Some((0, 3)), "a token is left to run");
+        assert_eq!(super::kept_for(&kept, &[1, 9, 9]), Some((3, 2)));
+        assert_eq!(super::kept_for(&kept, &[7, 8]), None);
+        assert_eq!(super::kept_for(&[], &[1, 2]), None);
+    }
+
     /// The template's `</think>` token is never a reply's text: dropped from its delta wherever it comes (the reasoning's end, or again
     /// after it), while another token's text that holds the same characters stays.
     #[test]

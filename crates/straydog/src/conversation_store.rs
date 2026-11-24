@@ -175,6 +175,17 @@ impl Store {
         Store { path: directory.join(format!("{bundle}.{EXTENSION}")) }
     }
 
+    /// The store of `bundle`'s kept conversation `slot` in `directory`: slot 0 is the file [`new`](Self::new) names, a later slot's file has the
+    /// slot in its name before the extension.
+    pub fn slot(directory: &Path, bundle: &str, slot: usize) -> Store {
+        let first = Store::new(directory, bundle);
+        if slot == 0 {
+            return first;
+        }
+        let name = first.path.file_stem().map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+        Store { path: directory.join(format!("{name}.{slot}.{EXTENSION}")) }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
