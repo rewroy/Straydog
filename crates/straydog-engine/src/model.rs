@@ -5831,10 +5831,12 @@ impl Model {
     }
 
     /// Whether a verification's first layer and its PLE layer follow each other on the device (see [`Group::front_chained`]): a fully resident
-    /// model's, and a partially resident one's on CUDA, where the first layer's hybrid handshake ends in a wait and nothing is read back or
-    /// uploaded between the layers. `STRAYDOG_FRONT_CHAIN=0` keeps the rows going through the host there.
+    /// model's, and a partially resident one's, where the first layer's hybrid handshake ends in a wait and nothing is read back or uploaded
+    /// between the layers. `STRAYDOG_FRONT_CHAIN=0` keeps the rows going through the host there. On HIP too (11-24, an R9700 at --vram 5.5,
+    /// Qwen3.8 UD-IQ1_S, MTP drafts): `check` found 0 floats differing in 100 passes, the PLE layer 0.20 -> 0.04 ms a pass and the first layer
+    /// 0.62 -> 0.59.
     fn front_chained(&self) -> bool {
-        self.group.front_chained() && (!self.partial || (cfg!(feature = "cuda") && front_chain_wanted()))
+        self.group.front_chained() && (!self.partial || front_chain_wanted())
     }
 
     /// The rows through the first layer, the PLE layer and the spans. With `keep`, a partially resident model's rows may stay on the device
