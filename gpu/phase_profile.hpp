@@ -1,12 +1,14 @@
 // STRAYDOG_PREFILL_PHASES (development): an event after each phase of a prompt batch's layers (on the device's stream), the time between two
-// events added to the second's name when the list is resolved, the sums printed when the device is destroyed. A phase's time is the stream's
-// time from the previous event: a host wait shows as the phase queued after it.
+// events added to the second's name when the list is resolved, the sums printed at the end of each prompt (sd_phase_report) and of the
+// device's batches left when it is destroyed. A phase's time is the stream's time from the previous event: a host wait shows as the phase
+// queued after it.
 #pragma once
 #include "phase_profile_common.hpp"
 void phase_report(Device& d) {
     try {
         cleanup(hipSetDevice(d.ordinal));
         phase_resolve(d, true);
+        if (!d.phase_batches) return;
         std::vector<std::pair<std::string, Device::PhaseSum>> rows(d.phase_totals.begin(), d.phase_totals.end());
         std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.sum > b.second.sum; });
         double total = 0;
@@ -31,4 +33,15 @@ void phase_report(Device& d) {
                      (unsigned long long)d.phase_host_layers, double(d.phase_host_counts_ns) / 1e6 / layers, double(d.phase_host_hints_ns) / 1e6 / layers,
                      double(d.phase_host_gather_ns) / 1e6 / layers, double(d.phase_host_settle_ns) / 1e6 / layers);
     } catch (...) {}
+}
+// The report of the prompt batches since the last, and the sums begun again: a served worker is killed and never destroys its devices, so
+// its engine asks for one at the end of each prompt. The next mark is not timed from the last (the time between two prompts is no phase's).
+void phase_report_since(Device& d) {
+    phase_report(d);
+    d.phase_totals.clear();
+    d.phase_batches = d.phase_layers = d.phase_prestage_issued = d.phase_prestage_used = d.phase_streamed = d.phase_bus_bytes = 0;
+    d.phase_cpu_routes = d.phase_missing_layers = 0;
+    d.phase_host_counts_ns = d.phase_host_hints_ns = d.phase_host_gather_ns = d.phase_host_settle_ns = d.phase_host_layers = 0;
+    std::fill(std::begin(d.phase_routes), std::end(d.phase_routes), uint64_t(0));
+    d.phase_broken = true;
 }

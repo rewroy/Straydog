@@ -1778,6 +1778,12 @@ impl Backend {
         check(unsafe { ffi::sd_prefill_bank_halves(self.handle, layer as u64, bytes) }).map(|halves| halves == 1)
     }
 
+    /// STRAYDOG_PREFILL_PHASES: print the prompt phases since the last report and begin again (nothing without the variable).
+    pub fn phase_report(&self) -> Result<()> {
+        // SAFETY: a live handle; the device's work for the prompt has all been queued.
+        check(unsafe { ffi::sd_phase_report(self.handle) }).map(drop)
+    }
+
     pub fn clear_layer_bank(&mut self) -> Result<()> {
         // SAFETY: settles pending transfers and removes table references before returning.
         check(unsafe { ffi::sd_prefill_bank_clear(self.handle) }).map(drop)

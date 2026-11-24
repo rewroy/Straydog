@@ -1920,6 +1920,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn sd_prefill_bank_clear(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn sd_phase_report(handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
+}
 pub type sd_prefill_observer = ::std::option::Option<
     unsafe extern "C" fn(
         context: *mut ::std::os::raw::c_void,

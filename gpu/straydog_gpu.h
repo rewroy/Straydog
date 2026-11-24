@@ -555,6 +555,9 @@ int sd_prefill_bank_half_free(void* handle);
    their gathers. */
 int sd_prefill_bank_times(void* handle, uint64_t* out);
 int sd_prefill_bank_clear(void* handle);
+/* STRAYDOG_PREFILL_PHASES (development): print the phases of the prompt batches since the last report and begin the sums again (a served
+   worker is killed without destroying its devices, so its engine asks at the end of each prompt). Nothing without the variable. */
+int sd_phase_report(void* handle);
 /* Development only: synchronous host observations of prefill phases (0 input, 1 HC input, 2 attention output,
    3 attention residual, 4 second HC input, 5 MoE output, 6 final residual). Null disables the observer.
    The callback's rows are borrowed for this call; it returns zero on success and must not unwind. */

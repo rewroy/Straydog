@@ -4577,8 +4577,11 @@ impl Model {
         self.group.prompt_scan(new_tokens >= self.chunked_scan_from, new_tokens >= self.hc_fused_from)?;
         let output = self.prefill_read(tokens, position, plan, cancelled, progress);
         let cleared = self.group.prompt_scan(false, false);
+        // (STRAYDOG_PREFILL_PHASES: the prompt's phases, which a served worker would never print otherwise)
+        let reported = self.group.phase_report();
         let output = output?;
         cleared?;
+        reported?;
         Ok(output)
     }
 
