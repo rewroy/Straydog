@@ -1097,6 +1097,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     1717 / 1711 ms, 2,397 tokens 2081 / 2088 -> 1714 / 1703, 3,394 tokens 2393 / 2395 -> 2119 / 2131 (a third of the streamed
     experts left, 22,600-25,600 routes to the CPU). A narrower bus (a PCIe 4.0 x8 card) makes a streamed expert dearer, and the
     CPU's share larger.
+    A streamed expert's cost is learned only on layers whose streamed experts all go by DMA (a gathered layer's time is its gathers'
+    too), and one batch moves a learned cost by at most half or double: one prompt whose gathers met a cold drive no longer hands the
+    next batch to the CPU.
+  - A batch of 1,536 rows or more (`STRAYDOG_PREGATHER_ROWS`) gathers the next layer's experts ahead: when a layer has queued its
+    streamed chunks, a thread of the CPU's workers gathers the experts the next layer's slots and tier do not hold, those the last
+    batch through it routed to, into a page-locked mirror of their own, and that layer copies them from it by DMA. On by default on
+    Windows (`STRAYDOG_PREGATHER=0` turns it off), off elsewhere (`=1` turns it on): on an RTX 5070 Ti at 5.5 GiB (Qwen3.8 UD-IQ1_S) a
+    2,127-token continuation took 2.32 -> 2.00 s, 765 tokens the same; on an R9700 with 19 of 48 layers gathered, 2,127 tokens took
+    1.94 -> 2.13 s. The bytes the GEMMs read are the banks', so the same bits.
   - A long prompt can borrow expert-slot VRAM to widen its batches, up to 4096 rows. On one GPU
     the threshold is the smaller of 1536 new tokens and two original batches; the cache then
     gives way to the staging pool. With several GPUs the threshold is 65536 new tokens: each
@@ -1350,8 +1359,10 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 - `STRAYDOG_PREFILL_PHASES=1` (development; 2 also lists each stream phase over 4 ms) times a prompt read's layers on each device's stream with
   events between their phases (`gpu/phase_profile.hpp`: the hyperconnections' four steps, the DeltaNet layer's five, the attention's, the MoE layer's
   router, routing, the host's planning gap, the resident, prestaged and streamed GEMMs and the shared expert's, the wait for a streamed chunk and
-  for the CPU's routes), the stream's time since the last event added to a phase's name, and prints the sums per 4096-row batch with the experts
-  streamed over the bus when the device goes (the example does at its end). A wait of the host's shows as the phase queued after it
+  for the CPU's routes), the stream's time since the last event added to a phase's name, and prints the sums at the end of each prompt
+  (`sd_phase_report`: a served worker is killed and never destroys its devices, so it prints them as the example does) with the experts
+  streamed over the bus, the host's time a MoE layer (the wait for the expert counts, the read-ahead hints, the gathers, the CPU's routes,
+  the settle) and the experts gathered ahead with the host's wait for them. A wait of the host's shows as the phase queued after it
   (`gap_batch_start`, `gap_span_start`: the stream idle between two spans), so the idle time of a stage is its gaps and its waits. Two RTX 4090,
   IQ3_S, a 32K read before this work, the first device per batch of 4096 rows: attention 155 ms (6 layers), DeltaNet 150 (20 layers: projections
   48 + 20, scan 63, convolution, normalization and gate 19), the MoE layers' GEMMs 215 (resident gate/up 78 and down 48, the shared expert's gate
