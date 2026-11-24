@@ -889,6 +889,11 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     // (a pageable layer's tiered experts first: hybrid_stream_missing copies them by DMA and gathers only the chunks after them)
     if (!plan.mapped[0] && !plan.tier[0].empty())
         std::stable_partition(missing.begin(),missing.end(),[&](size_t expert) { return expert_tiered(plan,expert); });
+    // (then those the CPU's workers gathered ahead while the last layer ran, in the order they lie in their mirror: pregather_start)
+    if (const std::vector<int32_t>* ahead=plan.hybrid ? pregather_held(d,plan) : nullptr) {
+        auto rest=std::find_if(missing.begin(),missing.end(),[&](size_t expert) { return !expert_tiered(plan,expert); });
+        std::stable_partition(rest,missing.end(),[&](size_t expert) { return (*ahead)[expert]>=0; });
+    }
     std::vector<size_t> offsets{prestaged_end};
     for (size_t expert : missing) { add(expert); offsets.push_back(host_tiles.size()); }
     if (host_tiles.size()>max_tiles) throw std::runtime_error("inconsistent Straydog expert grouping");

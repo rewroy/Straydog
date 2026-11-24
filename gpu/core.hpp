@@ -956,6 +956,32 @@ struct Device {
         std::vector<int32_t> position;        // by expert: its position there, or -1
         hipEvent_t event=nullptr;
     } prestage;
+    // A wide prompt batch's next layer, gathered ahead (pregather_start, pregather_held): while a layer's streamed experts go over the bus and its
+    // GPU work and the next layer's dense work run, the CPU's workers gather the experts of the next layer that neither its slots nor the tier
+    // hold into a page-locked mirror of their own; that layer then copies them from it by DMA instead of gathering them.
+    struct Pregather {
+        const ResidentMoe* next = nullptr;      // the layer after the one whose MoE the span runs now (decoder_span)
+        size_t position = SIZE_MAX, rows = 0;   // the batch the span runs now: a gather ahead serves only the batch it was made in
+        const ResidentMoe* plan = nullptr;      // the layer the mirror holds experts of (null: none)
+        size_t made_position = SIZE_MAX, made_rows = 0;
+        std::vector<int32_t> place;             // per expert of `plan`: its slot in the mirror, or -1
+        uint8_t* mirror = nullptr;
+        size_t capacity = 0;                    // experts the mirror holds, at the staging slots' stride
+        hipEvent_t read = nullptr;              // after the last copy out of the mirror (the next gather into it waits for it)
+        bool read_pending = false;
+        std::unique_ptr<Background> worker;
+        // How many of the mirror's experts have landed (the worker gathers them in their order, a chunk at a time): a layer copies a chunk as
+        // soon as it is there, as a gathered chunk goes over while the next is gathered; `failed` ends every wait (the worker's wait rethrows).
+        std::atomic<size_t> ready{0};
+        std::atomic<bool> failed{false};
+        std::mutex lock;
+        std::condition_variable landed;
+        // (off unless STRAYDOG_PREGATHER=1: on Linux, an R9700 at --vram 5.5 with 19 of 48 layers gathered, a 765-token continuation took
+        // 1.84-2.11 s with it against 1.47 s without, the same logits: 23% of the experts gathered ahead were not routed, and the chunks' own
+        // gathers there already go over beside the copies)
+        bool disabled = !(std::getenv("STRAYDOG_PREGATHER") && std::getenv("STRAYDOG_PREGATHER")[0] == '1');
+        uint64_t gathered = 0, used = 0;        // experts gathered ahead, and of them those a layer then took
+    } pregather;
     hipStream_t copy_stream=nullptr;
     void* cpu=nullptr;
     float* exchange=nullptr;      // pinned host: selected, probabilities, activation, CPU result
@@ -1028,6 +1054,7 @@ struct Device {
     uint64_t phase_routes[4] = {0, 0, 0, 0};   // routes of the resident, prestaged, streamed experts and the CPU's
     explicit Device(int value) : ordinal(value) {}
     ~Device() {
+        pregather.worker.reset();   // (its job reads a plan's banks and writes into the mirror: done before either goes)
         abort_flag_release(abort_flag);
         if (phase_on) phase_report(*this);
         cleanup(hipSetDevice(ordinal));
@@ -1058,6 +1085,8 @@ struct Device {
         if (slots.base) cleanup(hipFree(slots.base));
         if (slots.host) cleanup(hipHostFree(slots.host));
         if (prestage.event) cleanup(hipEventDestroy(prestage.event));
+        if (pregather.mirror) cleanup(hipHostFree(pregather.mirror));
+        if (pregather.read) cleanup(hipEventDestroy(pregather.read));
         if (counts_event) cleanup(hipEventDestroy(counts_event));
         for (hipEvent_t& event : layer_bank_free) if (event) cleanup(hipEventDestroy(event));
         if (layer_bank_loaded) cleanup(hipEventDestroy(layer_bank_loaded));

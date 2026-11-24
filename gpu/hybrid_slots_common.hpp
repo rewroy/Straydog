@@ -28,6 +28,9 @@ void hybrid_gather(Device& d, const ResidentMoe& plan, const size_t* experts, si
                    const uint8_t* const* bank_sources = nullptr);
 void hybrid_point_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count, const uint8_t* base,
                           uint8_t* const* regions = nullptr);
+const std::vector<int32_t>* pregather_held(Device& d, const ResidentMoe& plan);
+void pregather_wait(Device& d, size_t through);
+void pregather_start(Device& d);
 void hybrid_observe_batch(ResidentMoe& plan, const unsigned* counts, size_t tokens, const int32_t* tail, size_t tail_tokens);
 // The deferred observations of a layer-order pass's chunks (Device::deferred): those whose copies have landed, oldest first, or with `all`
 // every one, each waited for.
@@ -124,7 +127,7 @@ struct CopyBatch {
 // stream, before they are waited for. The GPU's time from the first copy to the last expert's GEMMs, in ns (0 with none missing).
 template<class Compute, class Meanwhile>
 uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<size_t>& missing, Compute&& compute, Meanwhile&& meanwhile) {
-    if (missing.empty()) { meanwhile(); return 0; }
+    if (missing.empty()) { meanwhile(); pregather_start(d); return 0; }
     if (d.copier) d.copier->wait();   // the copy stream and read-ahead state are this thread's again
     struct Span {
         hipEvent_t began = nullptr, ended = nullptr;
@@ -163,6 +166,9 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     // the caller puts the tiered ones first)
     const bool gather_layer = d.slots.host && d.cpu && !plan.mapped[0];
     const std::vector<size_t>& order = missing;
+    // (the experts the CPU's workers gathered ahead for this layer, while the last one ran: pregather_start; the caller put them after the tiered)
+    const std::vector<int32_t>* ahead = pregather_held(d, plan);
+    bool ahead_read = false;
     uint64_t gathered_ns = 0;
     StreamEvents events;
     std::vector<uint8_t*> targets;
@@ -175,6 +181,10 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
             gather = false;
             for (size_t i = 0; i < count && !gather; ++i) gather = !expert_tiered(plan, order[first + i]);
         }
+        // A chunk of experts all gathered ahead copies from that mirror, a run of consecutive ones at a time, as a gathered chunk's mirror does.
+        bool from_ahead = ahead != nullptr;
+        for (size_t i = 0; i < count && from_ahead; ++i) from_ahead = (*ahead)[order[first + i]] >= 0;
+        if (from_ahead) gather = false;
         uint8_t* host = gather ? d.slots.host + buffer * half * d.slots.bytes : nullptr;
         if (gather) {
             // The DMA two chunks back read this mirror (its `loaded` event follows it on the copy stream).
@@ -189,7 +199,20 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         // Straight from the banks, a chunk's matrices land role by role, so a run of consecutive experts is one copy a role: three copies
         // an expert, each a third of a megabyte, kept the bus at 19 GB/s (22 so) on a Radeon AI PRO R9700.
         uint8_t* regions[3] = {base, base + half * plan.host_bytes[0], base + half * (plan.host_bytes[0] + plan.host_bytes[1])};
-        if (gather) {
+        if (from_ahead) {
+            // (the chunk's last expert lies furthest in the mirror: the worker gathers in that order)
+            pregather_wait(d, size_t((*ahead)[order[first + count - 1]]) + 1);
+            for (size_t i = 0; i < count;) {
+                const int32_t at = (*ahead)[order[first + i]];
+                size_t j = i + 1;
+                while (j < count && (*ahead)[order[first + j]] == at + int32_t(j - i)) ++j;
+                check(hipMemcpyAsync(base + i * d.slots.bytes, d.pregather.mirror + size_t(at) * d.slots.bytes, (j - i) * d.slots.bytes,
+                                     hipMemcpyHostToDevice, d.copy_stream));
+                i = j;
+            }
+            ahead_read = true;
+            d.pregather.used += count;
+        } else if (gather) {
             // The mirror holds the chunk's experts at the staging buffer's own stride: one copy takes them all (the slots' padding past each
             // expert's bytes is the mirror's, zeroed when it was made). A copy an expert asked the host for one call each of a layer's ~130
             // gathered experts, where each call costs the host tens of microseconds on Windows.
@@ -207,7 +230,7 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         check(hipEventRecord(events.loaded[buffer], d.copy_stream));
         check(hipStreamWaitEvent(d.stream, events.loaded[buffer], 0));
         phase(d, "moe_stream_wait");
-        hybrid_point_experts(d, plan, order.data() + first, count, base, gather ? nullptr : regions);
+        hybrid_point_experts(d, plan, order.data() + first, count, base, gather || from_ahead ? nullptr : regions);
         compute(first, count);
         phase(d, "moe_stream_gemm");
         if (fail_streamed_chunk.load() && fail_streamed_chunk.fetch_sub(1) == 1) throw std::runtime_error("Straydog test: a streamed chunk fails");
@@ -215,7 +238,13 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
         d.streamed_experts += count;
     }
     check(hipEventRecord(span.ended, d.stream));
+    if (ahead) {
+        // (the next gather ahead into the mirror waits for these copies)
+        if (ahead_read) { check(hipEventRecord(d.pregather.read, d.copy_stream)); d.pregather.read_pending = true; }
+        d.pregather.plan = nullptr;
+    }
     meanwhile();
+    pregather_start(d);
     const auto settling = std::chrono::steady_clock::now();
     streamed.settle();
     if (d.phase_on) {

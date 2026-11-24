@@ -32,6 +32,8 @@ void phase_report(Device& d) {
         std::fprintf(stderr, "PHASES   host a MoE layer (%llu): counts wait %.2f ms, hints %.2f ms, gather %.2f ms, settle %.2f ms\n",
                      (unsigned long long)d.phase_host_layers, double(d.phase_host_counts_ns) / 1e6 / layers, double(d.phase_host_hints_ns) / 1e6 / layers,
                      double(d.phase_host_gather_ns) / 1e6 / layers, double(d.phase_host_settle_ns) / 1e6 / layers);
+        std::fprintf(stderr, "PHASES   experts gathered ahead %llu, used %llu (pregather)\n", (unsigned long long)d.pregather.gathered,
+                     (unsigned long long)d.pregather.used);
     } catch (...) {}
 }
 // The report of the prompt batches since the last, and the sums begun again: a served worker is killed and never destroys its devices, so
