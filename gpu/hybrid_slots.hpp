@@ -648,7 +648,7 @@ void pregather_start(Device& d) {
     if (pg.worker) pg.worker->wait();   // (the last gather ahead may still be landing: the mirror is written again below)
     const ResidentMoe* next = pg.next;
     if (pg.disabled || !next || !next->hybrid || next->layer_prefill || next->host_copy || !d.slots.host || !d.cpu || next->mapped[0] ||
-        pg.rows * 10 < 4 * next->experts || !d.slots.bytes)
+        pg.rows * 10 < 4 * next->experts || pg.rows < pg.min_rows || !d.slots.bytes)
         return;
     std::vector<size_t> experts;
     // (those the last batch through that layer routed to, where there was one: a request's next batch reads the text that followed)

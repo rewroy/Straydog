@@ -981,6 +981,10 @@ struct Device {
         // 1.84-2.11 s with it against 1.47 s without, the same logits: 23% of the experts gathered ahead were not routed, and the chunks' own
         // gathers there already go over beside the copies)
         bool disabled = !(std::getenv("STRAYDOG_PREGATHER") && std::getenv("STRAYDOG_PREGATHER")[0] == '1');
+        // Only a batch of this many rows or more (STRAYDOG_PREGATHER_ROWS): the gather ahead goes over beside the GPU's layer only where that
+        // layer takes as long as the gather. An RTX 5070 Ti at --vram 5.5 (UD-IQ1_S), served continuations: 765 tokens 2,560 -> 3,069 ms with
+        // it, 2,127 tokens 2,297 -> 2,098 ms.
+        size_t min_rows = std::getenv("STRAYDOG_PREGATHER_ROWS") ? size_t(std::strtoull(std::getenv("STRAYDOG_PREGATHER_ROWS"), nullptr, 10)) : 1536;
         uint64_t gathered = 0, used = 0;        // experts gathered ahead, and of them those a layer then took
     } pregather;
     hipStream_t copy_stream=nullptr;
