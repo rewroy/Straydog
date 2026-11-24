@@ -816,23 +816,20 @@ impl Plan {
         error
     }
 
+    /// (Windows: the startup budgets, which only Windows lowers below the caps given)
+    #[cfg(windows)]
     pub(crate) fn startup_vram_reduced(&self) -> bool {
-        #[cfg(windows)]
-        return self.original_vram_caps.as_ref().is_some_and(|caps| caps.iter().zip(&self.budgets).any(|(given, actual)| actual < given));
-        #[cfg(not(windows))]
-        false
+        self.original_vram_caps.as_ref().is_some_and(|caps| caps.iter().zip(&self.budgets).any(|(given, actual)| actual < given))
     }
 
+    #[cfg(windows)]
     pub(crate) fn report_startup_vram(&self, actual: &[(usize, u64)]) -> Result<(), String> {
-        #[cfg(windows)]
         if let Some(caps) = self.original_vram_caps.as_deref() {
             validate_vram_caps(Some(caps), actual.len())?;
             for (index, &(ordinal, budget)) in actual.iter().enumerate() {
                 if let Some(line) = explicit_startup_line(ordinal, caps[index], budget) { eprintln!("{line}"); }
             }
         }
-        #[cfg(not(windows))]
-        let _ = actual;
         Ok(())
     }
 }
