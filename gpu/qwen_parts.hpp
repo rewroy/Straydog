@@ -481,6 +481,15 @@ void prefill_layer_part(Device& d, size_t layer, size_t position, size_t steps, 
         std::max({(steps + 1) / 2 * hc_batch_floats, steps * gdn_batch_floats_of<2>(), steps * qsa_batch_floats_of<2>()}) > workspace->second / 4)
         throw std::runtime_error("prefill batch exceeds the resident expert workspace");
     const bool linear = decoder_linear(layer);
+    // (STRAYDOG_PREFILL_PHASES: a batch begins at this device's first layer, as prefill_span counts them; each layer is its own call here)
+    if (d.phase_on) {
+        d.phase_mtp = layer == 48;
+        if (d.phase_first == size_t(-1)) { d.phase_first = 48; for (const auto& entry : d.decoder) d.phase_first = std::min(d.phase_first, entry.first); }
+        const bool start = layer == d.phase_first;
+        if (start) ++d.phase_batches;
+        ++d.phase_layers;
+        phase(d, start ? "gap_batch_start" : "gap_layer_start");
+    }
     const BatchRows own = batch_rows(steps, plan.part), other = batch_rows(steps, 1 - plan.part);
     // (with FP16 projections, each scatter's residual update normalizes the rows for the HyperConnection after it)
     const bool fold = batch_half(d, own.count);
