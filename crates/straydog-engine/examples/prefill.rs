@@ -131,7 +131,7 @@ fn main() -> Result<(), String> {
     if let Some(note) = &model.placement_note {
         eprintln!("placement: {note}");
     }
-    eprintln!("wide batch {} rows from {} new tokens{}", model.wide_batch_size, straydog_engine::model::WIDE_READ_TOKENS,
+    eprintln!("wide batch {} rows from {} new tokens{}", model.wide_batch_size, straydog_engine::model::wide_read_tokens(),
               model.wide_note.as_deref().map_or_else(String::new, |note| format!(" ({note})")));
     for (index, device) in model.info()?["devices"].as_array().into_iter().flatten().enumerate() {
         let (used, budget) = (device["allocated_bytes"].as_u64().unwrap_or(0), device["budget_bytes"].as_u64().unwrap_or(0));

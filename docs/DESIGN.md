@@ -1709,7 +1709,7 @@ layer (§6.2).
   takes `DERIVED_BATCH` (0) as the batch to derive and narrow, any other as asked, which is tried at
   its rows with the K/V in VRAM, then in host memory at the rows halved to 1024 (as before 4096 was the
   default; the `one-gpu-partial` golden's 4096 on a 24 GiB card stays 4096).
-- **A long read's wider batches.** A read of `WIDE_READ_TOKENS` (16384) new tokens or more is read in batches of up to
+- **A long read's wider batches.** A read of `WIDE_READ_TOKENS` (8192; `STRAYDOG_PREFILL_WIDE_FROM`) new tokens or more is read in batches of up to
   `Model::wide_batch_size` rows when the batch was derived, the layers are in parts (§8 above) and the VRAM left holds the
   workspaces of more (`wide_placement`; the ready line says the rows, or what they lack, and the request line the batches it
   ran in; `STRAYDOG_PREFILL_WIDE=off` or N rows). What a batch pays once, whatever its rows, is the FP16 expansion of every

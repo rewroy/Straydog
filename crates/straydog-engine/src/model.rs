@@ -4597,7 +4597,7 @@ impl Model {
         }
         // A long read's batches are as wide as the workspaces were made (the batch asked for is the default's: a short read, an image, the warm-up
         // pass and a batch given are not widened).
-        if self.wide_batch_size > batch && tokens.len() - position >= WIDE_READ_TOKENS && self.images.is_empty() && self.warm_stop.is_none() {
+        if self.wide_batch_size > batch && tokens.len() - position >= wide_read_tokens() && self.images.is_empty() && self.warm_stop.is_none() {
             batch = self.wide_batch_size;
         }
         // (a batch that rests narrow widens as soon as a read takes more than one of it, besides the last token's own: putting the slots back
@@ -7021,8 +7021,15 @@ fn partial_pair(cuda: bool, devices: usize, budget: u64) -> bool {
 /// MoE's gather fork run beside the device's own work (qwen_parts.hpp: halves of 4096 do), and 8192 read 240K tokens in 38.40/38.43 s against
 /// 38.94/39.41, 120K 18.48/18.50 against 18.83/19.02, 60K 9.21/9.23 against 9.41/9.52, 20K 4.28/4.31 against 4.35/4.34 (UD-IQ1_M, 11-24).
 const WIDE_ROWS: [usize; 1] = [8192];
-/// The new tokens a read has from which its batches are the wide ones: two wide batches (a 20K read in 3.78 s against 3.81 at 4096 rows).
-pub const WIDE_READ_TOKENS: usize = 16_384;
+/// The new tokens a read has from which its batches are the wide ones: one wide batch. At 16384 (two of 12288's) the reads below it kept
+/// 4096-row batches, whose halves of 2048 rows let no exchange run beside the work; from 8192 (UD-IQ1_M on two R9700, two runs each)
+/// 8,192 tokens 2.66/2.58 -> 2.56/2.52 s, 10,000 1.83/1.84 -> 1.80/1.81, 12,000 2.15/2.16 -> 2.14/2.14, 14,000 2.52/2.54 -> 2.47/2.48.
+pub const WIDE_READ_TOKENS: usize = 8_192;
+/// [`WIDE_READ_TOKENS`], or STRAYDOG_PREFILL_WIDE_FROM (development) in its place.
+pub fn wide_read_tokens() -> usize {
+    static TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TOKENS.get_or_init(|| std::env::var("STRAYDOG_PREFILL_WIDE_FROM").ok().and_then(|value| value.parse().ok()).unwrap_or(WIDE_READ_TOKENS))
+}
 /// [`Settings::prefill_batch_size`] when the batch is not given: derived from the GPU budgets.
 pub const DERIVED_BATCH: usize = 0;
 
