@@ -266,11 +266,15 @@ fn host_name(authority: &str) -> &str {
     authority.split(':').next().unwrap_or(authority)
 }
 
-/// A name of this machine or its local network: `localhost` and names under it, a `.local` name (mDNS), `[::1]`, and an IPv4 address that is
-/// loopback, private or link-local. A public name never is, whatever address it is made to lead to.
+/// A name of this machine or its local network: `localhost` and names under it, a `.local` name (mDNS), a machine's own name with no dot (as
+/// another machine of the network opens it, `http://homelab:8080`), `[::1]`, and an IPv4 address that is loopback, private or link-local. A public
+/// name never is, whatever address it is made to lead to: a name a site can lead here is a domain, with a dot in it.
 fn local_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local") || name == "[::1]" {
+        return true;
+    }
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !name.chars().all(|c| c.is_ascii_digit()) {
         return true;
     }
     name.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback() || ip.is_private() || ip.is_link_local())
@@ -471,18 +475,18 @@ mod tests {
             }
             map
         };
-        for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "192.168.0.100:8080", "doggybox.local", "172.17.0.1:8080"] {
+        for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "192.168.0.100:8080", "doggybox.local", "172.17.0.1:8080", "homelab:8080", "DESKTOP-A1B2:18581"] {
             assert_eq!(foreign_request(&headers(&[("host", host)]), false), None, "{host}");
         }
         assert_eq!(foreign_request(&headers(&[]), false), None, "no host at all (HTTP/1.0)");
         for origin in ["http://localhost:3000", "http://127.0.0.1:8080", "http://[::1]:5173", "http://app.localhost", "http://doggybox.local",
-                       "http://192.168.0.100", "http://10.0.0.7:8080", "http://169.254.1.1"] {
+                       "http://192.168.0.100", "http://10.0.0.7:8080", "http://169.254.1.1", "http://homelab:3000"] {
             assert_eq!(foreign_request(&headers(&[("host", "doggybox.local"), ("origin", origin)]), false), None, "{origin}");
         }
         for origin in ["https://evil.example", "null", "http://localhost.evil.example", "http://8.8.8.8"] {
             assert!(foreign_request(&headers(&[("host", "127.0.0.1:8080"), ("origin", origin)]), false).is_some(), "{origin}");
         }
-        for host in ["rebound.example:8080", "8.8.8.8", "localhost.evil.example"] {
+        for host in ["rebound.example:8080", "8.8.8.8", "localhost.evil.example", "2130706433:8080"] {
             assert!(foreign_request(&headers(&[("host", host)]), false).is_some(), "{host}: a rebound name, with no Origin on a GET");
         }
         assert_eq!(foreign_request(&headers(&[("host", "rebound.example:8080"), ("origin", "https://evil.example")]), true), None, "with a key");
