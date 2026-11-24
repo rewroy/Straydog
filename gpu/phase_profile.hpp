@@ -29,9 +29,9 @@ void phase_report(Device& d) {
                      (unsigned long long)d.phase_prestage_issued, (unsigned long long)d.phase_prestage_used, double(d.phase_bus_bytes) / 1e9,
                      double(d.phase_bus_bytes) / 1e9 / batches, (unsigned long long)d.phase_cpu_routes);
         const double layers = double(std::max<uint64_t>(d.phase_host_layers, 1));
-        std::fprintf(stderr, "PHASES   host a MoE layer (%llu): counts wait %.2f ms, hints %.2f ms, gather %.2f ms, settle %.2f ms\n",
+        std::fprintf(stderr, "PHASES   host a MoE layer (%llu): counts wait %.2f ms, hints %.2f ms, gather %.2f ms, CPU routes %.2f ms, settle %.2f ms\n",
                      (unsigned long long)d.phase_host_layers, double(d.phase_host_counts_ns) / 1e6 / layers, double(d.phase_host_hints_ns) / 1e6 / layers,
-                     double(d.phase_host_gather_ns) / 1e6 / layers, double(d.phase_host_settle_ns) / 1e6 / layers);
+                     double(d.phase_host_gather_ns) / 1e6 / layers, double(d.phase_host_cpu_ns) / 1e6 / layers, double(d.phase_host_settle_ns) / 1e6 / layers);
         std::fprintf(stderr, "PHASES   experts gathered ahead %llu, used %llu (pregather)\n", (unsigned long long)d.pregather.gathered,
                      (unsigned long long)d.pregather.used);
     } catch (...) {}
@@ -43,7 +43,8 @@ void phase_report_since(Device& d) {
     d.phase_totals.clear();
     d.phase_batches = d.phase_layers = d.phase_prestage_issued = d.phase_prestage_used = d.phase_streamed = d.phase_bus_bytes = 0;
     d.phase_cpu_routes = d.phase_missing_layers = 0;
-    d.phase_host_counts_ns = d.phase_host_hints_ns = d.phase_host_gather_ns = d.phase_host_settle_ns = d.phase_host_layers = 0;
+    d.phase_host_counts_ns = d.phase_host_hints_ns = d.phase_host_gather_ns = d.phase_host_settle_ns = d.phase_host_cpu_ns = d.phase_host_layers = 0;
     std::fill(std::begin(d.phase_routes), std::end(d.phase_routes), uint64_t(0));
+    d.pregather.gathered = d.pregather.used = 0;
     d.phase_broken = true;
 }

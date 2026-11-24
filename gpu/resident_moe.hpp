@@ -988,6 +988,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
             throw std::runtime_error(std::string("Straydog CPU experts: ")+sd_cpu_error());
         const auto done=std::chrono::steady_clock::now();
         cpu_ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(done-began).count());
+        if (d.phase_on) d.phase_host_cpu_ns+=cpu_ns;
         compute_ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(done-computing).count());
         d.prompt_cpu_routes+=n;
         // (the gate/up scratch and the product after it: routes*1920 floats, a staged row and its route each)
