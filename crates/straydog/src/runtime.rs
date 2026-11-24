@@ -1413,7 +1413,7 @@ impl Driver {
             if bytes == 0 {
                 return Ok(Err(header["reason"].as_str().unwrap_or("it holds none").to_string()));
             }
-            let held = header["tokens"].as_array().map_or(0, Vec::len);
+            let held = held_tokens(&header);
             let state = tokio::time::timeout(Duration::from_secs(120), process.read_body(bytes)).await
                 .map_err(|_| "Straydog's worker did not finish the conversation state within 120 s".to_string())??;
             Ok(Ok((state, held)))
@@ -1959,6 +1959,11 @@ fn replaces_kept(held: usize, unclaimed: usize) -> bool {
     held >= unclaimed
 }
 
+/// The tokens of the conversation a worker's `conversation_state` header gives (a count: Qwen3.8's and DeepSeek-V4.1's workers both send one).
+fn held_tokens(header: &Value) -> usize {
+    header["tokens"].as_u64().map_or(0, |tokens| tokens as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1970,6 +1975,10 @@ mod tests {
         assert!(!replaces_kept(5924, 61_004), "a warm-up's system prompt after a start leaves the conversation the run never touched");
         assert!(replaces_kept(70_000, 61_004), "a longer conversation of this run is the latest");
         assert!(replaces_kept(61_004, 61_004));
+        // (as a worker sends it: the count of the tokens)
+        let header = json!({"id": "kept-state", "event": "conversation_state", "tokens": 1360, "digest": "ab", "bytes": 9 << 20});
+        assert_eq!(held_tokens(&header), 1360);
+        assert!(!replaces_kept(held_tokens(&header), 2560));
     }
 
     /// Decides: the log line of a worker that stopped carries its last stderr lines (Rust's "memory allocation of N bytes failed" among
