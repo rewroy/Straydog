@@ -1722,7 +1722,12 @@ layer (§6.2).
   of the layer once, so a width between two chunks gains nothing and costs the experts' second read over fewer rows: two
   R9700s, `--vram 30`, a fresh 242K read, 50.0 s at 4096 rows, 50.97 s at 5120 (2 x 2560), 50.05 s at 6144 (2 x 3072),
   49.1 s at 8192 (2 x 4096; 48.9 after a pause, three reads in a row 50.5, 49.12, 49.13), 95K 18.4 and 18.1 s (4096, 8192),
-  32K 6.0 s at 8192 once its staging is pinned. Widths are therefore the multiples of 4096: 12288 and 8192.
+  32K 6.0 s at 8192 once its staging is pinned. Widths are therefore the multiples of 4096, and the width is 8192, not 12288: a
+  batch's halves of 4096 rows let each device send its rows beside its own work (a DeltaNet layer's projections of its rows, the
+  MoE's chunks of its rows: `qwen_gather_fork`), halves of 6144 let neither, and every exchange kernel of a 12288-row read sat on
+  the stream alone (a 32K trace: ~1.0 s a device of 6.65). UD-IQ1_M, the prefill example, two runs each, 12288 against 8192 rows:
+  240K 38.94/39.41 against 38.40/38.43 s, 120K 18.83/19.02 against 18.48/18.50, 60K 9.41/9.52 against 9.21/9.23, 20K 4.35/4.34
+  against 4.28/4.31; chunks of 3072 laid on a 12288 batch's halves gave the fork but no gain (39.29/39.38 s).
   What a row of a batch cost in VRAM on each device was 350908 bytes: the experts' workspace 197208 (49302 floats), the decoder's
   61456, the MTP rows 40960 and embeddings 10240, the sums' inbox 20480 (two slots of a row's 2560 floats) and the peer link's
   20564 (inputs, partials and routes), 1.34 GiB at 4096 rows and 2.68 at 8192. Beside the weights, with the drafter and K/V in

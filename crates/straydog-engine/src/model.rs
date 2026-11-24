@@ -7017,8 +7017,10 @@ fn partial_pair(cuda: bool, devices: usize, budget: u64) -> bool {
 /// The rows a long read's batches may be, widest first, where the workspaces hold them (`wide_placement`).
 /// A multiple of the experts' chunk (4096 rows, `MOE_CHUNK_ROWS`): between two, the experts of a batch are read from VRAM in two chunks that are each
 /// narrower than 4096 and the batch pays them over more rows (two R9700s, `--vram 30`, a fresh 242K read: 50.0 s at 4096 rows, 5120 rows (2 x 2560)
-/// 51.0 s, 6144 (2 x 3072) 50.05 s, 8192 (2 x 4096) 49.1 s).
-const WIDE_ROWS: [usize; 2] = [12288, 8192];
+/// 51.0 s, 6144 (2 x 3072) 50.05 s, 8192 (2 x 4096) 49.1 s). Not 12288: its halves of 6144 rows let neither the DeltaNet layers' sends nor the
+/// MoE's gather fork run beside the device's own work (qwen_parts.hpp: halves of 4096 do), and 8192 read 240K tokens in 38.40/38.43 s against
+/// 38.94/39.41, 120K 18.48/18.50 against 18.83/19.02, 60K 9.21/9.23 against 9.41/9.52, 20K 4.28/4.31 against 4.35/4.34 (UD-IQ1_M, 11-24).
+const WIDE_ROWS: [usize; 1] = [8192];
 /// The new tokens a read has from which its batches are the wide ones: two wide batches (a 20K read in 3.78 s against 3.81 at 4096 rows).
 pub const WIDE_READ_TOKENS: usize = 16_384;
 /// [`Settings::prefill_batch_size`] when the batch is not given: derived from the GPU budgets.
