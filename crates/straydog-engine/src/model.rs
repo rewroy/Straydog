@@ -2887,7 +2887,8 @@ impl Model {
         // What the start planned and why it planned no more, for a log that says where the CPU's experts are read from.
         let gib = |bytes: u64| if bytes == u64::MAX { "no bound".to_string() } else { format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64) };
         let planned = layers.iter().map(|layer| sizes[*layer]).sum::<u64>();
-        let free = crate::host::left_free(self.weights.host_memory_bytes);
+        // (what the plan kept free: host::lockable heeds STRAYDOG_KEEP_FREE)
+        let free = crate::host::lock_kept_free(self.weights.host_memory_bytes);
         // (on Windows the commit, which locked memory and VRAM are charged to 1 to 1, can bind before the physical memory does)
         let commit = crate::host::commit_left();
         let why = if layers.len() == 48 {
