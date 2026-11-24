@@ -1549,7 +1549,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "straydog"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "axum",
  "clap",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "straydog-api"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "axum",
  "futures",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "straydog-engine"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "getrandom 0.3.4",
  "image",
@@ -1614,11 +1614,11 @@ dependencies = [
 
 [[package]]
 name = "straydog-gguf"
-version = "0.1.15"
+version = "0.1.16"
 
 [[package]]
 name = "straydog-gpu"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "straydog-isolation"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "straydog-provision"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "memmap2",
  "serde_json",
