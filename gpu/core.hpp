@@ -313,6 +313,46 @@ private:
     bool stop_ = false;
     std::thread thread_;   // last: starts after the members it uses
 };
+#elif defined(_WIN32)
+// Read-ahead hints off the compute thread, as on Linux: PrefetchVirtualMemory walks the pages of every range it is given, those in
+// memory too, and the thread that asks waits for it (a 765-token continuation of Qwen3.8 UD-IQ1_S on an RTX 5070 Ti at --vram 5.5:
+// 24-29 ms a layer, 1.2-1.4 s a prompt, asked by the thread that then gathers the layer). Here no layer waits for it: a cold expert is
+// still asked for in large concurrent reads, ahead of the gather's page faults. What is queued while a call runs goes in the next one.
+class ReadAhead {
+public:
+    ReadAhead() : thread_([this]() { run(); }) {}
+    ~ReadAhead() {
+        { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; }
+        wake_.notify_one();
+        thread_.join();
+    }
+    void add(const std::vector<std::pair<const uint8_t*, size_t>>& ranges) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& range : ranges) queued_.push_back({const_cast<uint8_t*>(range.first), range.second});
+        }
+        wake_.notify_one();
+    }
+private:
+    void run() {
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true) {
+            wake_.wait(lock, [this]() { return stop_ || !queued_.empty(); });
+            if (stop_) return;
+            entries.clear();
+            entries.swap(queued_);
+            lock.unlock();
+            PrefetchVirtualMemory(GetCurrentProcess(), ULONG_PTR(entries.size()), entries.data(), 0);
+            lock.lock();
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> queued_;
+    bool stop_ = false;
+    std::thread thread_;   // last: starts after the members it uses
+};
 #endif
 // Fixed-size device slots holding one routed expert's gate, up and down slices.
 struct ExpertCacheChunk {
@@ -963,7 +1003,7 @@ struct Device {
     std::unique_ptr<Background> copier;   // issues bounded swaps' copies (hybrid_rebalance)
     std::unique_ptr<Background> bank_loader;   // gathers and copies a layer-order pass's bank loaded ahead (load_prefill_bank)
     std::shared_ptr<struct Transfers> transfers;   // asynchronous uploads (transfer.hpp), from the first use
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     std::unique_ptr<ReadAhead> read_ahead;   // started by the first expert read-ahead hint
 #endif
     // STRAYDOG_PREFILL_PHASES (development): events between a prompt batch's phases, summed by name (phase_profile.hpp), printed when the device goes

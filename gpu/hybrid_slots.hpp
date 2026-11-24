@@ -55,8 +55,8 @@ size_t expert_slot_bytes(const ResidentMoe& plan) {
 // Ask the OS to read these experts' host bank slices now, as concurrent large reads. Cold mapped
 // weights otherwise arrive one page fault at a time in whichever copy or CPU thread touches them
 // first (~1 GB/s from an NVMe that reads 5 GB/s in parallel). The hint itself costs a system call
-// even for resident pages, so an expert hinted within the last 30 s is skipped. Linux hints on the
-// device's read-ahead thread (see ReadAhead). A hint only: it never changes results.
+// even for resident pages, so an expert hinted within the last 30 s is skipped, and the hints go
+// on the device's read-ahead thread (see ReadAhead). A hint only: it never changes results.
 void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count) {
     // A layer held as page-locked copies (sd_hybrid_repoint) no longer reads the mapping: there is nothing to ask the OS for.
     if (plan.host_copy) return;
@@ -65,8 +65,8 @@ void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_
     if (plan.prefetched.size() != plan.experts) plan.prefetched.assign(plan.experts, {});
     std::vector<std::pair<const uint8_t*, size_t>> ranges;
     for (size_t i = 0; i < count; ++i) {
-        // (a tiered expert is read from the engine's page-locked copy, never the mapping: Windows' PrefetchVirtualMemory, which the host
-        // waits for, would only walk pages that cannot leave memory)
+        // (a tiered expert is read from the engine's page-locked copy, never the mapping: a hint would only walk pages that cannot leave
+        // memory)
         if (expert_tiered(plan, experts[i])) continue;
         auto& last = plan.prefetched[experts[i]];
         if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(30)) continue;
@@ -76,13 +76,7 @@ void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_
     }
     if (ranges.empty()) return;
 #endif
-#if defined(_WIN32)
-    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-    entries.reserve(ranges.size());
-    for (const auto& range : ranges) entries.push_back({const_cast<uint8_t*>(range.first), range.second});
-    PrefetchVirtualMemory(GetCurrentProcess(), entries.size(), entries.data(), 0);
-    (void)d;
-#elif defined(__linux__)
+#if defined(_WIN32) || defined(__linux__)
     if (!d.read_ahead) d.read_ahead = std::make_unique<ReadAhead>();
     d.read_ahead->add(ranges);
 #else
