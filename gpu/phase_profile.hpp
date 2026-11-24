@@ -26,5 +26,9 @@ void phase_report(Device& d) {
                      double(d.phase_streamed) / double(std::max<uint64_t>(d.phase_layers, 1)),
                      (unsigned long long)d.phase_prestage_issued, (unsigned long long)d.phase_prestage_used, double(d.phase_bus_bytes) / 1e9,
                      double(d.phase_bus_bytes) / 1e9 / batches, (unsigned long long)d.phase_cpu_routes);
+        const double layers = double(std::max<uint64_t>(d.phase_host_layers, 1));
+        std::fprintf(stderr, "PHASES   host a MoE layer (%llu): counts wait %.2f ms, hints %.2f ms, gather %.2f ms, settle %.2f ms\n",
+                     (unsigned long long)d.phase_host_layers, double(d.phase_host_counts_ns) / 1e6 / layers, double(d.phase_host_hints_ns) / 1e6 / layers,
+                     double(d.phase_host_gather_ns) / 1e6 / layers, double(d.phase_host_settle_ns) / 1e6 / layers);
     } catch (...) {}
 }

@@ -796,7 +796,12 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     // (observations deferred before this one go first, in order)
     if (!d.deferred.empty()) observe_deferred(d,true);
     std::vector<unsigned> host_counts(groups_count);
+    const auto counts_asked=std::chrono::steady_clock::now();
     read_back(host_counts.data(),counts,groups_count*4);
+    if (d.phase_on) {
+        d.phase_host_counts_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-counts_asked).count());
+        ++d.phase_host_layers;
+    }
     const size_t tail=plan.hybrid ? std::min(steps,hybrid_prompt_tail) : 0;
     std::vector<int32_t> host_tail(tail*10);
     if (tail) read_back(host_tail.data(),selected+(steps-tail)*10,tail*10*4);

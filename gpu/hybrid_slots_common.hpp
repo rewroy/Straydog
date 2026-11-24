@@ -151,7 +151,9 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     } streamed{d, plan, missing};
     check(hipEventCreate(&span.began)); check(hipEventCreate(&span.ended));
     check(hipEventRecord(span.began, d.copy_stream));
+    const auto hinting = std::chrono::steady_clock::now();
     prefetch_experts(d, plan, missing.data(), missing.size());
+    if (d.phase_on) d.phase_host_hints_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - hinting).count());
     const size_t half = std::min(d.slots.chunk / 2, hybrid_point_limit);
     // Pageable banks: the CPU workers gather each chunk into the page-locked mirror while the GPU
     // computes the previous one, so cold pages fault in concurrently instead of one copy at a time
@@ -214,7 +216,12 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     }
     check(hipEventRecord(span.ended, d.stream));
     meanwhile();
+    const auto settling = std::chrono::steady_clock::now();
     streamed.settle();
+    if (d.phase_on) {
+        d.phase_host_settle_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - settling).count());
+        d.phase_host_gather_ns += gathered_ns;
+    }
     float ms = 0;
     check(hipEventElapsedTime(&ms, span.began, span.ended));
     // (what a gathered expert cost the CPU's workers: prompt_cpu_share weighs a route against it)
