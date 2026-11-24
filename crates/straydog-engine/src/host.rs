@@ -594,9 +594,11 @@ const COMMIT_AFTER_LOCKS: u64 = 1 << 30;
 /// left and the `vram_room` the slots will take. Windows charges commit for what is locked (1 to 1 over 29 GiB at 62 GiB with an 8 GiB
 /// page file, which left 0.5 GiB of commit with physical memory to spare), and a GPU budget has taken its
 /// commit by then.
+/// Less what is kept free ([`lock_kept_free`]: [`left_free`], or STRAYDOG_KEEP_FREE for a measurement, which the plan of what to lock heeds
+/// as the locking does: with it only the locking, an RTX 5070 Ti PC with 61.6 GiB planned 13.5 GiB of tier by the commit left whatever it was).
 #[cfg(any(windows, test))]
 fn lockable_of(available: u64, commit: u64, vram_room: u64, memory: u64) -> u64 {
-    within_free(u64::MAX, 0, available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS + vram_room)), memory)
+    available.min(commit.saturating_sub(COMMIT_AFTER_LOCKS + vram_room)).saturating_sub(lock_kept_free(memory))
 }
 
 /// Bytes of rows the process holds already (allocated, so charged to the commit, and written by each pass whether they are locked or not) that may
