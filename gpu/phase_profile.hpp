@@ -8,7 +8,13 @@ void phase_report(Device& d) {
     try {
         cleanup(hipSetDevice(d.ordinal));
         phase_resolve(d, true);
-        if (!d.phase_batches) return;
+        if (!d.phase_batches) {
+            // (a prompt read of no batch through this device's prefill spans: its layers took another path, or none ran here)
+            if (d.phase_layers || !d.phase_totals.empty())
+                std::fprintf(stderr, "PHASES device %d: %llu layers and %zu phases timed, no batch began on its first layer\n", d.ordinal,
+                             (unsigned long long)d.phase_layers, d.phase_totals.size());
+            return;
+        }
         std::vector<std::pair<std::string, Device::PhaseSum>> rows(d.phase_totals.begin(), d.phase_totals.end());
         std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.sum > b.second.sum; });
         double total = 0;
@@ -34,7 +40,11 @@ void phase_report(Device& d) {
                      double(d.phase_host_gather_ns) / 1e6 / layers, double(d.phase_host_cpu_ns) / 1e6 / layers, double(d.phase_host_settle_ns) / 1e6 / layers);
         std::fprintf(stderr, "PHASES   experts gathered ahead %llu, used %llu (pregather); the host's wait for them %.2f ms a MoE layer\n",
                      (unsigned long long)d.pregather.gathered, (unsigned long long)d.pregather.used, double(d.phase_host_ahead_ns) / 1e6 / layers);
-    } catch (...) {}
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "PHASES device %d: no report (%s)\n", d.ordinal, e.what());
+    } catch (...) {
+        std::fprintf(stderr, "PHASES device %d: no report\n", d.ordinal);
+    }
 }
 // The report of the prompt batches since the last, and the sums begun again: a served worker is killed and never destroys its devices, so
 // its engine asks for one at the end of each prompt. The next mark is not timed from the last (the time between two prompts is no phase's).
