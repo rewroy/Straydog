@@ -817,6 +817,8 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     std::vector<size_t> on_cpu;
     if (plan.hybrid) {
         hybrid_observe_batch(plan,host_counts.data(),steps,host_tail.data(),tail);
+        plan.last_routed.resize(experts);
+        for (size_t expert=0;expert<experts;++expert) plan.last_routed[expert]=host_counts[expert]>0;
         for (size_t expert=0;expert<experts;++expert)
             if (!plan.layer_prefill && host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
 #if !defined(__HIPCC__)

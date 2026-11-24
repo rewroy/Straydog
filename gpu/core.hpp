@@ -260,6 +260,7 @@ struct ResidentMoe {
     Matrix half[3]{};
     void* batch_table=nullptr;
     std::vector<unsigned> last_counts;   // the rows each expert had in the last prompt batch through this layer (prestage's guess of the next)
+    std::vector<uint8_t> last_routed;    // whether each expert had rows in the last prompt batch through this layer (pregather's guess of the next)
 };
 // An expert's bytes of `role` on the host, wherever its layer keeps them (the bank's mapping or its copy): every reader of a routed expert's
 // host bytes goes through this, so that a layer's experts need not sit at one stride from one base.

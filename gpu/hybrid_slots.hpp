@@ -651,8 +651,10 @@ void pregather_start(Device& d) {
         pg.rows * 10 < 4 * next->experts || !d.slots.bytes)
         return;
     std::vector<size_t> experts;
+    // (those the last batch through that layer routed to, where there was one: a request's next batch reads the text that followed)
+    const bool guessed = next->last_routed.size() == next->experts;
     for (size_t expert = 0; expert < next->experts; ++expert)
-        if (next->slot_of[expert] < 0 && !expert_tiered(*next, expert)) experts.push_back(expert);
+        if (next->slot_of[expert] < 0 && !expert_tiered(*next, expert) && (!guessed || next->last_routed[expert])) experts.push_back(expert);
     if (experts.size() < 16) return;
     if (pg.capacity < experts.size()) {
         if (pg.read_pending) { check(hipEventSynchronize(pg.read)); pg.read_pending = false; }
