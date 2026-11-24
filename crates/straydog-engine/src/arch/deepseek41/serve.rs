@@ -67,6 +67,19 @@ const ROOM_STEP: usize = 4;
 /// Floats of the checkpoints' compressed rows and index keys a step between requests copies
 /// ([`Engines::make_room`]): 32 MB, ~6 ms (~0.15 s when the host has to find the pages).
 const CHECKPOINT_STEP: usize = 8 << 20;
+/// The machine's available memory below which the expert stores give host tier arenas back between requests, and the margin above it
+/// they give back to ([`Engines::tend_memory`]): the tier is sized from the whole memory (served::HOST_SHARE), and what the other
+/// programs then take beyond the rest is the page cache's, then the swap's (Homelab, 2026-11-23: 143 MB available, the box's own pages
+/// read again and again, and a request's first token 393-469 s away).
+const HOST_FLOOR: u64 = 3 << 30;
+const HOST_MARGIN: u64 = 4 << 30;
+
+/// [`HOST_FLOOR`], or STRAYDOG_HOST_FLOOR GiB (for a check on the served path: a floor above the machine's memory gives the tier back at
+/// once).
+fn host_floor() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| std::env::var("STRAYDOG_HOST_FLOOR").ok().and_then(|value| value.trim().parse::<u64>().ok()).map_or(HOST_FLOOR, |gib| gib << 30))
+}
 
 /// The engines of consecutive layer ranges (one, or one per device).
 pub struct Engines {
@@ -92,6 +105,8 @@ pub struct Engines {
     files: &'static Pinned,
     /// DSpark, when the model's drafter is pinned and there.
     drafting: Option<Drafting>,
+    /// Whether the vision encoder's weights were read ahead of the warm-up's reads ([`Engine::read_vision`]), once.
+    vision_read: bool,
 }
 
 /// DSpark beside the engine that runs the layers it reads ([`TAP_LAYERS`]): the drafter, the policy
@@ -166,7 +181,11 @@ impl served::Engines for Engines {
     }
 
     fn take_draft_stats(&mut self) -> Option<(usize, Vec<usize>, f64)> {
-        let stats = self.drafting.as_mut()?.policy.take_stats();
+        let policy = &mut self.drafting.as_mut()?.policy;
+        if let Some(line) = policy.calibration_line() {
+            eprintln!("{line}");
+        }
+        let stats = policy.take_stats();
         Some((stats.runs, stats.widths.to_vec(), stats.draft_ms))
     }
 
@@ -192,6 +211,16 @@ impl served::Engines for Engines {
     }
 
     fn warm(&mut self, vram: &[(usize, usize)], host: &[(usize, usize)]) -> Result<(usize, usize, usize), String> {
+        // (the vision encoder first, while the drive has nothing else to read: see Engine::read_vision)
+        if !self.vision_read {
+            self.vision_read = true;
+            let started = std::time::Instant::now();
+            match self.engines[0].read_vision() {
+                Ok(0) => {}
+                Ok(bytes) => eprintln!("Straydog vision encoder read ahead of the warm-up: {:.2} GB in {:.2} s", bytes as f64 / 1e9, started.elapsed().as_secs_f64()),
+                Err(error) => eprintln!("Straydog vision encoder not read ahead: {error}"),
+            }
+        }
         let (mut reading, mut placed, mut hosted) = (0, vram.len(), host.len());
         for engine in &mut self.engines {
             let (read, engine_placed, engine_hosted) = engine.warm_experts(vram, host)?;
@@ -302,6 +331,27 @@ impl served::Engines for Engines {
             done &= engine.make_room(ROOM_STEP)?;
         }
         Ok(done)
+    }
+
+    fn tend_memory(&mut self) -> Result<(), String> {
+        let available = crate::host::available_bytes();
+        let floor = host_floor();
+        if available == 0 || available >= floor {
+            return Ok(());
+        }
+        let want = (floor + HOST_MARGIN - available).div_ceil(self.engines.len().max(1) as u64);
+        let (mut freed, mut left) = (0, 0);
+        for engine in &mut self.engines {
+            let (given, kept) = engine.give_back_host(want)?;
+            freed += given;
+            left += kept;
+        }
+        if freed > 0 {
+            let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+            eprintln!("Straydog host tier: gave {:.1} GiB back to the machine, which had {:.1} GiB available; it holds {:.1} GiB now",
+                      gib(freed), gib(available), gib(left));
+        }
+        Ok(())
     }
 
     fn prefetch_ahead(&mut self, tokens: &[u32], now: usize) -> Result<(), String> {
@@ -747,10 +797,16 @@ fn off(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| value == "0")
 }
 
+/// DS41_DSPARK_WIDTH=N (1 to 3): every DSpark draft verifies N of its tokens, not as many as its policy picks, and
+/// drafts on through what would be the policy's pauses (to measure the policy against a fixed width on a served model).
+fn fixed_width() -> Option<usize> {
+    std::env::var("DS41_DSPARK_WIDTH").ok().and_then(|value| value.trim().parse().ok()).filter(|width| (1..MAX_SLOTS).contains(width))
+}
+
 /// DSpark's file, opened and authenticated, when the model's drafter is pinned, lies in its directory
 /// ([`bundle::dspark_in`]) and can sit beside an engine: DS41_DSPARK=0 leaves it out, and so does
 /// DS41_DRAFTS=0 (no verify passes to draft for). Its layout is checked against the model's.
-fn open_dspark(root: &Path, id: bundle::Id, data_dir: &Path, target: &Pinned, groups: &[(Vec<usize>, std::ops::Range<usize>)])
+fn open_dspark(root: &Path, id: bundle::Id, data_dir: &Path, target: &Pinned, groups: &[(Vec<usize>, std::ops::Range<usize>)], vram: &dyn Fn(usize) -> u64)
                -> Result<Option<(Pinned, DsparkPlan)>, String> {
     if off("DS41_DSPARK") || off("DS41_DRAFTS") {
         return Ok(None);
@@ -768,7 +824,7 @@ fn open_dspark(root: &Path, id: bundle::Id, data_dir: &Path, target: &Pinned, gr
     let directory = path.parent().ok_or("the DSpark drafter has no directory")?;
     let files = Pinned::open(directory, data_dir, &source.pins()).map_err(|error| format!("DSpark drafter: {error}"))?;
     Dspark::from_headers(&files.header, &target.header).map_err(|error| format!("DSpark drafter: {error}"))?;
-    let resident = drafter::resident_counts()?;
+    let resident = drafter::resident_counts(groups[engine].0.iter().map(|&device| vram(device)).sum())?;
     Ok(Some((files, DsparkPlan { engine, resident })))
 }
 
@@ -782,7 +838,7 @@ fn load_dspark(draft: &Pinned, plan: &DsparkPlan, engine: &mut Engine<'static, P
     let started = Instant::now();
     let before = allocated(engine)?;
     engine.enable_tap()?;
-    let drafter = Drafter::load(&mut engine.beside()?, draft, target, vocabulary)?;
+    let drafter = Drafter::load(&mut engine.beside()?, draft, target, vocabulary, plan.resident)?;
     let used: Vec<u64> = allocated(engine)?.iter().zip(&before).map(|(after, before)| after - before).collect();
     let planned: Vec<u64> = (0..used.len()).map(|index| drafter::footprint(index, used.len(), vocabulary, plan.resident)).collect();
     let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
@@ -924,7 +980,8 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     };
     // DSpark, when its file is there: opened (and its layout checked against the model's), and
     // the VRAM it takes counted with the engine it sits beside.
-    let (dspark_files, dspark_plan) = match open_dspark(root, id, data_dir, &files, &groups)? {
+    let device_vram = |device: usize| settings.devices.iter().position(|&other| other == device).map_or(0, |at| settings.vram_bytes[at]);
+    let (dspark_files, dspark_plan) = match open_dspark(root, id, data_dir, &files, &groups, &device_vram)? {
         Some((files, plan)) => (Some(files), Some(plan)),
         None => (None, None),
     };
@@ -1037,7 +1094,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     })?;
     let drafting = match (dspark_files, dspark_plan, drafter) {
         (Some(files), Some(plan), Some(drafter)) => Some(Drafting {
-            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, fixed_width: None, rings: (0..CHECKPOINTS).map(|_| None).collect(),
+            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, fixed_width: fixed_width(), rings: (0..CHECKPOINTS).map(|_| None).collect(),
             _files: files,
         }),
         _ => None,
@@ -1079,7 +1136,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
                            saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
-                           budget: checkpoints, marked: Vec::new(), step: CHECKPOINT_STEP, files, drafting },
+                           budget: checkpoints, marked: Vec::new(), step: CHECKPOINT_STEP, files, drafting, vision_read: false },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,
         load_seconds: [("open".to_string(), open_seconds), ("read and place".to_string(), place_seconds)].into_iter().chain(startup).collect(),

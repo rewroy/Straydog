@@ -1207,6 +1207,10 @@ int sd_prefill_bank_halves(void* handle, uint64_t layer, uint64_t bytes) {
     try { return prefill_bank_halves(device(handle), size_t(layer), size_t(bytes)) ? 1 : 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }
 }
+int sd_phase_report(void* handle) {
+    try { Device& d=device(handle); if (d.phase_on) phase_report_since(d); return 0; }
+    catch (const std::exception& e) { last_error=e.what(); return -1; }
+}
 int sd_prefill_bank_clear(void* handle) {
     try { clear_prefill_bank(device(handle)); return 0; }
     catch (const std::exception& e) { last_error=e.what(); return -1; }

@@ -109,7 +109,7 @@ pub(crate) struct Shape {
 }
 
 /// The worker request for an OpenAI chat completion request, and the shape of its answer.
-pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Result<(Value, Shape), ApiError> {
+pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool, reminders: bool) -> Result<(Value, Shape), ApiError> {
     let messages = match given(payload, "messages") {
         Some(Value::Array(messages)) if !messages.is_empty() => messages,
         _ => return Err(ApiError::invalid("messages must be a non-empty list")),
@@ -175,7 +175,11 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
             _ => return Err(ApiError::invalid("response_format type must be text, json_object or json_schema")),
         },
     };
-    let constraint = constraint(config.markup, json, tools.is_some(), forced);
+    let names: Vec<String> = match &tools {
+        Some(Value::Array(list)) => list.iter().filter_map(|tool| tool.get("function")?.get("name")?.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    };
+    let constraint = constraint(config.markup, json, &names, forced);
     let suppress = match given(payload, "suppress") {
         None => None,
         Some(Value::Str(kind)) if kind == NOT_CP932_HAN => Some(Value::Str(kind.clone())),
@@ -285,7 +289,8 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
         Some(_) => return Err(ApiError::invalid("stream_options must be an object")),
     };
 
-    let messages = messages.iter().map(|item| message(item, vision)).collect::<Result<Vec<_>, _>>()?;
+    let messages = messages.iter().map(|item| message(item, vision, reminders)).collect::<Result<Vec<_>, _>>()?;
+    reminder_ends(&messages)?;
     // Qwen's card is the API's; another family's worker reports its own card and fills in what is
     // left null here.
     let (temperature, top_k, top_p, min_p, presence_penalty) = match markup {
@@ -335,34 +340,31 @@ pub(crate) fn translate(payload: &Value, config: &ApiConfig, vision: bool) -> Re
 }
 
 /// What the worker holds the answer to ([`straydog_engine::constraint`]), as its request's
-/// `constraint`: a forced tool call's opening (the markup's, with the named function's name), or
-/// the JSON `response_format` asks for (`true`: any object), racing a tool call's opening when
-/// the model may call one. Null: nothing.
-fn constraint(markup: Markup, json: Option<Value>, tools: bool, forced: Option<Option<String>>) -> Value {
-    // A named function is called once: its invoke's close, then the block's, then the end.
-    let call = |name: Option<&str>| {
+/// `constraint`: a forced tool call's opening (the markup's, with the named function's name, or
+/// with one of `names`, the request's tools, where any is required), or the JSON `response_format`
+/// asks for (`true`: any object), racing the opening of a call of one of `names` when the model
+/// may call one. Null: nothing.
+fn constraint(markup: Markup, json: Option<Value>, names: &[String], forced: Option<Option<String>>) -> Value {
+    // A call's opening with its function's name; a named function is called once: its invoke's close, then the block's, then the end.
+    let call = |name: &str, once: bool| {
         let (open, whitespace, until, close) = match markup {
-            Markup::Dsml => (format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{}", name.map_or(String::new(), |name| format!("{name}\">\n"))),
-                             0, "</｜DSML｜ invoke>", "\n</｜DSML｜ calls>"),
-            Markup::Qwen => (format!("<tool_call>\n<function={}", name.map_or(String::new(), |name| format!("{name}>\n"))), 4,
-                             "</function>", "\n</tool_call>"),
+            Markup::Dsml => (format!("\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{name}\">\n"), 0, "</｜DSML｜ invoke>", "\n</｜DSML｜ calls>"),
+            Markup::Qwen => (format!("<tool_call>\n<function={name}>\n"), 4, "</function>", "\n</tool_call>"),
         };
         let mut fields = vec![("prefix".into(), Value::Str(open)), ("whitespace".into(), Value::Int(whitespace))];
-        if name.is_some() {
+        if once {
             fields.push(("until".into(), Value::Str(until.into())));
             fields.push(("close".into(), Value::Str(close.into())));
         }
         Value::Object(fields)
     };
+    // (a call the model must make, or may make in place of the JSON, is of a tool the request gave: held to the opening alone, a
+    // model told a call was required called write_file, which no request had offered, and wrote "test" over the page it had made)
+    let any_of = || names.iter().map(|name| call(name, false)).collect::<Vec<_>>();
     let alternatives = match (forced, json) {
-        (Some(name), _) => vec![call(name.as_deref())],
-        (None, Some(schema)) => {
-            let mut alternatives = vec![Value::Object(vec![("json".into(), schema)])];
-            if tools {
-                alternatives.push(call(None));
-            }
-            alternatives
-        }
+        (Some(Some(name)), _) => vec![call(&name, true)],
+        (Some(None), _) => any_of(),
+        (None, Some(schema)) => std::iter::once(Value::Object(vec![("json".into(), schema)])).chain(any_of()).collect(),
         (None, None) => return Value::Null,
     };
     Value::Object(vec![("alternatives".into(), Value::Array(alternatives))])
@@ -393,13 +395,38 @@ fn same(value: &Value, other: &Value) -> bool {
 
 /// What an image is refused with where the model reads none.
 pub(crate) const NO_IMAGES: &str = "this model reads no images";
+/// A `latest_reminder` message to a model whose template has no such role.
+pub(crate) const NO_REMINDERS: &str = "this model's chat template has no latest_reminder role";
+/// The messages end with a `latest_reminder` that does not follow a user's message ([`reminder_ends`]).
+pub(crate) const REMINDER_LAST: &str = "a latest_reminder that ends the messages must come right after a user's message: the template \
+     begins the answer there, and after anything else the prompt would end with no answer begun";
+
+/// Messages that end with `latest_reminder` messages must have a user's message before them (or a system message after the first,
+/// as the template has it): it begins the answer after that message, and the reminders go into it. After an assistant's or a tool's
+/// message the prompt ends with no answer begun, and the model writes on from the reminder's text: a client's note after a stopped
+/// reply was written on for 3.7 and 4.7 thousand characters, minutes of a turn, before a tool was called.
+fn reminder_ends(messages: &[Value]) -> Result<(), ApiError> {
+    let role = |message: &Value| message.get("role").and_then(Value::as_str).map(str::to_string);
+    if messages.last().and_then(role).as_deref() != Some("latest_reminder") {
+        return Ok(());
+    }
+    match messages.iter().enumerate().rev().find(|(_, message)| role(message).as_deref() != Some("latest_reminder")) {
+        Some((_, message)) if role(message).as_deref() == Some("user") => Ok(()),
+        Some((at, message)) if at > 0 && role(message).as_deref() == Some("system") => Ok(()),
+        _ => Err(ApiError::invalid(REMINDER_LAST)),
+    }
+}
 
 /// A message for the template: the known fields in the client's order, a developer message
 /// as a system one, and the content as text; with `vision` (a model that reads images), a user's
-/// or a tool's content with images as its parts.
-fn message(message: &Value, vision: bool) -> Result<Value, ApiError> {
+/// or a tool's content with images as its parts. With `reminders` (a template that renders it), a `latest_reminder` message too: a
+/// client's own notes beside a user's message, which the model reads as not the user's.
+fn message(message: &Value, vision: bool, reminders: bool) -> Result<Value, ApiError> {
     let role = message.get("role").and_then(Value::as_str);
-    let (Value::Object(fields), Some("system" | "developer" | "user" | "assistant" | "tool")) = (message, role) else {
+    if role == Some("latest_reminder") && !reminders {
+        return Err(ApiError::invalid(NO_REMINDERS));
+    }
+    let (Value::Object(fields), Some("system" | "developer" | "user" | "assistant" | "tool" | "latest_reminder")) = (message, role) else {
         return Err(ApiError::invalid("each message needs a role: system, developer, user, assistant or tool"));
     };
     let mut kept = Vec::new();
@@ -440,7 +467,8 @@ fn has_images(content: &Value) -> bool {
 }
 
 /// Content with images, as its parts for the template (the worker takes the images out): text
-/// parts, and images as `image_url` parts with a `data:` URL or `image` parts with a base64 source.
+/// parts, and images as `image_url` parts with a `data:` URL (or `sha256:` and the digest of one sent before) or `image` parts with a
+/// base64 source.
 fn parts(content: &Value) -> Result<Value, ApiError> {
     let Value::Array(parts) = content else { return Err(ApiError::invalid("message content must be a list of parts")) };
     for part in parts {
@@ -452,9 +480,10 @@ fn parts(content: &Value) -> Result<Value, ApiError> {
                     Some(object) => object.get("url").and_then(Value::as_str),
                     None => None,
                 };
+                // (or `sha256:` and the digest of an image sent before, whose rows the worker keeps: it says if it does not)
                 match url {
-                    Some(url) if url.starts_with("data:") => true,
-                    Some(_) => return Err(ApiError::invalid("an image_url must be a data: URL (the server fetches nothing)")),
+                    Some(url) if url.starts_with("data:") || url.starts_with("sha256:") => true,
+                    Some(_) => return Err(ApiError::invalid("an image_url must be a data: URL, or sha256: and an image's digest (the server fetches nothing)")),
                     None => false,
                 }
             }
@@ -466,4 +495,49 @@ fn parts(content: &Value) -> Result<Value, ApiError> {
         }
     }
     Ok(content.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reminders that end the messages follow a user's message (the template begins the answer after it), or the request is refused.
+    #[test]
+    fn a_latest_reminder_ends_the_messages_only_after_a_users() {
+        let list = |roles: &[&str]| -> Vec<Value> {
+            roles.iter().map(|role| pyjson::parse(&format!(r#"{{"role": "{role}", "content": "x"}}"#)).unwrap()).collect()
+        };
+        for fine in [&["user"][..], &["system", "user", "latest_reminder"], &["user", "latest_reminder", "latest_reminder"],
+                     &["system", "latest_reminder", "user"], &["user", "assistant", "tool", "user", "latest_reminder"],
+                     &["user", "assistant", "system", "latest_reminder"]] {
+            assert!(reminder_ends(&list(fine)).is_ok(), "{fine:?}");
+        }
+        for refused in [&["user", "assistant", "latest_reminder"][..], &["user", "assistant", "tool", "latest_reminder"],
+                        &["system", "latest_reminder"], &["latest_reminder"]] {
+            assert_eq!(reminder_ends(&list(refused)).unwrap_err().message, REMINDER_LAST, "{refused:?}");
+        }
+    }
+
+    /// A `latest_reminder` message goes to a model whose template renders that role (as its text), and is refused for any other.
+    #[test]
+    fn a_latest_reminder_is_taken_where_the_template_has_the_role() {
+        let reminder = pyjson::parse(r#"{"role": "latest_reminder", "content": [{"type": "text", "text": "Now: 19:43"}], "name": "app"}"#).unwrap();
+        let taken = message(&reminder, false, true).unwrap();
+        assert_eq!(taken.get("role"), Some(&Value::Str("latest_reminder".into())));
+        assert_eq!(taken.get("content"), Some(&Value::Str("Now: 19:43".into())));
+        assert_eq!(message(&reminder, true, false).unwrap_err().message, NO_REMINDERS);
+        let other = pyjson::parse(r#"{"role": "reminder", "content": "x"}"#).unwrap();
+        assert!(message(&other, false, true).unwrap_err().message.starts_with("each message needs a role"));
+    }
+
+    /// An image part's URL is a `data:` URL or `sha256:` and the digest of one sent before (the worker checks the digest's form); the server fetches nothing.
+    #[test]
+    fn an_image_is_its_data_or_the_digest_of_one_sent_before() {
+        let part = |url: &str| pyjson::parse(&format!(r#"[{{"type": "image_url", "image_url": {{"url": "{url}"}}}}]"#)).unwrap();
+        assert!(parts(&part("data:image/png;base64,AAEC")).is_ok());
+        assert!(parts(&part(&format!("sha256:{}", "ab".repeat(32)))).is_ok());
+        for url in ["https://example.com/a.png", "file:///a.png", "SHA256:ab"] {
+            assert!(parts(&part(url)).unwrap_err().message.contains("sha256: and an image's digest"), "{url}");
+        }
+    }
 }

@@ -58,13 +58,16 @@ pub struct Warm {
     fill: Option<(Vec<(usize, usize)>, usize)>,
     /// What the fill placed so far: in VRAM, in the host tier, and the drive's bytes at its start.
     filled: (usize, usize, u64),
+    /// The steps with experts still to read (since [`Warm::waits`] last took them): all, those that found as many reads on their way as
+    /// they may have (the drive's pace), and those that started none for want of room in the stores (the host tier's pinning, or slots).
+    waits: (usize, usize, usize),
 }
 
 impl Warm {
     pub fn new(layers: usize, experts: usize) -> Warm {
         Warm {
             layers, experts, pending: Default::default(), stalled: 0, base: RANK_LISTS, listed: false, prior: Vec::new(), fill: None,
-            filled: (0, 0, 0),
+            filled: (0, 0, 0), waits: (0, 0, 0),
         }
     }
 
@@ -140,6 +143,12 @@ impl Warm {
 
     /// What the fill placed so far: experts into VRAM and into the host tier, and the bytes the
     /// drive was read for since it began.
+    /// The steps with experts to read since the last call, those whose reads were at the most in flight, and those that found no room:
+    /// where a warm-up's time went besides the drive.
+    pub fn waits(&mut self) -> (usize, usize, usize) {
+        std::mem::take(&mut self.waits)
+    }
+
     pub fn filled<E: Engines>(&self, engines: &E) -> (usize, usize, u64) {
         (self.filled.0, self.filled.1, engines.drive_bytes().saturating_sub(self.filled.2))
     }
@@ -167,7 +176,12 @@ impl Warm {
                 return Ok(if reading == 0 { Warmed::Done } else { Warmed::Going });
             }
         }
-        if reading >= in_flight || (self.pending.0.is_empty() && self.pending.1.is_empty()) {
+        if self.pending.0.is_empty() && self.pending.1.is_empty() {
+            return Ok(Warmed::Going);
+        }
+        self.waits.0 += 1;
+        if reading >= in_flight {
+            self.waits.1 += 1;
             return Ok(Warmed::Going);
         }
         let count = count.min((in_flight - reading).div_ceil(engines.devices_per_expert()));
@@ -188,6 +202,9 @@ impl Warm {
         }
         // No room for a long while (the stores full of what requests brought in) and nothing on
         // its way: done. (Room comes as the host tier is pinned, and as reads land.)
+        if placed + hosted == 0 {
+            self.waits.2 += 1;
+        }
         self.stalled = if placed + hosted == 0 && reads == 0 { self.stalled + 1 } else { 0 };
         if self.stalled > if self.listed { FILL_PATIENCE } else { WARM_PATIENCE } {
             self.pending = Default::default();

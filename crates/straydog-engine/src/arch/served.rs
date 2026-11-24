@@ -139,6 +139,11 @@ pub trait Engines {
     fn make_room(&mut self) -> Result<bool, String> {
         Ok(true)
     }
+    /// Between requests, and every few seconds while none comes: where the machine's available memory has run short beside the
+    /// expert stores' host tier, give some of the tier back.
+    fn tend_memory(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// Start reading what passes over `tokens` (continuing the held sequence) will read from the
     /// drive (DeepSeek-V4.1's Engram rows), behind the pass before them; a pass reads them itself
     /// otherwise.
@@ -339,6 +344,9 @@ const PROGRESS_AT_ONCE: usize = 4096;
 /// A kept conversation's sections ([`Session::export_conversation`]): its tokens, then the engines' checkpoint.
 const KEPT_TOKENS: u64 = u64::from_le_bytes(*b"KEPTTOKS");
 const KEPT_CHECKPOINT: u64 = u64::from_le_bytes(*b"KEPTSNAP");
+/// The fewest tokens a kept conversation has: a one-off question (a server's health check after a start) is no conversation to take
+/// back, and it would take the place of the one the person was in.
+const KEPT_MINIMUM: usize = 1024;
 
 /// The fewest tokens a system prompt has to be checkpointed as a conversation's root (a shorter
 /// one prefills in about a second).
@@ -383,8 +391,26 @@ fn refreshed(checkpoints: &mut Vec<Checkpoint>, index: usize) -> usize {
     checkpoints.len() - 1
 }
 
+/// Where a prompt whose generation prompt begins with `start` has its turn checkpointed ([`Session::turn_mark`]): [`TURN_BACK`]
+/// before the last `start` within its last [`TURN_REACH`] tokens; where that is not past the `reused` tokens the request resumed
+/// from (or its root, just saved), there, where the state already is. Put one token past them instead, the token was read alone,
+/// by the one-row pass, where a request reading the same prompt from elsewhere read it within a longer pass: on two R9700 with
+/// DeepSeek-V4.1 a new conversation's prompt logits from its root differed from the same prompt read from nothing
+/// (deepseek41_served), as each start split the prompt where it resumed.
+fn turn_at(tokens: &[u32], reused: usize, start: u32) -> Option<usize> {
+    let lowest = tokens.len().saturating_sub(TURN_REACH).max(reused + 1);
+    let begins = (lowest..tokens.len()).rev().find(|&index| tokens[index] == start)?;
+    let turn = begins.saturating_sub(TURN_BACK);
+    if turn > reused { Some(turn) } else { (reused > 0).then_some(reused) }
+}
+
 /// How far before a prompt's end its reply's generation prompt may begin to be checkpointed.
 const TURN_REACH: usize = 64;
+/// How far before its reply's generation prompt a turn is checkpointed: the last tokens of the message before it are split otherwise
+/// by what follows them in the next prompt. A tool's result that ended `</tool_result>` before the generation prompt was split
+/// otherwise where an app's note followed it after a stopped reply: the next prompt agreed one token short of the checkpoint, and an
+/// agent's 48K-token conversation was read again from its system prompt (43K tokens, 23.6 s on two R9700s).
+const TURN_BACK: usize = 8;
 
 /// A stem is worth a checkpoint where it is this much longer than what the request resumed from.
 const STEM_GAIN: usize = 1024;
@@ -504,6 +530,40 @@ struct Decoded {
     marked: Vec<usize>,
     marks: usize,
     mark_seconds: f64,
+    /// Long lookup matches seen ([`WIDE_PROBE`]): how many, the tokens a pass of [`WIDE_PROBE`] drafts would have
+    /// emitted for them (its accepted drafts and the token after), and the passes those tokens took.
+    wide: (usize, usize, usize),
+}
+
+/// The drafts a long lookup match is measured against (not verified): what a verify pass of eight rows would take of
+/// a copy, against the engines' rows now (a diagnostic of whether wider verify passes would pay).
+const WIDE_PROBE: usize = 7;
+
+/// A long lookup match being followed: its drafts, the tokens emitted since it was proposed, the passes they took.
+struct Probe {
+    drafts: Vec<u32>,
+    after: Vec<u32>,
+    passes: usize,
+}
+
+impl Probe {
+    /// The match's run once known: (its drafts' accepted count + the token after, the passes the sequence took to
+    /// emit that many), or None while the emitted tokens still agree with the drafts.
+    fn settled(&self) -> Option<(usize, usize)> {
+        let agreed = self.drafts.iter().zip(&self.after).take_while(|(draft, token)| draft == token).count();
+        (self.after.len() > agreed).then_some((agreed + 1, self.passes))
+    }
+
+    /// One more pass, which emitted `tokens` after those before: into `done` once the run is known (and the probe ends).
+    fn passed(probe: &mut Option<Probe>, tokens: &[u32], done: &mut Decoded) {
+        let Some(followed) = probe.as_mut() else { return };
+        followed.passes += 1;
+        followed.after.extend_from_slice(tokens);
+        if let Some((tokens, passes)) = followed.settled() {
+            (done.wide.0, done.wide.1, done.wide.2) = (done.wide.0 + 1, done.wide.1 + tokens, done.wide.2 + passes);
+            *probe = None;
+        }
+    }
 }
 
 /// How a drafter is to choose its tokens for a request with this sampling: drawn from its own distribution when
@@ -544,8 +604,9 @@ fn feed<E: Engines>(engines: &mut E, history: &mut Vec<u32>, batch: usize, token
 /// tokens, each to `emit`; an end token ends the reply unsent. With engines that verify drafts,
 /// each token is fed with engine drafts, else prompt-lookup drafts (drafts::Ngrams), in one pass;
 /// the drafts the target distribution accepts (sampling::accept: exact for any sampling) are
-/// emitted after it and kept, the rest rewound. A `constraint` chooses every token itself (no
-/// drafts); one that only suppresses keeps them, masking the rows they are accepted on.
+/// emitted after it and kept, the rest rewound. A `constraint` keeps them where it takes any token
+/// ([`Constraint::takes_drafts`]: one that only suppresses, a reasoning, a forced call past its
+/// opening), masking the rows they are accepted on; elsewhere it chooses every token itself.
 #[allow(clippy::too_many_arguments)]
 fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>, vocabulary: usize, end: &[u32], max_new: usize,
                       sampling: &Sampling, seed: u64, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(u32),
@@ -556,13 +617,14 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
     // drafter that draws nothing)
     let mut draws = Rng::new(seed ^ 0x6472_6177_5eed_d5a2);
     let mut generated = Generated::new(vocabulary);
-    let rows = if constraint.as_deref().is_some_and(Constraint::chooses_every_token) { 1 } else { engines.verify_rows() };
+    let rows = engines.verify_rows();
     let mut ngrams = Ngrams::new();
     if rows > 1 {
         ngrams.extend(history);
     }
     let mut policy = Policy::new(rows);
     let mut done = Decoded::default();
+    let mut probe: Option<Probe> = None;
     let mut mark_at = history.len() + MARK_EVERY;
     let mut next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
     loop {
@@ -576,14 +638,20 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             break;
         }
         let mut probabilities = Vec::new();
-        let (mut drafts, engine_draft) = if rows > 1 {
+        if rows > 1 {
             ngrams.push(next);
+        }
+        let (mut drafts, engine_draft) = if rows > 1 && constraint.as_deref().is_none_or(Constraint::takes_drafts) {
             // A long match is verified as it is: those drafts are accepted nearly always (an edit
             // repeats its source), and an engine's draft costs milliseconds to be no better.
             let (proposal, matched) = ngrams.propose(rows - 1);
             let mut lookup = None;
             if matched >= LONG_MATCH {
                 lookup = Some(policy.width(matched).min(proposal.len()));
+                if probe.is_none() {
+                    let (drafts, _) = ngrams.propose(WIDE_PROBE);
+                    probe = (!drafts.is_empty()).then_some(Probe { drafts, after: Vec::new(), passes: 0 });
+                }
             }
             match lookup.filter(|&width| width > 0) {
                 Some(width) => (proposal[..width.min(max_new - done.emitted)].to_vec(), false),
@@ -607,10 +675,13 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         } else {
             (Vec::new(), false)
         };
-        // A suppressed point proposal could only be rejected, and the draw after it is that row's all the same: no row is spent
+        // A refused point proposal could only be rejected, and the draw after it is that row's all the same: no row is spent
         // on it. (A drawn one is left for the accept rule, whose replacement of it makes the tokens follow the target's distribution.)
-        if let Some(held) = constraint.as_deref().filter(|_| probabilities.is_empty() && !drafts.is_empty()) {
-            drafts.truncate(held.allowed_prefix(&drafts));
+        // Neither goes past where the reply stops taking drafts.
+        if let Some(held) = constraint.as_deref().filter(|_| !drafts.is_empty()) {
+            let taken = if probabilities.is_empty() { held.allowed_prefix(&drafts) } else { held.open_prefix(&drafts) };
+            drafts.truncate(taken);
+            probabilities.truncate(taken);
         }
         if drafts.is_empty() {
             let logits = engines.forward(&[next])?;
@@ -618,6 +689,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
             (done.passes, done.fed) = (done.passes + 1, done.fed + 1);
             mark(engines, history, &mut mark_at, &mut done)?;
             next = pick(&logits, sampling, &generated, &mut rng, &mut constraint)?;
+            Probe::passed(&mut probe, &[next], &mut done);
             continue;
         }
         let fed: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
@@ -661,6 +733,7 @@ fn decode<E: Engines>(engines: &mut E, history: &mut Vec<u32>, logits: Vec<f32>,
         history.push(next);
         history.extend_from_slice(&drafts[..kept]);
         ngrams.extend(&drafts[..kept]);
+        Probe::passed(&mut probe, &drafts[..kept].iter().copied().chain([token]).collect::<Vec<_>>(), &mut done);
         if stop {
             break;
         }
@@ -860,7 +933,8 @@ impl<E: Engines> Session<E> {
             fed = root;
         }
         if let Some(start) = self.turn_mark(tokens, fed) {
-            if self.feed(&tokens[fed..start], cancelled, &mut |done| progress(done, total))?.is_none() {
+            // (a turn where the request resumed, or at the root just saved, takes the state as it is: nothing is read)
+            if start > fed && self.feed(&tokens[fed..start], cancelled, &mut |done| progress(done, total))?.is_none() {
                 return Ok(());
             }
             let saving = Instant::now();
@@ -939,6 +1013,7 @@ impl<E: Engines> Session<E> {
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,
             "draft_tokens": decoded.drafted, "accepted_drafts": decoded.accepted, "decode_seconds": decode_seconds,
             "engine_draft_tokens": decoded.engine_drafted, "accepted_engine_drafts": decoded.engine_accepted,
+            "wide_lookup": [decoded.wide.0, decoded.wide.1, decoded.wide.2],
             "decode_tokens_per_second": if steps > 0 { json!(steps as f64 / decode_seconds) } else { Value::Null },
             "experts_per_token": {"vram": per(hits2 - hits), "host": per(host2 - host), "drive": per(drive2 - drive), "cpu": per(cpu2 - cpu)},
             "decode_profile": decode_profile,
@@ -1020,12 +1095,11 @@ impl<E: Engines> Session<E> {
         Ok((self.history.len(), kind))
     }
 
-    /// Where the prompt's last generation prompt begins, to be checkpointed: past what is held,
-    /// within the prompt's last [`TURN_REACH`] tokens.
+    /// Where the prompt's last generation prompt begins, less [`TURN_BACK`], to be checkpointed: past
+    /// what is held, within the prompt's last [`TURN_REACH`] tokens.
     fn turn_mark(&self, tokens: &[u32], reused: usize) -> Option<usize> {
         let start = self.turn_start.filter(|_| self.engines.checkpoints() > 0)?;
-        let lowest = tokens.len().saturating_sub(TURN_REACH).max(reused + 1);
-        (lowest..tokens.len()).rev().find(|&index| tokens[index] == start)
+        turn_at(tokens, reused, start)
     }
 
     /// Where the prompt's system prompt ends (its first user message begins), to be checkpointed
@@ -1070,17 +1144,26 @@ impl<E: Engines> Session<E> {
         Ok(())
     }
 
-    /// The kept conversation (`--keep-conversation`, [`Engines::export_checkpoint`]): the latest turn's checkpoint, where the last reply
-    /// began, as a prefix state's bytes ([`crate::prefix::header`]: the tokens, then the engines' checkpoint) and its tokens. None without such a
-    /// checkpoint, or with one holding image tokens (as a resident model keeps none of those).
+    /// A token a kept conversation may hold: the vocabulary's, and an image position's where the engines read images (its id from the
+    /// image's digest, as the next request's prompt gives it again: an agent's conversation holds the pages it checked, and none was kept).
+    fn keeps(&self, token: u32) -> bool {
+        (token as usize) < self.vocabulary || (token >= crate::vision::IMAGE_TOKEN && self.engines.vision())
+    }
+
+    /// The checkpoint a kept conversation is: the latest turn's the engines still hold, of at least [`KEPT_MINIMUM`] tokens. None without
+    /// one, or when it holds tokens [`keeps`](Self::keeps) refuses.
+    fn kept_checkpoint(&self) -> Option<&Checkpoint> {
+        self.checkpoints.iter().rev()
+            .find(|checkpoint| !checkpoint.root && checkpoint.tokens.len() >= KEPT_MINIMUM && self.engines.holds(checkpoint.slot))
+            .filter(|checkpoint| checkpoint.tokens.iter().all(|&token| self.keeps(token)))
+    }
+
+    /// The kept conversation (`--keep-conversation`, [`Engines::export_checkpoint`]): the [`kept_checkpoint`](Self::kept_checkpoint), where
+    /// the last reply began, as a prefix state's bytes ([`crate::prefix::header`]: the tokens, then the engines' checkpoint) and its tokens.
     pub fn export_conversation(&mut self) -> Result<Option<(Vec<u32>, Vec<u8>)>, String> {
-        let engines = &self.engines;
-        let Some(checkpoint) = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && engines.holds(checkpoint.slot)) else {
+        let Some(checkpoint) = self.kept_checkpoint() else {
             return Ok(None);
         };
-        if checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary) {
-            return Ok(None);
-        }
         let (slot, tokens) = (checkpoint.slot, checkpoint.tokens.clone());
         let state = self.engines.export_checkpoint(slot)?;
         let mut bytes = crate::prefix::header(tokens.len(), 0, &[(KEPT_TOKENS, 4 * tokens.len() as u64), (KEPT_CHECKPOINT, state.len() as u64)]);
@@ -1103,8 +1186,7 @@ impl<E: Engines> Session<E> {
 
     /// The bytes [`export_conversation`](Self::export_conversation) would give now (the latest turn's tokens with them); None as it gives none.
     pub fn conversation_size(&self) -> Option<(usize, u64)> {
-        let checkpoint = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && self.engines.holds(checkpoint.slot))?;
-        (!checkpoint.tokens.iter().any(|&token| token as usize >= self.vocabulary)).then_some(())?;
+        let checkpoint = self.kept_checkpoint()?;
         // (an estimate before the copy: the state grows with its tokens about as the engines' snapshots do)
         Some((checkpoint.tokens.len(), self.engines.checkpoint_bytes(checkpoint.slot)))
     }
@@ -1120,7 +1202,7 @@ impl<E: Engines> Session<E> {
             return Err("not a kept conversation of these engines".into());
         }
         let tokens = crate::prefix::tokens_of(parsed.payload, parsed.tokens);
-        if tokens.is_empty() || tokens.iter().any(|&token| token as usize >= self.vocabulary) {
+        if tokens.is_empty() || !tokens.iter().all(|&token| self.keeps(token)) {
             return Err("a kept conversation with tokens outside the vocabulary".into());
         }
         let engines = &self.engines;
@@ -1163,6 +1245,11 @@ impl<E: Engines> Session<E> {
         self.warmth.step(&mut self.engines, count, in_flight)
     }
 
+    /// The warm-up's steps and its waits since the last call ([`Warm::waits`]).
+    pub fn warm_waits(&mut self) -> (usize, usize, usize) {
+        self.warmth.waits()
+    }
+
     /// What the fill placed so far ([`Warm::filled`]).
     pub fn filled(&self) -> (usize, usize, u64) {
         self.warmth.filled(&self.engines)
@@ -1177,6 +1264,11 @@ impl<E: Engines> Session<E> {
     /// for the next prefill (without waiting); whether that is done.
     pub fn make_room(&mut self) -> Result<bool, String> {
         self.engines.make_room()
+    }
+
+    /// Between requests: the host tier given back where the machine's memory runs short ([`Engines::tend_memory`]).
+    pub fn tend_memory(&mut self) -> Result<(), String> {
+        self.engines.tend_memory()
     }
 
     /// After the first passes: lend the expert stores the VRAM the cards still have spare
@@ -1408,6 +1500,27 @@ mod tests {
         assert_eq!(demoted(&held, &third), [0]);
     }
 
+    /// Decides: a turn is checkpointed a few tokens before its generation prompt, where the next prompt still agrees when what
+    /// follows the last message there splits that message's last tokens otherwise; never at or before what was resumed from.
+    #[test]
+    fn a_turn_is_checkpointed_a_few_tokens_before_its_generation_prompt() {
+        let prompt: Vec<u32> = std::iter::repeat(1).take(100).chain([7, 8]).collect();
+        assert_eq!(turn_at(&prompt, 0, 7), Some(100 - TURN_BACK));
+        assert_eq!(turn_at(&prompt, 95, 7), Some(95), "at what was resumed from, not a token past it");
+        assert_eq!(turn_at(&prompt, 0, 9), None, "no generation prompt");
+        let far: Vec<u32> = [7].into_iter().chain(std::iter::repeat(1).take(TURN_REACH + 4)).collect();
+        assert_eq!(turn_at(&far, 0, 7), None, "only within the last tokens");
+    }
+
+    /// Decides: where a prompt is split for its turn does not depend on where the request resumed: a short first message after a
+    /// root has its turn at the root, whether the request read the root itself or resumed from it.
+    #[test]
+    fn a_turn_short_of_its_margin_is_where_the_request_resumed() {
+        let prompt: Vec<u32> = std::iter::repeat_n(1, 5920).chain([3, 4, 5, 7, 8]).collect();
+        assert_eq!(turn_at(&prompt, 5920, 7), Some(5920), "at the root, read or resumed from");
+        assert_eq!(turn_at(&[1, 1, 1, 7, 8], 0, 7), None, "from nothing, short of the margin: no turn");
+    }
+
     /// A cancel is seen before every pass, the first too: a prompt's next stretch (after a
     /// checkpoint) starts no pass for a client that has left.
     #[test]
@@ -1519,6 +1632,51 @@ mod tests {
         assert_eq!((done.engine_drafted, toy.verified[0].len()), (1, 2), "{:?}", toy.verified);
     }
 
+    /// A reply held to a forced call takes drafts past the call's opening and while it reasons, with the tokens of one that takes
+    /// none (greedy), and, free from its start, the very decode of a reply held to nothing, drafts, draws and all, sampled or not.
+    #[test]
+    fn a_forced_call_takes_drafts_past_its_opening() {
+        use std::sync::Arc;
+
+        use crate::constraint::{Alternative, TokenBytes};
+        // 0 end, 1 "</think>", 2 "a", 3 "b", then letters
+        let pieces = ["<e>", "</think>", "a", "b", "c", "d", "e", "f"];
+        let tokens = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; 8]).with_think_close(Some(1)));
+        let decoding = |rows: usize, constraint: Option<Constraint>, sampling: &Sampling, seed: u64| {
+            let mut constraint = constraint;
+            let mut toy = Toy { vocabulary: 8, rows, ..Toy::default() };
+            let mut history = PROMPT.to_vec();
+            let logits = toy.forward(&PROMPT).unwrap();
+            let mut out = Vec::new();
+            let done = decode(&mut toy, &mut history, logits, 8, &[0], 160, sampling, seed, &|| false, &mut |token| out.push(token),
+                              constraint.as_mut()).unwrap();
+            assert_eq!(toy.held, history);
+            (out, done)
+        };
+        let samplings = [Sampling::GREEDY, Sampling { temperature: 1.0, ..Sampling::GREEDY }, Sampling::recommended(true), Sampling::recommended(false)];
+        for thinking in [false, true] {
+            let call = || Some(Constraint::new(Arc::clone(&tokens), &[0], thinking, vec![Alternative::prefix("ab", 0), Alternative::prefix("ac", 0)]));
+            let (one, _) = decoding(1, call(), &Sampling::GREEDY, 1);
+            let (out, done) = decoding(4, call(), &Sampling::GREEDY, 1);
+            assert_eq!(out, one, "thinking {thinking}");
+            assert!(done.drafted > 0, "thinking {thinking}: {done:?}");
+            for sampling in &samplings {
+                for seed in 0..6 {
+                    let (out, _) = decoding(4, call(), sampling, seed);
+                    let answer = if thinking { out.iter().position(|&token| token == 1).map_or(&[][..], |at| &out[at + 1..]) } else { &out[..] };
+                    let text: String = answer.iter().map(|&token| pieces[token as usize]).collect();
+                    assert!(text.starts_with("ab") || text.starts_with("ac") || text == "a" || text.is_empty(), "{sampling:?} {seed} thinking {thinking}: {text}");
+                }
+            }
+        }
+        for sampling in &samplings {
+            for seed in 0..4 {
+                let free = || Some(Constraint::new(Arc::clone(&tokens), &[0], false, vec![Alternative::Free]));
+                assert_eq!(decoding(4, free(), sampling, seed), decoding(4, None, sampling, seed), "{sampling:?} {seed}");
+            }
+        }
+    }
+
     /// Whether the engines are asked to draw their drafts: when the request samples plainly (a temperature, nothing cut,
     /// no penalty), at its temperature and with a seed of each round's own; never for a greedy reply or a cut one, whose
     /// drafts are point proposals.
@@ -1593,6 +1751,27 @@ mod tests {
         assert_eq!(done, plain_done);
         assert_eq!(empty.draft_calls.len(), 7);
         assert!(empty.verified.is_empty() && empty.rewinds.is_empty());
+    }
+
+    /// A long lookup match is followed: the toy's reply repeats itself, so a pass of eight rows would take each run in one pass
+    /// where the engine's rows of four take two or more; nothing of what is decoded changes.
+    #[test]
+    fn long_lookup_matches_say_what_a_wider_pass_would_take() {
+        // (a reply that copies seven tokens over and over: each run is eight tokens, two passes of four rows)
+        let copied = [1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6, 7, 1];
+        let (plain, _) = run(1, &copied, &[], 80, &Sampling::GREEDY, 1);
+        let (out, done) = run(4, &copied, &[], 80, &Sampling::GREEDY, 1);
+        assert_eq!(out, plain);
+        let (matches, tokens, passes) = done.wide;
+        // (the last run may end at max_new)
+        assert!(matches > 1 && tokens > (matches - 1) * (WIDE_PROBE + 1) && tokens <= matches * (WIDE_PROBE + 1) && passes == 2 * matches,
+                "{:?}", done.wide);
+        // (a reply whose matches are short ones: each run a pass, as wide as now)
+        let (out, done) = run(4, &PROMPT, &[], 80, &Sampling::GREEDY, 1);
+        assert_eq!(out, run(1, &PROMPT, &[], 80, &Sampling::GREEDY, 1).0);
+        assert!(done.wide.0 > 0 && done.wide.2 == done.wide.0, "{:?}", done.wide);
+        // (one row a pass has no lookup)
+        assert_eq!(run(1, &copied, &[], 80, &Sampling::GREEDY, 1).1.wide, (0, 0, 0));
     }
 
     /// A lookup match of [`LONG_MATCH`] tokens is verified without asking the engine for a draft,
@@ -1696,6 +1875,50 @@ mod tests {
         // every position's token frequencies agree within sampling noise
         for (position, (plain, drafted)) in counts[0].iter().zip(&counts[1]).enumerate() {
             for (token, (&a, &b)) in plain.iter().zip(drafted).enumerate() {
+                let (a, b) = (a as f64 / trials as f64, b as f64 / trials as f64);
+                assert!((a - b).abs() < 0.03, "position {position}, token {token}: {a:.3} vs {b:.3}");
+            }
+        }
+    }
+
+    /// Drafts in a reasoning held to a forced call, whose rows refuse the end and an id no token has, and whose `</think>` is the
+    /// last draft a pass takes before the call's opening, which is chosen token by token: the tokens come as often as without drafts.
+    #[test]
+    fn sampled_drafts_in_a_held_reasoning_keep_the_target_distribution() {
+        use std::sync::Arc;
+
+        use crate::constraint::{Alternative, TokenBytes};
+        // 0 end, 1 "</think>", 2 "b" (the call's opening), 7 no token
+        let pieces = ["<e>", "</think>", "b", "c", "d", "e", "f", ""];
+        let tokens = Arc::new(TokenBytes::new(pieces.iter().map(|piece| piece.as_bytes().to_vec()).collect(), vec![false; 8]).with_think_close(Some(1)));
+        let sampling = Sampling { temperature: 1.0, top_k: 0, top_p: 1.0, min_p: 0.0, presence_penalty: 0.0 };
+        let trials = 6000;
+        let mut counts = [[[0usize; 8]; 6]; 2];
+        let mut drafted = 0;
+        for (side, rows) in [1, 4].into_iter().enumerate() {
+            for seed in 0..trials {
+                let mut held = Constraint::new(Arc::clone(&tokens), &[0], true, vec![Alternative::prefix("b", 0)]);
+                let mut toy = Toy { vocabulary: 8, rows, ..Toy::default() };
+                let mut history = PROMPT.to_vec();
+                let logits = toy.forward(&PROMPT).unwrap();
+                let mut out = Vec::new();
+                let done = decode(&mut toy, &mut history, logits, 8, &[0], 6, &sampling, seed as u64 * 7919 + 13, &|| false,
+                                  &mut |token| out.push(token), Some(&mut held)).unwrap();
+                assert_eq!(toy.held, history);
+                drafted += done.drafted;
+                let close = out.iter().position(|&token| token == 1);
+                assert!(!out.contains(&7), "{out:?}");
+                if let Some(at) = close {
+                    assert!(out.get(at + 1).is_none_or(|&token| token == 2), "the call's opening after the close: {out:?}");
+                }
+                for (position, &token) in out.iter().enumerate() {
+                    counts[side][position][token as usize] += 1;
+                }
+            }
+        }
+        assert!(drafted > trials / 10, "drafts were taken ({drafted})");
+        for (position, (plain, drafts)) in counts[0].iter().zip(&counts[1]).enumerate() {
+            for (token, (&a, &b)) in plain.iter().zip(drafts).enumerate() {
                 let (a, b) = (a as f64 / trials as f64, b as f64 / trials as f64);
                 assert!((a - b).abs() < 0.03, "position {position}, token {token}: {a:.3} vs {b:.3}");
             }

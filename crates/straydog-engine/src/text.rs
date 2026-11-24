@@ -22,8 +22,10 @@ fn gguf_pre_tokenizer(name: &str) -> Option<serde_json::Value> {
 /// ([`Text::defuse`]): [`Text::encode`] takes it as ordinary text, never as that token.
 pub const DEFUSED: char = '\u{e001}';
 
-/// Segments (the text between two added tokens) of at least this many bytes are kept by their digest once encoded ([`Text::encode`]).
-const MEMO_FROM: usize = 4096;
+/// Segments (the text between two added tokens) of at least this many bytes are kept by their digest once encoded ([`Text::encode`]). An agent's
+/// conversation is mostly short ones (a reasoning, a tool call, a small tool result): kept from 4096 bytes on, a 192,496-token one was encoded
+/// in 43 ms each turn, from 64 in 2.4 ms (DeepSeek-V4.1's tokenizer, Ryzen 5 7500F).
+const MEMO_FROM: usize = 64;
 /// The most tokens the kept segments hold, the oldest let go first (16 MiB): a conversation at the longest context a model is
 /// served with, DeepSeek-V4.1's 1,048,576 tokens, with room for others. A segment longer than this is not kept: at 1 << 19 a
 /// 932,410-token conversation was encoded again each turn, 0.9 s of a 1.55 s wait for its first token.

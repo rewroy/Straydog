@@ -59,6 +59,8 @@ enum Job {
 /// sixteen bulk reads busy (~300 MB queued); a request's reads go ahead of them.
 const WARM_STEP: usize = 64;
 const WARM_IN_FLIGHT: usize = 64;
+/// How often the machine's available memory is looked at while no request comes (the served model's `tend_memory`).
+const MEMORY_LOOK: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where a span of a warm-up (`elapsed`, from the readers' totals `at` to now) spent its time: the readers' bytes and their rate, the drive's
 /// reads in flight on average (of the sixteen the shared readers admit) and the checks', and the time it stood `paused` for requests and for
@@ -71,6 +73,14 @@ fn reads_note(at: (u64, u64, u64, u64), elapsed: std::time::Duration, paused: st
     format!("the readers {reads} reads, {:.1} GB, {:.2} GB/s; the drive's reads in flight {:.1} on average, the checks {:.1}; paused {:.1} s for \
              requests and making room", bytes as f64 / 1e9, bytes as f64 / 1e9 / seconds, read_ns as f64 / 1e9 / seconds,
             verify_ns as f64 / 1e9 / seconds, paused.as_secs_f64())
+}
+
+/// Where a warm-up's steps went (the served model's `warm_waits`): of those with experts to read, the share
+/// that found the reads in flight at their most (the drive's pace) and the share that found no room for the next (the host tier still
+/// being pinned, or no slot free).
+fn waits_note((steps, full, roomless): (usize, usize, usize)) -> String {
+    let share = |part: usize| 100.0 * part as f64 / steps.max(1) as f64;
+    format!("of {steps} steps with experts to read, {:.0}% found the reads at their most, {:.0}% no room", share(full), share(roomless))
 }
 
 /// The request loop's side: each request runs on the model's thread.
@@ -193,8 +203,8 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                                 match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
                                     Ok(Warmed::Going) => {}
                                     Ok(Warmed::Listed) => {
-                                        eprintln!("Straydog warmed up in {:.1} s; {}", since.elapsed().as_secs_f64(),
-                                                  reads_note(reads_at, since.elapsed(), paused));
+                                        eprintln!("Straydog warmed up in {:.1} s; {}; {}", since.elapsed().as_secs_f64(),
+                                                  reads_note(reads_at, since.elapsed(), paused), waits_note(served.model.warm_waits()));
                                         listed = Some(Instant::now());
                                         reads_at = straydog_engine::experts::reader_totals();
                                         paused = std::time::Duration::ZERO;
@@ -202,9 +212,10 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                                     Ok(Warmed::Done) => {
                                         let (vram, host, bytes) = served.model.filled();
                                         eprintln!("Straydog filled its free slots with {vram} experts for VRAM, {host} for the host tier \
-                                                   ({:.1} GiB from the drive) in {:.1} s; {}", bytes as f64 / (1u64 << 30) as f64,
+                                                   ({:.1} GiB from the drive) in {:.1} s; {}; {}", bytes as f64 / (1u64 << 30) as f64,
                                                   listed.map_or(0.0, |listed| listed.elapsed().as_secs_f64()),
-                                                  reads_note(reads_at, listed.map_or(std::time::Duration::ZERO, |listed| listed.elapsed()), paused));
+                                                  reads_note(reads_at, listed.map_or(std::time::Duration::ZERO, |listed| listed.elapsed()), paused),
+                                                  waits_note(served.model.warm_waits()));
                                         warming = None;
                                         rooming = true;
                                     }
@@ -219,9 +230,16 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 } else {
-                    match queue.recv() {
+                    // (while no request comes, the machine's memory is looked at every few seconds: what grows beside the host tier)
+                    match queue.recv_timeout(MEMORY_LOOK) {
                         Ok(job) => job,
-                        Err(_) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Err(error) = served.model.tend_memory() {
+                                eprintln!("Straydog could not give host memory back: {error}");
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 };
                 match job {
@@ -230,6 +248,9 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                         let _ = reply.send(served.run(&text, &output, &id, &body, &cancel, started));
                         if warming.is_some() {
                             paused += running.elapsed();
+                        }
+                        if let Err(error) = served.model.tend_memory() {
+                            eprintln!("Straydog could not give host memory back: {error}");
                         }
                         rooming = true;
                     }
@@ -289,6 +310,8 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         None => header.metadata.get("tokenizer.chat_template").and_then(|value| value.text())
             .ok_or("the GGUF has no chat template")?.to_string(),
     };
+    // (a template that renders the latest_reminder role: the app's notes beside a user's message, apart from what the user said)
+    let reminders = source.contains("latest_reminder");
     let template = ChatTemplate::new(&source).map_err(|exc| exc.0)?;
     let efforts = architecture == "deepseek41";
     report("warm", 0, 0);
@@ -315,6 +338,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "load_seconds": seconds,
         "gpu": model.info()?,
         "vision": model.engines.vision(),
+        "latest_reminder": reminders,
         // (what the kept conversation's file is keyed on beside the bundle and the build: Session::export_conversation's layout)
         "prefix": {"version": straydog_engine::prefix::VERSION, "layout": format!("{KEPT_LAYOUT} layers {}", model.placement["layers"])},
     });
@@ -402,35 +426,73 @@ impl<E: Engines> Loaded<E> {
         let thinking = thinking && !unreasoned;
         let pieces = images::pieces(&prompt, images.len()).map_err(refused)?;
         // (one whose rows are kept is not decoded again: its plan says how long its span is)
+        // (one named by its digest is one whose rows are kept, or the request is sent again with its bytes: refused before any is decoded)
+        let kept_plan = |digest: &[u8; 32]| self.encoded.iter().find(|(kept, _, _)| kept == digest).map(|&(_, _, plan)| plan);
+        let gone: Vec<[u8; 32]> = images.iter().filter_map(|image| match image {
+            images::Taken::Held(digest) if kept_plan(digest).is_none() => Some(*digest),
+            _ => None,
+        }).collect();
+        if !gone.is_empty() {
+            return Err(crate::worker::not_held(&gone));
+        }
         let images: Vec<images::Image> = images
             .iter()
-            .map(|bytes| {
-                let digest = images::digest(bytes);
-                match self.encoded.iter().find(|(kept, _, _)| *kept == digest) {
-                    Some(&(_, _, plan)) => Ok(images::known(digest, plan)),
-                    None => images::prepare(bytes),
+            .map(|image| match image {
+                images::Taken::Held(digest) => Ok(images::known(*digest, kept_plan(digest).expect("a kept image"))),
+                images::Taken::Bytes(bytes) => {
+                    let digest = images::digest(bytes);
+                    match kept_plan(&digest) {
+                        Some(plan) => Ok(images::known(digest, plan)),
+                        None => images::prepare(bytes),
+                    }
                 }
             })
             .collect::<Result<_, _>>()
             .map_err(refused)?;
-        let (mut ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
+        let (ids, spans) = images::ids(text, &pieces, &images).map_err(Failure::from)?;
         // A reply sent back keeps the ids the model wrote it in, as far as its text is the prompt's (Text::reach): the same text
-        // encoded again can be split otherwise, and the engines then read the reply again from the first such place.
-        if images.is_empty() {
-            let held = self.model.held();
-            let shared = ids.iter().zip(held).take_while(|(new, old)| new == old).count();
-            if shared < held.len() && shared < ids.len() {
-                let (count, at) = text.reach(held, &prompt);
-                if count > shared {
-                    let mut kept = held[..count].to_vec();
-                    kept.extend(text.encode(&prompt[at..]).map_err(Failure::from)?);
-                    ids = kept;
+        // encoded again can be split otherwise, and the engines then read the reply again from the first such place. Piece by
+        // piece, through each picture whose ids the session holds where the prompt has it: a conversation's first picture had
+        // every earlier reply encoded again, and an agent's 86K-token conversation was read again from 19K tokens in (45 s).
+        let parts: Vec<Part> = {
+            let mut placed = spans.iter();
+            pieces.iter().map(|piece| match piece {
+                images::Piece::Text(part) => Part::Text(part),
+                images::Piece::Image(_) => {
+                    let &(index, start) = placed.next().expect("a span for each picture placed");
+                    Part::Image(&ids[start..start + images[index].plan.tokens()])
                 }
+            }).collect()
+        };
+        let reach = |held: &[u32], part: &str| text.reach(held, part);
+        let encoded = |part: &str| text.encode(part).map_err(Failure::from);
+        let held = self.model.held();
+        let (kept, starts) = written(held, &parts, reach, encoded)?;
+        // (only where that agrees with the session further than the prompt encoded afresh)
+        let agreed = |ids: &[u32]| ids.iter().zip(held).take_while(|(new, old)| new == old).count();
+        let (mut ids, mut spans) = if agreed(&kept) > agreed(&ids) {
+            (kept, spans.iter().zip(starts).map(|(&(index, _), start)| (index, start)).collect::<Vec<_>>())
+        } else {
+            (ids.clone(), spans.clone())
+        };
+        // (after a start, the kept conversation's tokens are what its replies were written in: a prompt encoded afresh split one of
+        // them otherwise and never began with all of them, so a conversation of more than one turn was never taken. Kept to where
+        // the prompt then begins with all of them, and goes on from that conversation.)
+        if let Some(tokens) = crate::worker::kept_tokens() {
+            let (from_kept, kept_starts) = written(&tokens, &parts, reach, encoded)?;
+            if from_kept.len() > tokens.len() && from_kept.starts_with(&tokens) && !ids.starts_with(&tokens) {
+                spans = spans.iter().zip(kept_starts).map(|(&(index, _), start)| (index, start)).collect();
+                ids = from_kept;
             }
         }
         let encode_seconds = started.elapsed().as_secs_f64();
+        // (a conversation an earlier run kept, which this prompt goes on from: its images' positions are in the state, by their digests' ids)
+        let kept_seconds = crate::worker::take_kept(&mut self.model, output, id, cancel, &ids);
         let image_started = Instant::now();
-        let rows = self.image_rows(&images, &spans)?;
+        // (an image the session already holds past needs no rows, as the passes embed only what they read: after a start that took a
+        // kept conversation, every screenshot of it was encoded again for the first request, a second or more each)
+        let held = self.model.held_prefix(&ids);
+        let rows = self.image_rows(&images, &spans, held)?;
         self.model.engines.set_images(spans.iter().map(|&(index, start)| (start, rows[index].clone().unwrap_or_default())).collect());
         let image_seconds = image_started.elapsed().as_secs_f64();
         let context = self.model.context;
@@ -482,8 +544,6 @@ impl<E: Engines> Loaded<E> {
         // go without it and a reasoning_end event marks the place. The same text otherwise written (the
         // reasoning quoting a tag) stays the reasoning's.
         let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
-        // (a conversation an earlier run kept, which this prompt goes on from: not one with images)
-        let kept_seconds = if images.is_empty() { crate::worker::take_kept(&mut self.model, output, id, cancel, &ids) } else { None };
         let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -547,12 +607,16 @@ impl<E: Engines> Loaded<E> {
 }
 
 impl<E: Engines> Loaded<E> {
-    /// The span rows of the placed images (by index; none for an image the prompt does not hold):
-    /// those encoded lately kept, the others encoded together.
-    fn image_rows(&mut self, images: &[images::Image], spans: &[(usize, usize)]) -> Result<Vec<Option<Arc<Vec<f32>>>>, Failure> {
+    /// The span rows of the placed images (by index; none for an image the prompt does not hold, or one whose
+    /// positions all lie in the `held` prefix the session goes on from): those encoded lately kept, the others
+    /// encoded together.
+    fn image_rows(&mut self, images: &[images::Image], spans: &[(usize, usize)], held: usize) -> Result<Vec<Option<Arc<Vec<f32>>>>, Failure> {
         let mut rows: Vec<Option<Arc<Vec<f32>>>> = vec![None; images.len()];
         let mut missing = Vec::new();
-        for &(index, _) in spans {
+        for &(index, start) in spans {
+            if passed(start, images[index].plan.tokens(), held) {
+                continue;
+            }
             match self.encoded.iter().position(|(digest, _, _)| *digest == images[index].digest) {
                 Some(at) => {
                     let kept = self.encoded.remove(at);
@@ -582,5 +646,93 @@ impl<E: Engines> Loaded<E> {
             self.encoded.remove(0);
         }
         Ok(rows)
+    }
+}
+
+/// A piece of a prompt for [`written`]: a text, or a picture's ids.
+enum Part<'a> {
+    Text(&'a str),
+    Image(&'a [u32]),
+}
+
+/// The prompt's ids, with the session's `held` ids kept as written: through each text they spell (`reach`: how many, and how far
+/// into the text) and each picture whose ids they are, in order; from the first place they part, each text encoded (`encoded`)
+/// and each picture's ids as they are. With the place each picture's ids begin.
+fn written(held: &[u32], parts: &[Part], reach: impl Fn(&[u32], &str) -> (usize, usize),
+           encoded: impl Fn(&str) -> Result<Vec<u32>, Failure>) -> Result<(Vec<u32>, Vec<usize>), Failure> {
+    let (mut ids, mut starts, mut kept) = (Vec::new(), Vec::new(), Some(0));
+    for part in parts {
+        match *part {
+            Part::Text(text) => {
+                let Some(at_held) = kept else {
+                    ids.extend(encoded(text)?);
+                    continue;
+                };
+                let (count, at) = reach(&held[at_held..], text);
+                ids.extend_from_slice(&held[at_held..at_held + count]);
+                if at == text.len() {
+                    kept = Some(at_held + count);
+                } else {
+                    ids.extend(encoded(&text[at..])?);
+                    kept = None;
+                }
+            }
+            Part::Image(image) => {
+                starts.push(ids.len());
+                kept = kept.filter(|&at_held| held[at_held..].starts_with(image)).map(|at_held| at_held + image.len());
+                ids.extend_from_slice(image);
+            }
+        }
+    }
+    Ok((ids, starts))
+}
+
+/// Whether an image span of `tokens` positions from `start` lies wholly in the `held` prefix, short of its last position (the one place
+/// a pass may read again): its rows are then not read.
+fn passed(start: usize, tokens: usize, held: usize) -> bool {
+    start + tokens < held
+}
+
+#[cfg(test)]
+mod tests {
+    /// The replies held are kept as written across the pictures: each text the held ids spell keeps them, each picture whose ids
+    /// they are keeps its place; from where they part, texts are encoded and pictures are as given, and every picture's start
+    /// follows its text.
+    #[test]
+    fn replies_are_kept_as_written_across_the_pictures() {
+        use super::{written, Part};
+        // (the texts "ab" and "cd": the held reply wrote "ab" as 5, an encoder writes 6 7; "cd" is 8 either way; a picture 100 101)
+        let spell = |text: &str| -> Vec<(u32, &'static str)> { match text { "ab" => vec![(5, "ab")], "cd" => vec![(8, "cd")], _ => vec![] } };
+        let reach = |held: &[u32], text: &str| -> (usize, usize) {
+            let mut at = 0;
+            let mut count = 0;
+            for (&token, (id, piece)) in held.iter().zip(spell(text)) {
+                if token != id {
+                    break;
+                }
+                count += 1;
+                at += piece.len();
+            }
+            (count, at)
+        };
+        let encoded = |text: &str| Ok::<_, super::Failure>(match text { "ab" => vec![6, 7], "cd" => vec![8], "b" => vec![7], _ => vec![] });
+        let picture = [100, 101];
+        let parts = [Part::Text("ab"), Part::Image(&picture), Part::Text("cd")];
+        let ok = |result: Result<(Vec<u32>, Vec<usize>), super::Failure>| result.ok().unwrap();
+        // the reply before the picture as the model wrote it, the picture in place
+        assert_eq!(ok(written(&[5, 100, 101, 8, 9], &parts, reach, encoded)), (vec![5, 100, 101, 8], vec![1]));
+        // nothing held: all encoded, the picture after its text
+        assert_eq!(ok(written(&[], &parts, reach, encoded)), (vec![6, 7, 100, 101, 8], vec![2]));
+        // another picture held there: the text before it kept, the rest as given
+        assert_eq!(ok(written(&[5, 200, 201, 8], &parts, reach, encoded)), (vec![5, 100, 101, 8], vec![1]));
+    }
+
+    /// An image is passed only when all of it lies before the held prefix's last position, which a pass may read again.
+    #[test]
+    fn an_image_the_session_holds_past_needs_no_rows() {
+        assert!(super::passed(100, 50, 151), "positions 100..149, held 0..150");
+        assert!(!super::passed(100, 50, 150), "its last position is the held prefix's last");
+        assert!(!super::passed(100, 50, 120), "half of it is new");
+        assert!(!super::passed(100, 50, 0), "nothing held");
     }
 }

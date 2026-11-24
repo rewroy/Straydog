@@ -785,7 +785,7 @@ impl Backend {
                             output_stride: u64, scratch: &Buffer) -> Result<()> {
         // SAFETY: a live handle; the library checks every range against its allocations.
         check(unsafe {
-            ffi::sd_op_linear_gemm_half(self.handle(), weights.pointer, kind as i32, rows, cols, first, input, steps, output.cast(),
+            ffi::sd_op_linear_gemm_half(self.handle(), weights.pointer, kind as i32, rows, cols, first, input.cast(), steps, output.cast(),
                                         output_stride, scratch.pointer.cast(), scratch.bytes)
         })
     }

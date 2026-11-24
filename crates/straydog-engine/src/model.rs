@@ -2887,7 +2887,8 @@ impl Model {
         // What the start planned and why it planned no more, for a log that says where the CPU's experts are read from.
         let gib = |bytes: u64| if bytes == u64::MAX { "no bound".to_string() } else { format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64) };
         let planned = layers.iter().map(|layer| sizes[*layer]).sum::<u64>();
-        let free = crate::host::left_free(self.weights.host_memory_bytes);
+        // (what the plan kept free: host::lockable heeds STRAYDOG_KEEP_FREE)
+        let free = crate::host::lock_kept_free(self.weights.host_memory_bytes);
         // (on Windows the commit, which locked memory and VRAM are charged to 1 to 1, can bind before the physical memory does)
         let commit = crate::host::commit_left();
         let why = if layers.len() == 48 {
@@ -4577,8 +4578,11 @@ impl Model {
         self.group.prompt_scan(new_tokens >= self.chunked_scan_from, new_tokens >= self.hc_fused_from)?;
         let output = self.prefill_read(tokens, position, plan, cancelled, progress);
         let cleared = self.group.prompt_scan(false, false);
+        // (STRAYDOG_PREFILL_PHASES: the prompt's phases, which a served worker would never print otherwise)
+        let reported = self.group.phase_report();
         let output = output?;
         cleared?;
+        reported?;
         Ok(output)
     }
 
@@ -6208,13 +6212,15 @@ impl Model {
             if plan.probe {
                 self.metric_count("drafts_probe_passes", 1);
             }
-            let limit = if force_single_row { 0 } else { plan.drafts.min(self.speculative).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
+            // (a reply held to alternatives drafts only where it may take any token: Constraint::takes_drafts)
+            let open = held.as_deref().is_none_or(Constraint::takes_drafts);
+            let limit = if force_single_row || !open { 0 } else { plan.drafts.min(self.speculative).min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             // The token's PLE rows read while the drafter runs; the drafts' while layer 0 does.
             let mut clock = Instant::now();
             self.prefetch_ple(&self.history, &[token])?;
             self.phase("PLE prefetch", &mut clock);
             ngrams.push(token);
-            let copy_limit = if force_single_row || plan.probe || self.pipeline.no_copy() { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
+            let copy_limit = if force_single_row || !open || plan.probe || self.pipeline.no_copy() { 0 } else { self.copy_drafts.min(max_new - produced - 1).min(self.context.saturating_sub(self.history.len() + 1)) };
             let (copy, matched) = ngrams.propose(copy_limit);
             let width = if matched >= LONG_MATCH { policy.width(matched).min(copy.len()) } else { 0 };
             // (a copied token the request refuses could only be rejected: no row is spent on it)
@@ -6238,6 +6244,14 @@ impl Model {
                 (copy[..width].to_vec(), Vec::new())
             } else {
                 self.draft(&mtp_hidden, &mtp_tokens, mtp_position, limit, sampling, rng, suppression)?
+            };
+            // (nor past where it stops taking them, nor a point draft it refuses; a drawn one it refuses is left to its masked row)
+            let (drafts, proposed) = match held.as_deref().filter(|_| !copied && self.forced_rows.is_none()) {
+                Some(held) => {
+                    let taken = if proposed.is_empty() { held.allowed_prefix(&drafts) } else { held.open_prefix(&drafts) };
+                    (drafts[..taken].to_vec(), proposed[..taken.min(proposed.len())].to_vec())
+                }
+                None => (drafts, proposed),
             };
             let rows: Vec<u32> = std::iter::once(token).chain(drafts.iter().copied()).collect();
             let mut clock = Instant::now();
@@ -6328,7 +6342,7 @@ impl Model {
             }
             self.passes_with_draft = if rows.len() == 1 { 0 } else { self.passes_with_draft + 1 };
             // What the pass cost and kept goes to the windows the drafts are chosen by; the end of a probe may change them.
-            if !measuring && !copied && self.forced_rows.is_none() {
+            if !measuring && !copied && open && self.forced_rows.is_none() {
                 let outcome = self.width.as_mut().and_then(|chooser| chooser.record(plan, limit, rows.len(), accepted, seconds));
                 if let Some(outcome) = outcome {
                     if outcome.worth_saying() {
@@ -6653,13 +6667,15 @@ impl Model {
         self.sample_seed = seed;
         let Some(mut logits) = output else { return Ok(()) };
         self.assist_request();
-        let applies = self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token)
-            && self.pipeline_applies(sampling, constraint.as_deref());
+        let applies = self.speculative > 0 && self.pipeline_applies(sampling, constraint.as_deref());
         // The reply is marked as it grows, where a later request may continue it. (Not a pipelined one: its passes overlap, and
         // the state between two of them is not the sequence's.)
         self.mark_at = if checkpoint && self.reply_marks && !applies { self.history.len() + MARK_EVERY } else { usize::MAX };
         self.pipeline_live_for(applies)?;
-        if self.speculative > 0 && !constraint.as_deref().is_some_and(Constraint::chooses_every_token) {
+        // (a constrained reply too: its passes draft where it may take any token, Constraint::takes_drafts. It took none before, and
+        // Dogmind asks for a call, tool_choice required, right after it stops a reasoning that writes out a program: the request
+        // that writes it)
+        if self.speculative > 0 {
             // (greedy requests of a partially resident model on two GPUs, STRAYDOG_PIPELINE=1: the first GPU runs the next pass's
             // layers while the second finishes this one's; any other takes the ordinary loop)
             if applies {

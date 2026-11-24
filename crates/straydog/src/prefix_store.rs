@@ -100,6 +100,17 @@ impl Wrap for Dpapi {
 /// on the drive, wraps a file's key with AES-256-GCM (a random nonce, [`ENTROPY`] as the associated data). As DPAPI, any process of the user may
 /// unwrap what it wrapped, nobody else. The key lasts the boot (and the keyring's idle expiry, three days by default): a file kept before then no
 /// longer opens, and is deleted as any file that does not open.
+/// The last place [`KernelKeyring::lock`] tries ([`keyring_lock_beside`]).
+#[cfg(target_os = "linux")]
+static LOCK_BESIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The kernel keyring's lock may go in `dir`, the directory a kept conversation is in, where neither the runtime directory nor `~/.cache` can
+/// be written. The first such directory a process names stands.
+#[cfg(target_os = "linux")]
+pub fn keyring_lock_beside(dir: &Path) {
+    let _ = LOCK_BESIDE.set(dir.to_path_buf());
+}
+
 #[cfg(target_os = "linux")]
 pub struct KernelKeyring;
 
@@ -143,42 +154,58 @@ impl KernelKeyring {
     }
 
     /// An exclusive lock of the user's, held while it lives: a file of the user's alone (mode 0600, not a link) in a directory the user owns
-    /// that no one else may write (the runtime directory, else `~/.cache/straydog`, made 0700). Never in a shared directory, where another user
-    /// could hold it or put a link in its place; and waited for ten seconds at most.
+    /// that no one else may write: the runtime directory, else `~/.cache/straydog` (made 0700), else the directory the kept conversation is in
+    /// ([`keyring_lock_beside`]). Never in a shared directory, where another user could hold it or put a link in its place; and waited for ten
+    /// seconds at most. A service with no runtime directory and its home read-only (Homelab's: `ProtectHome=read-only`) kept nothing at its stops
+    /// until the third place.
     fn lock() -> Result<std::fs::File, String> {
+        let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("straydog"));
+        let places = [std::env::var_os("XDG_RUNTIME_DIR").map(|dir| (PathBuf::from(dir), false)), home.map(|dir| (dir, true)),
+                      LOCK_BESIDE.get().map(|dir| (dir.clone(), true))];
+        Self::lock_in(&places.into_iter().flatten().collect::<Vec<_>>())
+    }
+
+    /// [`KernelKeyring::lock`] in the first of `places` (each a directory, and whether it may be made) where it can be.
+    fn lock_in(places: &[(PathBuf, bool)]) -> Result<std::fs::File, String> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
         use std::os::unix::io::AsRawFd;
         // SAFETY: getuid has no failure.
         let uid = unsafe { libc::getuid() };
         let private = |dir: &Path| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0);
-        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|dir| private(dir)) {
-            Some(dir) => dir,
-            None => {
-                let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("the kernel's keyring's lock: no home directory")?;
-                let dir = home.join(".cache").join("straydog");
-                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)
-                    .map_err(|error| format!("the kernel's keyring's lock {}: {error}", dir.display()))?;
-                if !private(&dir) {
-                    return Err(format!("the kernel's keyring's lock: {} is not the user's alone", dir.display()));
+        let mut tried = Vec::new();
+        for (dir, made) in places {
+            if *made {
+                if let Err(error) = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir) {
+                    tried.push(format!("{}: {error}", dir.display()));
+                    continue;
                 }
-                dir
             }
-        };
-        let path = dir.join("straydog-keyring.lock");
-        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)
-            .map_err(|error| format!("the kernel's keyring's lock {}: {error}", path.display()))?;
-        if !file.metadata().is_ok_and(|meta| meta.uid() == uid && meta.is_file()) {
-            return Err(format!("the kernel's keyring's lock: {} is not the user's file", path.display()));
-        }
-        let started = std::time::Instant::now();
-        // SAFETY: a descriptor this function owns; the lock goes with the file.
-        while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            if started.elapsed() > Duration::from_secs(10) {
-                return Err(format!("the kernel's keyring's lock {}: held by another process for 10 s", path.display()));
+            if !private(dir) {
+                tried.push(format!("{} is not the user's alone", dir.display()));
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let path = dir.join("straydog-keyring.lock");
+            let file = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    tried.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if !file.metadata().is_ok_and(|meta| meta.uid() == uid && meta.is_file()) {
+                return Err(format!("the kernel's keyring's lock: {} is not the user's file", path.display()));
+            }
+            let started = std::time::Instant::now();
+            // SAFETY: a descriptor this function owns; the lock goes with the file.
+            while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                if started.elapsed() > Duration::from_secs(10) {
+                    return Err(format!("the kernel's keyring's lock {}: held by another process for 10 s", path.display()));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return Ok(file);
         }
-        Ok(file)
+        Err(format!("the kernel's keyring's lock has no place ({})", if tried.is_empty() { "no directory to try".into() } else { tried.join("; ") }))
     }
 
     fn sealing() -> Result<LessSafeKey, String> {
@@ -604,6 +631,32 @@ pub fn build_id() -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keyring's lock goes in the first place it can: a directory that cannot be made (a read-only home, as under a service) or one another
+    /// may write is passed over for the next, and with none the error says why each was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_keyrings_lock_goes_where_it_can() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("straydog-keyring-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let read_only = root.join("home");
+        std::fs::create_dir(&read_only).unwrap();
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let shared = root.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let beside = root.join("conversation");
+        let held = KernelKeyring::lock_in(&[(read_only.join(".cache").join("straydog"), true), (shared.clone(), false), (beside.clone(), true)]).unwrap();
+        assert!(beside.join("straydog-keyring.lock").is_file());
+        assert_eq!(std::fs::metadata(&beside).unwrap().permissions().mode() & 0o777, 0o700);
+        drop(held);
+        let none = KernelKeyring::lock_in(&[(read_only.join("x"), true), (shared.clone(), false)]).unwrap_err();
+        assert!(none.contains("has no place") && none.contains("not the user's alone"), "{none}");
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// A wrapper that needs no user: the key's bytes flipped.
     struct Flip;

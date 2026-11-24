@@ -54,6 +54,15 @@ impl<T: Tensors> Engine<'_, T> {
         self.tensors.tensor(&format!("{PATCH}.weight")).is_ok()
     }
 
+    /// The vision encoder's weights read and checked from its file now, the bytes they are: an image's first encoding reads them otherwise,
+    /// and behind a warm-up's reads from the same drive two screenshots took 183 s before their rows (1.5 s once the warm-up was over).
+    pub fn read_vision(&self) -> Result<u64> {
+        if !self.vision() {
+            return Ok(0);
+        }
+        encoder_weights(self.tensors).0.iter().try_fold(0, |bytes, (name, _)| Ok(bytes + self.tensors.tensor(name)?.data.len() as u64))
+    }
+
     /// The rows the next passes embed at image positions: each span's first position and its
     /// rows ([`Engine::encode_images`]), replacing those set before.
     pub fn set_images(&mut self, spans: Vec<(usize, Arc<Vec<f32>>)>) {
@@ -135,26 +144,10 @@ impl<T: Tensors> Engine<'_, T> {
     }
 }
 
-/// Each image's span rows ([`crate::vision::span`]): START, the encoder's rows with a NEWLINE after
-/// each row of the grid, END; `width` (the model's) values a position, rounded to BF16 as the
-/// reference's embeddings are. The encoder runs in `arena`, whose bytes `reserve` makes free for
-/// as far as it reaches (given before anything is written there).
-pub fn encode_image_rows<T: Tensors + ?Sized>(gpu: &mut Backend, arena: Buffer, tensors: &T, width: usize, images: &[Patches],
-                                              reserve: impl FnOnce(&mut Backend, u64) -> Result<()>) -> Result<Vec<Vec<f32>>> {
-    if images.is_empty() {
-        return Ok(Vec::new());
-    }
-    let config = VisionConfig::DEEPSEEK41;
-    let patch = tensors.tensor(&format!("{PATCH}.weight"))?;
-    let [values, vision_width] = patch.dims[..] else { return Err("an unexpected vision patch embedding".into()) };
+/// The encoder's weights by name, each a product's (true) or a vector's, in the order of their places in the device's copy: the products first
+/// (one conversion to FP16 covers them), then the vectors; and its layers.
+fn encoder_weights<T: Tensors + ?Sized>(tensors: &T) -> (Vec<(String, bool)>, usize) {
     let layers = (0..).take_while(|&layer| tensors.tensor(&block(layer, "norm1.weight")).is_ok()).count();
-    // (the reference's vision_n_heads: the file's tensors do not tell it)
-    let heads = 16;
-    let ffn = tensors.tensor(&block(0, "mlp.w2.weight"))?.dims[0];
-    if values != 3 * config.patch * config.patch || layers == 0 || vision_width % heads != 0 {
-        return Err("an unexpected vision encoder shape".into());
-    }
-    // The weights' places: the products first (one conversion to FP16 covers them), then the vectors.
     let mut names: Vec<(String, bool)> = vec![(format!("{PATCH}.weight"), true)];
     for layer in 0..layers {
         for part in ["attn.wqkv.weight", "attn.wo.weight", "mlp.w1.weight", "mlp.w2.weight"] {
@@ -168,6 +161,28 @@ pub fn encode_image_rows<T: Tensors + ?Sized>(gpu: &mut Backend, arena: Buffer, 
         for part in ["norm1.weight", "attn.wqkv.bias", "attn.wo.bias", "norm2.weight"] {
             names.push((block(layer, part), false));
         }
+    }
+    (names, layers)
+}
+
+/// Each image's span rows ([`crate::vision::span`]): START, the encoder's rows with a NEWLINE after
+/// each row of the grid, END; `width` (the model's) values a position, rounded to BF16 as the
+/// reference's embeddings are. The encoder runs in `arena`, whose bytes `reserve` makes free for
+/// as far as it reaches (given before anything is written there).
+pub fn encode_image_rows<T: Tensors + ?Sized>(gpu: &mut Backend, arena: Buffer, tensors: &T, width: usize, images: &[Patches],
+                                              reserve: impl FnOnce(&mut Backend, u64) -> Result<()>) -> Result<Vec<Vec<f32>>> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = VisionConfig::DEEPSEEK41;
+    let patch = tensors.tensor(&format!("{PATCH}.weight"))?;
+    let [values, vision_width] = patch.dims[..] else { return Err("an unexpected vision patch embedding".into()) };
+    let (names, layers) = encoder_weights(tensors);
+    // (the reference's vision_n_heads: the file's tensors do not tell it)
+    let heads = 16;
+    let ffn = tensors.tensor(&block(0, "mlp.w2.weight"))?.dims[0];
+    if values != 3 * config.patch * config.patch || layers == 0 || vision_width % heads != 0 {
+        return Err("an unexpected vision encoder shape".into());
     }
     let mut weights = Vec::with_capacity(names.len());
     let mut at = 0u64;

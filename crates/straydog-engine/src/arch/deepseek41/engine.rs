@@ -1103,9 +1103,12 @@ impl Shard {
             Some(arena) => Some(experts.lend_region(arena)?.0),
             None => None,
         };
-        // The expansions' ring holds experts too between prompt passes (DS41_LEND_EXPANSIONS=0: not lent): a decode pass expands
-        // nothing, and the ring is 512 MiB a device, ~110 slots of UD-IQ2_XXS's ~5000.
-        let expansion_region = match expansions.filter(|_| std::env::var("DS41_LEND_EXPANSIONS").map_or(true, |value| value != "0")) {
+        // The expansions' ring may hold experts between prompt passes (DS41_LEND_EXPANSIONS=1: lent): a decode pass expands
+        // nothing, and the ring is 512 MiB a device, ~110 slots of UD-IQ2_XXS's ~5000. Not by default: with both cards' links at
+        // their full speed (PCIe 5.0 x8) a decode pass took 40.2 ms with it lent and 38.2-38.3 ms without (UD-IQ2_XXS on two
+        // R9700s, DSpark at width 3, 159 tokens the same), though it saved 2.6 host-tier fills a token; it paid only while one
+        // card's link had fallen to PCIe 2.0, where a fill cost three times as much.
+        let expansion_region = match expansions.filter(|_| std::env::var("DS41_LEND_EXPANSIONS").is_ok_and(|value| value == "1")) {
             Some(ring) => Some(experts.lend_region(ring)?.0),
             None => None,
         };
@@ -2047,6 +2050,17 @@ impl<'a, T: Tensors> Engine<'a, T> {
             shard.experts.settle(&mut shard.gpu)?;
         }
         Ok(())
+    }
+
+    /// Between requests: `bytes` of the expert stores' host tier given back to the machine, shared by the devices
+    /// ([`DeviceExperts::give_back`]); the bytes given back and the tier's bytes left.
+    pub fn give_back_host(&mut self, bytes: u64) -> Result<(u64, u64)> {
+        let shards = self.shards.len().max(1) as u64;
+        let mut freed = 0;
+        for shard in &mut self.shards {
+            freed += shard.experts.give_back(&mut shard.gpu, bytes.div_ceil(shards))?;
+        }
+        Ok((freed, self.shards.iter().map(|shard| shard.experts.host_tier_bytes()).sum()))
     }
 
     /// Forget the sequence (the caches' contents stay, as warm experts do).

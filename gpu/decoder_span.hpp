@@ -409,10 +409,18 @@ void prefill_span(Device& d,size_t begin,size_t end,size_t position,size_t steps
         record(0,[&]() { hc_prefill(d,pointers+4+(linear ? 9 : 10),kinds+4+(linear ? 9 : 10),steps,hidden,mixed,scratch,fused); });
         phase(d,"hc");
         SD_PREFILL_OBSERVE(d,layer,4,position,steps,2560,mixed);
+        {
+            // (the layer after this one on this device, whose experts this one's MoE may gather ahead: pregather_start)
+            const auto following=d.decoder.find(layer+1);
+            const bool parts=d.resident.find(plan.moe)->second->part;
+            d.pregather.next=!parts && following!=d.decoder.end() ? d.resident.find(following->second.moe)->second.get() : nullptr;
+            d.pregather.position=position; d.pregather.rows=steps;
+        }
         record(3,[&]() {
             if (d.resident.find(plan.moe)->second->part) resident_moe_parts(d,plan.moe,layer,steps,mixed,branch);
             else resident_moe(d,plan.moe,steps,mixed,branch,true);
         });
+        d.pregather.next=nullptr;   // (a MoE run outside this loop gathers nothing ahead)
         phase(d,"moe_combine");
         SD_PREFILL_OBSERVE(d,layer,5,position,steps,2560,branch);
         if (fused && layer+1<end) {

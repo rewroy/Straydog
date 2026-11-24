@@ -62,14 +62,26 @@ const RANKING: [[u8; EXPERTS]; 3] = [
 /// UD-IQ1_M's were the same within their spread (code 76.7 and 78.5, the turns 18.9 and 19.3 s).
 pub const RESIDENT: [usize; 3] = [48, 28, 16];
 
-/// How many of each stage's routed experts are kept: [`RESIDENT`], or with DS41_DSPARK_RESIDENT=A,B,C
-/// each stage's first A, B, C of [`RANKING`], or `all` for all of them.
-pub fn resident_counts() -> Result<[usize; 3]> {
-    parse_counts(std::env::var_os("DS41_DSPARK_RESIDENT").as_deref().map(|value| value.to_string_lossy()).as_deref())
+/// The counts kept where the engine DSpark sits beside has [`ROOMY_BYTES`] of VRAM or more: the first 87, 50 and
+/// 29 again. There the 1.4 GB more they take is some 3% of the target's expert slots, and on both R9700s
+/// (2026-11-23, UD-IQ2_XXS, the 11-07 scenarios) they kept an agent turn's drafts at 2.78 tokens a pass
+/// where 48/28/16 kept 2.13 and 1.83: a token's decode 10-24% quicker on all but prose, a prompt's
+/// reading 0-5% slower (32K +0.8 s, 93K +0.6 s).
+pub const RESIDENT_ROOMY: [usize; 3] = [87, 50, 29];
+
+/// The VRAM of an engine (its devices' budgets together) from which DSpark keeps [`RESIDENT_ROOMY`].
+pub const ROOMY_BYTES: u64 = 40 << 30;
+
+/// How many of each stage's routed experts are kept beside an engine of `engine_vram` bytes of VRAM:
+/// [`RESIDENT_ROOMY`] from [`ROOMY_BYTES`], [`RESIDENT`] below, or with DS41_DSPARK_RESIDENT=A,B,C each
+/// stage's first A, B, C of [`RANKING`], or `all` for all of them.
+pub fn resident_counts(engine_vram: u64) -> Result<[usize; 3]> {
+    let setting = std::env::var_os("DS41_DSPARK_RESIDENT");
+    parse_counts(setting.as_deref().map(|value| value.to_string_lossy()).as_deref(), engine_vram)
 }
 
-fn parse_counts(setting: Option<&str>) -> Result<[usize; 3]> {
-    let Some(setting) = setting else { return Ok(RESIDENT) };
+fn parse_counts(setting: Option<&str>, engine_vram: u64) -> Result<[usize; 3]> {
+    let Some(setting) = setting else { return Ok(if engine_vram >= ROOMY_BYTES { RESIDENT_ROOMY } else { RESIDENT }) };
     if setting.trim() == "all" {
         return Ok([EXPERTS; 3]);
     }
@@ -546,8 +558,8 @@ pub fn footprint(index: usize, devices: usize, vocabulary: usize, resident: [usi
 
 impl Drafter {
     /// Load DSpark (`draft`, checked by [`super::dspark::Dspark`]) onto a target engine's devices,
-    /// split among them; its head is theirs ([`Beside`]).
-    pub fn load(devices: &mut [Beside<'_>], draft: &impl Tensors, target: &impl Tensors, vocabulary: usize) -> Result<Drafter> {
+    /// split among them, keeping `counts` of each stage's routed experts ([`resident_counts`]); its head is theirs ([`Beside`]).
+    pub fn load(devices: &mut [Beside<'_>], draft: &impl Tensors, target: &impl Tensors, vocabulary: usize, counts: [usize; 3]) -> Result<Drafter> {
         let count = devices.len();
         if count == 0 || !HEADS.is_multiple_of(count) || !GROUPS.is_multiple_of(count) || !FFN.is_multiple_of(32 * count) {
             return Err(format!("DSpark does not split among {count} devices"));
@@ -562,7 +574,6 @@ impl Drafter {
         if first_row != vocabulary {
             return Err(format!("the target's head has {first_row} rows, not {vocabulary}"));
         }
-        let counts = resident_counts()?;
         let mut parts = Vec::new();
         for (index, device) in devices.iter_mut().enumerate() {
             parts.push(Part::load(device.gpu, draft, index, count, device.head_rows, counts)?);
@@ -878,7 +889,17 @@ pub struct Policy {
     paused: usize,
     /// What the rounds since [`Policy::take_stats`] did.
     stats: Stats,
+    /// The confidences of the last round's drafts that were verified.
+    last: Vec<f32>,
+    /// Since the start, per slot and per tenth of DSpark's confidence (rounded): the drafts tried (every one before it
+    /// matched) and of them matched: the served traffic's own [`CALIBRATION`], logged every [`CALIBRATION_LINE`] tries.
+    seen: [[(u32, u32); 11]; MAX_SLOTS - 1],
+    /// Tries since the last line of them.
+    since_line: u32,
 }
+
+/// The drafts tried between two lines of what DSpark's confidences met on served traffic ([`Policy::calibration_line`]).
+pub const CALIBRATION_LINE: u32 = 4096;
 
 /// What a [`Policy`]'s rounds did: the drafts it was asked for and, of those, how many tokens each
 /// verified (index 0: none, the draft thrown away).
@@ -936,7 +957,8 @@ impl Default for Policy {
 impl Policy {
     /// With a first guess at a one-row pass's and a draft's milliseconds.
     pub fn new(pass_ms: f64, draft_ms: f64) -> Policy {
-        Policy { unit_ms: pass_ms, extra: 1.0, draft_ms, skill: 1.0, chosen: (0, 0.0), saved: 1.0, pass_ms, paused: 0, stats: Stats::default() }
+        Policy { unit_ms: pass_ms, extra: 1.0, draft_ms, skill: 1.0, chosen: (0, 0.0), saved: 1.0, pass_ms, paused: 0, stats: Stats::default(),
+                 last: Vec::new(), seen: [[(0, 0); 11]; MAX_SLOTS - 1], since_line: 0 }
     }
 
     /// A pass of `rows` rows (1 to 4) in one-row passes now.
@@ -985,6 +1007,12 @@ impl Policy {
     /// what decoding its tokens one at a time would have cost over what it did.
     pub fn verified(&mut self, accepted: usize) {
         let (width, expected) = std::mem::take(&mut self.chosen);
+        // (a slot was tried when every draft before it matched; the last round's confidences are those of its verified drafts)
+        for (slot, &confidence) in std::mem::take(&mut self.last).iter().enumerate().take(accepted + 1) {
+            let cell = &mut self.seen[slot.min(MAX_SLOTS - 2)][(confidence.clamp(0.0, 1.0) * 10.0).round() as usize];
+            (cell.0, cell.1) = (cell.0 + 1, cell.1 + u32::from(slot < accepted));
+            self.since_line += 1;
+        }
         if width == 0 {
             return;
         }
@@ -1003,6 +1031,22 @@ impl Policy {
     /// (a prompt where it read badly may be followed by one where it reads well).
     fn forgive(&mut self) {
         self.skill += (1.0 - self.skill) * 0.01;
+    }
+
+    /// Every [`CALIBRATION_LINE`] drafts tried, a line of what DSpark's confidences met since the start, per slot: at each
+    /// tenth of confidence the drafts matched of those tried (where [`CALIBRATION`] puts them from six probe prompts), and
+    /// the policy's skill and pass costs now.
+    pub fn calibration_line(&mut self) -> Option<String> {
+        if self.since_line < CALIBRATION_LINE {
+            return None;
+        }
+        self.since_line = 0;
+        let slots: Vec<String> = self.seen.iter().enumerate().map(|(slot, cells)| {
+            let cells: Vec<String> = cells.iter().enumerate().filter(|(_, cell)| cell.0 > 0)
+                .map(|(tenth, cell)| format!("{:.1} {}/{} ({:.2} by calibration)", tenth as f64 / 10.0, cell.1, cell.0, CALIBRATION[slot][tenth])).collect();
+            format!("slot {}: {}", slot + 1, cells.join(", "))
+        }).collect();
+        Some(format!("Straydog DSpark calibration on served drafts (skill {:.2}, extra {:.2}): {}", self.skill, self.extra, slots.join("; ")))
     }
 
     /// What the rounds did since the last call.
@@ -1032,6 +1076,7 @@ impl Policy {
             }
         }
         self.chosen = (best.0, best.2);
+        self.last = confidences[..best.0].to_vec();
         self.stats.runs += 1;
         self.stats.widths[best.0] += 1;
         if best.0 == 0 {
@@ -1046,6 +1091,27 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verified draft's slots count where its confidences put them: tried while every draft before matched, matched
+    /// below the accepted count; a line once enough were tried.
+    #[test]
+    fn served_drafts_count_against_their_confidences() {
+        let mut policy = Policy::new(20.0, 1.0);
+        assert_eq!(policy.width(&[0.99, 0.9, 0.3], 3), 2, "the third draft is not worth its row");
+        policy.verified(1);
+        assert_eq!(policy.seen[0][10], (1, 1));
+        assert_eq!(policy.seen[1][9], (1, 0));
+        assert!(policy.seen[2].iter().all(|cell| cell.0 == 0), "a draft not verified was not tried");
+        // (a round that missed at its first draft tries its first slot alone)
+        assert_eq!(policy.width(&[0.99, 0.9, 0.3], 3), 2);
+        policy.verified(0);
+        assert_eq!((policy.seen[0][10], policy.seen[1][9]), ((2, 1), (1, 0)));
+        assert!(policy.calibration_line().is_none());
+        policy.since_line = CALIBRATION_LINE;
+        let line = policy.calibration_line().unwrap();
+        assert!(line.contains("slot 1: 1.0 1/2") && line.contains("slot 2: 0.9 0/1"), "{line}");
+        assert_eq!(policy.since_line, 0);
+    }
 
     fn noted(positions: std::ops::Range<usize>) -> History {
         let mut history = History::new();
@@ -1097,11 +1163,17 @@ mod tests {
 
     #[test]
     fn the_resident_experts_are_a_default_a_list_or_all() {
-        assert_eq!(parse_counts(None).unwrap(), [48, 28, 16]);
-        assert_eq!(parse_counts(Some("all")).unwrap(), [128; 3]);
-        assert_eq!(parse_counts(Some(" 128, 3 ,10")).unwrap(), [128, 3, 10]);
+        // by the engine's VRAM: one R9700's budget, or a small one, keeps 48/28/16; both R9700s' 87/50/29
+        assert_eq!(parse_counts(None, 30 << 30).unwrap(), [48, 28, 16]);
+        assert_eq!(parse_counts(None, 5 << 30).unwrap(), [48, 28, 16]);
+        assert_eq!(parse_counts(None, 60 << 30).unwrap(), [87, 50, 29]);
+        assert_eq!(parse_counts(None, ROOMY_BYTES).unwrap(), RESIDENT_ROOMY);
+        // and what is set is kept, whatever the VRAM
+        assert_eq!(parse_counts(Some("48,28,16"), 60 << 30).unwrap(), [48, 28, 16]);
+        assert_eq!(parse_counts(Some("all"), 5 << 30).unwrap(), [128; 3]);
+        assert_eq!(parse_counts(Some(" 128, 3 ,10"), 60 << 30).unwrap(), [128, 3, 10]);
         for wrong in ["", "87,50", "87,50,29,1", "2,50,29", "87,50,129", "a,b,c", "-1,50,29"] {
-            assert!(parse_counts(Some(wrong)).is_err(), "{wrong}");
+            assert!(parse_counts(Some(wrong), 60 << 30).is_err(), "{wrong}");
         }
         // every stage ranks each of its experts once, and the default keeps the ones most used
         for ranking in RANKING {

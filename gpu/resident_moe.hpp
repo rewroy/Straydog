@@ -548,7 +548,10 @@ __global__ void prompt_cpu_scatter(const float* rows,const int32_t* routes,float
     float* to=outputs+size_t(routes[blockIdx.x])*2560;
     for (unsigned i=threadIdx.x;i<2560;i+=256) to[i]=from[i];
 }
-inline void prompt_cost(double& average,double sample) { average=average>0 ? 0.7*average+0.3*sample : sample; }
+// (a sample moves the average by at most half or double: one prompt that waited on a contended drive does not set what the next batches take)
+inline void prompt_cost(double& average,double sample) {
+    average=average>0 ? 0.7*average+0.3*std::clamp(sample,0.5*average,2.0*average) : sample;
+}
 // Room for `floats` in the pinned prompt buffer (between batches: no copy reads it).
 // Pinned memory, or where the system refuses it (a machine short of memory) pageable memory, whose copies the driver stages; null
 // when even that is refused: the batch then streams the CPU's experts as well (grouped_expert_prefill).
@@ -796,7 +799,12 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     // (observations deferred before this one go first, in order)
     if (!d.deferred.empty()) observe_deferred(d,true);
     std::vector<unsigned> host_counts(groups_count);
+    const auto counts_asked=std::chrono::steady_clock::now();
     read_back(host_counts.data(),counts,groups_count*4);
+    if (d.phase_on) {
+        d.phase_host_counts_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-counts_asked).count());
+        ++d.phase_host_layers;
+    }
     const size_t tail=plan.hybrid ? std::min(steps,hybrid_prompt_tail) : 0;
     std::vector<int32_t> host_tail(tail*10);
     if (tail) read_back(host_tail.data(),selected+(steps-tail)*10,tail*10*4);
@@ -809,6 +817,8 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     std::vector<size_t> on_cpu;
     if (plan.hybrid) {
         hybrid_observe_batch(plan,host_counts.data(),steps,host_tail.data(),tail);
+        plan.last_routed.resize(experts);
+        for (size_t expert=0;expert<experts;++expert) plan.last_routed[expert]=host_counts[expert]>0;
         for (size_t expert=0;expert<experts;++expert)
             if (!plan.layer_prefill && host_counts[expert] && plan.slot_of[expert]<0) { missing.push_back(expert); absent[expert]=true; }
 #if !defined(__HIPCC__)
@@ -881,6 +891,11 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
     // (a pageable layer's tiered experts first: hybrid_stream_missing copies them by DMA and gathers only the chunks after them)
     if (!plan.mapped[0] && !plan.tier[0].empty())
         std::stable_partition(missing.begin(),missing.end(),[&](size_t expert) { return expert_tiered(plan,expert); });
+    // (then those the CPU's workers gathered ahead while the last layer ran, in the order they lie in their mirror: pregather_start)
+    if (const std::vector<int32_t>* ahead=plan.hybrid ? pregather_held(d,plan) : nullptr) {
+        auto rest=std::find_if(missing.begin(),missing.end(),[&](size_t expert) { return !expert_tiered(plan,expert); });
+        std::stable_partition(rest,missing.end(),[&](size_t expert) { return (*ahead)[expert]>=0; });
+    }
     std::vector<size_t> offsets{prestaged_end};
     for (size_t expert : missing) { add(expert); offsets.push_back(host_tiles.size()); }
     if (host_tiles.size()>max_tiles) throw std::runtime_error("inconsistent Straydog expert grouping");
@@ -973,6 +988,7 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
             throw std::runtime_error(std::string("Straydog CPU experts: ")+sd_cpu_error());
         const auto done=std::chrono::steady_clock::now();
         cpu_ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(done-began).count());
+        if (d.phase_on) d.phase_host_cpu_ns+=cpu_ns;
         compute_ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(done-computing).count());
         d.prompt_cpu_routes+=n;
         // (the gate/up scratch and the product after it: routes*1920 floats, a staged row and its route each)
@@ -994,7 +1010,11 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
 #if !defined(__HIPCC__)
     prestage.end();
 #endif
-    if (missing.size()>=16) prompt_cost(d.prompt_stream_ns,double(stream_ns)/double(missing.size()));
+    // A streamed expert's cost is learned where the bus takes them all: a layer that gathers waits for its gathers too, and its time is not
+    // the bus's (after a 58K-token prompt whose gathers fought a cold drive, an RTX 5070 Ti at --vram 5.5 gave the CPU ~370 experts a layer of
+    // the next 765-token batch, 174 ms a layer)
+    const bool gathered=prompt_gathered(d,plan) && std::any_of(missing.begin(),missing.end(),[&](size_t expert) { return !expert_tiered(plan,expert); });
+    if (missing.size()>=16 && !gathered) prompt_cost(d.prompt_stream_ns,double(stream_ns)/double(missing.size()));
     if (cpu_routes.size()>=16) prompt_cost(d.prompt_cpu_ns,double(compute_ns)/double(cpu_routes.size()));
     // The share moves toward the CPU finishing at nine tenths of the GPU's time (a CPU that took everything finished last); a gathered
     // layer's CPU time is its gathers' too, and its share is set otherwise (prompt_cpu_share).

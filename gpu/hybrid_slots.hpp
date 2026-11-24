@@ -55,8 +55,8 @@ size_t expert_slot_bytes(const ResidentMoe& plan) {
 // Ask the OS to read these experts' host bank slices now, as concurrent large reads. Cold mapped
 // weights otherwise arrive one page fault at a time in whichever copy or CPU thread touches them
 // first (~1 GB/s from an NVMe that reads 5 GB/s in parallel). The hint itself costs a system call
-// even for resident pages, so an expert hinted within the last 30 s is skipped. Linux hints on the
-// device's read-ahead thread (see ReadAhead). A hint only: it never changes results.
+// even for resident pages, so an expert hinted within the last 30 s is skipped, and the hints go
+// on the device's read-ahead thread (see ReadAhead). A hint only: it never changes results.
 void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_t count) {
     // A layer held as page-locked copies (sd_hybrid_repoint) no longer reads the mapping: there is nothing to ask the OS for.
     if (plan.host_copy) return;
@@ -65,6 +65,9 @@ void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_
     if (plan.prefetched.size() != plan.experts) plan.prefetched.assign(plan.experts, {});
     std::vector<std::pair<const uint8_t*, size_t>> ranges;
     for (size_t i = 0; i < count; ++i) {
+        // (a tiered expert is read from the engine's page-locked copy, never the mapping: a hint would only walk pages that cannot leave
+        // memory)
+        if (expert_tiered(plan, experts[i])) continue;
         auto& last = plan.prefetched[experts[i]];
         if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(30)) continue;
         last = now;
@@ -73,13 +76,7 @@ void prefetch_experts(Device& d, ResidentMoe& plan, const size_t* experts, size_
     }
     if (ranges.empty()) return;
 #endif
-#if defined(_WIN32)
-    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-    entries.reserve(ranges.size());
-    for (const auto& range : ranges) entries.push_back({const_cast<uint8_t*>(range.first), range.second});
-    PrefetchVirtualMemory(GetCurrentProcess(), entries.size(), entries.data(), 0);
-    (void)d;
-#elif defined(__linux__)
+#if defined(_WIN32) || defined(__linux__)
     if (!d.read_ahead) d.read_ahead = std::make_unique<ReadAhead>();
     d.read_ahead->add(ranges);
 #else
@@ -466,6 +463,8 @@ void create_expert_slots(Device& d, size_t cache, size_t stage, size_t slot_byte
             const hipError_t pinned = hipHostMalloc(reinterpret_cast<void**>(&d.slots.host), d.slots.chunk * slot_bytes, hipHostMallocDefault);
             if (pinned != hipSuccess)
                 throw std::runtime_error(std::string(gpu_error_text(pinned)) + " (expert slot staging mirror, code " + std::to_string(int(pinned)) + ")");
+            // (a gathered chunk goes over in one copy, the slots' padding past each expert's bytes with it: zeros, never another's bytes)
+            std::memset(d.slots.host, 0, d.slots.chunk * slot_bytes);
         }
         check(hipHostMalloc(reinterpret_cast<void**>(&d.exchange), hybrid_exchange_floats * 4, hipHostMallocDefault));
         std::memset(d.exchange, 0, hybrid_exchange_floats * 4);
@@ -616,6 +615,104 @@ void hybrid_point_experts(Device& d, ResidentMoe& plan, const size_t* experts, s
         hybrid_point<<<1, hybrid_point_limit, 0, d.stream>>>(static_cast<MoeGroup*>(plan.table), list);
     }
     check(hipGetLastError());
+}
+// The places of `plan`'s experts the mirror holds for this batch (pregather_start), which may still be landing (pregather_wait); null when it holds
+// none of them. A gather ahead of another layer or another batch is waited for and forgotten.
+const std::vector<int32_t>* pregather_held(Device& d, const ResidentMoe& plan) {
+    auto& pg = d.pregather;
+    if (!pg.plan) return nullptr;
+    if (pg.plan != &plan || pg.made_position != pg.position || pg.made_rows != pg.rows) { pg.worker->wait(); pg.plan = nullptr; return nullptr; }
+    return &pg.place;
+}
+// Until the mirror's first `through` experts have landed; a gather that failed is rethrown.
+void pregather_wait(Device& d, size_t through) {
+    auto& pg = d.pregather;
+    if (pg.ready.load(std::memory_order_acquire) >= through) return;
+    const auto waiting = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> held(pg.lock);
+        pg.landed.wait(held, [&]() { return pg.failed.load(std::memory_order_acquire) || pg.ready.load(std::memory_order_acquire) >= through; });
+    }
+    if (d.phase_on) d.phase_host_ahead_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waiting).count());
+    if (pg.failed.load(std::memory_order_acquire)) {
+        pg.worker->wait();
+        throw std::runtime_error("Straydog gather ahead failed");
+    }
+}
+// A layer's streamed experts are asked for: the next layer's experts that neither its slots nor its tier hold are gathered by the CPU's workers into
+// the mirror, on a thread of its own, while this thread settles the layer and queues the next one's dense work; the next layer copies them from
+// the mirror by DMA (hybrid_stream_missing). Only where the guess is the set: a batch whose routes cover nearly every expert (rows x 10 routes at
+// least four times the experts: e^-4 of them unused) and a layer whose banks the workers gather (not page-locked, not held as copies, not a
+// layer-order pass), and a batch of Pregather::min_rows or more. On Windows unless STRAYDOG_PREGATHER=0 (Device::Pregather).
+void pregather_start(Device& d) {
+    auto& pg = d.pregather;
+    if (pg.plan) pg.plan = nullptr;   // (gathered ahead for a layer that streamed nothing)
+    if (pg.worker) pg.worker->wait();   // (the last gather ahead may still be landing: the mirror is written again below)
+    const ResidentMoe* next = pg.next;
+    if (pg.disabled || !next || !next->hybrid || next->layer_prefill || next->host_copy || !d.slots.host || !d.cpu || next->mapped[0] ||
+        pg.rows * 10 < 4 * next->experts || pg.rows < pg.min_rows || !d.slots.bytes)
+        return;
+    std::vector<size_t> experts;
+    // (those the last batch through that layer routed to, where there was one: a request's next batch reads the text that followed)
+    const bool guessed = next->last_routed.size() == next->experts;
+    for (size_t expert = 0; expert < next->experts; ++expert)
+        if (next->slot_of[expert] < 0 && !expert_tiered(*next, expert) && (!guessed || next->last_routed[expert])) experts.push_back(expert);
+    if (experts.size() < 16) return;
+    if (pg.capacity < experts.size()) {
+        if (pg.read_pending) { check(hipEventSynchronize(pg.read)); pg.read_pending = false; }
+        if (pg.mirror) { check(hipHostFree(pg.mirror)); pg.mirror = nullptr; pg.capacity = 0; }
+        // Room for the layer that gathers the most, once: allocated layer by layer as wider ones came, the page-locked mirror and its zeroing
+        // fall in the middle of a prompt (on an R9700, two 2,127-token batches with the gather ahead had a moe_combine of 264 ms, 30 ms at
+        // most without).
+        size_t room = experts.size();
+        for (const auto& entry : d.resident) {
+            const ResidentMoe& plan = *entry.second;
+            if (!plan.hybrid || plan.host_copy || plan.mapped[0]) continue;
+            size_t gathered = 0;
+            for (size_t expert = 0; expert < plan.experts; ++expert) gathered += plan.slot_of[expert] < 0 && !expert_tiered(plan, expert);
+            room = std::max(room, gathered);
+        }
+        // (a machine that refuses this much page-locked memory goes on without gathering ahead)
+        if (hipHostMalloc(reinterpret_cast<void**>(&pg.mirror), room * d.slots.bytes, hipHostMallocDefault) != hipSuccess) {
+            (void)hipGetLastError();
+            pg.mirror = nullptr; pg.disabled = true;
+            return;
+        }
+        std::memset(pg.mirror, 0, room * d.slots.bytes);   // (the slots' padding past each expert's bytes, as the staging mirror's)
+        pg.capacity = room;
+    }
+    if (!pg.read) check(hipEventCreateWithFlags(&pg.read, hipEventDisableTiming));
+    if (!pg.worker) pg.worker = std::make_unique<Background>(d.ordinal);
+    pg.place.assign(next->experts, -1);
+    for (size_t i = 0; i < experts.size(); ++i) pg.place[experts[i]] = int32_t(i);
+    pg.plan = next; pg.made_position = pg.position; pg.made_rows = pg.rows;
+    pg.gathered += experts.size();
+    const bool wait_read = pg.read_pending;
+    pg.read_pending = false;
+    pg.ready.store(0, std::memory_order_release);
+    pg.failed.store(false, std::memory_order_release);
+    Device* device = &d;
+    const size_t step = std::max<size_t>(1, std::min(d.slots.chunk / 2, hybrid_point_limit));   // (the streamed chunks' size)
+    pg.worker->run([device, next, experts = std::move(experts), wait_read, step]() {
+        auto& pg = device->pregather;
+        try {
+            // (the copies of the last gather ahead out of the mirror have landed before it is written again)
+            if (wait_read) check(hipEventSynchronize(pg.read));
+            std::vector<uint8_t*> targets;
+            for (size_t first = 0; first < experts.size(); first += step) {
+                const size_t count = std::min(step, experts.size() - first);
+                targets.clear();
+                for (size_t i = 0; i < count; ++i) targets.push_back(pg.mirror + (first + i) * device->slots.bytes);
+                hybrid_gather(*device, *next, experts.data() + first, count, targets.data(), nullptr);
+                { std::lock_guard<std::mutex> held(pg.lock); pg.ready.store(first + count, std::memory_order_release); }
+                pg.landed.notify_all();
+            }
+        } catch (...) {
+            { std::lock_guard<std::mutex> held(pg.lock); pg.failed.store(true, std::memory_order_release); }
+            pg.landed.notify_all();
+            throw;
+        }
+    });
 }
 #if !defined(__HIPCC__)
 // Prestage (CUDA): the staging slots past the chunks' two buffers hold, for a wide prompt batch's layer, the experts its slots do not hold

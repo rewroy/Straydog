@@ -545,7 +545,8 @@ Three drafters:
   without asking a drafter. A resident Qwen3.8 verifies up to eight rows a pass for such copies
   (three for its MTP drafts): a long match is checked seven tokens at a time.
 
-A constrained reply takes no drafts.
+A constrained reply takes drafts only where it may take any token: in its reasoning (to the template's `</think>`
+token) and past a forced call's opening (§6.3).
 
 ### 6.3 Sampling and constraints
 
@@ -576,6 +577,15 @@ A constrained reply takes no drafts.
 
   Each token is drawn from the model's distribution, and drawn again without a refused one
   (masked after 32), so allowed tokens keep their relative probabilities.
+  - Where the reply may take any token (its reasoning, held to nothing but the end, and a forced call past its opening),
+    the decode takes drafts as without a constraint (DeepSeek-V4.1's DSpark and lookup, Qwen3.8's MTP drafts and copies,
+    whose rows are then read whole, as for a suppression): the rows they are verified on are masked as a suppression's
+    are (the end where it may not come, an id no token has), and a draft of the `</think>` token is the last a pass takes,
+    the token after it then chosen against the call's opening. The opening itself, JSON and a named call's close are
+    chosen token by token. Dogmind asks for a call (`tool_choice` `required`) right after it stops a reasoning that writes
+    out a program; that request writes the program, and it came at one token a pass before (6,111 to 18,792 tokens of
+    `create_file` at 44.7-44.9 tok/s on two R9700 with DeepSeek-V4.1, where the replies around it drafted 2.3-3.0 tokens a
+    pass).
 - **Suppression** (`constraint.rs`). A request's `suppress: "not_cp932_han"` refuses every token that would write a Han
   letter in U+3400-U+9FFF with no CP932 form (a simplified 员, 约, 叠 in a Japanese reply), reasoning and tool arguments
   included. 塡剝頰噓俱繫鷗醬 are real Japanese with no CP932 form, and stay.
@@ -694,7 +704,10 @@ the request that goes on from it.
   events `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN`, which tokio holds off the process's end
   for), or a line `stop` on standard input with `--stop-on-stdin`. A program that starts the server
   with no console has nothing else to send: that pipe is held by the program alone, which is why it
-  needs no address, no key and no console. Nothing is written per request.
+  needs no address, no key and no console. Nothing is written per request. A state shorter than the
+  file an earlier run kept, when no request of this run went on from that file, leaves the file as it
+  is: a health check after a start, or an app's warm-up of its system prompt, is not the conversation
+  the person comes back to. DeepSeek-V4.1 keeps no conversation under 1024 tokens either, as Qwen3.8.
 - **The file.** `<data dir>/conversation/<bundle>.sdconv`, one a bundle, replaced whole (a `.part`
   file, synced, then renamed over the old one). As the system block's (6.4) with two sealed parts:
 
@@ -973,7 +986,11 @@ file beside the bundle.
 its routes) left its acceptance as it was, but what the drafter keeps is the target's expert slots: with
 48/28/16 a draft's tokens are kept a little less often (a code reply's 81-82% where 85-89%), and a bundle
 short of slots runs faster (UD-IQ2_XXS: code 51.7 to 55.7 tokens/s, five agent turns 26.6 to 25.5 s;
-UD-IQ1_M the same within its spread). `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
+UD-IQ1_M the same within its spread). Where the engine DSpark sits beside has 40 GiB of VRAM or more
+(both R9700s), the 1.4 GB more of 87/50/29 is some 3% of the target's slots, and they are kept: on
+2026-11-23 (UD-IQ2_XXS, the 11-07 scenarios) an agent turn's drafts gave 2.78 tokens a pass where
+48/28/16 gave 2.13 and 1.83, a token's decode 10-24% quicker on all scenes but prose, a prompt's reading
+0-5% slower. `DS41_DSPARK_RESIDENT=A,B,C`, or `all`, changes them.
 
 **The width policy** (`drafter::Policy`). After each sampled token the drafter drafts three tokens
 (~2.3 ms), and the policy picks how many a verify pass checks. It picks the width with the most
@@ -985,6 +1002,11 @@ expected tokens a millisecond:
 
 A draft costs its milliseconds whatever the round makes of it, so the policy also keeps a running
 mean of what its rounds saved. When that mean falls below nothing, drafting pauses for 16 rounds.
+
+The calibration was fitted on 2026-10-24 to six probe prompts. Served drafts are counted against it:
+every 4096 drafts tried, the server logs a line "DSpark calibration on served drafts". Per slot and
+per tenth of confidence it gives the drafts accepted of those tried, beside the calibration's rate,
+with the policy's skill and pass costs then.
 
 ### 7.5 Images
 
@@ -1075,6 +1097,15 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
     1717 / 1711 ms, 2,397 tokens 2081 / 2088 -> 1714 / 1703, 3,394 tokens 2393 / 2395 -> 2119 / 2131 (a third of the streamed
     experts left, 22,600-25,600 routes to the CPU). A narrower bus (a PCIe 4.0 x8 card) makes a streamed expert dearer, and the
     CPU's share larger.
+    A streamed expert's cost is learned only on layers whose streamed experts all go by DMA (a gathered layer's time is its gathers'
+    too), and one batch moves a learned cost by at most half or double: one prompt whose gathers met a cold drive no longer hands the
+    next batch to the CPU.
+  - A batch of 1,536 rows or more (`STRAYDOG_PREGATHER_ROWS`) gathers the next layer's experts ahead: when a layer has queued its
+    streamed chunks, a thread of the CPU's workers gathers the experts the next layer's slots and tier do not hold, those the last
+    batch through it routed to, into a page-locked mirror of their own, and that layer copies them from it by DMA. On by default on
+    Windows (`STRAYDOG_PREGATHER=0` turns it off), off elsewhere (`=1` turns it on): on an RTX 5070 Ti at 5.5 GiB (Qwen3.8 UD-IQ1_S) a
+    2,127-token continuation took 2.32 -> 2.00 s, 765 tokens the same; on an R9700 with 19 of 48 layers gathered, 2,127 tokens took
+    1.94 -> 2.13 s. The bytes the GEMMs read are the banks', so the same bits.
   - A long prompt can borrow expert-slot VRAM to widen its batches, up to 4096 rows. On one GPU
     the threshold is the smaller of 1536 new tokens and two original batches; the cache then
     gives way to the staging pool. With several GPUs the threshold is 65536 new tokens: each
@@ -1328,8 +1359,10 @@ for bit. A deliberate numerical change is checked against an F32-GEMM run, then 
 - `STRAYDOG_PREFILL_PHASES=1` (development; 2 also lists each stream phase over 4 ms) times a prompt read's layers on each device's stream with
   events between their phases (`gpu/phase_profile.hpp`: the hyperconnections' four steps, the DeltaNet layer's five, the attention's, the MoE layer's
   router, routing, the host's planning gap, the resident, prestaged and streamed GEMMs and the shared expert's, the wait for a streamed chunk and
-  for the CPU's routes), the stream's time since the last event added to a phase's name, and prints the sums per 4096-row batch with the experts
-  streamed over the bus when the device goes (the example does at its end). A wait of the host's shows as the phase queued after it
+  for the CPU's routes), the stream's time since the last event added to a phase's name, and prints the sums at the end of each prompt
+  (`sd_phase_report`: a served worker is killed and never destroys its devices, so it prints them as the example does) with the experts
+  streamed over the bus, the host's time a MoE layer (the wait for the expert counts, the read-ahead hints, the gathers, the CPU's routes,
+  the settle) and the experts gathered ahead with the host's wait for them. A wait of the host's shows as the phase queued after it
   (`gap_batch_start`, `gap_span_start`: the stream idle between two spans), so the idle time of a stage is its gaps and its waits. Two RTX 4090,
   IQ3_S, a 32K read before this work, the first device per batch of 4096 rows: attention 155 ms (6 layers), DeltaNet 150 (20 layers: projections
   48 + 20, scan 63, convolution, normalization and gate 19), the MoE layers' GEMMs 215 (resident gate/up 78 and down 48, the shared expert's gate
@@ -1876,10 +1909,17 @@ with a model of its own reads no file it was not given.
   - `GET /v1/models`, and llama-server's `GET /props` and `GET /slots` (the context as `n_ctx`).
 - **`POST /v1/chat/completions`,** streaming (SSE `chat.completion.chunk`) or not:
   - messages: system (and developer), user, assistant (content, `reasoning_content`,
-    `tool_calls`) and tool;
+    `tool_calls`) and tool; and `latest_reminder` where the model's template renders it (DeepSeek-V4.1's, its
+    `<｜latest_reminder｜>`), for a client's own notes beside a user's message, which the model then reads as not the user's.
+    `/props` and `/v1/models`' `meta` say `latest_reminder: true` for such a model; any other refuses the role;
   - content as a string or text parts. For a model that reads images (`/props`
     `modalities.vision`), user and tool content may also hold `image_url` with a `data:` URL, or
-    `image` with a base64 source. The server fetches nothing;
+    `image` with a base64 source. The server fetches nothing. An image sent before may be named by the SHA-256 of its encoded
+    bytes, `image_url` `sha256:` and 64 lowercase hex digits, while the worker keeps its rows: a conversation sends all its
+    images with every request (an agent's day of page checks, 97% of 4.3 GB over 308 requests). A request naming one it no
+    longer keeps (its rows went, or the worker started again) fails before anything runs with the error `type`
+    `image_not_held`, its conversation left as it was, and the client sends it again with the bytes. `/props` and
+    `/v1/models`' `meta` say `image_digests: true` (another server refuses `sha256:` as an invalid request);
   - `tools`, `tool_choice` (`auto`, `none`, `required`, or a function named);
   - `response_format`: `text`, `json_object`, or `json_schema` (the structured-outputs subset;
     other keywords accepted, not enforced);

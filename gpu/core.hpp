@@ -260,6 +260,7 @@ struct ResidentMoe {
     Matrix half[3]{};
     void* batch_table=nullptr;
     std::vector<unsigned> last_counts;   // the rows each expert had in the last prompt batch through this layer (prestage's guess of the next)
+    std::vector<uint8_t> last_routed;    // whether each expert had rows in the last prompt batch through this layer (pregather's guess of the next)
 };
 // An expert's bytes of `role` on the host, wherever its layer keeps them (the bank's mapping or its copy): every reader of a routed expert's
 // host bytes goes through this, so that a layer's experts need not sit at one stride from one base.
@@ -310,6 +311,46 @@ private:
     std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<std::pair<const uint8_t*, size_t>> queue_;
+    bool stop_ = false;
+    std::thread thread_;   // last: starts after the members it uses
+};
+#elif defined(_WIN32)
+// Read-ahead hints off the compute thread, as on Linux: PrefetchVirtualMemory walks the pages of every range it is given, those in
+// memory too, and the thread that asks waits for it (a 765-token continuation of Qwen3.8 UD-IQ1_S on an RTX 5070 Ti at --vram 5.5:
+// 24-29 ms a layer, 1.2-1.4 s a prompt, asked by the thread that then gathers the layer). Here no layer waits for it: a cold expert is
+// still asked for in large concurrent reads, ahead of the gather's page faults. What is queued while a call runs goes in the next one.
+class ReadAhead {
+public:
+    ReadAhead() : thread_([this]() { run(); }) {}
+    ~ReadAhead() {
+        { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; }
+        wake_.notify_one();
+        thread_.join();
+    }
+    void add(const std::vector<std::pair<const uint8_t*, size_t>>& ranges) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& range : ranges) queued_.push_back({const_cast<uint8_t*>(range.first), range.second});
+        }
+        wake_.notify_one();
+    }
+private:
+    void run() {
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true) {
+            wake_.wait(lock, [this]() { return stop_ || !queued_.empty(); });
+            if (stop_) return;
+            entries.clear();
+            entries.swap(queued_);
+            lock.unlock();
+            PrefetchVirtualMemory(GetCurrentProcess(), ULONG_PTR(entries.size()), entries.data(), 0);
+            lock.lock();
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> queued_;
     bool stop_ = false;
     std::thread thread_;   // last: starts after the members it uses
 };
@@ -916,6 +957,40 @@ struct Device {
         std::vector<int32_t> position;        // by expert: its position there, or -1
         hipEvent_t event=nullptr;
     } prestage;
+    // A wide prompt batch's next layer, gathered ahead (pregather_start, pregather_held): while a layer's streamed experts go over the bus and its
+    // GPU work and the next layer's dense work run, the CPU's workers gather the experts of the next layer that neither its slots nor the tier
+    // hold into a page-locked mirror of their own; that layer then copies them from it by DMA instead of gathering them.
+    struct Pregather {
+        const ResidentMoe* next = nullptr;      // the layer after the one whose MoE the span runs now (decoder_span)
+        size_t position = SIZE_MAX, rows = 0;   // the batch the span runs now: a gather ahead serves only the batch it was made in
+        const ResidentMoe* plan = nullptr;      // the layer the mirror holds experts of (null: none)
+        size_t made_position = SIZE_MAX, made_rows = 0;
+        std::vector<int32_t> place;             // per expert of `plan`: its slot in the mirror, or -1
+        uint8_t* mirror = nullptr;
+        size_t capacity = 0;                    // experts the mirror holds, at the staging slots' stride
+        hipEvent_t read = nullptr;              // after the last copy out of the mirror (the next gather into it waits for it)
+        bool read_pending = false;
+        std::unique_ptr<Background> worker;
+        // How many of the mirror's experts have landed (the worker gathers them in their order, a chunk at a time): a layer copies a chunk as
+        // soon as it is there, as a gathered chunk goes over while the next is gathered; `failed` ends every wait (the worker's wait rethrows).
+        std::atomic<size_t> ready{0};
+        std::atomic<bool> failed{false};
+        std::mutex lock;
+        std::condition_variable landed;
+        // (on Windows unless STRAYDOG_PREGATHER=0, elsewhere only with STRAYDOG_PREGATHER=1: on Linux, an R9700 at --vram 5.5 with 19 of 48
+        // layers gathered and the CPU taking routes of the same batches, 2,127-token continuations took 1.98-2.00 -> 2.45 s and 1.83-1.87 ->
+        // 2.03 s with it, 91% of the experts gathered ahead used)
+#if defined(_WIN32)
+        bool disabled = std::getenv("STRAYDOG_PREGATHER") && std::getenv("STRAYDOG_PREGATHER")[0] == '0';
+#else
+        bool disabled = !(std::getenv("STRAYDOG_PREGATHER") && std::getenv("STRAYDOG_PREGATHER")[0] == '1');
+#endif
+        // Only a batch of this many rows or more (STRAYDOG_PREGATHER_ROWS): the gather ahead goes over beside the GPU's layer only where that
+        // layer takes as long as the gather. An RTX 5070 Ti at --vram 5.5 (UD-IQ1_S), served continuations: 765 tokens 2,560 -> 3,069 ms with
+        // it, 2,127 tokens 2,297 -> 2,098 ms.
+        size_t min_rows = std::getenv("STRAYDOG_PREGATHER_ROWS") ? size_t(std::strtoull(std::getenv("STRAYDOG_PREGATHER_ROWS"), nullptr, 10)) : 1536;
+        uint64_t gathered = 0, used = 0;        // experts gathered ahead, and of them those a layer then took
+    } pregather;
     hipStream_t copy_stream=nullptr;
     void* cpu=nullptr;
     float* exchange=nullptr;      // pinned host: selected, probabilities, activation, CPU result
@@ -963,7 +1038,7 @@ struct Device {
     std::unique_ptr<Background> copier;   // issues bounded swaps' copies (hybrid_rebalance)
     std::unique_ptr<Background> bank_loader;   // gathers and copies a layer-order pass's bank loaded ahead (load_prefill_bank)
     std::shared_ptr<struct Transfers> transfers;   // asynchronous uploads (transfer.hpp), from the first use
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     std::unique_ptr<ReadAhead> read_ahead;   // started by the first expert read-ahead hint
 #endif
     // STRAYDOG_PREFILL_PHASES (development): events between a prompt batch's phases, summed by name (phase_profile.hpp), printed when the device goes
@@ -981,10 +1056,16 @@ struct Device {
     std::map<std::string, PhaseSum> phase_totals;
     uint64_t phase_batches = 0, phase_layers = 0, phase_prestage_issued = 0, phase_prestage_used = 0, phase_streamed = 0, phase_bus_bytes = 0,
              phase_cpu_routes = 0, phase_missing_layers = 0;
+    // The host's time in a prompt batch's MoE layers (STRAYDOG_PREFILL_PHASES): waiting for the expert counts, asking for the read-ahead
+    // hints, gathering streamed experts into the staging mirror, computing the CPU's routes (with its wait for their rows), and waiting at
+    // the end for the streams the layer queued (settle).
+    uint64_t phase_host_counts_ns = 0, phase_host_hints_ns = 0, phase_host_gather_ns = 0, phase_host_settle_ns = 0, phase_host_cpu_ns = 0,
+             phase_host_ahead_ns = 0, phase_host_layers = 0;
     size_t phase_first = size_t(-1);
     uint64_t phase_routes[4] = {0, 0, 0, 0};   // routes of the resident, prestaged, streamed experts and the CPU's
     explicit Device(int value) : ordinal(value) {}
     ~Device() {
+        pregather.worker.reset();   // (its job reads a plan's banks and writes into the mirror: done before either goes)
         abort_flag_release(abort_flag);
         if (phase_on) phase_report(*this);
         cleanup(hipSetDevice(ordinal));
@@ -1015,6 +1096,8 @@ struct Device {
         if (slots.base) cleanup(hipFree(slots.base));
         if (slots.host) cleanup(hipHostFree(slots.host));
         if (prestage.event) cleanup(hipEventDestroy(prestage.event));
+        if (pregather.mirror) cleanup(hipHostFree(pregather.mirror));
+        if (pregather.read) cleanup(hipEventDestroy(pregather.read));
         if (counts_event) cleanup(hipEventDestroy(counts_event));
         for (hipEvent_t& event : layer_bank_free) if (event) cleanup(hipEventDestroy(event));
         if (layer_bank_loaded) cleanup(hipEventDestroy(layer_bank_loaded));

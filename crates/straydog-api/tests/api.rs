@@ -476,11 +476,15 @@ async fn response_format_and_tool_choice_reach_the_worker_as_a_constraint() {
         (json!({"response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}}}),
          Markup::Qwen, r#"{"alternatives": [{"json": {"type": "object"}}]}"#.to_string()),
         (json!({"response_format": {"type": "json_object"}, "tools": read_file()}), Markup::Qwen,
-         r#"{"alternatives": [{"json": true}, {"prefix": "<tool_call>\n<function=", "whitespace": 4}]}"#.to_string()),
+         r#"{"alternatives": [{"json": true}, {"prefix": "<tool_call>\n<function=read_file>\n", "whitespace": 4}]}"#.to_string()),
         (json!({"response_format": {"type": "json_object"}, "tools": read_file(), "tool_choice": "none"}), Markup::Qwen,
          r#"{"alternatives": [{"json": true}]}"#.to_string()),
         (json!({"tools": read_file(), "tool_choice": "required"}), Markup::Dsml,
-         format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}", "whitespace": 0}}]}}"#)),
+         format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}read_file\">\n", "whitespace": 0}}]}}"#)),
+        // (a required call is of one of the tools given, each its own opening)
+        (json!({"tools": [read_file()[0].clone(), {"type": "function", "function": {"name": "check_page", "parameters": {"type": "object"}}}],
+                "tool_choice": "required"}), Markup::Dsml,
+         format!(r#"{{"alternatives": [{{"prefix": "{dsml_call}read_file\">\n", "whitespace": 0}}, {{"prefix": "{dsml_call}check_page\">\n", "whitespace": 0}}]}}"#)),
         (json!({"tools": read_file(), "tool_choice": {"type": "function", "function": {"name": "read_file"}}}), Markup::Qwen,
          r#"{"alternatives": [{"prefix": "<tool_call>\n<function=read_file>\n", "whitespace": 4, "until": "</function>", "close": "\n</tool_call>"}]}"#.to_string()),
     ];
@@ -787,6 +791,13 @@ async fn invalid_requests_are_refused() {
     assert_eq!(complete(&mock, ask(json!({}))).await, invalid("the prompt exceeds the context"));
     let streamed = ask(json!({"stream": true}));
     assert_eq!(complete(&mock, streamed).await, invalid("No user query found in messages."));
+
+    // Images named by digest that the worker does not keep: their own error type, for the client to send their bytes, streamed or not.
+    let gone = "Straydog does not hold 1 of the images named by digest (sha256:ab); send their bytes";
+    let not_held = json!({"event": "error", "message": gone, "fatal": false, "kind": "image_not_held"});
+    let mock = Mock::new(vec![Script::Events(vec![not_held.clone()]), Script::Events(vec![not_held])]);
+    assert_eq!(complete(&mock, ask(json!({}))).await, refused(400, "image_not_held", gone));
+    assert_eq!(complete(&mock, ask(json!({"stream": true}))).await, refused(400, "image_not_held", gone));
 }
 
 #[tokio::test]
@@ -842,7 +853,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(models, json!({"object": "list", "data": [{
         "id": "Qwen3.8-Flash-Next-IQ3_S", "object": "model", "created": 1_760_000_000, "owned_by": "straydog",
         "meta": {"n_ctx": 262144, "quantization": "IQ3_S", "ready": false, "vision": false, "suppress": ["not_cp932_han"],
-                 "tool_writing": true, "reasoning_off": true}}]}));
+                 "tool_writing": true, "reasoning_off": true, "image_digests": true, "latest_reminder": false}}]}));
     for path in ["/props", "/slots"] {
         assert_eq!(fetch(app(&mock), get(path)).await, refused(503, "unavailable_error", "Loading model"), "{path}");
     }
@@ -852,7 +863,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(fetch(app(&mock), get("/health")).await, (StatusCode::OK, json!({"status": "ok"})));
     let (_, models) = fetch(app(&mock), get("/v1/models")).await;
     assert_eq!(models["data"][0]["meta"], json!({"n_ctx": 131072, "quantization": "IQ3_S", "ready": true, "vision": false, "suppress": ["not_cp932_han"],
-                                                 "tool_writing": true, "reasoning_off": true, "placement": {"resident": true, "host_kv": false}}));
+                                                 "tool_writing": true, "reasoning_off": true, "image_digests": true, "latest_reminder": false, "placement": {"resident": true, "host_kv": false}}));
     // llama-server's endpoints, where its clients read the context.
     let slot = json!({"id": 0, "n_ctx": 131072, "speculative": true, "is_processing": true,
                       "params": {"n_predict": -1, "seed": 0, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
@@ -861,7 +872,7 @@ async fn health_and_models_follow_the_engine() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(props, json!({"default_generation_settings": slot, "total_slots": 1,
                              "model_alias": "Qwen3.8-Flash-Next-IQ3_S", "modalities": {"vision": false, "audio": false},
-                             "suppress": ["not_cp932_han"], "tool_writing": true, "reasoning_off": true,
+                             "suppress": ["not_cp932_han"], "tool_writing": true, "reasoning_off": true, "image_digests": true, "latest_reminder": false,
                              "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false}));
     assert_eq!(fetch(app(&mock), get("/slots")).await, (StatusCode::OK, json!([slot])));
 

@@ -536,13 +536,15 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// and at each change. When the read-ahead hint opens and shuts (Windows) is only with --verbose: it follows the drive's reads, a line every
 /// few seconds through a day of serving, and each request's line already says how many hints were taken and left. The expert store's account
 /// of its evictions against an LRU's and the best possible ones stays: a line every 2^20 uses of decode and verify passes, a few minutes
-/// of decoding. A row table's account of its cache (Engram's rows) stays too: a line every 2^20 rows asked, ~20K tokens.
+/// of decoding. A row table's account of its cache (Engram's rows) stays too: a line every 2^20 rows asked, ~20K tokens. So does what
+/// DSpark's confidences met on served drafts: a line every 4096 drafts tried, some minutes of an agent's use.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
-     "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:"]
+     "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:",
+     "Straydog DSpark calibration"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -725,8 +727,15 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
         },
         count(&usage["completion_tokens"]),
         number(&timings["decode_tokens_per_second"], 1),
+        // (a generation that did not end of itself: what stopped it. A client that closed the stream (an agent that stopped a reply it
+        // did not want) threw those tokens away, and its next prompt goes on from before them)
+        match event["finish_reason"].as_str() {
+            Some("cancelled") => ", stopped by the client".to_string(),
+            Some("length") => ", stopped at its max_tokens".to_string(),
+            _ => String::new(),
+        } +
         // (an engine that verifies drafts says how many it checked and kept, and of those the engine's own)
-        match timings["draft_tokens"].as_u64() {
+        &match timings["draft_tokens"].as_u64() {
             Some(drafted) if drafted > 0 => format!(" ({} of {} drafts kept in {} passes; DSpark {} of {}{})", count(&timings["accepted_drafts"]), drafted,
                                                    count(&timings["decode_passes"]), count(&timings["accepted_engine_drafts"]),
                                                    count(&timings["engine_draft_tokens"]),
@@ -739,6 +748,10 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
                                                                .map_or_else(String::new, |ms| format!(", {:.1} ms each", ms / runs as f64))),
                                                        _ => String::new(),
                                                    }),
+            _ => String::new(),
+        } + &match timings["wide_lookup"].as_array().map(|wide| wide.iter().map(|value| value.as_u64().unwrap_or(0)).collect::<Vec<_>>()).as_deref() {
+            // (long lookup matches, followed: the tokens a verify pass of eight rows would have emitted for them, against the passes they took)
+            Some(&[matches, tokens, passes]) if matches > 0 => format!("; long lookup matches {matches}: {tokens} tokens in {passes} passes, a pass of 8 each"),
             _ => String::new(),
         } + &match (timings["penalty_top_passes"].as_u64(), timings["penalty_top_fallback_passes"].as_u64()) {
             (Some(passes), Some(retries)) => format!("; penalized top: {passes} passes, {retries} full-logit retries"),
@@ -1041,6 +1054,7 @@ impl Runtime {
             refusal,
             prefix: Cache::new(settings),
             keeper: Keeper::new(settings),
+            unclaimed: AtomicUsize::new(0),
             saves: Mutex::new(Vec::new()),
             restarts: Mutex::new(Vec::new()),
         };
@@ -1109,6 +1123,8 @@ struct Driver {
     prefix: Cache,
     /// What the run keeps of the conversation's state, for the next start, when the person asked for it (Windows).
     keeper: Keeper,
+    /// The tokens of the conversation an earlier run kept while no request of this run has gone on from it (0: there is none, or one did).
+    unclaimed: AtomicUsize,
     /// The saves under way, each on a thread of its own: the server waits for them before it ends.
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// When the worker was started again after it failed ([`RESTARTS`] within [`RESTART_WINDOW`] at the most).
@@ -1345,6 +1361,7 @@ impl Driver {
     async fn tell_kept_tokens(&self, process: &mut Process) {
         let Some(opening) = self.ready_frame().and_then(|ready| self.keeper.restore(&ready)) else { return };
         let Ok(Some(tokens)) = opening.await else { return };
+        self.unclaimed.store(tokens.len(), Ordering::Relaxed);
         let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into()))]);
         if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&tokens)).await {
             tracing::warn!("Straydog could not tell its worker the conversation the last run kept: {message}");
@@ -1354,6 +1371,7 @@ impl Driver {
     /// A request begins with the tokens of the kept conversation, and its worker asks for the state: read from the drive, opened, and sent. The worker
     /// is told why when it cannot be (the request then goes on without it). Err only when the worker is unusable.
     async fn hand_conversation(&self, process: &mut Process) -> Result<(), String> {
+        self.unclaimed.store(0, Ordering::Relaxed);
         let state = match self.ready_frame() {
             Some(ready) => {
                 let keeper = self.keeper.clone();
@@ -1395,12 +1413,20 @@ impl Driver {
             if bytes == 0 {
                 return Ok(Err(header["reason"].as_str().unwrap_or("it holds none").to_string()));
             }
+            let held = held_tokens(&header);
             let state = tokio::time::timeout(Duration::from_secs(120), process.read_body(bytes)).await
                 .map_err(|_| "Straydog's worker did not finish the conversation state within 120 s".to_string())??;
-            Ok(Ok(state))
+            Ok(Ok((state, held)))
         }.await;
         let state = match given {
-            Ok(Ok(state)) => state,
+            Ok(Ok((state, held))) => {
+                let unclaimed = self.unclaimed.load(Ordering::Relaxed);
+                if !replaces_kept(held, unclaimed) {
+                    tracing::info!("Straydog conversation: the {unclaimed} tokens the last run kept stay kept (this run's {held} did not go on from them)");
+                    return;
+                }
+                state
+            }
             Ok(Err(reason)) => {
                 // (the memory or the drive it would take is the only thing a person may want to know of; a worker that holds none is the usual case)
                 if reason.contains("room for") {
@@ -1883,7 +1909,7 @@ impl Engine for Runtime {
                 processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
                                   "gpu": ready["gpu"], "sampling": ready["sampling"], "vision": ready["vision"] == true,
-                                  "vision_refusal": ready["vision_refusal"]}),
+                                  "vision_refusal": ready["vision_refusal"], "latest_reminder": ready["latest_reminder"] == true}),
             },
             Phase::Failed(message) => EngineState::Failed(message.clone()),
         }
@@ -1925,9 +1951,35 @@ impl Engine for Runtime {
     }
 }
 
+/// Whether the conversation a worker holds at a stop (`held` tokens) takes the place of the file an earlier run kept, of `unclaimed` tokens
+/// that no request of this run went on from (0 when there is none, or one did). The latest conversation is the one taken back, unless it is
+/// shorter than the earlier one it never touched: a server's health check after a start, or an app's warm-up of its system prompt, is the last
+/// thing such a run did, and the conversation the person was in is the one they come back to.
+fn replaces_kept(held: usize, unclaimed: usize) -> bool {
+    held >= unclaimed
+}
+
+/// The tokens of the conversation a worker's `conversation_state` header gives (a count: Qwen3.8's and DeepSeek-V4.1's workers both send one).
+fn held_tokens(header: &Value) -> usize {
+    header["tokens"].as_u64().map_or(0, |tokens| tokens as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides: a stop keeps the latest conversation unless it is shorter than an earlier run's that this run never went on from.
+    #[test]
+    fn a_shorter_conversation_does_not_take_the_place_of_one_never_taken() {
+        assert!(replaces_kept(5924, 0), "nothing kept, or the kept one was taken: the latest is kept");
+        assert!(!replaces_kept(5924, 61_004), "a warm-up's system prompt after a start leaves the conversation the run never touched");
+        assert!(replaces_kept(70_000, 61_004), "a longer conversation of this run is the latest");
+        assert!(replaces_kept(61_004, 61_004));
+        // (as a worker sends it: the count of the tokens)
+        let header = json!({"id": "kept-state", "event": "conversation_state", "tokens": 1360, "digest": "ab", "bytes": 9 << 20});
+        assert_eq!(held_tokens(&header), 1360);
+        assert!(!replaces_kept(held_tokens(&header), 2560));
+    }
 
     /// Decides: the log line of a worker that stopped carries its last stderr lines (Rust's "memory allocation of N bytes failed" among
     /// them), at most six, and nothing when it wrote none; a worker the system killed says the system may have stopped it for memory.
@@ -2029,6 +2081,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(refusal_paths(&exposure), ["m/a.gguf", "m/b.gguf", "m", "d"].map(PathBuf::from));
+    }
+
+    /// Decides: the log tells a generation the client closed, or that its max_tokens stopped, from one that ended of itself (an agent's stopped
+    /// drafts were found only from the next prompt's going on from before them: 15,401 tokens of one such request on 11-22).
+    #[test]
+    fn a_request_line_says_what_stopped_its_generation() {
+        let line = |reason: &str| request_summary(&json!({"event": "done", "finish_reason": reason, "usage": {"completion_tokens": 15401},
+                                                          "timings": {"decode_tokens_per_second": 55.7}}), None);
+        assert!(line("cancelled").contains("15401 tokens at 55.7 tok/s, stopped by the client"), "{}", line("cancelled"));
+        assert!(line("length").contains("15401 tokens at 55.7 tok/s, stopped at its max_tokens"), "{}", line("length"));
+        assert!(!line("stop").contains("stopped"), "{}", line("stop"));
     }
 
     /// A counted prefill phase reads as a count after the timed phases, not as seconds.
@@ -2165,6 +2228,7 @@ mod tests {
         assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
         assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        assert!(stays_in_the_log("Straydog DSpark calibration on served drafts (skill 1.12, extra 0.74): slot 1: 0.9 812/861 (0.97 by calibration)"));
         // (why a picture was slow: the vision encoder on the CPU, as the GPU could not, and what the GPU took)
         assert!(stays_in_the_log("Straydog vision: on the CPU, as the GPU could not: no room for 412 MB more in this device's budget"));
         assert!(stays_in_the_log("Straydog vision: 3 image(s) on the GPU in 1.07 s (room 0.01 s, the expert pool let go, back 0.12 s)"));

@@ -138,6 +138,9 @@ impl SamplingDefaults {
 
 /// The largest request body.
 pub const BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// The error `type` of a request that names by digest (`sha256:`) images the worker no longer keeps: the client sends it again with their bytes.
+pub const IMAGE_NOT_HELD: &str = "image_not_held";
 /// What a request sees while the model loads (llama-server's wording).
 const LOADING: &str = "Loading model";
 
@@ -182,6 +185,12 @@ impl Api {
     /// Whether the model reads images (the worker reports its vision encoder).
     fn vision(&self) -> bool {
         matches!(self.engine.state(), EngineState::Ready { placement, .. } if placement["vision"] == true)
+    }
+
+    /// Whether the model's chat template renders the `latest_reminder` role (DeepSeek-V4.1's): a client's own notes beside a user's
+    /// message reach the model marked as not the user's.
+    fn reminders(&self) -> bool {
+        matches!(self.engine.state(), EngineState::Ready { placement, .. } if placement["latest_reminder"] == true)
     }
 
     /// The engine's one slot as llama-server describes a slot: it answers one request at a
@@ -303,7 +312,8 @@ async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<
     api.authorize(&headers)?;
     let config = &api.config;
     let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false, "vision": api.vision(),
-                          "suppress": [NOT_CP932_HAN], "tool_writing": true, "reasoning_off": true});
+                          "suppress": [NOT_CP932_HAN], "tool_writing": true, "reasoning_off": true, "image_digests": true,
+                          "latest_reminder": api.reminders()});
     if let EngineState::Ready { context, placement, .. } = api.engine.state() {
         meta["n_ctx"] = context.into();
         meta["ready"] = true.into();
@@ -326,6 +336,10 @@ async fn props(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<s
         "tool_writing": true,
         // (one reply may be asked with no reasoning in a conversation that thinks, its prompt unchanged: `straydog.reasoning` false)
         "reasoning_off": true,
+        // (an image sent before may be named by its digest, `sha256:`, and one the worker no longer keeps is refused as IMAGE_NOT_HELD)
+        "image_digests": true,
+        // (a message of the role `latest_reminder` is taken: the model's template marks it as not the user's)
+        "latest_reminder": api.reminders(),
         "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false,
     })))
 }
@@ -342,7 +356,7 @@ async fn chat_completions(State(api): State<Arc<Api>>, headers: HeaderMap, body:
     api.authorize(&headers)?;
     api.ready()?;
     let payload = read_payload(&headers, body).await?;
-    let (mut request, shape) = request::translate(&payload, &api.config, api.vision()).map_err(|mut error| {
+    let (mut request, shape) = request::translate(&payload, &api.config, api.vision(), api.reminders()).map_err(|mut error| {
         // (what the worker found wrong with the model's vision encoder file, for the one who sent the image)
         if error.message == request::NO_IMAGES {
             if let EngineState::Ready { placement, .. } = api.engine.state() {

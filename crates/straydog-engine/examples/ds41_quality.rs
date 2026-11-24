@@ -37,8 +37,8 @@
 //! writes every draft's routes, a line a stage (read back after the draft, outside its timing).
 //! --draft-bench K prefills the first prompt (128 tokens or more), pauses a second, then drafts K
 //! times at its end alone and prints their times (for a kernel trace of the drafts).
-//! DSpark keeps its 87, 50 and 29 most used routed experts of each stage resident (the served
-//! default); DS41_DSPARK_RESIDENT=A,B,C keeps other counts, `all` all 128.
+//! DSpark keeps the served default of most used routed experts of each stage resident (87, 50 and 29
+//! with 31 GiB a device on two devices); DS41_DSPARK_RESIDENT=A,B,C keeps other counts, `all` all 128.
 
 #[path = "common/files.rs"]
 mod files;
@@ -372,13 +372,6 @@ fn main() -> Result<(), String> {
         let devices: Vec<usize> = (index * tp..(index + 1) * tp).collect();
         engines.push(Engine::new(hp.clone(), &files, &devices, 31 << 30, settings)?);
     }
-    if let Some(keep) = spare {
-        for engine in &mut engines {
-            let before = engine.expert_capacity().0;
-            let (bytes, made) = engine.lend_spare(keep)?;
-            println!("spare: {} MiB a GPU lent as {made} expert slots ({before} before)", bytes >> 20);
-        }
-    }
     let dspark_files = dspark_dir.as_ref().map(|dir| files::Files::open(Path::new(dir))).transpose()?;
     let mut drafter = match &dspark_files {
         Some(draft) => {
@@ -388,12 +381,23 @@ fn main() -> Result<(), String> {
             Dspark::from_headers(&draft.header, &files.header)?;
             engines[0].enable_tap()?;
             let loading = std::time::Instant::now();
-            let drafter = Drafter::load(&mut engines[0].beside()?, draft, &files, vocabulary)?;
+            // (the counts served on these devices: each engine's budget here is 31 GiB a device)
+            let counts = straydog_engine::arch::deepseek41::drafter::resident_counts((31u64 << 30) * tp as u64)?;
+            let drafter = Drafter::load(&mut engines[0].beside()?, draft, &files, vocabulary, counts)?;
             println!("dspark: loaded in {:.1} s", loading.elapsed().as_secs_f64());
             Some(drafter)
         }
         None => None,
     };
+    // (lent after DSpark is beside the engine, as the server lends what its first passes leave: lent before, the VRAM
+    // its 87/50/29 resident experts take was given to slots, and its load ran out of room)
+    if let Some(keep) = spare {
+        for engine in &mut engines {
+            let before = engine.expert_capacity().0;
+            let (bytes, made) = engine.lend_spare(keep)?;
+            println!("spare: {} MiB a GPU lent as {made} expert slots ({before} before)", bytes >> 20);
+        }
+    }
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     for tokens_file in tokens_files.split(',') {
         let raw = std::fs::read(tokens_file).map_err(|exc| format!("{tokens_file}: {exc}"))?;
