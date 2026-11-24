@@ -344,6 +344,9 @@ const PROGRESS_AT_ONCE: usize = 4096;
 /// A kept conversation's sections ([`Session::export_conversation`]): its tokens, then the engines' checkpoint.
 const KEPT_TOKENS: u64 = u64::from_le_bytes(*b"KEPTTOKS");
 const KEPT_CHECKPOINT: u64 = u64::from_le_bytes(*b"KEPTSNAP");
+/// The fewest tokens a kept conversation has: a one-off question (a server's health check after a start) is no conversation to take
+/// back, and it would take the place of the one the person was in.
+const KEPT_MINIMUM: usize = 1024;
 
 /// The fewest tokens a system prompt has to be checkpointed as a conversation's root (a shorter
 /// one prefills in about a second).
@@ -1147,17 +1150,20 @@ impl<E: Engines> Session<E> {
         (token as usize) < self.vocabulary || (token >= crate::vision::IMAGE_TOKEN && self.engines.vision())
     }
 
-    /// The kept conversation (`--keep-conversation`, [`Engines::export_checkpoint`]): the latest turn's checkpoint, where the last reply
-    /// began, as a prefix state's bytes ([`crate::prefix::header`]: the tokens, then the engines' checkpoint) and its tokens. None without such a
-    /// checkpoint, or with one holding tokens [`keeps`](Self::keeps) refuses.
+    /// The checkpoint a kept conversation is: the latest turn's the engines still hold, of at least [`KEPT_MINIMUM`] tokens. None without
+    /// one, or when it holds tokens [`keeps`](Self::keeps) refuses.
+    fn kept_checkpoint(&self) -> Option<&Checkpoint> {
+        self.checkpoints.iter().rev()
+            .find(|checkpoint| !checkpoint.root && checkpoint.tokens.len() >= KEPT_MINIMUM && self.engines.holds(checkpoint.slot))
+            .filter(|checkpoint| checkpoint.tokens.iter().all(|&token| self.keeps(token)))
+    }
+
+    /// The kept conversation (`--keep-conversation`, [`Engines::export_checkpoint`]): the [`kept_checkpoint`](Self::kept_checkpoint), where
+    /// the last reply began, as a prefix state's bytes ([`crate::prefix::header`]: the tokens, then the engines' checkpoint) and its tokens.
     pub fn export_conversation(&mut self) -> Result<Option<(Vec<u32>, Vec<u8>)>, String> {
-        let engines = &self.engines;
-        let Some(checkpoint) = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && engines.holds(checkpoint.slot)) else {
+        let Some(checkpoint) = self.kept_checkpoint() else {
             return Ok(None);
         };
-        if !checkpoint.tokens.iter().all(|&token| self.keeps(token)) {
-            return Ok(None);
-        }
         let (slot, tokens) = (checkpoint.slot, checkpoint.tokens.clone());
         let state = self.engines.export_checkpoint(slot)?;
         let mut bytes = crate::prefix::header(tokens.len(), 0, &[(KEPT_TOKENS, 4 * tokens.len() as u64), (KEPT_CHECKPOINT, state.len() as u64)]);
@@ -1180,8 +1186,7 @@ impl<E: Engines> Session<E> {
 
     /// The bytes [`export_conversation`](Self::export_conversation) would give now (the latest turn's tokens with them); None as it gives none.
     pub fn conversation_size(&self) -> Option<(usize, u64)> {
-        let checkpoint = self.checkpoints.iter().rev().find(|checkpoint| !checkpoint.root && self.engines.holds(checkpoint.slot))?;
-        checkpoint.tokens.iter().all(|&token| self.keeps(token)).then_some(())?;
+        let checkpoint = self.kept_checkpoint()?;
         // (an estimate before the copy: the state grows with its tokens about as the engines' snapshots do)
         Some((checkpoint.tokens.len(), self.engines.checkpoint_bytes(checkpoint.slot)))
     }

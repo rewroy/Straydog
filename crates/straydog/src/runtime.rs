@@ -1054,6 +1054,7 @@ impl Runtime {
             refusal,
             prefix: Cache::new(settings),
             keeper: Keeper::new(settings),
+            unclaimed: AtomicUsize::new(0),
             saves: Mutex::new(Vec::new()),
             restarts: Mutex::new(Vec::new()),
         };
@@ -1122,6 +1123,8 @@ struct Driver {
     prefix: Cache,
     /// What the run keeps of the conversation's state, for the next start, when the person asked for it (Windows).
     keeper: Keeper,
+    /// The tokens of the conversation an earlier run kept while no request of this run has gone on from it (0: there is none, or one did).
+    unclaimed: AtomicUsize,
     /// The saves under way, each on a thread of its own: the server waits for them before it ends.
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// When the worker was started again after it failed ([`RESTARTS`] within [`RESTART_WINDOW`] at the most).
@@ -1358,6 +1361,7 @@ impl Driver {
     async fn tell_kept_tokens(&self, process: &mut Process) {
         let Some(opening) = self.ready_frame().and_then(|ready| self.keeper.restore(&ready)) else { return };
         let Ok(Some(tokens)) = opening.await else { return };
+        self.unclaimed.store(tokens.len(), Ordering::Relaxed);
         let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into()))]);
         if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&tokens)).await {
             tracing::warn!("Straydog could not tell its worker the conversation the last run kept: {message}");
@@ -1367,6 +1371,7 @@ impl Driver {
     /// A request begins with the tokens of the kept conversation, and its worker asks for the state: read from the drive, opened, and sent. The worker
     /// is told why when it cannot be (the request then goes on without it). Err only when the worker is unusable.
     async fn hand_conversation(&self, process: &mut Process) -> Result<(), String> {
+        self.unclaimed.store(0, Ordering::Relaxed);
         let state = match self.ready_frame() {
             Some(ready) => {
                 let keeper = self.keeper.clone();
@@ -1408,12 +1413,20 @@ impl Driver {
             if bytes == 0 {
                 return Ok(Err(header["reason"].as_str().unwrap_or("it holds none").to_string()));
             }
+            let held = header["tokens"].as_array().map_or(0, Vec::len);
             let state = tokio::time::timeout(Duration::from_secs(120), process.read_body(bytes)).await
                 .map_err(|_| "Straydog's worker did not finish the conversation state within 120 s".to_string())??;
-            Ok(Ok(state))
+            Ok(Ok((state, held)))
         }.await;
         let state = match given {
-            Ok(Ok(state)) => state,
+            Ok(Ok((state, held))) => {
+                let unclaimed = self.unclaimed.load(Ordering::Relaxed);
+                if !replaces_kept(held, unclaimed) {
+                    tracing::info!("Straydog conversation: the {unclaimed} tokens the last run kept stay kept (this run's {held} did not go on from them)");
+                    return;
+                }
+                state
+            }
             Ok(Err(reason)) => {
                 // (the memory or the drive it would take is the only thing a person may want to know of; a worker that holds none is the usual case)
                 if reason.contains("room for") {
@@ -1938,9 +1951,26 @@ impl Engine for Runtime {
     }
 }
 
+/// Whether the conversation a worker holds at a stop (`held` tokens) takes the place of the file an earlier run kept, of `unclaimed` tokens
+/// that no request of this run went on from (0 when there is none, or one did). The latest conversation is the one taken back, unless it is
+/// shorter than the earlier one it never touched: a server's health check after a start, or an app's warm-up of its system prompt, is the last
+/// thing such a run did, and the conversation the person was in is the one they come back to.
+fn replaces_kept(held: usize, unclaimed: usize) -> bool {
+    held >= unclaimed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decides: a stop keeps the latest conversation unless it is shorter than an earlier run's that this run never went on from.
+    #[test]
+    fn a_shorter_conversation_does_not_take_the_place_of_one_never_taken() {
+        assert!(replaces_kept(5924, 0), "nothing kept, or the kept one was taken: the latest is kept");
+        assert!(!replaces_kept(5924, 61_004), "a warm-up's system prompt after a start leaves the conversation the run never touched");
+        assert!(replaces_kept(70_000, 61_004), "a longer conversation of this run is the latest");
+        assert!(replaces_kept(61_004, 61_004));
+    }
 
     /// Decides: the log line of a worker that stopped carries its last stderr lines (Rust's "memory allocation of N bytes failed" among
     /// them), at most six, and nothing when it wrote none; a worker the system killed says the system may have stopped it for memory.
