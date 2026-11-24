@@ -75,6 +75,14 @@ fn reads_note(at: (u64, u64, u64, u64), elapsed: std::time::Duration, paused: st
             verify_ns as f64 / 1e9 / seconds, paused.as_secs_f64())
 }
 
+/// Where a warm-up's steps went (the served model's `warm_waits`): of those with experts to read, the share
+/// that found the reads in flight at their most (the drive's pace) and the share that found no room for the next (the host tier still
+/// being pinned, or no slot free).
+fn waits_note((steps, full, roomless): (usize, usize, usize)) -> String {
+    let share = |part: usize| 100.0 * part as f64 / steps.max(1) as f64;
+    format!("of {steps} steps with experts to read, {:.0}% found the reads at their most, {:.0}% no room", share(full), share(roomless))
+}
+
 /// The request loop's side: each request runs on the model's thread.
 struct Handle(mpsc::Sender<Job>);
 
@@ -195,8 +203,8 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                                 match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
                                     Ok(Warmed::Going) => {}
                                     Ok(Warmed::Listed) => {
-                                        eprintln!("Straydog warmed up in {:.1} s; {}", since.elapsed().as_secs_f64(),
-                                                  reads_note(reads_at, since.elapsed(), paused));
+                                        eprintln!("Straydog warmed up in {:.1} s; {}; {}", since.elapsed().as_secs_f64(),
+                                                  reads_note(reads_at, since.elapsed(), paused), waits_note(served.model.warm_waits()));
                                         listed = Some(Instant::now());
                                         reads_at = straydog_engine::experts::reader_totals();
                                         paused = std::time::Duration::ZERO;
@@ -204,9 +212,10 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                                     Ok(Warmed::Done) => {
                                         let (vram, host, bytes) = served.model.filled();
                                         eprintln!("Straydog filled its free slots with {vram} experts for VRAM, {host} for the host tier \
-                                                   ({:.1} GiB from the drive) in {:.1} s; {}", bytes as f64 / (1u64 << 30) as f64,
+                                                   ({:.1} GiB from the drive) in {:.1} s; {}; {}", bytes as f64 / (1u64 << 30) as f64,
                                                   listed.map_or(0.0, |listed| listed.elapsed().as_secs_f64()),
-                                                  reads_note(reads_at, listed.map_or(std::time::Duration::ZERO, |listed| listed.elapsed()), paused));
+                                                  reads_note(reads_at, listed.map_or(std::time::Duration::ZERO, |listed| listed.elapsed()), paused),
+                                                  waits_note(served.model.warm_waits()));
                                         warming = None;
                                         rooming = true;
                                     }

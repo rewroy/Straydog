@@ -1245,6 +1245,11 @@ impl<E: Engines> Session<E> {
         self.warmth.step(&mut self.engines, count, in_flight)
     }
 
+    /// The warm-up's steps and its waits since the last call ([`Warm::waits`]).
+    pub fn warm_waits(&mut self) -> (usize, usize, usize) {
+        self.warmth.waits()
+    }
+
     /// What the fill placed so far ([`Warm::filled`]).
     pub fn filled(&self) -> (usize, usize, u64) {
         self.warmth.filled(&self.engines)
