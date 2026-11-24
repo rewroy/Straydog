@@ -548,7 +548,10 @@ __global__ void prompt_cpu_scatter(const float* rows,const int32_t* routes,float
     float* to=outputs+size_t(routes[blockIdx.x])*2560;
     for (unsigned i=threadIdx.x;i<2560;i+=256) to[i]=from[i];
 }
-inline void prompt_cost(double& average,double sample) { average=average>0 ? 0.7*average+0.3*sample : sample; }
+// (a sample moves the average by at most half or double: one prompt that waited on a contended drive does not set what the next batches take)
+inline void prompt_cost(double& average,double sample) {
+    average=average>0 ? 0.7*average+0.3*std::clamp(sample,0.5*average,2.0*average) : sample;
+}
 // Room for `floats` in the pinned prompt buffer (between batches: no copy reads it).
 // Pinned memory, or where the system refuses it (a machine short of memory) pageable memory, whose copies the driver stages; null
 // when even that is refused: the batch then streams the CPU's experts as well (grouped_expert_prefill).
@@ -999,7 +1002,11 @@ void grouped_expert_prefill(Device& d,ResidentMoe& plan,MoeGroup* groups,size_t 
 #if !defined(__HIPCC__)
     prestage.end();
 #endif
-    if (missing.size()>=16) prompt_cost(d.prompt_stream_ns,double(stream_ns)/double(missing.size()));
+    // A streamed expert's cost is learned where the bus takes them all: a layer that gathers waits for its gathers too, and its time is not
+    // the bus's (after a 58K-token prompt whose gathers fought a cold drive, an RTX 5070 Ti at --vram 5.5 gave the CPU ~370 experts a layer of
+    // the next 765-token batch, 174 ms a layer)
+    const bool gathered=prompt_gathered(d,plan) && std::any_of(missing.begin(),missing.end(),[&](size_t expert) { return !expert_tiered(plan,expert); });
+    if (missing.size()>=16 && !gathered) prompt_cost(d.prompt_stream_ns,double(stream_ns)/double(missing.size()));
     if (cpu_routes.size()>=16) prompt_cost(d.prompt_cpu_ns,double(compute_ns)/double(cpu_routes.size()));
     // The share moves toward the CPU finishing at nine tenths of the GPU's time (a CPU that took everything finished last); a gathered
     // layer's CPU time is its gathers' too, and its share is set otherwise (prompt_cpu_share).

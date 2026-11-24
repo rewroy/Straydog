@@ -227,7 +227,9 @@ uint64_t hybrid_stream_missing(Device& d, ResidentMoe& plan, const std::vector<s
     // (what a gathered expert cost the CPU's workers: prompt_cpu_share weighs a route against it)
     if (gather_layer && plan.tier[0].empty() && missing.size() >= 16) {
         const double sample = double(gathered_ns) / double(missing.size());
-        d.prompt_gather_ns = d.prompt_gather_ns > 0 ? 0.7 * d.prompt_gather_ns + 0.3 * sample : sample;
+        // (by at most half or double a sample, as prompt_cost)
+        d.prompt_gather_ns = d.prompt_gather_ns > 0 ? 0.7 * d.prompt_gather_ns + 0.3 * std::clamp(sample, 0.5 * d.prompt_gather_ns, 2.0 * d.prompt_gather_ns)
+                                                    : sample;
     }
     return uint64_t(double(ms) * 1e6);
 }
