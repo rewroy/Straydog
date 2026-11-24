@@ -1060,7 +1060,7 @@ struct Device {
     // hints, gathering streamed experts into the staging mirror, computing the CPU's routes (with its wait for their rows), and waiting at
     // the end for the streams the layer queued (settle).
     uint64_t phase_host_counts_ns = 0, phase_host_hints_ns = 0, phase_host_gather_ns = 0, phase_host_settle_ns = 0, phase_host_cpu_ns = 0,
-             phase_host_layers = 0;
+             phase_host_ahead_ns = 0, phase_host_layers = 0;
     size_t phase_first = size_t(-1);
     uint64_t phase_routes[4] = {0, 0, 0, 0};   // routes of the resident, prestaged, streamed experts and the CPU's
     explicit Device(int value) : ordinal(value) {}

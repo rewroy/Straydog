@@ -628,10 +628,12 @@ const std::vector<int32_t>* pregather_held(Device& d, const ResidentMoe& plan) {
 void pregather_wait(Device& d, size_t through) {
     auto& pg = d.pregather;
     if (pg.ready.load(std::memory_order_acquire) >= through) return;
+    const auto waiting = std::chrono::steady_clock::now();
     {
         std::unique_lock<std::mutex> held(pg.lock);
         pg.landed.wait(held, [&]() { return pg.failed.load(std::memory_order_acquire) || pg.ready.load(std::memory_order_acquire) >= through; });
     }
+    if (d.phase_on) d.phase_host_ahead_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waiting).count());
     if (pg.failed.load(std::memory_order_acquire)) {
         pg.worker->wait();
         throw std::runtime_error("Straydog gather ahead failed");
