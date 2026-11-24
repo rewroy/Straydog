@@ -977,10 +977,14 @@ struct Device {
         std::atomic<bool> failed{false};
         std::mutex lock;
         std::condition_variable landed;
-        // (off unless STRAYDOG_PREGATHER=1: on Linux, an R9700 at --vram 5.5 with 19 of 48 layers gathered, a 765-token continuation took
-        // 1.84-2.11 s with it against 1.47 s without, the same logits: 23% of the experts gathered ahead were not routed, and the chunks' own
-        // gathers there already go over beside the copies)
+        // (on Windows unless STRAYDOG_PREGATHER=0, elsewhere only with STRAYDOG_PREGATHER=1: on Linux, an R9700 at --vram 5.5 with 19 of 48
+        // layers gathered and the CPU taking routes of the same batches, 2,127-token continuations took 1.98-2.00 -> 2.45 s and 1.83-1.87 ->
+        // 2.03 s with it, 91% of the experts gathered ahead used)
+#if defined(_WIN32)
+        bool disabled = std::getenv("STRAYDOG_PREGATHER") && std::getenv("STRAYDOG_PREGATHER")[0] == '0';
+#else
         bool disabled = !(std::getenv("STRAYDOG_PREGATHER") && std::getenv("STRAYDOG_PREGATHER")[0] == '1');
+#endif
         // Only a batch of this many rows or more (STRAYDOG_PREGATHER_ROWS): the gather ahead goes over beside the GPU's layer only where that
         // layer takes as long as the gather. An RTX 5070 Ti at --vram 5.5 (UD-IQ1_S), served continuations: 765 tokens 2,560 -> 3,069 ms with
         // it, 2,127 tokens 2,297 -> 2,098 ms.

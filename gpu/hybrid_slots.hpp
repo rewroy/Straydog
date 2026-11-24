@@ -641,7 +641,7 @@ void pregather_wait(Device& d, size_t through) {
 // the mirror, on a thread of its own, while this thread settles the layer and queues the next one's dense work; the next layer copies them from
 // the mirror by DMA (hybrid_stream_missing). Only where the guess is the set: a batch whose routes cover nearly every expert (rows x 10 routes at
 // least four times the experts: e^-4 of them unused) and a layer whose banks the workers gather (not page-locked, not held as copies, not a
-// layer-order pass). Only with STRAYDOG_PREGATHER=1 (Device::Pregather).
+// layer-order pass), and a batch of Pregather::min_rows or more. On Windows unless STRAYDOG_PREGATHER=0 (Device::Pregather).
 void pregather_start(Device& d) {
     auto& pg = d.pregather;
     if (pg.plan) pg.plan = nullptr;   // (gathered ahead for a layer that streamed nothing)
