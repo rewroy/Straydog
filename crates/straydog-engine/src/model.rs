@@ -4015,11 +4015,10 @@ impl Model {
 
     fn head_logits(&mut self, row: &[f32], step: bool) -> Result<Vec<f32>> {
         let mut clock = Instant::now();
-        // (CUDA: the head's mix and projection in one wait, into the last step's allocation; elsewhere a wait and a copy to the host
-        // between them)
+        // (the head's mix and projection in one wait, into the last step's allocation, where both are on the last device; else a wait
+        // and a copy to the host between them)
         let mut logits = std::mem::take(&mut self.logits_spare);
-        let fused = cfg!(feature = "cuda")
-            && self.with_operands(Model::head_operands, |group, operands| group.decode_head(operands, row, &mut logits))?;
+        let fused = self.with_operands(Model::head_operands, |group, operands| group.decode_head(operands, row, &mut logits))?;
         if !fused {
             let mixed = self.with_operands(
                 |model| Ok(model.head_operands()?[..3].to_vec()),
