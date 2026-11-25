@@ -2700,7 +2700,7 @@ impl DeviceExperts {
     }
 
     /// Give host tier arenas back to the machine, the newest first, until `bytes` are freed; the bytes given back. For a tier sized from
-    /// the whole memory while other programs went on growing beside it (Homelab, 2026-11-23: a monitoring service grew to 23 GB and left 143
+    /// the whole memory while other programs went on growing beside it (a served machine, 2026-11-23: a monitoring service grew to 23 GB and left 143
     /// MB available, and the next request read 1,409 tokens in 469 s). Each class keeps its first arena (its staging: prepare_staging), and
     /// a tier still growing grows no more. The experts only the arenas given back held are let go (the drive holds every expert, and one a
     /// VRAM slot holds stays there). Settles first: no read writes into an arena then, and no copy reads one. Nothing is given back while

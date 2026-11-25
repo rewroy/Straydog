@@ -69,7 +69,7 @@ const ROOM_STEP: usize = 4;
 const CHECKPOINT_STEP: usize = 8 << 20;
 /// The machine's available memory below which the expert stores give host tier arenas back between requests, and the margin above it
 /// they give back to ([`Engines::tend_memory`]): the tier is sized from the whole memory (served::HOST_SHARE), and what the other
-/// programs then take beyond the rest is the page cache's, then the swap's (Homelab, 2026-11-23: 143 MB available, the box's own pages
+/// programs then take beyond the rest is the page cache's, then the swap's (a served machine, 2026-11-23: 143 MB available, the box's own pages
 /// read again and again, and a request's first token 393-469 s away).
 const HOST_FLOOR: u64 = 3 << 30;
 const HOST_MARGIN: u64 = 4 << 30;

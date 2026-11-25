@@ -76,7 +76,7 @@ pub fn description(settings: &Settings, ready: &Value, build: &str) -> Option<St
 
 /// [`description`] for a conversation kept across a stop: without the engine's version and build, which every deploy changes. What the
 /// state's bytes must fit stays in it (the layout, the context, the placement, the numerics), and a state that does not fit the engines
-/// to the byte is refused at import all the same. On Homelab, every start after a deploy deleted the kept conversation as another build's.
+/// to the byte is refused at import all the same. On a served machine, every start after a deploy deleted the kept conversation as another build's.
 #[cfg(any(windows, target_os = "linux", test))]
 pub fn lasting_description(settings: &Settings, ready: &Value) -> Option<String> {
     facts(settings, ready, "").map(|facts| facts.lasting().description())

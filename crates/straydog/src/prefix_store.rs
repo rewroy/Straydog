@@ -156,7 +156,7 @@ impl KernelKeyring {
     /// An exclusive lock of the user's, held while it lives: a file of the user's alone (mode 0600, not a link) in a directory the user owns
     /// that no one else may write: the runtime directory, else `~/.cache/straydog` (made 0700), else the directory the kept conversation is in
     /// ([`keyring_lock_beside`]). Never in a shared directory, where another user could hold it or put a link in its place; and waited for ten
-    /// seconds at most. A service with no runtime directory and its home read-only (Homelab's: `ProtectHome=read-only`) kept nothing at its stops
+    /// seconds at most. A service with no runtime directory and its home read-only (as a systemd service with `ProtectHome=read-only`) kept nothing at its stops
     /// until the third place.
     fn lock() -> Result<std::fs::File, String> {
         let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("straydog"));
