@@ -138,6 +138,9 @@ impl Reply {
         if self.tools.unread {
             eprintln!("WARN Straydog read no tool call in a reply's tool-call markup and released it as text");
         }
+        if self.tools.left_out > 0 {
+            eprintln!("WARN Straydog left out a tool call the reply was cut in ({} bytes of markup): neither run nor sent as text", self.tools.left_out);
+        }
         if !late.is_empty() {
             deltas.push(Delta::Content(late));
         }
