@@ -24,6 +24,10 @@ use crate::{ApiError, Generation};
 /// proxies from timing out.
 const KEEP_ALIVE: Duration = Duration::from_secs(1);
 
+/// A stream that has sent nothing for this long while the model writes (a tool call held until it is whole, for a client that
+/// does not take its pieces) sends an SSE comment: a proxy or client that closes an idle connection keeps it.
+const QUIET: Duration = Duration::from_secs(5);
+
 /// The answer to a request: JSON once the generation ends, or SSE once its first step is known.
 pub(crate) async fn respond(generation: Generation, shape: Shape, model: &str) -> Result<Response, ApiError> {
     let reply = Reply {
@@ -39,7 +43,7 @@ pub(crate) async fn respond(generation: Generation, shape: Shape, model: &str) -
         },
         calls: Vec::new(),
     };
-    let mut completion = Completion { generation, reply };
+    let mut completion = Completion { generation, reply, said: tokio::time::Instant::now() };
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
     let meta = Meta { id: format!("chatcmpl-{}", random_hex(16)), created, model: model.to_string() };
     if !shape.stream {
@@ -152,6 +156,8 @@ enum Step {
     Progress(u64, u64),
     /// The last deltas, then the end.
     Done(Vec<Delta>, End),
+    /// Nothing to send for [`QUIET`]: the model writes what is held.
+    Quiet,
 }
 
 struct End {
@@ -164,6 +170,8 @@ struct End {
 struct Completion {
     generation: Generation,
     reply: Reply,
+    /// When the last step before the end was given.
+    said: tokio::time::Instant,
 }
 
 impl Completion {
@@ -181,7 +189,12 @@ impl Completion {
                         (self.generation.interrupt)();
                     }
                     if !deltas.is_empty() {
+                        self.said = tokio::time::Instant::now();
                         return Ok(Step::Deltas(deltas));
+                    }
+                    if self.said.elapsed() >= QUIET {
+                        self.said = tokio::time::Instant::now();
+                        return Ok(Step::Quiet);
                     }
                 }
                 Some("reasoning_end") => {
@@ -190,7 +203,10 @@ impl Completion {
                         return Ok(Step::Deltas(deltas));
                     }
                 }
-                Some("progress") => return Ok(Step::Progress(count(&event["done"]), count(&event["total"]))),
+                Some("progress") => {
+                    self.said = tokio::time::Instant::now();
+                    return Ok(Step::Progress(count(&event["done"]), count(&event["total"])));
+                }
                 Some("done") => {
                     let deltas = self.reply.finish(event["finish_reason"] == "length");
                     return Ok(Step::Done(deltas, self.end(&event)));
@@ -236,7 +252,7 @@ impl Completion {
         loop {
             let (deltas, end) = match self.step().await? {
                 Step::Deltas(deltas) => (deltas, None),
-                Step::Progress(..) => continue,
+                Step::Progress(..) | Step::Quiet => continue,
                 Step::Done(deltas, end) => (deltas, Some(end)),
             };
             for delta in deltas {
@@ -307,6 +323,7 @@ impl Chunks {
                 self.commented = Some(Instant::now());
                 (vec![Event::default().comment(format!("prefill {done}/{total}"))], false)
             }
+            Ok(Step::Quiet) => (vec![Event::default().comment("writing")], false),
             Ok(Step::Done(deltas, end)) => {
                 let mut events: Vec<Event> = deltas.iter().map(|delta| self.chunk(Some(delta), None)).collect();
                 events.push(self.chunk(None, Some(&end)));
