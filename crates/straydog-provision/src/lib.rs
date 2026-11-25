@@ -406,6 +406,8 @@ mod mark_tests {
         std::fs::write(&other, (0..size).map(|at| (at * 37 % 241) as u8).collect::<Vec<u8>>()).unwrap();
         std::fs::File::options().write(true).open(&other).unwrap().set_modified(written).unwrap();
         std::fs::copy(&other, &path).unwrap();
+        // (a copy that keeps the write time: Windows' copy does, Linux's does not, so it is put back here on both)
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(written).unwrap();
         let now = std::fs::metadata(&path).unwrap();
         assert_eq!((now.len(), now.modified().unwrap()), (size as u64, written), "the same size and write time as before");
         assert!(!marked_as_checked(&File::open(&path).unwrap(), &tree), "read through and checked, not unhashed");
