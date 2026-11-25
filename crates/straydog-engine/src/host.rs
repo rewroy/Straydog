@@ -165,6 +165,7 @@ pub fn reclaim_counts() -> [u64; 3] {
 }
 
 /// [`reclaim_counts`] from the text of `/proc/vmstat`.
+#[cfg(any(target_os = "linux", test))]
 fn vmstat_counts(vmstat: &str) -> [u64; 3] {
     let count = |name: &str| vmstat.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.trim().parse::<u64>().ok()).unwrap_or(0);
     [count("pgscan_direct"), count("pswpout"), count("pgmajfault")]
@@ -187,6 +188,7 @@ pub fn machine_memory_note(since: Option<[u64; 3]>) -> String {
 }
 
 /// The memory part of [`machine_memory_note`] from the text of `/proc/meminfo`.
+#[cfg(any(target_os = "linux", test))]
 fn meminfo_note(meminfo: &str) -> String {
     let field = |name: &str| meminfo.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(':')?.split_whitespace().next()?.parse::<u64>().ok());
     let gb = |kib: u64| kib as f64 * 1024.0 / 1e9;
