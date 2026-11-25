@@ -140,7 +140,7 @@ static void qwen_vision_block(Device& d, const sd_qwen_vision_layer& w, float* x
         blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(n), int(rows), int(dim), &alpha,
             f32(s.k), HIP_R_32F, int(dim), (long long)(n * dim), f32(s.q) + first * dim, HIP_R_32F, int(dim), (long long)(n * dim),
             &zero, scores, HIP_R_32F, int(n), (long long)(s.query_rows * n), int(heads), HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
-        vision_softmax<<<dim3(unsigned(rows), unsigned(heads)), 256, 0, d.stream>>>(scores, n, s.query_rows, probs);
+        vision_softmax_rows(d, scores, rows, heads, n, s.query_rows, probs);
         // attended[first + row][h * dim ..] = probs[h][row] . v[h]
         blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_N, HIPBLAS_OP_N, int(dim), int(rows), int(n), &alpha,
             f16(s.v), HIP_R_16F, int(dim), (long long)(n * dim), probs, HIP_R_16F, int(n), (long long)(s.query_rows * n),

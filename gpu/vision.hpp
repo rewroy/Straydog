@@ -66,31 +66,54 @@ __global__ void vision_rope_split(const float* qkv, const float* bias, size_t pa
 }
 
 // Softmax of each row of `cols` scores (row blockIdx.x of head blockIdx.y, heads `stride` rows
-// apart), into FP16. A row of at most vision_softmax_kept scores a thread stays in its registers:
-// the scores are read once and each exponential is taken once, the same values in the same order
-// as reading the row three times, so the probabilities are the same to the bit. (A 1280x800
-// picture's 5,336 patches: 32 layers of 16 heads' rows, 230 of the encoder's 444 ms read three
-// times.) A longer row is read again for each step.
-constexpr unsigned vision_softmax_kept = 32;
+// apart), into FP16.
 __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, __half* probs) {
     const size_t at = (size_t(blockIdx.y) * stride + blockIdx.x) * cols;
     const float* row = scores + at;
     __half* out = probs + at;
     __shared__ float partial[256];
-    const bool kept = cols <= size_t(blockDim.x) * vision_softmax_kept;
+    float top = -INFINITY;
+    for (size_t i = threadIdx.x; i < cols; i += blockDim.x) top = fmaxf(top, row[i]);
+    partial[threadIdx.x] = top;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    top = partial[0];
+    __syncthreads();
+    float sum = 0;
+    for (size_t i = threadIdx.x; i < cols; i += blockDim.x) sum += expf(row[i] - top);
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = 1.0f / partial[0];
+    for (size_t i = threadIdx.x; i < cols; i += blockDim.x) out[i] = __float2half(expf(row[i] - top) * scale);
+}
+
+// vision_softmax for a row of at most 256 * vision_softmax_kept scores, which stays in its threads'
+// registers: the scores are read once and each exponential is taken once, the same values in the
+// same order, so the probabilities are the same to the bit. (A 1280x800 picture's 5,336 patches:
+// 230 of the encoder's 444 ms read three times, 194 so. Its own kernel: the registers it holds
+// slowed a longer row's, 15,960 patches 4.22 -> 4.48 s on CUDA, when one kernel took both.)
+constexpr unsigned vision_softmax_kept = 32;
+__global__ void __launch_bounds__(256) vision_softmax_kept_row(const float* scores, size_t cols, size_t stride, __half* probs) {
+    const size_t at = (size_t(blockIdx.y) * stride + blockIdx.x) * cols;
+    const float* row = scores + at;
+    __half* out = probs + at;
+    __shared__ float partial[256];
     float value[vision_softmax_kept];
     float top = -INFINITY;
-    if (kept) {
 #pragma unroll
-        for (unsigned k = 0; k < vision_softmax_kept; ++k) {
-            const size_t i = threadIdx.x + size_t(k) * blockDim.x;
-            if (i < cols) {
-                value[k] = row[i];
-                top = fmaxf(top, value[k]);
-            }
+    for (unsigned k = 0; k < vision_softmax_kept; ++k) {
+        const size_t i = threadIdx.x + size_t(k) * blockDim.x;
+        if (i < cols) {
+            value[k] = row[i];
+            top = fmaxf(top, value[k]);
         }
-    } else {
-        for (size_t i = threadIdx.x; i < cols; i += blockDim.x) top = fmaxf(top, row[i]);
     }
     partial[threadIdx.x] = top;
     __syncthreads();
@@ -101,17 +124,13 @@ __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, 
     top = partial[0];
     __syncthreads();
     float sum = 0;
-    if (kept) {
 #pragma unroll
-        for (unsigned k = 0; k < vision_softmax_kept; ++k) {
-            const size_t i = threadIdx.x + size_t(k) * blockDim.x;
-            if (i < cols) {
-                value[k] = expf(value[k] - top);
-                sum += value[k];
-            }
+    for (unsigned k = 0; k < vision_softmax_kept; ++k) {
+        const size_t i = threadIdx.x + size_t(k) * blockDim.x;
+        if (i < cols) {
+            value[k] = expf(value[k] - top);
+            sum += value[k];
         }
-    } else {
-        for (size_t i = threadIdx.x; i < cols; i += blockDim.x) sum += expf(row[i] - top);
     }
     partial[threadIdx.x] = sum;
     __syncthreads();
@@ -120,15 +139,19 @@ __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, 
         __syncthreads();
     }
     const float scale = 1.0f / partial[0];
-    if (kept) {
 #pragma unroll
-        for (unsigned k = 0; k < vision_softmax_kept; ++k) {
-            const size_t i = threadIdx.x + size_t(k) * blockDim.x;
-            if (i < cols) out[i] = __float2half(value[k] * scale);
-        }
-    } else {
-        for (size_t i = threadIdx.x; i < cols; i += blockDim.x) out[i] = __float2half(expf(row[i] - top) * scale);
+    for (unsigned k = 0; k < vision_softmax_kept; ++k) {
+        const size_t i = threadIdx.x + size_t(k) * blockDim.x;
+        if (i < cols) out[i] = __float2half(value[k] * scale);
     }
+}
+
+// The softmax of `rows` rows of `cols` scores for each of `heads` heads (the kept row's kernel where it fits).
+static void vision_softmax_rows(Device& d, const float* scores, size_t rows, size_t heads, size_t cols, size_t stride, __half* probs) {
+    if (cols <= size_t(256) * vision_softmax_kept)
+        vision_softmax_kept_row<<<dim3(unsigned(rows), unsigned(heads)), 256, 0, d.stream>>>(scores, cols, stride, probs);
+    else
+        vision_softmax<<<dim3(unsigned(rows), unsigned(heads)), 256, 0, d.stream>>>(scores, cols, stride, probs);
 }
 
 // silu(gate) * up of each row of [gate | up] (`ffn` each), into FP16.
@@ -251,7 +274,7 @@ static void vision_encode(Device& d, const sd_vision& model, const __half* patch
             blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(n), int(rows), int(dim), &alpha,
                 f16(s.k), HIP_R_16F, int(dim), (long long)(n * dim), f16(s.q) + first * dim, HIP_R_16F, int(dim), (long long)(n * dim),
                 &zero, scores, HIP_R_32F, int(n), (long long)(s.query_rows * n), int(heads), HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
-            vision_softmax<<<dim3(unsigned(rows), unsigned(heads)), 256, 0, d.stream>>>(scores, n, s.query_rows, probs);
+            vision_softmax_rows(d, scores, rows, heads, n, s.query_rows, probs);
             // attended[first + row][h * dim ..] = probs[h][row] . v[h]
             blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_N, HIPBLAS_OP_N, int(dim), int(rows), int(n), &alpha,
                 f16(s.v), HIP_R_16F, int(dim), (long long)(n * dim), probs, HIP_R_16F, int(n), (long long)(s.query_rows * n),
