@@ -149,6 +149,10 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
     let (loaded, ready) = mpsc::channel::<Result<(Value, Arc<Text>), String>>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
+            // (the machine's memory as the start found it, and the kernel's reclaiming from here to the warm-up's end: a start beside another
+            // model's file cache read and checked 3.3 times slower, 11-25)
+            let memory_at_start = straydog_engine::host::reclaim_counts();
+            eprintln!("Straydog memory at the start: {}", straydog_engine::host::machine_memory_note(None));
             let initialized = load(args, data_dir, &settings, report, place).and_then(|(served, frame, text)| {
                 #[cfg(windows)]
                 if plan.startup_vram_reduced() {
@@ -203,8 +207,9 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                                 match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
                                     Ok(Warmed::Going) => {}
                                     Ok(Warmed::Listed) => {
-                                        eprintln!("Straydog warmed up in {:.1} s; {}; {}", since.elapsed().as_secs_f64(),
-                                                  reads_note(reads_at, since.elapsed(), paused), waits_note(served.model.warm_waits()));
+                                        eprintln!("Straydog warmed up in {:.1} s; {}; {}; memory {}", since.elapsed().as_secs_f64(),
+                                                  reads_note(reads_at, since.elapsed(), paused), waits_note(served.model.warm_waits()),
+                                                  straydog_engine::host::machine_memory_note(Some(memory_at_start)));
                                         listed = Some(Instant::now());
                                         reads_at = straydog_engine::experts::reader_totals();
                                         paused = std::time::Duration::ZERO;
