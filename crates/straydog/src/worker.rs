@@ -1906,6 +1906,13 @@ pub(crate) struct Failure {
     pub kind: Option<&'static str>,
 }
 
+/// The tokens a reply may have: what was asked for, or the room the context leaves after the prompt when that is less. A prompt that
+/// does not fit is left to be refused as it was. (Refused before, an agent with an output limit of its own lost its turn at a
+/// 215,346-token prompt of 262,144 with max_tokens 65,536.)
+pub(crate) fn fitted_max_new(prompt: usize, asked: i128, context: usize) -> i128 {
+    if prompt < context { asked.min(context as i128 - prompt as i128) } else { asked }
+}
+
 pub(crate) fn refused(message: impl Into<String>) -> Failure {
     Failure { message: message.into(), fatal: false, kind: None }
 }
@@ -2120,7 +2127,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     };
     // (a max_tokens past the context gets the room there is, and the reply ends at the context as its length: refused, an agent with
     // an output limit of its own lost its turn at a 215,346-token prompt of 262,144 with max_tokens 65,536)
-    let max_new = if ids.len() < context { max_new.min(context as i128 - ids.len() as i128) } else { max_new };
+    let max_new = fitted_max_new(ids.len(), max_new, context);
     if ids.is_empty() || max_new < 1 || max_new > context as i128 || ids.len() as i128 + max_new > context as i128 {
         return Err(refused("Straydog prompt plus output exceeds the allocated context"));
     }
@@ -2812,6 +2819,15 @@ mod tests {
         assert!(!engine_failed(format!("no memory for its positions {}", straydog_engine::model::IMAGE_REFUSED), "site").fatal);
         // (a prompt found too long before anything ran leaves the engine as it was)
         assert!(!engine_failed("Straydog prompt plus output exceeds the allocated context", "site").fatal);
+    }
+
+    /// A max_tokens past the context gets the room left; one that fits, or a prompt that does not fit, is as asked.
+    #[test]
+    fn a_max_tokens_past_the_context_gets_the_room_left() {
+        assert_eq!(super::fitted_max_new(215_346, 65_536, 262_144), 46_798);
+        assert_eq!(super::fitted_max_new(1_000, 500, 262_144), 500);
+        assert_eq!(super::fitted_max_new(262_144, 100, 262_144), 100, "a prompt that fills the context is refused as before");
+        assert_eq!(super::fitted_max_new(37, 300_000, 262_144), 262_107);
     }
 
     #[test]

@@ -533,7 +533,7 @@ impl<E: Engines> Loaded<E> {
         };
         // (a max_tokens past the context gets the room there is, and the reply ends at the context as its length: refused, an agent with
         // an output limit of its own lost its turn at a 215,346-token prompt of 262,144 with max_tokens 65,536)
-        let max_new = if ids.len() < context { max_new.min(context as i128 - ids.len() as i128) } else { max_new };
+        let max_new = crate::worker::fitted_max_new(ids.len(), max_new, context);
         if ids.is_empty() || max_new < 1 || max_new > context as i128 || ids.len() as i128 + max_new > context as i128 {
             return Err(refused("Straydog prompt plus output exceeds the allocated context"));
         }
