@@ -243,7 +243,7 @@ pub fn authorized(key: Option<&str>, headers: &HeaderMap) -> bool {
 /// (a public name made to lead here, DNS rebinding, whose page could read even the routes a browser sends no `Origin` to). Otherwise any page the person
 /// had open could have the engine generate, holding the GPU and taking the place of the conversation it keeps, and a rebound one could read what it
 /// wrote and the logs. This machine and its local network are loopback, `*.localhost`, `*.local` and private or link-local IPv4 addresses: a proxy on
-/// the network (Caddy) passes on its client's host, `doggybox.local` or `192.168.0.100`. With a key, the key is the test, and neither is looked at.
+/// the network (Caddy) passes on its client's host, `server.local` or `192.168.1.20`. With a key, the key is the test, and neither is looked at.
 pub fn foreign_request(headers: &HeaderMap, keyed: bool) -> Option<&'static str> {
     if keyed {
         return None;
@@ -267,7 +267,7 @@ fn host_name(authority: &str) -> &str {
 }
 
 /// A name of this machine or its local network: `localhost` and names under it, a `.local` name (mDNS), a machine's own name with no dot (as
-/// another machine of the network opens it, `http://homelab:8080`), `[::1]`, and an IPv4 address that is loopback, private or link-local. A public
+/// another machine of the network opens it, `http://nas:8080`), `[::1]`, and an IPv4 address that is loopback, private or link-local. A public
 /// name never is, whatever address it is made to lead to: a name a site can lead here is a domain, with a dot in it.
 fn local_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
@@ -464,7 +464,7 @@ mod tests {
     use super::*;
 
     /// Decides: without a key, a browser's request from a site on the internet, a null origin and a public host name (a rebound one) are refused; a
-    /// request with no Origin naming a local host (a native client, a proxy's own request, Caddy passing `doggybox.local` on) and a page of this machine
+    /// request with no Origin naming a local host (a native client, a proxy's own request, Caddy passing `server.local` on) and a page of this machine
     /// or the local network are let through. With a key, nothing is refused here.
     #[test]
     fn a_request_from_a_site_on_the_internet_is_refused() {
@@ -475,13 +475,13 @@ mod tests {
             }
             map
         };
-        for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "192.168.0.100:8080", "doggybox.local", "172.17.0.1:8080", "homelab:8080", "DESKTOP-A1B2:18581"] {
+        for host in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "192.168.1.20:8080", "server.local", "172.17.0.1:8080", "nas:8080", "DESKTOP-A1B2:18581"] {
             assert_eq!(foreign_request(&headers(&[("host", host)]), false), None, "{host}");
         }
         assert_eq!(foreign_request(&headers(&[]), false), None, "no host at all (HTTP/1.0)");
-        for origin in ["http://localhost:3000", "http://127.0.0.1:8080", "http://[::1]:5173", "http://app.localhost", "http://doggybox.local",
-                       "http://192.168.0.100", "http://10.0.0.7:8080", "http://169.254.1.1", "http://homelab:3000"] {
-            assert_eq!(foreign_request(&headers(&[("host", "doggybox.local"), ("origin", origin)]), false), None, "{origin}");
+        for origin in ["http://localhost:3000", "http://127.0.0.1:8080", "http://[::1]:5173", "http://app.localhost", "http://server.local",
+                       "http://192.168.1.20", "http://10.0.0.7:8080", "http://169.254.1.1", "http://nas:3000"] {
+            assert_eq!(foreign_request(&headers(&[("host", "server.local"), ("origin", origin)]), false), None, "{origin}");
         }
         for origin in ["https://evil.example", "null", "http://localhost.evil.example", "http://8.8.8.8"] {
             assert!(foreign_request(&headers(&[("host", "127.0.0.1:8080"), ("origin", origin)]), false).is_some(), "{origin}");
