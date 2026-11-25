@@ -129,6 +129,30 @@ pub fn ensure_trees(root: &Path, id: bundle::Id, data_dir: &Path, progress: Prog
     build_trees(root, id, data_dir, true, progress).map_err(|error| error.to_string())
 }
 
+/// The marks of the files a worker read through and checked against their pins, as it found them ([`straydog_engine::verity::file_stamp`]), kept
+/// beside their trees where each file is still as it found it: the next start reads it unhashed. A mark is written only so, and when a tree is
+/// built; never at an ordinary start. The names of those marked.
+pub fn keep_stamps(root: &Path, id: bundle::Id, data_dir: &Path, verified: &[(String, String)]) -> Vec<String> {
+    let Ok(files) = bundle::verity_files_in(root, id) else { return Vec::new() };
+    verified.iter().filter_map(|(name, stamp)| {
+        let (path, asset, _) = files.iter().find(|(_, asset, _)| asset.name == *name)?;
+        let now = fs::File::open(path).ok().and_then(|file| straydog_engine::verity::file_stamp(&file))?;
+        // (changed since the worker read it, it is not marked: the next start reads it through again)
+        (now == *stamp).then_some(())?;
+        straydog_engine::verity::keep_stamp(&bundle::tree_path(data_dir, asset), stamp).ok()?;
+        Some(name.clone())
+    }).collect()
+}
+
+/// No mark for this file (one a worker found unlike its pin): the next start reads it through and checks it.
+pub fn forget_stamp(root: &Path, id: bundle::Id, data_dir: &Path, name: &str) {
+    if let Ok(files) = bundle::verity_files_in(root, id) {
+        if let Some((_, asset, _)) = files.iter().find(|(_, asset, _)| asset.name == name) {
+            straydog_engine::verity::forget_stamp(&bundle::tree_path(data_dir, asset));
+        }
+    }
+}
+
 /// A directory trees are about to be written into: made if missing, and found writable, or an
 /// error naming the fix.
 fn writable(directory: &Path) -> io::Result<()> {
@@ -161,6 +185,8 @@ fn build_trees(root: &Path, id: bundle::Id, data_dir: &Path, missing_only: bool,
         let file = fs::File::open(path).map_err(at(path))?;
         let tree = bundle::tree_path(data_dir, asset);
         let partial = partial_path(&tree);
+        // (the file as it was when it was read: its mark is kept with the tree only if nothing changed it while the tree was built)
+        let before = straydog_engine::verity::file_stamp(&file);
         let label = format!("building the verity tree of {}", asset.name);
         let done = AtomicU64::new(0);
         progress(&label, 0, asset.bytes);
@@ -169,9 +195,14 @@ fn build_trees(root: &Path, id: bundle::Id, data_dir: &Path, missing_only: bool,
         let built: String = built.iter().map(|byte| format!("{byte:02x}")).collect();
         if built != *digest {
             fs::remove_file(&partial).map_err(at(&partial))?;
+            straydog_engine::verity::forget_stamp(&tree);
             return Err(invalid(format!("verity digest mismatch: {}", asset.name)));
         }
         fs::rename(&partial, &tree).map_err(at(&tree))?;
+        match (before, straydog_engine::verity::file_stamp(&file)) {
+            (Some(before), Some(after)) if before == after => straydog_engine::verity::keep_stamp(&tree, &after).map_err(at(&tree))?,
+            _ => straydog_engine::verity::forget_stamp(&tree),
+        }
         names.push(asset.name.clone());
     }
     Ok(names)
@@ -346,5 +377,60 @@ mod tests {
         fs::write(scratch.path().join("dspark").join(&asset.name), b"").unwrap();
         fetch_dspark(&root, bundle::Id::find(Some(bundle::DEEPSEEK), None, "IQ2_XS").unwrap(), false, &quiet).unwrap();
         assert!(!root.join("dspark").exists());
+    }
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use std::fs::File;
+    use straydog_engine::verity::{build, file_stamp, forget_stamp, keep_stamp, marked_as_checked};
+
+    /// Decides: a start reads a file unhashed only as it was when it was last read through and checked (its mark kept beside its tree). An ordinary
+    /// restart finds its mark. Its bytes replaced by others of the same size, by a copy that keeps the file's times (as `robocopy /COPY:DAT` and a
+    /// restore from a backup do), it does not, and the check refuses the bytes. Its permissions changed (as the grant to the worker's profile changes
+    /// them after the tree was built), it does not once, and does again once it is checked and marked again.
+    #[test]
+    fn a_file_is_read_unhashed_only_as_it_was_marked() {
+        let dir = std::env::temp_dir().join(format!("straydog-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, other, tree) = (dir.join("shard.gguf"), dir.join("other.gguf"), dir.join("shard.gguf.verity"));
+        let size = (2 << 20) + 77;
+        std::fs::write(&path, (0..size).map(|at| (at * 31 % 251) as u8).collect::<Vec<u8>>()).unwrap();
+        let digest = build(&File::open(&path).unwrap(), &tree, &|_| {}).unwrap();
+        keep_stamp(&tree, &file_stamp(&File::open(&path).unwrap()).unwrap()).unwrap();
+        assert!(marked_as_checked(&File::open(&path).unwrap(), &tree), "an ordinary restart reads it unhashed");
+        assert!(marked_as_checked(&File::open(&path).unwrap(), &tree), "and the next");
+        // (other bytes of the same size, copied over it with its own write time kept)
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&other, (0..size).map(|at| (at * 37 % 241) as u8).collect::<Vec<u8>>()).unwrap();
+        std::fs::File::options().write(true).open(&other).unwrap().set_modified(written).unwrap();
+        std::fs::copy(&other, &path).unwrap();
+        let now = std::fs::metadata(&path).unwrap();
+        assert_eq!((now.len(), now.modified().unwrap()), (size as u64, written), "the same size and write time as before");
+        assert!(!marked_as_checked(&File::open(&path).unwrap(), &tree), "read through and checked, not unhashed");
+        let again = dir.join("again.verity");
+        assert_ne!(build(&File::open(&path).unwrap(), &again, &|_| {}).unwrap(), digest, "and the check refuses its bytes");
+        // (the file as it was, checked and marked: read unhashed again)
+        std::fs::write(&path, (0..size).map(|at| (at * 31 % 251) as u8).collect::<Vec<u8>>()).unwrap();
+        keep_stamp(&tree, &file_stamp(&File::open(&path).unwrap()).unwrap()).unwrap();
+        assert!(marked_as_checked(&File::open(&path).unwrap(), &tree));
+        // (its permissions changed, as a grant does)
+        #[cfg(windows)]
+        {
+            let granted = std::process::Command::new("icacls").arg(&path).args(["/grant", "*S-1-15-2-1:(R)"]).output().unwrap();
+            assert!(granted.status.success(), "{}", String::from_utf8_lossy(&granted.stdout));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        assert!(!marked_as_checked(&File::open(&path).unwrap(), &tree), "once read through after its permissions changed");
+        keep_stamp(&tree, &file_stamp(&File::open(&path).unwrap()).unwrap()).unwrap();
+        assert!(marked_as_checked(&File::open(&path).unwrap(), &tree), "then unhashed, as before");
+        forget_stamp(&tree);
+        assert!(!marked_as_checked(&File::open(&path).unwrap(), &tree), "no mark, no unhashed read");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1353,6 +1353,8 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     if let Some(data_dir) = &args.data_dir {
         weights.open_trees(data_dir)?;
     }
+    // (the files this start reads through and checks: the server marks them once they are loaded, for the next start to read them unhashed)
+    let read_through = weights.read_through();
     let open_seconds = opened.elapsed().as_secs_f64();
     loading.report("prepare", 0, 0);
     let resource = |name: &str| weights.resources.get(name).cloned().ok_or(format!("missing resource {name}"));
@@ -1442,6 +1444,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
                       "note": model.placement_note},
         "load_seconds": seconds,
         "gpu": model.info()?,
+        "verified": read_through.iter().map(|(name, stamp)| json!({"name": name, "stamp": stamp})).collect::<Vec<_>>(),
     });
     let gpus: Vec<(usize, String)> = args.devices.iter()
         .map(|&ordinal| (ordinal, straydog_gpu::device_info(ordinal).map_or_else(|_| "unknown GPU".into(), |(name, _, _)| name)))

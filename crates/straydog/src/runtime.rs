@@ -1048,6 +1048,7 @@ impl Runtime {
             shared: shared.clone(),
             timeout: Duration::from_secs_f64(settings.startup_timeout),
             expected: (settings.ctx_size as u64, settings.bundle),
+            trees: (settings.model.clone(), settings.data_dir.clone()),
             verbose: settings.verbose,
             warm_directory: Some(settings.data_dir.join("warm")),
             cancel_patience,
@@ -1112,6 +1113,8 @@ struct Driver {
     shared: Arc<Shared>,
     timeout: Duration,
     expected: (u64, straydog_engine::bundle::Id),
+    /// The model's directory and the data directory its trees are in: where the marks of the files a worker read through and checked are kept.
+    trees: (PathBuf, PathBuf),
     verbose: bool,
     /// Where the expert store's contents are kept between runs (`<data-dir>/warm`), if anywhere.
     warm_directory: Option<PathBuf>,
@@ -1716,6 +1719,15 @@ impl Driver {
                     tracing::info!("Straydog load steps: {}", steps.join(", "));
                 }
                 ready["loaded_seconds"] = started.elapsed().as_secs_f64().into();
+                // (the files the worker read through and checked against their pins: marked beside their trees, where each is still as it found it)
+                let verified: Vec<(String, String)> = ready["verified"].as_array().into_iter().flatten()
+                    .filter_map(|entry| Some((entry["name"].as_str()?.to_string(), entry["stamp"].as_str()?.to_string())))
+                    .collect();
+                if !verified.is_empty() {
+                    for name in straydog_provision::keep_stamps(&self.trees.0, self.expected.1, &self.trees.1, &verified) {
+                        tracing::info!("Straydog checked {name} as it read it: the next start reads it unhashed");
+                    }
+                }
                 self.set(Phase::Ready(ready));
                 Ok(process)
             }
@@ -1726,6 +1738,10 @@ impl Driver {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let tail = String::from_utf8_lossy(&self.shared.stderr_tail.lock().unwrap()).to_string();
                 let reason = start_reason(&tail, message);
+                // (a file the worker found unlike its pin keeps no mark: the next start reads it through again)
+                if let Some(name) = reason.split(straydog_engine::load::DIGEST_MISMATCH).nth(1).and_then(|rest| rest.split_whitespace().next()) {
+                    straydog_provision::forget_stamp(&self.trees.0, self.expected.1, &self.trees.1, name);
+                }
                 // Refused by the OS: find out why, as the user (a drive that keeps no file
                 // permissions, a path the worker's profile may not read) and say so.
                 let why = if was_refused(&reason) {

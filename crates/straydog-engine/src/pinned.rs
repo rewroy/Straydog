@@ -29,11 +29,12 @@ const TREE_CACHE_BYTES: usize = 32 << 20;
 /// A whole tensor is verified by this many threads when it is large.
 const THREADS: usize = 8;
 
-type Signature = (u64, Option<SystemTime>);
+/// A file's size, modification time and change time ([`crate::verity::changed_at`]): a copy that keeps the times still changes the last.
+type Signature = (u64, Option<SystemTime>, Option<SystemTime>);
 
 fn signature(file: &File) -> Result<Signature, String> {
     let metadata = file.metadata().map_err(|exc| exc.to_string())?;
-    Ok((metadata.len(), metadata.modified().ok()))
+    Ok((metadata.len(), metadata.modified().ok(), crate::verity::changed_at(file)))
 }
 
 /// Whether the engine gathers rows of a table rather than taking it whole.

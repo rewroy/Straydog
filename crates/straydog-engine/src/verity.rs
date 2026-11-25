@@ -635,6 +635,107 @@ impl Verifier {
     }
 }
 
+/// When a file last changed in any way, its bytes or what is said of it (its permissions, attributes, times), as no tool sets back: its change time
+/// (`ctime` on Unix, `FILE_BASIC_INFO.ChangeTime` on Windows). A copy that keeps a file's times still changes it; so does a grant.
+pub fn changed_at(file: &File) -> Option<std::time::SystemTime> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec().max(0) as u32))
+    }
+    #[cfg(windows)]
+    {
+        basic_info(file).and_then(|info| from_file_time(info.ChangeTime))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        file.metadata().ok()?.modified().ok()
+    }
+}
+
+#[cfg(windows)]
+fn basic_info(file: &File) -> Option<windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO};
+    let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the struct lives through the call, which is told its size; the handle is the file's own.
+    let done = unsafe { GetFileInformationByHandleEx(file.as_raw_handle() as _, FileBasicInfo, (&mut info as *mut FILE_BASIC_INFO).cast(), std::mem::size_of::<FILE_BASIC_INFO>() as u32) };
+    (done != 0).then_some(info)
+}
+
+/// A FILETIME (100 ns since 1601) as a time.
+#[cfg(windows)]
+fn from_file_time(ticks: i64) -> Option<std::time::SystemTime> {
+    const BEFORE_1970: i64 = 116_444_736_000_000_000;
+    let since = ticks.checked_sub(BEFORE_1970).filter(|since| *since >= 0)?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new((since / 10_000_000) as u64, ((since % 10_000_000) * 100) as u32))
+}
+
+/// A file as it is now, for its mark ([`stamp_path`]): its size, its write time, its change time ([`changed_at`]) and which file it is (Windows: the
+/// volume's serial number and the file's index; Unix: the device and the inode). The same mark is the same file, unchanged in any way.
+pub fn file_stamp(file: &File) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        Some(format!("{} {}.{} {}.{} {}:{}", metadata.len(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec(), metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let basic = basic_info(file)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as in `basic_info`.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return None;
+        }
+        let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Some(format!("{size} {} {} {:08x}:{index:016x}", basic.LastWriteTime, basic.ChangeTime, info.dwVolumeSerialNumber))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let metadata = file.metadata().ok()?;
+        Some(format!("{} {:?}", metadata.len(), metadata.modified().ok()))
+    }
+}
+
+/// Where a tree keeps the mark of its file as it was when it was last read through and checked against its pin: beside it. A start reads the file
+/// unhashed only where the file's mark now is that one ([`marked_as_checked`]).
+pub fn stamp_path(tree: &Path) -> std::path::PathBuf {
+    let mut name = tree.as_os_str().to_owned();
+    name.push(".stamp");
+    std::path::PathBuf::from(name)
+}
+
+/// Whether `file` is as it was when it was last read through and checked against its pin, by the mark kept beside `tree`. Not its times against the
+/// tree's: on Windows a write time is set back by any copy that keeps it, and a change time moves on with a grant of the file to the worker's
+/// profile, which came after its tree was built. Nothing that changes a file in any way (its bytes, its times, its permissions, which file it is)
+/// keeps its mark; a start that finds another reads it through and checks it, once, and its mark is then written again.
+pub fn marked_as_checked(file: &File, tree: &Path) -> bool {
+    match (file_stamp(file), std::fs::read_to_string(stamp_path(tree))) {
+        (Some(now), Ok(kept)) => kept.trim() == now,
+        _ => false,
+    }
+}
+
+/// `stamp` kept beside `tree`, whole or not at all.
+pub fn keep_stamp(tree: &Path, stamp: &str) -> std::io::Result<()> {
+    let path = stamp_path(tree);
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    std::fs::write(&partial, format!("{stamp}\n"))?;
+    std::fs::rename(&partial, &path)
+}
+
+/// No mark kept beside `tree`: its file is to be read through and checked at the next start.
+pub fn forget_stamp(tree: &Path) {
+    let _ = std::fs::remove_file(stamp_path(tree));
+}
+
 #[cfg(test)]
 mod pool_tests {
     use super::*;

@@ -27,6 +27,9 @@ use crate::weights::{Progress, Weights};
 /// A chunk at least this cached is read through the page cache: memory is faster than the SSD.
 const CACHED: f64 = 0.95;
 
+/// What a load says of a file whose bytes are not those its pin says, before the file's name.
+pub const DIGEST_MISMATCH: &str = "Straydog asset digest mismatch: ";
+
 /// Whether chunks not in the page cache are read past it (direct reads, Linux): only when the
 /// files could not stay cached, as a model larger than three quarters of the host memory.
 /// Both read the SSD as fast (4.7 GB/s for the IQ3_S bundle); direct reads cost no kernel copy
@@ -417,7 +420,7 @@ fn read_chunk(source: &Source, chunk: usize, slot: &mut Buffer) -> Result<usize,
         done += part;
     }
     if format!("{:x}", digest.finalize()) != source.digests[chunk] {
-        return Err(format!("Straydog asset digest mismatch: {}", source.name));
+        return Err(format!("{DIGEST_MISMATCH}{}", source.name));
     }
     Ok(length)
 }
