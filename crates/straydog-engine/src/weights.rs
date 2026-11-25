@@ -395,9 +395,10 @@ impl Weights {
     }
 
     /// The files a start reads through and checks against their pins, as their marks were when their trees were opened ([`verity::file_stamp`]): for
-    /// the server to keep beside their trees once the load has checked them, so that the next start reads them unhashed.
+    /// the server to keep beside their trees once the load has checked them, so that the next start reads them unhashed. Only the files the load
+    /// reads ([`Weights::files_to_read`]): a file it does not read whole, as the drafter's while the drafter is not in use, was not checked.
     pub fn read_through(&self) -> Vec<(String, String)> {
-        (0..self.files.len())
+        (0..self.files_to_read().len())
             .filter(|&file| self.verifiers.get(file).is_some_and(Option::is_some) && !self.file_checked(file))
             .filter_map(|file| Some((self.assets[file].clone(), self.stamps.get(file)?.clone()?)))
             .collect()
