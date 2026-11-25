@@ -603,6 +603,19 @@ mod tests {
             std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(store.tokens_or_delete(&Flip, &key, 1), Some(kept.clone()), "and opens once it can be read");
         }
+        // (on Windows: another program holding it open with nothing shared, as a scan or a backup can, the open fails with a sharing violation)
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            write();
+            let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(store.path()).unwrap();
+            assert_eq!(store.tokens_or_delete(&Flip, &key, 1), None);
+            assert!(store.exists(), "a file another program holds stays");
+            assert!(store.state_or_delete(&Flip, &key, 1).unwrap_err().starts_with(PASSING));
+            assert!(store.exists(), "and stays for a request too");
+            drop(held);
+            assert_eq!(store.tokens_or_delete(&Flip, &key, 1), Some(kept.clone()), "and opens once it is let go");
+        }
         // the option at the start of a run
         write();
         assert!(!store.begin(true) && store.exists(), "a run that keeps leaves the file");
