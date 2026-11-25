@@ -23,8 +23,10 @@ use crate::conversation::Keeper;
 use crate::prefix::{Cache, Due, Restored};
 use crate::worker::FRAME_BYTES;
 
-/// Generations accepted at once: the running one and three waiting.
-const QUEUE: usize = 4;
+/// Generations accepted at once: the running one and the rest waiting their turn. A client that runs helpers side by side sends several
+/// requests at once (an agent's explore helpers, five and more): with three waiting, the fifth was refused (503 server_busy) and its helper
+/// failed, where a server that queues them has each wait. A waiting request holds only its body.
+const QUEUE: usize = 64;
 const STDERR_TAIL: usize = 8192;
 /// Finished generations the dashboard keeps.
 const RECENT: usize = 120;
