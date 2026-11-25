@@ -142,6 +142,10 @@ the mapping's pages back in: on an RTX 5070 Ti at `--vram 5.5` (UD-IQ2_XS, a 19 
 and a new 2,076-token conversation read in 5.6 s instead of 5.4. `STRAYDOG_HOST_TIER=0`
 locks whole layers; `=1` takes the tier on any build.
 
+A served DeepSeek keeps four conversations in 2 GiB of host memory. For a client that runs several long conversations at once,
+`STRAYDOG_CHECKPOINTS=8 STRAYDOG_CHECKPOINT_GIB=6` keeps them (six ~95K-token conversations taking turns: 93 s instead of 1,125),
+at 4 GiB of the host tier.
+
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
 or its GGUF.
