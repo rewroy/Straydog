@@ -181,9 +181,10 @@ pub fn machine_memory_note(since: Option<[u64; 3]>) -> String {
     let held = { let (available, page_file) = windows_available(); format!("available {:.1} GB, page file room {:.1} GB", available as f64 / 1e9, page_file as f64 / 1e9) };
     #[cfg(not(any(windows, target_os = "linux")))]
     let held = String::from("not known");
+    // (the counts are Linux's: elsewhere they would read as nothing taken back, which is not known)
     match since {
-        Some(at) => format!("{held}; since the start {}", reclaim_note(at, reclaim_counts())),
-        None => held,
+        Some(at) if cfg!(target_os = "linux") => format!("{held}; since the start {}", reclaim_note(at, reclaim_counts())),
+        _ => held,
     }
 }
 

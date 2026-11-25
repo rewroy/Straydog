@@ -149,10 +149,8 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
     let (loaded, ready) = mpsc::channel::<Result<(Value, Arc<Text>), String>>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            // (the machine's memory as the start found it, and the kernel's reclaiming from here to the warm-up's end: a start beside another
-            // model's file cache read and checked 3.3 times slower, 11-25)
+            // (the kernel's reclaiming from here to the warm-up's end; the memory as the start found it is the worker's first line)
             let memory_at_start = straydog_engine::host::reclaim_counts();
-            eprintln!("Straydog memory at the start: {}", straydog_engine::host::machine_memory_note(None));
             let initialized = load(args, data_dir, &settings, report, place).and_then(|(served, frame, text)| {
                 #[cfg(windows)]
                 if plan.startup_vram_reduced() {

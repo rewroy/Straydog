@@ -1281,6 +1281,9 @@ fn placement_key(gpus: &[(usize, String)], vram: &str, context: usize, drafter: 
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
+    // (the machine's memory as every start finds it, before it reads or places anything: a start beside another model's file cache read and
+    // checked 3.3 times slower, 11-25)
+    eprintln!("Straydog memory at the start: {}", straydog_engine::host::machine_memory_note(None));
     straydog_engine::host::set_prefetch_memory_limits(args.host_memory_limit_files.clone());
     // (Windows: a worker has no window, so the system may count it as background and lower its clocks: it asks not to be)
     if !straydog_engine::host::full_speed() {
