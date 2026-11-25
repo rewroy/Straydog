@@ -1966,6 +1966,11 @@ with a model of its own reads no file it was not given.
   Answers carry `reasoning_content` deltas, structured `tool_calls`, and `usage` with
   `prompt_tokens_details.cached_tokens`, plus the engine's `timings`. Sampling controls the
   engine does not implement are accepted only at their neutral value; anything else is a 400.
+- **Stream comments and cut replies.** A stream also sends SSE comments, which clients skip: `: prefill done/total` at
+  most once a second while the prompt is read, and `: writing` after 5 s with nothing to send while a tool call is held
+  until it is whole (for a client that does not take its pieces). A proxy that closes an idle connection keeps the answer.
+  A reply cut inside a tool call (max_tokens, a stop string) neither runs the call nor sends its markup as text; the
+  answer is the text before it, and `finish_reason` says why it ended.
 - **Turns.** A request that ends with a tool message continues the assistant's reply; one that
   ends with a user message starts a new one. That is all the cache needs from a client.
 - **Errors** are OpenAI-style objects. Before a stream's first byte, the status says it (400,
