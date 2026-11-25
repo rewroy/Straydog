@@ -253,7 +253,10 @@ pub fn foreign_request(headers: &HeaderMap, keyed: bool) -> Option<&'static str>
         return Some("a host name that is not this machine or its local network");
     }
     let origin = headers.get(axum::http::header::ORIGIN)?;
-    let local = origin.to_str().ok().and_then(|origin| origin.split_once("://")).map(|(_, rest)| host_name(rest)).is_some_and(local_name);
+    // (only a page's own scheme names a host: `chrome-extension://<id>` and the like name none, and are not local)
+    let local = origin.to_str().ok().and_then(|origin| origin.split_once("://"))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        .map(|(_, rest)| host_name(rest)).is_some_and(local_name);
     (!local).then_some("a web page's request from a site that is not on this machine or its local network")
 }
 
@@ -271,10 +274,12 @@ fn host_name(authority: &str) -> &str {
 /// name never is, whatever address it is made to lead to: a name a site can lead here is a domain, with a dot in it.
 fn local_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
+    // (a name may end in the root's dot, `localhost.`, and be the same name)
+    let name = name.strip_suffix('.').unwrap_or(&name);
     if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local") || name == "[::1]" {
         return true;
     }
-    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !name.chars().all(|c| c.is_ascii_digit()) {
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && !name.chars().all(|c| c.is_ascii_digit()) {
         return true;
     }
     name.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback() || ip.is_private() || ip.is_link_local())
@@ -340,7 +345,9 @@ impl From<SubmitError> for ApiError {
     }
 }
 
-async fn health(State(api): State<Arc<Api>>) -> Response {
+async fn health(State(api): State<Arc<Api>>, headers: HeaderMap) -> Response {
+    // (with a key, a request without it is told the status alone: what failed names the model and the worker's last words)
+    let told = api.config.api_key.is_none() || authorized(api.config.api_key.as_deref(), &headers);
     match api.engine.state() {
         EngineState::Ready { .. } => Json(json!({"status": "ok"})).into_response(),
         EngineState::Loading { progress } => {
@@ -349,7 +356,7 @@ async fn health(State(api): State<Arc<Api>>) -> Response {
                 .into_response()
         }
         EngineState::Failed(message) => {
-            let error = ApiError::server(message).object();
+            let error = ApiError::server(if told { message } else { "the engine failed to start".to_string() }).object();
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"status": "error", "error": error}))).into_response()
         }
     }
@@ -483,6 +490,15 @@ mod tests {
                        "http://192.168.1.20", "http://10.0.0.7:8080", "http://169.254.1.1", "http://nas:3000"] {
             assert_eq!(foreign_request(&headers(&[("host", "server.local"), ("origin", origin)]), false), None, "{origin}");
         }
+        // A page of an extension or another scheme names no host: not local, whatever its id looks like; a name may end in the root's dot,
+        // and a dotless name may hold an underscore.
+        for origin in ["chrome-extension://abcdefghijklmnopabcdefghijklmnop", "moz-extension://1b2c3d4e-0000-4000-8000-000000000000", "file://", "ws://localhost"] {
+            assert!(foreign_request(&headers(&[("host", "127.0.0.1:8080"), ("origin", origin)]), false).is_some(), "{origin}");
+        }
+        for host in ["localhost.", "localhost.:8080", "server.local.", "my_box:8080"] {
+            assert_eq!(foreign_request(&headers(&[("host", host)]), false), None, "{host}");
+        }
+        assert!(foreign_request(&headers(&[("host", "evil.example.")]), false).is_some(), "a public name with the root's dot");
         for origin in ["https://evil.example", "null", "http://localhost.evil.example", "http://8.8.8.8"] {
             assert!(foreign_request(&headers(&[("host", "127.0.0.1:8080"), ("origin", origin)]), false).is_some(), "{origin}");
         }

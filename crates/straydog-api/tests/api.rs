@@ -880,6 +880,15 @@ async fn health_and_models_follow_the_engine() {
     let mut failed = refused(500, "server_error", "the GPU stopped responding");
     failed.1["status"] = "error".into();
     assert_eq!(fetch(app(&mock), get("/health")).await, failed);
+    // With a key, a request without it is told that the engine failed, and not what it said: that names the model and the worker's last words.
+    let mut keyed = config();
+    keyed.api_key = Some("sk-local".into());
+    let mut told_less = refused(500, "server_error", "the engine failed to start");
+    told_less.1["status"] = "error".into();
+    assert_eq!(fetch(router(mock.clone(), keyed.clone()), get("/health")).await, told_less);
+    let mut with_key = get("/health");
+    with_key.headers_mut().insert("authorization", "Bearer sk-local".parse().unwrap());
+    assert_eq!(fetch(router(mock.clone(), keyed), with_key).await, failed);
 
     assert_eq!(fetch(app(&mock), get("/v1/nothing")).await, refused(404, "not_found_error", "no such route"));
     let wrong_method = refused(405, "invalid_request_error", "method not allowed");

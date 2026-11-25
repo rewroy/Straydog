@@ -155,6 +155,14 @@ fn open_part(key: &[u8], nonce: [u8; NONCE], aad: &[u8], sealed: &mut [u8]) -> R
         .map_err(|_| "it does not open: a byte of it is not as it was written".to_string())
 }
 
+/// What starts the reason a file could not be opened for a reason of the moment (the drive, another program holding it, memory): the file is kept,
+/// and not used this time. Any other reason is the file's own (not one, changed, another engine's, another user's), and it is deleted.
+const PASSING: &str = "for now: ";
+
+fn passing(error: impl std::fmt::Display) -> String {
+    format!("{PASSING}{error}")
+}
+
 /// The file of one bundle's kept conversation, in a directory.
 pub struct Store {
     path: PathBuf,
@@ -218,9 +226,9 @@ impl Store {
         let mut file = match std::fs::File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(passing(error)),
         };
-        let length = file.metadata().map_err(|error| error.to_string())?.len();
+        let length = file.metadata().map_err(passing)?.len();
         let (head, bytes) = Head::read(&mut file, length)?;
         if head.layout != layout {
             return Err(format!("its state is of layout {}, this engine's is {layout}", head.layout));
@@ -239,7 +247,7 @@ impl Store {
         let opened = (|| {
             let (part, _) = head.parts();
             let mut sealed = vec![0u8; part as usize];
-            file.read_exact(&mut sealed).map_err(|error| error.to_string())?;
+            file.read_exact(&mut sealed).map_err(passing)?;
             let plain = open_part(&key, head.tokens_nonce, &aad(&bytes, TOKENS, &[]), &mut sealed)?;
             if plain as u64 != 4 * head.tokens {
                 return Err("its tokens are not the count its header says".to_string());
@@ -250,11 +258,15 @@ impl Store {
         opened.map(Some)
     }
 
-    /// [`open_tokens`](Self::open_tokens) for a start: a file that does not open, for whatever is wrong with it, is deleted, with one line in the log,
-    /// and the start goes on as without it.
+    /// [`open_tokens`](Self::open_tokens) for a start: a file that does not open for what is wrong with it is deleted, with one line in the log, and
+    /// the start goes on as without it; one that does not open for a reason of the moment ([`PASSING`]) is kept, and not used this time.
     pub fn tokens_or_delete(&self, wrap: &dyn Wrap, key: &[u8; 32], layout: u32) -> Option<Vec<u32>> {
         match self.open_tokens(wrap, key, layout) {
             Ok(tokens) => tokens,
+            Err(reason) if reason.starts_with(PASSING) => {
+                tracing::warn!("Straydog conversation: {} not opened this start ({reason}); it is kept", self.path.display());
+                None
+            }
             Err(reason) => {
                 self.delete();
                 tracing::warn!("Straydog conversation: deleted {} ({reason}); this start goes on without it", self.path.display());
@@ -263,11 +275,15 @@ impl Store {
         }
     }
 
-    /// [`open_state`](Self::open_state) for a request: a file that no longer opens is deleted, as at the start.
+    /// [`open_state`](Self::open_state) for a request: a file that no longer opens is deleted, as at the start, and kept for a reason of the moment.
     pub fn state_or_delete(&self, wrap: &dyn Wrap, key: &[u8; 32], layout: u32) -> Result<Vec<u8>, String> {
         self.open_state(wrap, key, layout).inspect_err(|reason| {
-            self.delete();
-            tracing::warn!("Straydog conversation: deleted {} ({reason})", self.path.display());
+            if reason.starts_with(PASSING) {
+                tracing::warn!("Straydog conversation: {} not opened for this request ({reason}); it is kept", self.path.display());
+            } else {
+                self.delete();
+                tracing::warn!("Straydog conversation: deleted {} ({reason})", self.path.display());
+            }
         })
     }
 
@@ -289,10 +305,10 @@ impl Store {
             let (tokens_part, state_part) = head.parts();
             // (the tokens' part, sealed as it is in the file, is bound into the state's associated data)
             let mut tokens_sealed = vec![0u8; tokens_part as usize];
-            file.read_exact(&mut tokens_sealed).map_err(|error| error.to_string())?;
+            file.read_exact(&mut tokens_sealed).map_err(passing)?;
             let mut sealed = Vec::new();
-            sealed.try_reserve_exact(state_part as usize).map_err(|_| format!("no memory for {} MB of state", state_part >> 20))?;
-            let read = (&mut file).take(state_part).read_to_end(&mut sealed).map_err(|error| error.to_string())?;
+            sealed.try_reserve_exact(state_part as usize).map_err(|_| passing(format!("no memory for {} MB of state", state_part >> 20)))?;
+            let read = (&mut file).take(state_part).read_to_end(&mut sealed).map_err(passing)?;
             if read as u64 != state_part {
                 return Err("its state is short".to_string());
             }
@@ -574,6 +590,19 @@ mod tests {
         assert!(store.state_or_delete(&Flip, &key, 1).is_err());
         assert!(!store.exists(), "a state found damaged deletes the file");
         assert!(store.state_or_delete(&Flip, &key, 1).unwrap_err().contains("gone"));
+        // a file that cannot be opened for a reason of the moment (here: no leave to read it) is kept, and not used this time
+        #[cfg(unix)]
+        if !matches!(std::env::var("USER").as_deref(), Ok("root")) {
+            use std::os::unix::fs::PermissionsExt;
+            write();
+            std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(store.tokens_or_delete(&Flip, &key, 1), None);
+            assert!(store.exists(), "a file that could not be read for now stays");
+            assert!(store.state_or_delete(&Flip, &key, 1).unwrap_err().starts_with(PASSING));
+            assert!(store.exists(), "and stays for a request too");
+            std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(store.tokens_or_delete(&Flip, &key, 1), Some(kept.clone()), "and opens once it can be read");
+        }
         // the option at the start of a run
         write();
         assert!(!store.begin(true) && store.exists(), "a run that keeps leaves the file");
