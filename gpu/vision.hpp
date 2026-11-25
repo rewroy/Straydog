@@ -66,14 +66,32 @@ __global__ void vision_rope_split(const float* qkv, const float* bias, size_t pa
 }
 
 // Softmax of each row of `cols` scores (row blockIdx.x of head blockIdx.y, heads `stride` rows
-// apart), into FP16.
+// apart), into FP16. A row of at most vision_softmax_kept scores a thread stays in its registers:
+// the scores are read once and each exponential is taken once, the same values in the same order
+// as reading the row three times, so the probabilities are the same to the bit. (A 1280x800
+// picture's 5,336 patches: 32 layers of 16 heads' rows, 230 of the encoder's 444 ms read three
+// times.) A longer row is read again for each step.
+constexpr unsigned vision_softmax_kept = 32;
 __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, __half* probs) {
     const size_t at = (size_t(blockIdx.y) * stride + blockIdx.x) * cols;
     const float* row = scores + at;
     __half* out = probs + at;
     __shared__ float partial[256];
+    const bool kept = cols <= size_t(blockDim.x) * vision_softmax_kept;
+    float value[vision_softmax_kept];
     float top = -INFINITY;
-    for (size_t i = threadIdx.x; i < cols; i += blockDim.x) top = fmaxf(top, row[i]);
+    if (kept) {
+#pragma unroll
+        for (unsigned k = 0; k < vision_softmax_kept; ++k) {
+            const size_t i = threadIdx.x + size_t(k) * blockDim.x;
+            if (i < cols) {
+                value[k] = row[i];
+                top = fmaxf(top, value[k]);
+            }
+        }
+    } else {
+        for (size_t i = threadIdx.x; i < cols; i += blockDim.x) top = fmaxf(top, row[i]);
+    }
     partial[threadIdx.x] = top;
     __syncthreads();
     for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
@@ -83,7 +101,18 @@ __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, 
     top = partial[0];
     __syncthreads();
     float sum = 0;
-    for (size_t i = threadIdx.x; i < cols; i += blockDim.x) sum += expf(row[i] - top);
+    if (kept) {
+#pragma unroll
+        for (unsigned k = 0; k < vision_softmax_kept; ++k) {
+            const size_t i = threadIdx.x + size_t(k) * blockDim.x;
+            if (i < cols) {
+                value[k] = expf(value[k] - top);
+                sum += value[k];
+            }
+        }
+    } else {
+        for (size_t i = threadIdx.x; i < cols; i += blockDim.x) sum += expf(row[i] - top);
+    }
     partial[threadIdx.x] = sum;
     __syncthreads();
     for (unsigned stride = blockDim.x / 2; stride > 0; stride /= 2) {
@@ -91,7 +120,15 @@ __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, 
         __syncthreads();
     }
     const float scale = 1.0f / partial[0];
-    for (size_t i = threadIdx.x; i < cols; i += blockDim.x) out[i] = __float2half(expf(row[i] - top) * scale);
+    if (kept) {
+#pragma unroll
+        for (unsigned k = 0; k < vision_softmax_kept; ++k) {
+            const size_t i = threadIdx.x + size_t(k) * blockDim.x;
+            if (i < cols) out[i] = __float2half(value[k] * scale);
+        }
+    } else {
+        for (size_t i = threadIdx.x; i < cols; i += blockDim.x) out[i] = __float2half(expf(row[i] - top) * scale);
+    }
 }
 
 // silu(gate) * up of each row of [gate | up] (`ffn` each), into FP16.
