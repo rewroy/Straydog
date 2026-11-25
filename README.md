@@ -154,7 +154,7 @@ and `--config FILE` reads them from a TOML file (with no `--config` and no model
 `setup` wrote). Options beat variables, which beat the file. `--print-config` shows the
 settings in effect and where each came from.
 
-### Keeping a conversation across starts (Windows)
+### Keeping a conversation across starts (Windows, Linux)
 
 An engine that starts again, as an app's update makes it, holds none of the conversation it held:
 the next request of a long conversation reads all of it again (36,169 tokens took 84 s on an
@@ -174,13 +174,16 @@ does not.
   prompt). A request takes back the one it goes on from.
 - **Where, and sealed how.** `<data dir>/conversation`, up to four files a bundle. The state is sealed with AES-256-GCM under a random key that DPAPI wraps for your Windows
   account, as the engine's other saved state is (the system block's, `prefix`): another user cannot
-  open it, and a changed byte refuses it. Its tokens are a sealed part of their own.
+  open it, and a changed byte refuses it. Its tokens are a sealed part of their own. On Linux the
+  key is held by the kernel's keyring for your user and lasts until a reboot: a state kept before
+  one no longer opens, and is deleted.
 - **At the next start** the files are opened lazily: their tokens are read, and each state stays on
   the drive until the first request whose prompt begins with its tokens. That request reads it from the file
   and goes on from there; the request line says `reused 38968 from kept, loaded in 1.8 s`. A
-  request that does not begin with them leaves the file as it is, for a later one. A file of
-  another build, bundle or placement of the engine is deleted, as is one that does not open, and
-  with the option off at the start the file is deleted.
+  request that does not begin with them leaves the file as it is, for a later one. A conversation
+  goes on across an update of the engine; a file of another bundle, context or placement is deleted,
+  as is one that does not open, and with the option off at the start the files are deleted: a second
+  server of the same bundle for a test takes its own `--data-dir`.
 - **What it costs and saves.** The file is about 28 KB a token (1.0 GB for 36,000 tokens), written
   in 2 to 2.5 s at the stop (the stop takes 3.5 to 4.7 s). On an RTX 5070 Ti held to 5.5 GiB a
   conversation of 38,975 tokens was read in 48.9 s from nothing, and in 1.8 s of loading and 2.2 s to
