@@ -540,14 +540,14 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// of its evictions against an LRU's and the best possible ones stays: a line every 2^20 uses of decode and verify passes, a few minutes
 /// of decoding. A row table's account of its cache (Engram's rows) stays too: a line every 2^20 rows asked, ~20K tokens. So does what
 /// DSpark's confidences met on served drafts: a line every 4096 drafts tried, some minutes of an agent's use. The machine's memory as a start
-/// finds it is a line a start.
+/// finds it is a line a start. A read's phases (STRAYDOG_PREFILL_PHASES) are what that switch asks for: written only with it set.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
      "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:",
-     "Straydog DSpark calibration", "Straydog memory at the start"]
+     "Straydog DSpark calibration", "Straydog memory at the start", "PHASES "]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -2250,6 +2250,8 @@ mod tests {
         assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
         assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        assert!(stays_in_the_log("PHASES device 0: 9 batches, 432 layers; stream time 5210.4 ms = 578.9 ms a batch"));
+        assert!(stays_in_the_log("PHASES   host a MoE layer (432): counts wait 0.10 ms, hints 0.20 ms, gather 9.40 ms, CPU routes 1.00 ms, settle 0.10 ms"));
         assert!(stays_in_the_log("Straydog memory at the start: free 0.8 GB, file cache 85.4 GB, available 17.7 GB, swap in use 1.4 GB"));
         assert!(stays_in_the_log("Straydog DSpark calibration on served drafts (skill 1.12, extra 0.74): slot 1: 0.9 812/861 (0.97 by calibration)"));
         // (why a picture was slow: the vision encoder on the CPU, as the GPU could not, and what the GPU took)
