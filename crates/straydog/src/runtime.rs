@@ -568,6 +568,12 @@ fn stays_in_the_log(line: &str) -> bool {
         .iter().any(|start| line.starts_with(start))
 }
 
+/// Whether a frame from the worker answers an ask for the warm-up state ([`Runtime::save_warm_state`]): the state, or an error to it (no
+/// other frame carries that id).
+fn is_late_warm_state(event: &Value) -> bool {
+    event["id"] == "warm-state"
+}
+
 /// The worker's last lines on stderr (an allocation that failed, a GPU error, a panic), for the log line that says it stopped: empty
 /// when it wrote none.
 fn worker_said(tail: &[u8]) -> String {
@@ -940,14 +946,30 @@ struct Process {
 struct Frames<R> {
     reader: R,
     partial: Vec<u8>,
+    /// Asks for the warm-up state the server stopped waiting for ([`Runtime::save_warm_state`]): their answers, when they come, are
+    /// passed over by whichever read meets them. A worker busy reading its warm-up answered one after the 30 s wait, and the first
+    /// request after a restart took it for its own and was refused as a mismatch (the worker started again under it).
+    late_warm_states: usize,
 }
 
 impl<R: AsyncBufRead + Unpin> Frames<R> {
     fn new(reader: R) -> Frames<R> {
-        Frames { reader, partial: Vec::new() }
+        Frames { reader, partial: Vec::new(), late_warm_states: 0 }
     }
 
     async fn read(&mut self) -> Result<Value, String> {
+        loop {
+            let frame = self.read_one().await?;
+            // (nothing awaits between the frame's end and this: a read dropped in a select loses no frame and no count)
+            if self.late_warm_states > 0 && is_late_warm_state(&frame) {
+                self.late_warm_states -= 1;
+                continue;
+            }
+            return Ok(frame);
+        }
+    }
+
+    async fn read_one(&mut self) -> Result<Value, String> {
         // read_until appends what it consumes to `partial` before it can be dropped.
         let room = (FRAME_BYTES + 1).saturating_sub(self.partial.len()) as u64;
         let read = (&mut self.reader).take(room).read_until(b'\n', &mut self.partial).await;
@@ -1597,7 +1619,13 @@ impl Driver {
                                  ("command", pyjson::Value::Str("warm_state".into()))]);
         let reply = async {
             process.send(&request).await?;
-            tokio::time::timeout(Duration::from_secs(30), process.read()).await.map_err(|_| "no reply".to_string())?
+            match tokio::time::timeout(Duration::from_secs(30), process.read()).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    process.stdout.late_warm_states += 1;
+                    Err("no reply".to_string())
+                }
+            }
         }
         .await;
         let state = match reply {
@@ -2518,6 +2546,32 @@ mod tests {
         assert_eq!(frames.read().await.unwrap()["event"], "done");
         drop(worker);
         assert_eq!(frames.read().await.unwrap_err(), "Straydog worker ended");
+    }
+
+    /// A warm-up state (or an error to its ask) that comes after the server stopped waiting for it is passed over by the next read,
+    /// whatever that read waits for; one the server waits for is read, and so is any other frame.
+    #[tokio::test]
+    async fn a_late_warm_state_is_passed_over() {
+        let (mut worker, server) = tokio::io::duplex(1024);
+        let mut frames = Frames::new(BufReader::new(server));
+        frames.late_warm_states = 1;
+        worker.write_all(b"{\"id\":\"warm-state\",\"event\":\"warm_state\",\"state\":{}}\n{\"id\":\"r1\",\"event\":\"token\",\"text\":\"x\"}\n")
+            .await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["id"], "r1");
+        assert_eq!(frames.late_warm_states, 0);
+        // (an ask the server waits for: its answer is read)
+        worker.write_all(b"{\"id\":\"warm-state\",\"event\":\"warm_state\",\"state\":null}\n").await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["event"], "warm_state");
+        // (a late error to such an ask goes the same way, so that the count comes back to 0 and the next ask's answer is read)
+        frames.late_warm_states = 1;
+        worker.write_all(b"{\"id\":\"warm-state\",\"event\":\"error\",\"message\":\"x\"}\n{\"id\":\"warm-state\",\"event\":\"warm_state\",\"state\":null}\n")
+            .await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["event"], "warm_state");
+        assert_eq!(frames.late_warm_states, 0);
+        // (any other frame is read as it comes)
+        frames.late_warm_states = 1;
+        worker.write_all(b"{\"id\":\"r2\",\"event\":\"done\"}\n").await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["id"], "r2");
     }
 
     /// A frame cut off by the worker's end is refused, not taken as the end alone.
