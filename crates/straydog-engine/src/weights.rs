@@ -372,6 +372,16 @@ impl Weights {
     /// their pinned digests): from then on the PLE table's rows are checked block by block as they
     /// are read, and partial residency's page-locked expert banks once locked.
     pub fn open_trees(&mut self, data_dir: &Path) -> Result<(), String> {
+        self.open_trees_marked(data_dir, None)
+    }
+
+    /// [`Weights::open_trees`] with the marks of the files as the server found them beside their trees, by asset name, in place of reading them:
+    /// a contained worker on Windows reads only the files granted to it, and a mark is written after the grants.
+    pub fn open_trees_with_marks(&mut self, data_dir: &Path, marks: &HashMap<String, String>) -> Result<(), String> {
+        self.open_trees_marked(data_dir, Some(marks))
+    }
+
+    fn open_trees_marked(&mut self, data_dir: &Path, marks: Option<&HashMap<String, String>>) -> Result<(), String> {
         let mut verifiers = vec![None; self.files.len()];
         let mut current = vec![false; self.files.len()];
         let mut stamps = vec![None; self.files.len()];
@@ -382,7 +392,10 @@ impl Weights {
         for (asset, digest) in bundle::verity_pins(self.bundle)?.into_iter().chain(table) {
             let Some(index) = self.assets.iter().position(|name| *name == asset.name) else { continue };
             let tree = bundle::tree_path(data_dir, &asset);
-            current[index] = tree_is_current(&self.files[index], &tree);
+            current[index] = match marks {
+                Some(marks) => verity::matches_mark(&self.files[index], marks.get(&asset.name).map(String::as_str)),
+                None => tree_is_current(&self.files[index], &tree),
+            };
             stamps[index] = verity::file_stamp(&self.files[index]);
             let verifier = verity::Verifier::open(&tree, asset.bytes, &verity::parse_digest(&digest)?, TREE_CACHE_BYTES)
                 .map_err(|error| format!("Straydog verity tree of {}: {error}", asset.name))?;

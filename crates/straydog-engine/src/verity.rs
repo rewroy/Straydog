@@ -715,10 +715,20 @@ pub fn stamp_path(tree: &Path) -> std::path::PathBuf {
 /// profile, which came after its tree was built. Nothing that changes a file in any way (its bytes, its times, its permissions, which file it is)
 /// keeps its mark; a start that finds another reads it through and checks it, once, and its mark is then written again.
 pub fn marked_as_checked(file: &File, tree: &Path) -> bool {
-    match (file_stamp(file), std::fs::read_to_string(stamp_path(tree))) {
-        (Some(now), Ok(kept)) => kept.trim() == now,
+    matches_mark(file, std::fs::read_to_string(stamp_path(tree)).ok().as_deref())
+}
+
+/// Whether `file` is as `kept` (a mark kept beside its tree, [`keep_stamp`]) says it was when it was last read through and checked: false without one.
+pub fn matches_mark(file: &File, kept: Option<&str>) -> bool {
+    match (file_stamp(file), kept) {
+        (Some(now), Some(kept)) => kept.trim() == now,
         _ => false,
     }
+}
+
+/// The mark kept beside `tree`, if there is one.
+pub fn kept_stamp(tree: &Path) -> Option<String> {
+    std::fs::read_to_string(stamp_path(tree)).ok().map(|kept| kept.trim().to_string()).filter(|kept| !kept.is_empty())
 }
 
 /// `stamp` kept beside `tree`, whole or not at all.
@@ -734,6 +744,28 @@ pub fn keep_stamp(tree: &Path, stamp: &str) -> std::io::Result<()> {
 /// No mark kept beside `tree`: its file is to be read through and checked at the next start.
 pub fn forget_stamp(tree: &Path) {
     let _ = std::fs::remove_file(stamp_path(tree));
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::*;
+
+    /// Decides: a mark given to the worker matches the file it opens as the mark beside the tree does, and nothing else does.
+    #[test]
+    fn a_given_mark_matches_as_the_kept_one_does() {
+        let directory = std::env::temp_dir().join(format!("straydog-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (path, tree) = (directory.join("shard.gguf"), directory.join("shard.gguf.tree"));
+        std::fs::write(&path, b"weights").unwrap();
+        let file = File::open(&path).unwrap();
+        assert!(kept_stamp(&tree).is_none());
+        assert!(!marked_as_checked(&file, &tree) && !matches_mark(&file, None));
+        keep_stamp(&tree, &file_stamp(&file).unwrap()).unwrap();
+        let kept = kept_stamp(&tree).unwrap();
+        assert!(marked_as_checked(&file, &tree) && matches_mark(&file, Some(&kept)) && matches_mark(&file, Some(&format!("{kept}\n"))));
+        assert!(!matches_mark(&file, Some("7 0.0 0.0 0:0")) && !matches_mark(&file, Some("")));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }
 
 #[cfg(test)]

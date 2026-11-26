@@ -223,10 +223,25 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
         push("host-memory-limit-file", file.display().to_string());
     }
     push("data-dir", settings.data_dir.display().to_string());
+    // (the marks kept beside the trees, of the files as they were when last read through and checked: the worker compares each with the file
+    // it opens. Read here: a worker contained on Windows reads only the files granted to it, and a mark is written after the grants, so it
+    // found none and every start read the whole model through: 76.7 GB in 17.6 s of a 19.4 s start on a PC, at each of its starts)
+    for (name, mark) in kept_marks(settings) {
+        push("file-mark", format!("{name}={mark}"));
+    }
     if let Some(gib) = settings.expert_ram {
         push("host-expert-bytes", ((gib * (1u64 << 30) as f64) as u64).to_string());
     }
     args
+}
+
+/// The marks kept beside the pinned files' trees, by the files' names ([`straydog_engine::verity::kept_stamp`]): none where a file has none.
+fn kept_marks(settings: &Settings) -> Vec<(String, String)> {
+    use straydog_engine::bundle;
+    bundle::verity_pins_in(&settings.model, settings.bundle).unwrap_or_default().into_iter()
+        .filter_map(|(asset, _)| Some((asset.name.clone(), straydog_engine::verity::kept_stamp(&bundle::tree_path(&settings.data_dir, &asset))?)))
+        .filter(|(name, mark)| !name.contains('=') && !mark.contains('\n'))
+        .collect()
 }
 
 /// The verity trees the worker reads: the pinned shards' in the data directory.

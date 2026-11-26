@@ -91,6 +91,9 @@ pub struct WorkerArgs {
     /// Straydog's data directory: the shards' verity trees (read only).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+    /// The marks kept beside the trees, NAME=MARK, as the server read them: the files a start reads unhashed where each is still as marked.
+    #[arg(long = "file-mark", hide = true)]
+    pub file_marks: Vec<String>,
     /// The routed experts' host tier of a bundle read on demand [default: planned from host memory].
     #[arg(long)]
     pub host_expert_bytes: Option<u64>,
@@ -1354,7 +1357,9 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     }
     // With the shards' verity trees, what is read again after loading is checked block by block.
     if let Some(data_dir) = &args.data_dir {
-        weights.open_trees(data_dir)?;
+        let marks: std::collections::HashMap<String, String> = args.file_marks.iter()
+            .filter_map(|entry| entry.split_once('=')).map(|(name, mark)| (name.to_string(), mark.to_string())).collect();
+        weights.open_trees_with_marks(data_dir, &marks)?;
     }
     // (the files this start reads through and checks: the server marks them once they are loaded, for the next start to read them unhashed)
     let read_through = weights.read_through();
