@@ -1338,6 +1338,12 @@ impl Driver {
                     break process.holders;
                 }
                 Served::Failed(message) => {
+                    // (the server is stopping, its queue closed, and the worker ended with it: a service's stop signals every process of the
+                    // service, the worker too, and one started again here was loaded only to be ended, while the stop waited for it)
+                    if jobs.is_closed() {
+                        tracing::info!("{message}; the server is stopping, so its worker is not started again");
+                        break process.holders;
+                    }
                     if !self.restart_allowed() {
                         // (the reason goes to the server's last line; other clients see that it failed, nothing of why)
                         let message = format!("{message}; restart the server");

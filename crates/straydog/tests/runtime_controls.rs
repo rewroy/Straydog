@@ -142,6 +142,22 @@ async fn serves(engine: &Runtime, body: pyjson::Value) -> bool {
     answered
 }
 
+/// A worker that ends as soon as a chat comes, as one a service's stop signals beside its server; each launch writes a line to LOG.
+fn ends_at_chat(log: &Path) {
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+    writeln!(file, "launched").unwrap();
+    drop(file);
+    ready();
+    for line in std::io::stdin().lock().lines() {
+        let frame: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if frame["command"].as_str() == Some("chat") {
+            // (after the server has been told to stop: the test closes the runtime right after it sends the chat)
+            std::thread::sleep(Duration::from_millis(500));
+            std::process::exit(1);
+        }
+    }
+}
+
 fn ready() {
     println!("{}", serde_json::json!({"event": "ready", "protocol": 1, "engine": "Straydog", "context": CONTEXT,
                                       "model": straydog_engine::bundle::MODEL, "provider": straydog_engine::bundle::ISTA, "quantization": QUANT}));
@@ -223,6 +239,7 @@ fn main() {
         Some("hung") => return hung(args.get(2).map(Path::new)),
         Some("fatal") => return fatal(args.get(2).map(Path::new)),
         Some("faulting") => return faulting(Path::new(&args[2])),
+        Some("ends-at-chat") => return ends_at_chat(Path::new(&args[2])),
         // As a worker that finds its GPUs' memory held fails: its reason on stderr, status 1.
         Some("fails") => {
             eprintln!("Straydog VRAM budget is unavailable");
@@ -441,6 +458,18 @@ fn main() {
         assert!(serves(&engine, hi()).await, "the worker started again ran the start's command, not the one made again");
         engine.close().await;
         println!("runtime_controls: a worker started again ran its command made again");
+
+        // A worker that ends while the server stops (its queue closed with a request under way): it is not started again.
+        let launches = scratch.join("stop-launches");
+        let engine = wait_ready(Runtime::start(&settings, (std::env::current_exe().unwrap(),
+                                                           vec!["ends-at-chat".into(), PathBuf::from(&launches).into_os_string()]))).await;
+        let pending = engine.generate(hi()).await.unwrap();
+        let started = Instant::now();
+        engine.close().await;
+        drop(pending);
+        assert_eq!(std::fs::read_to_string(&launches).unwrap(), "launched\n", "a worker was started again while the server stopped");
+        println!("runtime_controls: a worker that ended while the server stopped was not started again; closing took {:.1} s",
+                 started.elapsed().as_secs_f64());
 
         // A worker that fails to start: the runtime fails with its reason, at once.
         let engine = Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["fails".into()]));
