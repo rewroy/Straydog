@@ -351,7 +351,14 @@ impl Reader {
     /// Large cached reads for a temporary layer copy. Return only after every job has
     /// stopped writing, including failure: the destinations are borrowed for this call.
     pub(crate) fn read_verified(&self, ranges: &mut [VerifiedRead<'_>]) -> Result<()> {
-        const PIECE: usize = 4 << 20;
+        // (in pieces of 32 MiB: of a file that is mapped, as the model's shards are, reads around the page cache go nearly one at a time, and
+        // larger pieces keep the drive busy. A 2,076-token layer-order pass on an RTX 5070 Ti PC that could lock no layer of UD-IQ2_XS
+        // read its 42 GB of copies at 4.3 GB/s in 4 MiB pieces, 5.1 GB/s in 32 MiB ones: 11.5 -> 9.8 s)
+        self.read_verified_in(ranges, 32 << 20)
+    }
+
+    /// [`Reader::read_verified`] in pieces of `piece` bytes (a multiple of [`ALIGN`]).
+    fn read_verified_in(&self, ranges: &mut [VerifiedRead<'_>], piece: usize) -> Result<()> {
         for range in ranges.iter() {
             if !range.offset.is_multiple_of(ALIGN as u64) || !range.target.len().is_multiple_of(ALIGN)
                 || range.offset.checked_add(range.target.len() as u64).is_none() {
@@ -362,8 +369,8 @@ impl Reader {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut jobs = Vec::new();
         for (slot, range) in ranges.iter_mut().enumerate() {
-            for first in (0..range.target.len()).step_by(PIECE) {
-                let len = PIECE.min(range.target.len() - first);
+            for first in (0..range.target.len()).step_by(piece) {
+                let len = piece.min(range.target.len() - first);
                 // SAFETY: the ranges are disjoint mutable borrows, subdivided into
                 // disjoint pieces. All their completions are drained before returning.
                 let target = HostPointer(unsafe { range.target.as_mut_ptr().add(first) });
@@ -3553,8 +3560,9 @@ mod copied_reader_tests {
             if offset == 0 { Err("deliberate verification refusal".into()) } else { Ok(()) }
         });
         let mut buffer = storage::Buffer::new(8 << 20);
-        let result = reader.read_verified(&mut [VerifiedRead { file: fixture.file.clone(), file_index: 0, offset: 0,
-            target: buffer.as_mut_slice(), verifier: check }]);
+        // (in pieces of 4 MiB: two of the 8 MiB, which the barrier holds in their checks at once)
+        let result = reader.read_verified_in(&mut [VerifiedRead { file: fixture.file.clone(), file_index: 0, offset: 0,
+            target: buffer.as_mut_slice(), verifier: check }], 4 << 20);
         assert!(result.unwrap_err().contains("deliberate verification refusal"));
         assert_eq!(active.load(Ordering::SeqCst), 0, "a job outlived the borrowed destination");
     }

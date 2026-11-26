@@ -435,8 +435,9 @@ pub struct Verifier {
     /// The hash of each level-0 block, from the checked level 1 (empty when level 0 is one
     /// block, which the digest checks).
     level0: Vec<Hash>,
-    /// A checked, owned copy of every level-0 block, when the row-file budget holds it.
-    resident: Option<Box<[u8]>>,
+    /// A checked, owned copy of every level-0 block, when a budget holds it: kept once, at the start (the row files) or by a layer-order pass
+    /// that reads copies of the file ([`Verifier::keep_level0`]), and kept from then on.
+    resident: std::sync::OnceLock<Box<[u8]>>,
     /// Checked level-0 blocks, bounded, CLOCK-evicted.
     cache: Mutex<Level0>,
     pub tree_reads: AtomicU64,
@@ -494,7 +495,7 @@ impl Verifier {
         // (verifications on many threads read its blocks at once)
         let tree = crate::storage::concurrent(&tree).unwrap_or(tree);
         Ok(Verifier {
-            geometry, tree, digest: *digest, level0, resident: None,
+            geometry, tree, digest: *digest, level0, resident: std::sync::OnceLock::new(),
             cache: Mutex::new(Level0 { blocks: HashMap::new(), order: Vec::new(), hand: 0, capacity }),
             tree_reads: AtomicU64::new(0),
         })
@@ -509,11 +510,28 @@ impl Verifier {
     /// Called before readers share the verifier. The old bounded cache remains the fallback;
     /// no partially checked copy is published on a read, allocation or authentication failure.
     pub fn preload_level0(&mut self, budget: u64) -> Result<u64, String> {
-        let bytes = self.geometry.levels.first().copied().unwrap_or(0) * BLOCK as u64;
+        self.keep_level0(budget)
+    }
+
+    /// The bytes of the leaf level: what [`Verifier::keep_level0`] keeps.
+    pub fn level0_bytes(&self) -> u64 {
+        self.geometry.levels.first().copied().unwrap_or(0) * BLOCK as u64
+    }
+
+    /// Whether the leaf level is kept whole.
+    pub fn level0_kept(&self) -> bool {
+        self.resident.get().is_some()
+    }
+
+    /// [`Verifier::preload_level0`] while readers share the verifier: they check against the bounded cache until the copy is published, and
+    /// against it from then on (its bytes are those the cache would take from the tree). The leaf level's bytes, kept now or before, or 0
+    /// where `budget` does not hold them, nothing published on a failure.
+    pub fn keep_level0(&self, budget: u64) -> Result<u64, String> {
+        let bytes = self.level0_bytes();
         if bytes == 0 || bytes > budget {
             return Ok(0);
         }
-        if self.resident.is_some() {
+        if self.resident.get().is_some() {
             return Ok(bytes);
         }
         let Ok(length) = usize::try_from(bytes) else { return Ok(0) };
@@ -529,8 +547,9 @@ impl Verifier {
                 return Err(format!("tree block (0, {index}) does not verify"));
             }
         }
-        self.resident = Some(blocks.into_boxed_slice());
-        let cache = self.cache.get_mut().unwrap();
+        // (another thread may have kept it meanwhile: either copy holds the same checked bytes)
+        let _ = self.resident.set(blocks.into_boxed_slice());
+        let mut cache = self.cache.lock().unwrap();
         cache.blocks.clear();
         cache.blocks.shrink_to_fit();
         cache.order.clear();
@@ -573,7 +592,7 @@ impl Verifier {
                 }
                 continue;
             }
-            let (entries, entry) = match self.resident.as_deref() {
+            let (entries, entry) = match self.resident.get().map(|blocks| &blocks[..]) {
                 Some(entries) => (entries, (number * 32) as usize),
                 None => {
                     let tree_block = number / FAN;
@@ -968,6 +987,35 @@ mod resident_tests {
         assert_eq!(resident.tree_reads.load(Ordering::Relaxed), reads);
     }
 
+    /// A verifier readers share keeps its leaf level while they check (a layer-order pass's copies): before, during and after, every check of
+    /// the file's bytes passes and a changed byte fails; once kept, no check takes a tree block from the tree's file, and keeping it again
+    /// reads nothing more.
+    #[test]
+    fn a_shared_verifier_keeps_its_leaf_level_while_readers_check() {
+        let fixture = Fixture::new("shared", (3 * FAN as usize + 5) * BLOCK + 11);
+        let shared = std::sync::Arc::new(fixture.verifier());
+        let required = shared.level0_bytes();
+        assert!(!shared.level0_kept());
+        assert_eq!(shared.keep_level0(required - 1).unwrap(), 0);
+        assert!(!shared.level0_kept());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let shared = shared.clone();
+                let data = &fixture.data;
+                scope.spawn(move || for _ in 0..8 { shared.verify(0, data).unwrap(); });
+            }
+            assert_eq!(shared.keep_level0(required).unwrap(), required);
+        });
+        assert!(shared.level0_kept());
+        let reads = shared.tree_reads.load(Ordering::Relaxed);
+        shared.verify(0, &fixture.data).unwrap();
+        let mut changed = fixture.data.clone();
+        changed[2 * FAN as usize * BLOCK + 3] ^= 1;
+        assert!(shared.verify(0, &changed).is_err());
+        assert_eq!(shared.keep_level0(required).unwrap(), required);
+        assert_eq!(shared.tree_reads.load(Ordering::Relaxed), reads);
+    }
+
     #[test]
     fn a_bad_late_leaf_never_publishes_a_partly_checked_copy() {
         let fixture = Fixture::new("late-leaf", (2 * FAN as usize + 1) * BLOCK);
@@ -979,7 +1027,7 @@ mod resident_tests {
         byte[0] ^= 1;
         write_at(&tree, &byte, bad).unwrap();
         assert!(verifier.preload_level0(u64::MAX).unwrap_err().contains("(0, 2)"));
-        assert!(verifier.resident.is_none());
+        assert!(!verifier.level0_kept());
         verifier.verify(0, &fixture.data[..BLOCK]).unwrap();
         let at = 2 * FAN as usize * BLOCK;
         assert!(verifier.verify(at as u64, &fixture.data[at..at + BLOCK]).is_err());

@@ -119,6 +119,12 @@ fn reads_direct(reads: BankReads, unregistered: u64, available: u64) -> bool {
     }
 }
 
+/// Whether `leaves` bytes of tree leaf levels fit the read-ahead `room` beside a first copy of `copy` bytes and its margin: none to keep, nothing
+/// to fit.
+fn leaves_fit(leaves: u64, copy: u64, room: u64) -> bool {
+    leaves > 0 && leaves.saturating_add(copy).saturating_add(FIRST_COPIES_MARGIN) <= room
+}
+
 /// The layers' reads a pass keeps ahead of the layer it loads at most: each holds one layer's checked copy (some 0.86 GB for UD-IQ2_XS).
 /// One read ahead left the drive idle while the GPU computed a layer it held registered, and a layer's read began only once the layer
 /// before it had gone up: an RTX 5070 Ti PC (64 GB, UD-IQ2_XS at 9 GiB, 19 of 48 layers registered) read a 32K prompt's 24.4 GB at 1.16 GB/s
@@ -153,7 +159,18 @@ impl Prefetch {
         let direct = reads_direct(bank_reads(), unregistered, crate::host::prefetch_available_bytes());
         let plans: Vec<_> = (0..layers).map(|layer| Plan::new(weights, layer, direct)).collect();
         let bytes = plans.iter().flatten().map(|plan| plan.bytes).max()?;
-        let available = crate::host::read_ahead_room();
+        let room = crate::host::read_ahead_room();
+        // The trees' leaf levels of the files the copies come from, kept whole once, where they fit the room beside a first copy: the copies'
+        // checks then take no tree block from the trees' files and no lock between the readers, and the room left goes to the copies. Through
+        // the bounded cache instead (4 GiB of a file's bytes), a 2,076-token pass on an RTX 5070 Ti PC that could lock no layer of UD-IQ2_XS took
+        // some 80,000 tree blocks again, its readers' checks 162 s summed for 42 GB; with the leaf levels kept (565 MiB) 19 s, the drive the limit.
+        let mut files: Vec<usize> = plans.iter().flatten().filter(|plan| !registered.is_registered(plan.layer))
+            .flat_map(|plan| plan.roles.iter().map(|role| role.file_index)).collect();
+        files.sort_unstable();
+        files.dedup();
+        let leaves = weights.tree_leaves_to_keep(&files);
+        let kept = if leaves_fit(leaves, bytes as u64, room) { weights.keep_tree_leaves(&files, leaves).unwrap_or(0) } else { 0 };
+        let available = room.saturating_sub(kept);
         let mut free = Vec::new();
         // (development: STRAYDOG_LAYER_BANK_BUFFERS=N reads ahead into N buffers at most, to see a pass the memory left one or two)
         let most = std::env::var("STRAYDOG_LAYER_BANK_BUFFERS").ok().and_then(|value| value.trim().parse::<usize>().ok())
@@ -246,7 +263,18 @@ impl Drop for Prefetch {
 
 #[cfg(test)]
 mod bank_reads_tests {
-    use super::{bank_reads_named, reads_direct, BankReads};
+    use super::{bank_reads_named, leaves_fit, reads_direct, BankReads, FIRST_COPIES_MARGIN};
+
+    /// Decides: a pass keeps the trees' leaf levels only where they fit the read-ahead room beside a first copy and its margin, and keeps
+    /// none where there are none left to keep.
+    #[test]
+    fn the_leaf_levels_are_kept_only_beside_a_first_copy() {
+        let (mib, copy) = (1u64 << 20, 860u64 << 20);
+        assert!(leaves_fit(565 * mib, copy, 565 * mib + copy + FIRST_COPIES_MARGIN));
+        assert!(!leaves_fit(565 * mib, copy, 565 * mib + copy + FIRST_COPIES_MARGIN - 1));
+        assert!(!leaves_fit(0, copy, u64::MAX));
+        assert!(!leaves_fit(u64::MAX, copy, u64::MAX - 1));
+    }
 
     /// Decides: STRAYDOG_LAYER_BANK_DIRECT=1 reads around the page cache, =0 through it, and anything else (unset included) around it
     /// only where the bytes read again each pass exceed the memory available to keep them.
