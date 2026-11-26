@@ -679,9 +679,15 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
         (Some(resident), Some(available)) => {
             // (what the drive gave back for faults while it ran: Windows counts every process's)
+            // (and of them the reply's, after the prompt had been read: an RTX 4060 PC's first replies took 68 ms a token of CPU, and whether
+            // their experts' pages came from the drive the line could not say)
             let read_back = detail["fault_read_pages"].as_u64().map_or_else(String::new, |pages| {
-                let whose = if detail["fault_reads_system"] == true { " (every process)" } else { "" };
-                format!(", {:.2} GB read back from the drive{whose}", pages as f64 * 4096.0 / 1e9)
+                let whose = if detail["fault_reads_system"] == true { "every process" } else { "" };
+                let reply = detail["fault_read_pages_reply"].as_u64()
+                    .map_or_else(String::new, |reply| format!("{}{:.2} GB of them in the reply", if whose.is_empty() { "" } else { "; " },
+                                                              reply as f64 * 4096.0 / 1e9));
+                let note = if whose.is_empty() && reply.is_empty() { String::new() } else { format!(" ({whose}{reply})") };
+                format!(", {:.2} GB read back from the drive{note}", pages as f64 * 4096.0 / 1e9)
             });
             let limit = detail["working_set_limit_gib"].as_f64().map_or_else(String::new, |gib| format!(", working set limit {gib:.1} GiB"));
             let kv = match (detail["kv_positions"].as_u64(), detail["kv_gib"].as_f64()) {
@@ -2344,6 +2350,12 @@ mod tests {
                                                              "kv_positions": 262144, "kv_gib": 6.5, "kv_host": true})), 12), None);
         assert!(windows.contains("; memory: 23.4 GiB resident, 4.0 GiB available, 1741229 page faults, 7.60 GB read back from the drive (every process), working set limit 27.0 GiB, K/V 262144 positions 6.50 GiB in host memory"), "{windows}");
         assert!(windows.contains("; drafts probe: 12 passes at another width") && windows.lines().count() == 1, "{windows}");
+        // (and the reply's share of them, where the engine counted from the prompt's end)
+        let split = request_summary(&event(detail(json!({"fault_read_pages": 1_855_000, "fault_reads_system": true,
+                                                           "fault_read_pages_reply": 560_000})), 0), None);
+        assert!(split.contains("7.60 GB read back from the drive (every process; 2.29 GB of them in the reply)"), "{split}");
+        let linux_split = request_summary(&event(detail(json!({"fault_read_pages": 2_441, "fault_read_pages_reply": 0})), 0), None);
+        assert!(linux_split.contains("0.01 GB read back from the drive (0.00 GB of them in the reply)"), "{linux_split}");
         // (Linux: the process's own major faults, no working set limit; a K/V the VRAM holds)
         let linux = request_summary(&event(detail(json!({"fault_read_pages": 2_000, "fault_reads_system": false,
                                                            "kv_positions": 32768, "kv_gib": 0.81, "kv_host": false})), 0), None);

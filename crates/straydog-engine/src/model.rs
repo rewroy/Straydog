@@ -1504,6 +1504,8 @@ pub struct Model {
     memory_before: Option<(u64, u64, u64)>,
     /// The pages read from the drive for page faults when the request began ([`crate::host::fault_reads`]).
     fault_reads_before: Option<crate::host::FaultReads>,
+    /// The same count when the request's prompt had been read: what the reply then faulted in from the drive apart from the prompt.
+    fault_reads_prompt_end: Option<crate::host::FaultReads>,
     /// The CPU engine's read-ahead hints (taken, left) when the request began.
     read_aheads_before: (u64, u64),
     /// The CPU engine's phase times when the request began ([`CpuExperts::phase_ns`]).
@@ -1796,6 +1798,7 @@ impl Model {
             pass_counts: [0; PARTIAL_ROWS],
             memory_before: None,
             fault_reads_before: None,
+            fault_reads_prompt_end: None,
             read_aheads_before: (0, 0),
             cpu_phases_before: [0; 3],
             kv_capacity: context,
@@ -6465,6 +6468,7 @@ impl Model {
             self.pass_counts = [0; PARTIAL_ROWS];
             self.memory_before = crate::host::memory_note();
             self.fault_reads_before = crate::host::fault_reads();
+            self.fault_reads_prompt_end = None;
             self.read_aheads_before = self.cpu_read_aheads();
             self.cpu_phases_before = self.cpu_phase_ns();
         }
@@ -6528,6 +6532,8 @@ impl Model {
             // (the pages the drive gave back for faults while it ran, the working set's limit and the K/V's capacity: what the memory line
             // needs to say why a request waited on the drive)
             let read_back = crate::host::fault_reads().zip(self.fault_reads_before).map(|(now, before)| now.since(before));
+            // (of them the reply's: a decode whose CPU experts fault their pages in waits on the drive, which its time a token alone does not say)
+            let reply_read_back = crate::host::fault_reads().zip(self.fault_reads_prompt_end).map(|(now, before)| now.since(before).0);
             let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
             let kv_bytes = attention_layers(self.weights.drafter) * self.kv_capacity as u64 * kv_position_bytes();
             let (taken, left) = self.cpu_read_aheads();
@@ -6554,6 +6560,7 @@ impl Model {
                 "available_gib": memory.map(|note| note.1 as f64 / (1u64 << 30) as f64),
                 "page_faults": faults,
                 "fault_read_pages": read_back.map(|(pages, _)| pages), "fault_reads_system": read_back.map(|(_, system)| system),
+                "fault_read_pages_reply": reply_read_back,
                 "working_set_limit_gib": crate::host::working_set_limit_now().map(gib),
                 "kv_positions": self.kv_capacity, "kv_gib": gib(kv_bytes), "kv_host": self.host_kv,
                 "read_aheads": [taken - self.read_aheads_before.0, left - self.read_aheads_before.1],
@@ -6680,6 +6687,8 @@ impl Model {
         self.last_metrics.insert("prefill_seconds".into(), json!(elapsed));
         self.last_metrics.insert("prefill_tokens_per_second".into(), json!((tokens.len() - reused) as f64 / elapsed));
         if self.partial {
+            // (the drive's reads for faults so far: the reply's are counted from here, apart from the prompt's)
+            self.fault_reads_prompt_end = crate::host::fault_reads();
             // Re-pick cached experts from this prompt's routing before decoding.
             let rebalance = Instant::now();
             if std::mem::take(&mut self.slots_refill_ahead) {
