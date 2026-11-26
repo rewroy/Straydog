@@ -1220,6 +1220,11 @@ fn build_name() -> String {
     format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("STRAYDOG_COMMIT"))
 }
 
+/// How long the first request after a start waits for the system block's state still being read (the file decrypted and opened): the
+/// state saves reading the block again (on an RTX 4060 PC 6,096 tokens took 41-89 s; restored, 8.1 s with its read), and a read that takes
+/// longer than this is no longer one that pays.
+const PREFIX_WAIT: Duration = Duration::from_secs(20);
+
 /// A worker that failed (an error it called fatal, its exit, a cancelled generation it did not end) is started again, the request it
 /// failed for told so and those queued served by the new one, up to this many times within [`RESTART_WINDOW`]; one more failure ends
 /// the runtime as before. A GPU's memory or context that the failure left unusable is the old process's: the new one starts clean. On an
@@ -1438,8 +1443,17 @@ impl Driver {
                     continue;
                 }
             };
-            // (once a request has begun the worker holds a sequence of its own, which a state handed now would only displace)
-            restoring = None;
+            // The first request after a start, while the system block's state is still being read: it waits for the read and the state goes to
+            // the worker ahead of it, whose first request takes it where its prompt begins with the block (worker.rs take_prefix). Dropped as
+            // before, it was read again: on an RTX 5070 Ti PC a request 0.1 s after ready had its first token in 8.9-9.6 s, where one 5 s after
+            // ready, the state handed by then, had it in 0.78 s. A read past PREFIX_WAIT is left, and the request goes on without it.
+            if let Some(pending) = restoring.take() {
+                match tokio::time::timeout(PREFIX_WAIT, pending).await {
+                    Ok(Ok(Some(restored))) => self.hand_prefix(process, restored).await,
+                    Ok(_) => {}
+                    Err(_) => tracing::info!("Straydog prefix: not handed to the first request (still being read after {} s)", PREFIX_WAIT.as_secs()),
+                }
+            }
             changed = true;
             let skipped = self.shared.cancelled.lock().unwrap().remove(&job.id);
             let result = if skipped { Ok(()) } else { self.generation(process, &job, controls).await };
@@ -1469,8 +1483,8 @@ impl Driver {
         }
     }
 
-    /// Hand the worker the state of a system block an earlier run saved, which is opened by now: in the background, a request that comes
-    /// first never waits for it (the worker takes it only while no request has had the engine), and the worker's own line says what became of it.
+    /// Hand the worker the state of a system block an earlier run saved, which is opened by now: behind ready, or ahead of the first request
+    /// where that came while it was read ([`PREFIX_WAIT`]); the worker's own line says what became of it.
     async fn hand_prefix(&self, process: &mut Process, restored: Restored) {
         if restored.state().len() as u64 > crate::frames::BODY_LIMIT {
             return;
