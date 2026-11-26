@@ -851,6 +851,17 @@ mod tests {
             let first = &pins[0].0;
             straydog_engine::verity::keep_stamp(&bundle::tree_path(&settings.data_dir, first), "4096 133 134 0a0b:01").unwrap();
             assert_eq!(marks(&settings), vec![format!("{}=4096 133 134 0a0b:01", first.name)]);
+            // (and the worker's own parser reads it back whole: a mark holds spaces)
+            #[derive(clap::Parser)]
+            struct Worker {
+                #[command(flatten)]
+                args: crate::worker::WorkerArgs,
+            }
+            // (worker_args begins with the subcommand, which stands as the program's name here)
+            let line = crate::runtime::worker_args(&settings);
+            assert_eq!(line[0], "worker");
+            let parsed = <Worker as clap::Parser>::try_parse_from(line).unwrap().args;
+            assert_eq!(parsed.file_marks, vec![format!("{}=4096 133 134 0a0b:01", first.name)]);
             std::fs::remove_file(straydog_engine::verity::stamp_path(&bundle::tree_path(&settings.data_dir, first))).unwrap();
         }
     }
