@@ -566,7 +566,7 @@ fn stays_in_the_log(line: &str) -> bool {
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
      "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:",
      "Straydog DSpark calibration", "Straydog memory at the start", "PHASES ", "Straydog could not reset after a failed generation",
-     "Straydog failure place: "]
+     "Straydog failure place: ", "Straydog gather ahead", "Straydog host tier"]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -2319,6 +2319,10 @@ mod tests {
                                   (hybrid_slots.hpp:1200, code 700)"));
         assert!(stays_in_the_log("Straydog failure place: in the reply after 0 tokens, a prompt of 6602 tokens, 48 of 48 layers' banks locked, \
                                   GPU 0 4.71 of 5.38 GiB"));
+        // (what the GPU's view of host memory held when the gather ahead made its mirror, or why it made none, and what the host tier copied)
+        assert!(stays_in_the_log("Straydog gather ahead: off, no mirror of 0.72 GiB: the GPU's view of host memory holds 21.80 GiB of 23.60 GiB reservable \
+                                  (budget 31.80 GiB), 2.00 GiB kept; the experts go over the bus as they do without it"));
+        assert!(stays_in_the_log("Straydog host tier: 13963 experts of 48 layers to copy behind ready, 18.6 GiB, in place of 30 whole layers"));
         assert!(stays_in_the_log("PHASES   host a MoE layer (432): counts wait 0.10 ms, hints 0.20 ms, gather 9.40 ms, CPU routes 1.00 ms, settle 0.10 ms"));
         assert!(stays_in_the_log("Straydog memory at the start: free 0.8 GB, file cache 85.4 GB, available 17.7 GB, swap in use 1.4 GB"));
         assert!(stays_in_the_log("Straydog DSpark calibration on served drafts (skill 1.12, extra 0.74): slot 1: 0.9 812/861 (0.97 by calibration)"));

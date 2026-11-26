@@ -107,6 +107,16 @@ mod kv_cache_retention_tests {
         assert!(super::kv_cache_retention_named(Some("2")));
         assert!(!super::kv_cache_retention_named(Some("0")));
     }
+
+    /// Decides: the gather ahead is counted where gpu/core.hpp's Device::Pregather turns it on: a CUDA build on Windows unless 0, elsewhere
+    /// with 1 alone, never HIP.
+    #[test]
+    fn the_gather_ahead_is_on_as_the_native_side_reads_it() {
+        use super::gather_ahead_named as on;
+        assert!(on(None, true, true) && on(Some("1"), true, true) && !on(Some("0"), true, true));
+        assert!(!on(None, false, true) && on(Some("1"), false, true) && !on(Some("0"), false, true));
+        assert!(!on(None, true, false) && !on(Some("1"), false, false));
+    }
 }
 
 /// Cumulative native retained-growth counters, in the order of `sd_expert_slots_retain_stats`.
@@ -3334,6 +3344,12 @@ impl Backend {
 
     /// The routed experts a layer of this device's `layers` has beyond the slots, on average, with `stage` staging slots: what a wide read's layer
     /// has to bring over the bus, to size the staging slots for it ([`Group::create_expert_slots`]).
+    /// The bytes of one expert slot as [`Backend::create_expert_slots`] makes them: the largest expert of the device's partially resident
+    /// layers, at 256 bytes; 0 for a device with none.
+    pub fn slot_bytes(&self) -> u64 {
+        self.slot_bytes.div_ceil(256) * 256
+    }
+
     pub fn experts_beyond_slots(&self, layers: u64, stage: u64, margin: u64) -> Result<u64> {
         let slot = (if self.slot_bytes > 0 { self.slot_bytes } else { expert_bytes([42, 42, 42]) }).div_ceil(256) * 256;
         let cache = self.slots_that_fit(stage, margin, slot)?;
@@ -3651,6 +3667,16 @@ impl Backend {
 pub fn lock_host_range(ordinal: usize, range: &[u8]) -> Result<()> {
     // SAFETY: a mapped range that outlives the registration (unregistered before unmapping).
     check(unsafe { ffi::sd_host_register_on(ordinal as c_int, range.as_ptr().cast_mut().cast(), range.len() as u64) }).map(drop)
+}
+
+/// Whether a CUDA device gathers a wide batch's next layer ahead into a page-locked mirror, as gpu/core.hpp's Device::Pregather decides it:
+/// on Windows unless STRAYDOG_PREGATHER=0, elsewhere only with STRAYDOG_PREGATHER=1; never on HIP.
+pub fn gather_ahead_on() -> bool {
+    gather_ahead_named(std::env::var("STRAYDOG_PREGATHER").ok().as_deref(), cfg!(windows), cfg!(feature = "cuda"))
+}
+
+fn gather_ahead_named(value: Option<&str>, windows: bool, cuda: bool) -> bool {
+    cuda && if windows { !value.is_some_and(|value| value.starts_with('0')) } else { value.is_some_and(|value| value.starts_with('1')) }
 }
 
 /// The GPU `ordinal`'s system memory group as Windows gives it to this process (DXGI NON_LOCAL): the page-locked bytes the process holds of

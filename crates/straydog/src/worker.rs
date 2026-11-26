@@ -191,6 +191,10 @@ pub(crate) trait Served: Send {
     fn reset(&mut self) -> Result<(), String>;
     /// After a request's last frame was sent, if the engine is still free: what the engine does between requests.
     fn after_request(&mut self) {}
+    /// What the GPUs' view of host memory holds now ([`straydog_engine::model::Model::host_view`]), for a failure's line; None where it is not known.
+    fn host_view(&self) -> Option<String> {
+        None
+    }
 
     /// What a later start warms up with (the expert store's contents), or null.
     fn warm_state(&mut self) -> Result<Value, String> {
@@ -254,6 +258,10 @@ impl Served for Engine {
             }
         }
         result
+    }
+
+    fn host_view(&self) -> Option<String> {
+        self.model.host_view()
     }
 
     fn reset(&mut self) -> Result<(), String> {
@@ -1996,7 +2004,9 @@ fn generate<S: Served>(engine: &Mutex<S>, text: &Arc<Text>, output: &Output, id:
             // digest ran nothing, and the conversation it goes on stays live for the same request with their bytes.
             if failure.kind != Some(images::NOT_HELD) {
                 if let Err(exc) = engine.reset() {
-                    eprintln!("Straydog could not reset after a failed generation: {exc}; original failure: {message}");
+                    // (with what the GPUs' view of host memory held: page-locked memory past what may be reserved faults the GPU's work)
+                    let view = engine.host_view().map(|view| format!("; {view}")).unwrap_or_default();
+                    eprintln!("Straydog could not reset after a failed generation: {exc}; original failure: {message}{view}");
                     fatal = true;
                     message = format!("The engine could not reset after this request failed: {exc}. Restart it before retrying.");
                 }
