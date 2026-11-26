@@ -316,6 +316,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
     // (a template that renders the latest_reminder role: the app's notes beside a user's message, apart from what the user said)
     let reminders = source.contains("latest_reminder");
     let template = ChatTemplate::new(&source).map_err(|exc| exc.0)?;
+    let system_after_first = template.takes_system_after_first();
     let efforts = architecture == "deepseek41";
     report("warm", 0, 0);
     let warming = Instant::now();
@@ -342,6 +343,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "gpu": model.info()?,
         "vision": model.engines.vision(),
         "latest_reminder": reminders,
+        "system_after_first": system_after_first,
         // (what the kept conversation's file is keyed on beside the bundle and the build: Session::export_conversation's layout)
         "prefix": {"version": straydog_engine::prefix::VERSION, "layout": format!("{KEPT_LAYOUT} layers {}", model.placement["layers"])},
     });

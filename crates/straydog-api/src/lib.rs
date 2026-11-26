@@ -193,6 +193,15 @@ impl Api {
         matches!(self.engine.state(), EngineState::Ready { placement, .. } if placement["latest_reminder"] == true)
     }
 
+    /// Whether the model's chat template takes a system message after the first, where the conversation has it: a client's own notes go so
+    /// where it does, and as the user's where it does not (Qwen3.8's refuses one). None until the model is ready, or where the worker did not say.
+    fn system_after_first(&self) -> Option<bool> {
+        match self.engine.state() {
+            EngineState::Ready { placement, .. } => placement["system_after_first"].as_bool(),
+            _ => None,
+        }
+    }
+
     /// The engine's one slot as llama-server describes a slot: it answers one request at a
     /// time, with the server's defaults and no output limit but the context.
     fn slot(&self) -> Result<serde_json::Value, ApiError> {
@@ -367,7 +376,7 @@ async fn models(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<
     let config = &api.config;
     let mut meta = json!({"n_ctx": config.context, "quantization": config.quantization, "ready": false, "vision": api.vision(),
                           "suppress": [NOT_CP932_HAN], "tool_writing": true, "reasoning_off": true, "image_digests": true,
-                          "latest_reminder": api.reminders()});
+                          "latest_reminder": api.reminders(), "system_after_first": api.system_after_first()});
     if let EngineState::Ready { context, placement, .. } = api.engine.state() {
         meta["n_ctx"] = context.into();
         meta["ready"] = true.into();
@@ -394,6 +403,8 @@ async fn props(State(api): State<Arc<Api>>, headers: HeaderMap) -> Result<Json<s
         "image_digests": true,
         // (a message of the role `latest_reminder` is taken: the model's template marks it as not the user's)
         "latest_reminder": api.reminders(),
+        // (whether a system message past the first is taken where it is: where not, a client's notes go as the user's)
+        "system_after_first": api.system_after_first(),
         "build_info": concat!("straydog-", env!("CARGO_PKG_VERSION")), "is_sleeping": false,
     })))
 }

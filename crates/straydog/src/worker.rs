@@ -1370,6 +1370,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let template = String::from_utf8(resource("chat_template.jinja")?).map_err(|exc| exc.to_string())?;
     let reminders = template.contains("latest_reminder");
     let template = ChatTemplate::new(&template).map_err(|exc| exc.0)?;
+    let system_after_first = template.takes_system_after_first();
     let settings = Settings {
         context: args.context,
         state_budget_bytes: args.state_ram_bytes,
@@ -1439,6 +1440,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "prefix": {"version": straydog_engine::prefix::VERSION, "layout": model.prefix_layout()},
         "vision": vision.is_ok(),
         "latest_reminder": reminders,
+        "system_after_first": system_after_first,
         // (the engram table read: its precision and file, Unsloth's Qwen3.8)
         "engram": straydog_engine::bundle::table_in(&args.model, id).ok().flatten()
             .map(|(table, path)| json!({"precision": table.precision, "file": path.file_name().map(|name| name.to_string_lossy().into_owned())})),
