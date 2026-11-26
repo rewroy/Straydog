@@ -172,7 +172,7 @@ impl Prefetch {
         // kept: kept first, they held the first bank's read for 0.32-0.66 s (565 MiB on Linux, read, zeroed and checked), and a PC's pass
         // began with a 0.85 s wait. Their room is taken now, whether or not they are kept in the end.
         let leaves = weights.tree_leaves_to_keep(&files);
-        let keeping = leaves_fit(leaves, bytes as u64, room).then(|| {
+        let keeping = leaves_fit(leaves, bytes as u64, room) && {
             let verifiers = weights.tree_verifiers_to_keep(&files);
             std::thread::Builder::new().name("tree-leaves".into()).spawn(move || {
                 let mut kept = 0u64;
@@ -181,7 +181,7 @@ impl Prefetch {
                     kept += verifier.keep_level0(leaves.saturating_sub(kept)).unwrap_or(0);
                 }
             }).is_ok()
-        }).unwrap_or(false);
+        };
         // (the thread holds the verifiers it keeps, not the pass: it may outlive a short pass, which does not wait for it)
         let available = room.saturating_sub(if keeping { leaves } else { 0 });
         let mut free = Vec::new();
