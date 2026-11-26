@@ -1298,9 +1298,13 @@ pub fn pieces_of(layers: &[(usize, [(usize, u64); 3])], limit: u64) -> Vec<Piece
     pieces
 }
 
-/// What [`visible_lock_cap`] leaves of the host memory the GPUs see beside the banks and the sequence state: the K/V's growth holds its old
-/// and new planes at once for a moment, and a layer-order pass page-locks its rows.
-pub const VISIBLE_KEPT: u64 = 2 << 30;
+/// What [`visible_lock_cap`] leaves of the host memory the GPUs see beside the banks, the sequence state and the mirrors ([`visible_besides`]):
+/// the K/V's growth holds its old and new planes at once for a moment, a layer-order pass page-locks its rows (within [`ROWS_VISIBLE`]), and
+/// a GiB more for page-locked memory nothing counts, where an RTX 4060's work faulted when two mirrors were not counted (0.8 GiB).
+pub const VISIBLE_KEPT: u64 = 3 << 30;
+
+/// The most of [`VISIBLE_KEPT`] a layer-order pass's page-locked rows take ([`rows_visible_room`]).
+pub const ROWS_VISIBLE: u64 = 2 << 30;
 
 /// The most bank bytes to page-lock on Windows, given what DXGI says the process may reserve of the GPU's system memory group (`reservable`:
 /// the NON_LOCAL group's AvailableForReservation, the least of the GPUs') and the page-locked sequence state (`pinned_state`: the host K/V at
@@ -1314,12 +1318,34 @@ pub fn visible_lock_cap(reservable: Option<u64>, pinned_state: u64) -> u64 {
     reservable.map_or(u64::MAX, |reservable| reservable.saturating_sub(pinned_state).saturating_sub(VISIBLE_KEPT))
 }
 
+/// The staging slots the expert pool's page-locked host mirror holds (gpu/hybrid_slots.hpp create_expert_slots: the chunks' two buffers, at most).
+pub const STAGING_MIRROR_SLOTS: u64 = 32;
+
+/// The page-locked host memory a partially resident device takes after the start, beside the banks and the sequence state, that the GPUs'
+/// view of host memory must hold as well ([`visible_lock_cap`]'s `pinned_state` takes it): the staging slots' mirror, and the gather ahead's
+/// mirror at its largest, every expert of a layer at the slots' stride (gpu/hybrid_slots.hpp pregather_start, made at the first wide batch
+/// that is not a layer-order pass) where the gather ahead is on. Neither was counted: an RTX 4060 PC (Windows, 64 GB, 23.6 GiB reservable,
+/// 1.5 GiB of state) locked 20.2 GiB of banks and tier behind ready, and the request after each start's first faulted with an illegal memory
+/// access, five starts in a row.
+pub fn visible_besides(slot_bytes: u64, experts: u64, gather_ahead: bool) -> u64 {
+    let mirror = if gather_ahead { experts.saturating_mul(slot_bytes) } else { 0 };
+    mirror.saturating_add(STAGING_MIRROR_SLOTS.saturating_mul(slot_bytes))
+}
+
+/// The most an expert takes in a host tier ([`ExpertTier::make`]), of its roles' bytes (`roles`: gate, up, down): each role's with the whole
+/// verity blocks around it (a block more on each side at the most), aligned. What [`tier_within`] counts against its budget: counted at the
+/// experts' own bytes, the tier of that PC came to 20.2 GiB against a plan of 20.0.
+pub fn tier_expert_bytes(roles: [u64; 3]) -> u64 {
+    let block = crate::verity::BLOCK as u64;
+    roles.iter().map(|&bytes| bytes.saturating_add(2 * block).next_multiple_of(ALIGN as u64)).sum()
+}
+
 /// The bytes of a layer-order pass's rows that may be page-locked beside the banks under `visible_cap` ([`visible_lock_cap`]): what the cap
-/// left of the GPUs' view of host memory, [`VISIBLE_KEPT`]; no bound where no cap is in force (u64::MAX). A 99K prompt's one pass page-locks
+/// left of the GPUs' view of host memory for them, [`ROWS_VISIBLE`]; no bound where no cap is in force (u64::MAX). A 99K prompt's one pass page-locks
 /// 3.75 GiB of rows, which beside 18.8 GiB of banks and 1.4 GiB of state came to 24 GiB of the 22.5 GiB an RTX 5070 Ti PC with 62 GiB may
 /// reserve; within this the pass takes 49,152 rows (three 16,384s, 1.9 GiB) and the prompt is read in passes of that many.
 pub fn rows_visible_room(visible_cap: u64) -> u64 {
-    if visible_cap == u64::MAX { u64::MAX } else { VISIBLE_KEPT }
+    if visible_cap == u64::MAX { u64::MAX } else { ROWS_VISIBLE }
 }
 
 /// The layers of `planned` (in their order) that fit `room` together, stopping at the first that does not.
@@ -1466,10 +1492,47 @@ pub fn order_by_host_routes(layers: &mut [usize], host_routes: impl Fn(usize) ->
 mod tests {
     use super::*;
 
+    /// The RTX 4060 PC whose second request after each start faulted (UD-IQ1_S, 23.6 GiB reservable, 1.5 GiB of state): its plan, counting
+    /// neither the gather ahead's mirror nor the tier's blocks, locked within 20.0 GiB and the tier came to 20.2; the mirror (512 experts of
+    /// 1.44 MiB at the slots' stride) is 0.72 GiB more. Counted, the cap leaves both, and a tier of experts at their padded size stays within it.
+    #[test]
+    fn the_gpus_view_of_host_memory_holds_the_mirrors_and_the_tiers_blocks() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let gib = |value: f64| (value * GIB as f64) as u64;
+        let slot = (1.44 * MIB as f64) as u64 / 256 * 256 + 256;
+        let besides = visible_besides(slot, 512, true);
+        assert_eq!(besides, (512 + STAGING_MIRROR_SLOTS) * slot);
+        assert!(besides > gib(0.7) && besides < gib(0.8), "{besides}");
+        assert_eq!(visible_besides(slot, 512, false), STAGING_MIRROR_SLOTS * slot, "no gather ahead: the staging mirror alone");
+        let before = visible_lock_cap(Some(gib(23.6)), gib(1.5));
+        let after = visible_lock_cap(Some(gib(23.6)), gib(1.5) + besides);
+        assert_eq!(before - after, besides);
+        // (a role's bytes with a block more on each side, aligned: never less than the copy ExpertTier::make takes)
+        let block = crate::verity::BLOCK as u64;
+        for roles in [[493_000u64, 493_000, 525_000], [4096, 4096, 4096], [1, 1, 1], [500_000, 0, 7]] {
+            let padded = tier_expert_bytes(roles);
+            let copied: u64 = roles.iter().map(|&bytes| {
+                // (the worst place: an expert that starts a byte past a block's boundary)
+                let (start, end) = (1u64, 1 + bytes);
+                (end.next_multiple_of(block) - start / block * block).next_multiple_of(ALIGN as u64)
+            }).sum();
+            assert!(padded >= copied, "{roles:?}: {padded} < {copied}");
+            assert!(padded <= roles.iter().sum::<u64>() + 3 * (2 * block + ALIGN as u64), "{roles:?}: {padded}");
+        }
+        // (a tier counted at the padded size stays within its budget in the copies' own bytes)
+        let sizes = vec![gib(31.1 / 48.0); 48];
+        let roles = [sizes[0] / 512 / 3, sizes[0] / 512 / 3, sizes[0] / 512 - 2 * (sizes[0] / 512 / 3)];
+        let expert = vec![tier_expert_bytes(roles); 48];
+        let chosen = tier_within(&sizes, &expert, 512, after, &|layer, item| (48 * 512 - layer * 512 - item) as u64).unwrap();
+        let taken: u64 = chosen.iter().enumerate().map(|(layer, list)| list.len() as u64 * expert[layer]).sum();
+        assert!(taken <= after && taken + expert[0] > after, "{taken} of {after}");
+    }
+
     /// Decides: the banks' lock leaves the GPUs' view of host memory the sequence state and VISIBLE_KEPT, so that the 62 GiB PC's 22.54 GiB
-    /// reservable with 2.6 GiB of state leaves 17.96 GiB to the banks: UD-IQ2_XS's last 22 layers (17.8 GiB, as a 99K prompt was read with)
-    /// and not 25 (20.4 GiB); 21 of layers of its average size. No figure, no bound; and the layers given back come back only as far as the
-    /// room holds them.
+    /// reservable with 2.6 GiB of state leaves 16.96 GiB to the banks: within UD-IQ2_XS's last 22 layers (17.8 GiB, as a 99K prompt was read
+    /// with) and far from 25 (20.4 GiB); 20 of layers of its average size. No figure, no bound; and the layers given back come back only as far
+    /// as the room holds them.
     #[test]
     fn the_lock_leaves_the_gpus_view_of_host_memory_the_sequence_state_and_a_margin() {
         const GIB: u64 = 1 << 30;
@@ -1479,7 +1542,7 @@ mod tests {
         let cap = visible_lock_cap(Some(gib(22.54)), gib(2.58));
         assert_eq!(cap, gib(22.54) - gib(2.58) - VISIBLE_KEPT);
         let layers = layers_within(&sizes, cap);
-        assert_eq!(layers.len(), 21, "21 layers of {:.2} GiB fit {:.2} GiB", 39.4 / 48.0, cap as f64 / GIB as f64);
+        assert_eq!(layers.len(), 20, "20 layers of {:.2} GiB fit {:.2} GiB", 39.4 / 48.0, cap as f64 / GIB as f64);
         assert!(layers_within(&sizes, cap).iter().map(|&layer| sizes[layer]).sum::<u64>() <= cap);
         assert_eq!(visible_lock_cap(None, gib(2.58)), u64::MAX);
         assert_eq!(visible_lock_cap(Some(gib(3.0)), gib(2.58)), 0, "less than the state and the margin: nothing");

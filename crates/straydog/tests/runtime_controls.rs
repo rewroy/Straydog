@@ -101,6 +101,47 @@ fn fatal(marker: Option<&Path>) {
     }
 }
 
+/// A worker whose GPU work faults while it may page-lock banks: each launch writes to LOG what it was started with (STRAYDOG_LOCK_BUDGET and
+/// STRAYDOG_PREGATHER, or "unset"), and fails each chat with an illegal memory access unless its lock budget is 0, which it answers.
+fn faulting(log: &Path) {
+    let lock = std::env::var("STRAYDOG_LOCK_BUDGET").unwrap_or_else(|_| "unset".into());
+    let gather = std::env::var("STRAYDOG_PREGATHER").unwrap_or_else(|_| "unset".into());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+    writeln!(file, "{lock} {gather}").unwrap();
+    drop(file);
+    ready();
+    for line in std::io::stdin().lock().lines() {
+        let frame: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if frame["command"].as_str() != Some("chat") {
+            continue;
+        }
+        let id = frame["id"].as_str().unwrap().to_string();
+        if lock == "0" {
+            println!("{}", serde_json::json!({"id": id, "event": "delta", "content": "x"}));
+            println!("{}", serde_json::json!({"id": id, "event": "done", "finish_reason": "stop",
+                                              "usage": {"prompt_tokens": 1, "completion_tokens": 1}}));
+        } else {
+            println!("{}", serde_json::json!({"id": id, "event": "error", "fatal": true, "message": "The engine could not reset after this request \
+                failed: Straydog GPU: an illegal memory access was encountered (kernels.cpp:4374, code 700). Restart it before retrying."}));
+        }
+        std::io::stdout().flush().unwrap();
+    }
+}
+
+/// Whether `engine` answers `body` (a delta, then its end).
+async fn serves(engine: &Runtime, body: pyjson::Value) -> bool {
+    let mut next = engine.generate(body).await.unwrap();
+    let mut answered = false;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(20), next.events.next()).await.unwrap() {
+        match event["event"].as_str() {
+            Some("delta") => answered = true,
+            Some("done") => break,
+            other => panic!("unexpected event {other:?}: {event}"),
+        }
+    }
+    answered
+}
+
 fn ready() {
     println!("{}", serde_json::json!({"event": "ready", "protocol": 1, "engine": "Straydog", "context": CONTEXT,
                                       "model": straydog_engine::bundle::MODEL, "provider": straydog_engine::bundle::ISTA, "quantization": QUANT}));
@@ -181,6 +222,7 @@ fn main() {
         Some("in-a-pass") => return in_a_pass(),
         Some("hung") => return hung(args.get(2).map(Path::new)),
         Some("fatal") => return fatal(args.get(2).map(Path::new)),
+        Some("faulting") => return faulting(Path::new(&args[2])),
         // As a worker that finds its GPUs' memory held fails: its reason on stderr, status 1.
         Some("fails") => {
             eprintln!("Straydog VRAM budget is unavailable");
@@ -352,6 +394,39 @@ fn main() {
         assert!(matches!(engine.state(), EngineState::Failed(_)));
         println!("runtime_controls: a worker that kept failing was started again three times, then failed the runtime");
         engine.close().await;
+
+        // A worker whose GPU work faults (STRAYDOG_FAULT_FALLBACK=1 stands in for Windows): the next starts without page locks or the gather
+        // ahead and serves, and so does the next start of this version from its first worker; another version's marker is no reason to.
+        std::env::set_var("STRAYDOG_FAULT_FALLBACK", "1");
+        let faults = scratch.join("faults");
+        std::fs::create_dir_all(faults.join("data")).unwrap();
+        let fault_settings = config::resolve(Options { model: Some(faults.clone()), quant: Some(QUANT.into()), ctx_size: Some(CONTEXT),
+                                                       data_dir: Some(faults.join("data")), ..Options::default() }).unwrap();
+        let launches = faults.join("launches");
+        let faulting = (std::env::current_exe().unwrap(), vec!["faulting".into(), PathBuf::from(&launches).into_os_string()]);
+        let engine = wait_ready(Runtime::start(&fault_settings, faulting.clone())).await;
+        let mut failed = engine.generate(hi()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), failed.events.next()).await.unwrap().unwrap();
+        assert_eq!((event["event"].as_str(), event["fatal"].as_bool()), (Some("error"), Some(true)), "{event}");
+        assert!(serves(&engine, hi()).await, "the request after the fault was not answered");
+        engine.close().await;
+        assert_eq!(std::fs::read_to_string(&launches).unwrap(), "unset unset\n0 0\n");
+        let marker = std::fs::read_to_string(fault_settings.data_dir.join("gpu-fault")).unwrap();
+        assert!(marker.starts_with(env!("CARGO_PKG_VERSION")) && marker.contains("code 700"), "{marker}");
+        let engine = wait_ready(Runtime::start(&fault_settings, faulting.clone())).await;
+        assert!(serves(&engine, hi()).await, "the first request of the next start was not answered");
+        engine.close().await;
+        assert_eq!(std::fs::read_to_string(&launches).unwrap(), "unset unset\n0 0\n0 0\n");
+        std::fs::write(fault_settings.data_dir.join("gpu-fault"), "0.0.1 (0000000)\nan earlier version's fault\n").unwrap();
+        let engine = wait_ready(Runtime::start(&fault_settings, faulting.clone())).await;
+        let mut failed = engine.generate(hi()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), failed.events.next()).await.unwrap().unwrap();
+        assert_eq!(event["event"].as_str(), Some("error"), "another version's marker started the worker without locks: {event}");
+        assert!(serves(&engine, hi()).await, "the request after the fault was not answered");
+        engine.close().await;
+        assert!(std::fs::read_to_string(fault_settings.data_dir.join("gpu-fault")).unwrap().starts_with(env!("CARGO_PKG_VERSION")));
+        std::env::remove_var("STRAYDOG_FAULT_FALLBACK");
+        println!("runtime_controls: a GPU fault started the next worker without page locks, and the next start of this version too");
 
         // A worker that fails to start: the runtime fails with its reason, at once.
         let engine = Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["fails".into()]));

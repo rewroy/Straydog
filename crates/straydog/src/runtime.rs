@@ -555,15 +555,25 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// of its evictions against an LRU's and the best possible ones stays: a line every 2^20 uses of decode and verify passes, a few minutes
 /// of decoding. A row table's account of its cache (Engram's rows) stays too: a line every 2^20 rows asked, ~20K tokens. So does what
 /// DSpark's confidences met on served drafts: a line every 4096 drafts tried, some minutes of an agent's use. The machine's memory as a start
-/// finds it is a line a start. A read's phases (STRAYDOG_PREFILL_PHASES) are what that switch asks for: written only with it set.
+/// finds it is a line a start. A read's phases (STRAYDOG_PREFILL_PHASES) are what that switch asks for: written only with it set. A failed
+/// request whose reset failed too keeps its original failure here: the request's own error says only that the reset failed (a GPU fault is
+/// found at the reset's wait), and the operation that faulted, with its file and line, was otherwise only in a --verbose log; and so does the
+/// line that says where in the request a fatal failure came (the prompt's read or the reply, the banks locked, the GPUs' budgets).
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
      "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:",
-     "Straydog DSpark calibration", "Straydog memory at the start", "PHASES "]
+     "Straydog DSpark calibration", "Straydog memory at the start", "PHASES ", "Straydog could not reset after a failed generation",
+     "Straydog failure place: ", "Straydog gather ahead", "Straydog host tier"]
         .iter().any(|start| line.starts_with(start))
+}
+
+/// Whether a frame from the worker answers an ask for the warm-up state ([`Runtime::save_warm_state`]): the state, or an error to it (no
+/// other frame carries that id).
+fn is_late_warm_state(event: &Value) -> bool {
+    event["id"] == "warm-state"
 }
 
 /// The worker's last lines on stderr (an allocation that failed, a GPU error, a panic), for the log line that says it stopped: empty
@@ -938,14 +948,30 @@ struct Process {
 struct Frames<R> {
     reader: R,
     partial: Vec<u8>,
+    /// Asks for the warm-up state the server stopped waiting for ([`Runtime::save_warm_state`]): their answers, when they come, are
+    /// passed over by whichever read meets them. A worker busy reading its warm-up answered one after the 30 s wait, and the first
+    /// request after a restart took it for its own and was refused as a mismatch (the worker started again under it).
+    late_warm_states: usize,
 }
 
 impl<R: AsyncBufRead + Unpin> Frames<R> {
     fn new(reader: R) -> Frames<R> {
-        Frames { reader, partial: Vec::new() }
+        Frames { reader, partial: Vec::new(), late_warm_states: 0 }
     }
 
     async fn read(&mut self) -> Result<Value, String> {
+        loop {
+            let frame = self.read_one().await?;
+            // (nothing awaits between the frame's end and this: a read dropped in a select loses no frame and no count)
+            if self.late_warm_states > 0 && is_late_warm_state(&frame) {
+                self.late_warm_states -= 1;
+                continue;
+            }
+            return Ok(frame);
+        }
+    }
+
+    async fn read_one(&mut self) -> Result<Value, String> {
         // read_until appends what it consumes to `partial` before it can be dropped.
         let room = (FRAME_BYTES + 1).saturating_sub(self.partial.len()) as u64;
         let read = (&mut self.reader).take(room).read_until(b'\n', &mut self.partial).await;
@@ -1084,7 +1110,10 @@ impl Runtime {
             kept: Default::default(),
             saves: Mutex::new(Vec::new()),
             restarts: Mutex::new(Vec::new()),
+            fallback: Mutex::new(false),
+            fallback_marker: settings.data_dir.join("gpu-fault"),
         };
+        driver.read_fallback();
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
     }
@@ -1158,6 +1187,37 @@ struct Driver {
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// When the worker was started again after it failed ([`RESTARTS`] within [`RESTART_WINDOW`] at the most).
     restarts: Mutex<Vec<Instant>>,
+    /// Whether the worker starts with [`FALLBACK_VARIABLES`] after a GPU fault ([`fault_fallback_on`]), and the file that says so to the next
+    /// start of this version (`<data-dir>/gpu-fault`).
+    fallback: Mutex<bool>,
+    fallback_marker: PathBuf,
+}
+
+/// What a worker is started with after its GPU work faulted, where [`fault_fallback_on`]: no page-locked banks (no host tier, no layer the
+/// GPU reads in place or stages from) and no gather ahead's mirror. An RTX 4060 PC's request after each start's first faulted with an illegal
+/// memory access, six starts in a row, each the first request after the banks' locking had begun, and every request before it served; past
+/// the GPU's view of host memory the page locks fault the GPU's work (banks::visible_lock_cap). The locks' room was made larger for it, and
+/// were that not the cause, this keeps a second fault from coming of the same thing: one request fails, not every other one.
+const FALLBACK_VARIABLES: [(&str, &str); 2] = [("STRAYDOG_LOCK_BUDGET", "0"), ("STRAYDOG_PREGATHER", "0")];
+
+/// Whether a worker's GPU fault starts the next one with [`FALLBACK_VARIABLES`]: on Windows (STRAYDOG_FAULT_FALLBACK=1 elsewhere, for a test).
+/// Not on Linux by default, where two GPUs' decode depends on the locked layers (a layer not locked has no route staged to the GPU), and no
+/// fault has come of them.
+fn fault_fallback_on() -> bool {
+    cfg!(windows) || std::env::var("STRAYDOG_FAULT_FALLBACK").is_ok_and(|value| value == "1")
+}
+
+/// Whether a worker's failure is its GPU work's fault, as the message names it (the GPU layer's errors end in "(file:line, code N)"): an
+/// illegal or misaligned address, an address space or instruction that is not the kernel's, or a launch that failed. Such an error stays
+/// with the GPU's context: what found it was the next wait, not the work that made it.
+fn gpu_fault(message: &str) -> bool {
+    ["code 700)", "code 715)", "code 716)", "code 717)", "code 719)"].iter().any(|code| message.contains(code))
+        || message.contains("illegal memory access")
+}
+
+/// This build, as a fault's marker names it: a marker another version wrote is not this one's to follow.
+fn build_name() -> String {
+    format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("STRAYDOG_COMMIT"))
 }
 
 /// A worker that failed (an error it called fatal, its exit, a cancelled generation it did not end) is started again, the request it
@@ -1260,6 +1320,7 @@ impl Driver {
                     self.restarts.lock().unwrap().push(Instant::now());
                     tracing::warn!("{message}; Straydog starts its worker again ({} of {RESTARTS} within {} minutes)",
                                    self.restarts.lock().unwrap().len(), RESTART_WINDOW.as_secs() / 60);
+                    self.fall_back_after(&message);
                     // (clients see it loading from now; the old worker's processes gone first, and with them what they held of the GPUs)
                     self.set(Phase::Loading(json!({"stage": "restarting"})));
                     released(&process.holders).await;
@@ -1285,6 +1346,43 @@ impl Driver {
     }
 
     /// Whether a worker that failed may be started again: fewer than [`RESTARTS`] restarts within the last [`RESTART_WINDOW`].
+    /// A worker's GPU work faulted ([`gpu_fault`]): where [`fault_fallback_on`], the workers of this run start with [`FALLBACK_VARIABLES`] from
+    /// now, and so do those of the next starts of this version (the marker is written once, at the first fault).
+    fn fall_back_after(&self, message: &str) {
+        if !fault_fallback_on() || !gpu_fault(message) {
+            return;
+        }
+        let mut fallback = self.fallback.lock().unwrap();
+        if *fallback {
+            return;
+        }
+        *fallback = true;
+        let written = std::fs::create_dir_all(self.fallback_marker.parent().unwrap_or(Path::new(".")))
+            .and_then(|()| std::fs::write(&self.fallback_marker, format!("{}\n{}\n", build_name(), message.chars().take(1000).collect::<String>())));
+        let kept = match written {
+            Ok(()) => "; so do this version's next starts".to_string(),
+            Err(exc) => format!("; the next starts do not know it ({exc})"),
+        };
+        tracing::warn!("Straydog starts its worker without page-locked banks or the gather ahead from now, after its GPU work faulted{kept}");
+    }
+
+    /// At the start: a fault an earlier run of this version had ([`Driver::fall_back_after`]) starts the workers with [`FALLBACK_VARIABLES`];
+    /// another version's marker is removed, and this one starts as it would.
+    fn read_fallback(&self) {
+        if !fault_fallback_on() {
+            return;
+        }
+        let Ok(marker) = std::fs::read_to_string(&self.fallback_marker) else { return };
+        let mut lines = marker.lines();
+        if lines.next() == Some(build_name().as_str()) {
+            *self.fallback.lock().unwrap() = true;
+            tracing::warn!("Straydog starts its worker without page-locked banks or the gather ahead: an earlier run of this version faulted on the GPU ({})",
+                           lines.next().unwrap_or("").chars().take(300).collect::<String>());
+        } else {
+            let _ = std::fs::remove_file(&self.fallback_marker);
+        }
+    }
+
     fn restart_allowed(&self) -> bool {
         let mut restarts = self.restarts.lock().unwrap();
         restarts.retain(|at| at.elapsed() < RESTART_WINDOW);
@@ -1595,7 +1693,13 @@ impl Driver {
                                  ("command", pyjson::Value::Str("warm_state".into()))]);
         let reply = async {
             process.send(&request).await?;
-            tokio::time::timeout(Duration::from_secs(30), process.read()).await.map_err(|_| "no reply".to_string())?
+            match tokio::time::timeout(Duration::from_secs(30), process.read()).await {
+                Ok(reply) => reply,
+                Err(_) => {
+                    process.stdout.late_warm_states += 1;
+                    Err("no reply".to_string())
+                }
+            }
         }
         .await;
         let state = match reply {
@@ -1653,6 +1757,7 @@ impl Driver {
             .args(&args)
             .env_clear()
             .envs(worker_environment())
+            .envs(if *self.fallback.lock().unwrap() { &FALLBACK_VARIABLES[..] } else { &[] }.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2282,6 +2387,15 @@ mod tests {
         assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
         assert!(stays_in_the_log("PHASES device 0: 9 batches, 432 layers; stream time 5210.4 ms = 578.9 ms a batch"));
+        assert!(stays_in_the_log("Straydog could not reset after a failed generation: Straydog GPU: an illegal memory access was encountered \
+                                  (kernels.cpp:4374, code 700); original failure: Straydog GPU: an illegal memory access was encountered \
+                                  (hybrid_slots.hpp:1200, code 700)"));
+        assert!(stays_in_the_log("Straydog failure place: in the reply after 0 tokens, a prompt of 6602 tokens, 48 of 48 layers' banks locked, \
+                                  GPU 0 4.71 of 5.38 GiB"));
+        // (what the GPU's view of host memory held when the gather ahead made its mirror, or why it made none, and what the host tier copied)
+        assert!(stays_in_the_log("Straydog gather ahead: off, no mirror of 0.72 GiB: the GPU's view of host memory holds 21.80 GiB of 23.60 GiB reservable \
+                                  (budget 31.80 GiB), 2.00 GiB kept; the experts go over the bus as they do without it"));
+        assert!(stays_in_the_log("Straydog host tier: 13963 experts of 48 layers to copy behind ready, 18.6 GiB, in place of 30 whole layers"));
         assert!(stays_in_the_log("PHASES   host a MoE layer (432): counts wait 0.10 ms, hints 0.20 ms, gather 9.40 ms, CPU routes 1.00 ms, settle 0.10 ms"));
         assert!(stays_in_the_log("Straydog memory at the start: free 0.8 GB, file cache 85.4 GB, available 17.7 GB, swap in use 1.4 GB"));
         assert!(stays_in_the_log("Straydog DSpark calibration on served drafts (skill 1.12, extra 0.74): slot 1: 0.9 812/861 (0.97 by calibration)"));
@@ -2513,6 +2627,45 @@ mod tests {
         assert_eq!(frames.read().await.unwrap()["event"], "done");
         drop(worker);
         assert_eq!(frames.read().await.unwrap_err(), "Straydog worker ended");
+    }
+
+    /// The failures that start the next worker without page locks: the GPU's sticky faults, not a memory refusal or a stand-in's error.
+    #[test]
+    fn a_gpu_fault_is_told_from_other_failures() {
+        assert!(gpu_fault("Straydog reported a fatal inference error: The engine could not reset after this request failed: Straydog GPU: an \
+                           illegal memory access was encountered (kernels.cpp:4374, code 700). Restart it before retrying."));
+        assert!(gpu_fault("Straydog GPU: unspecified launch failure (hybrid_moe.hpp:700, code 719)"));
+        assert!(gpu_fault("Straydog GPU: misaligned address (resident_moe.hpp:12, code 716)"));
+        assert!(!gpu_fault("Straydog GPU: out of memory (kernels.cpp:4084, code 2)"));
+        assert!(!gpu_fault("Straydog GPU: out of memory (a stand-in)"));
+        assert!(!gpu_fault("Straydog generation request id mismatch"));
+        assert!(!gpu_fault("Straydog GPU: the launch timed out and was terminated (kernels.cpp:700, code 702)"));
+    }
+
+    /// A warm-up state (or an error to its ask) that comes after the server stopped waiting for it is passed over by the next read,
+    /// whatever that read waits for; one the server waits for is read, and so is any other frame.
+    #[tokio::test]
+    async fn a_late_warm_state_is_passed_over() {
+        let (mut worker, server) = tokio::io::duplex(1024);
+        let mut frames = Frames::new(BufReader::new(server));
+        frames.late_warm_states = 1;
+        worker.write_all(b"{\"id\":\"warm-state\",\"event\":\"warm_state\",\"state\":{}}\n{\"id\":\"r1\",\"event\":\"token\",\"text\":\"x\"}\n")
+            .await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["id"], "r1");
+        assert_eq!(frames.late_warm_states, 0);
+        // (an ask the server waits for: its answer is read)
+        worker.write_all(b"{\"id\":\"warm-state\",\"event\":\"warm_state\",\"state\":null}\n").await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["event"], "warm_state");
+        // (a late error to such an ask goes the same way, so that the count comes back to 0 and the next ask's answer is read)
+        frames.late_warm_states = 1;
+        worker.write_all(b"{\"id\":\"warm-state\",\"event\":\"error\",\"message\":\"x\"}\n{\"id\":\"warm-state\",\"event\":\"warm_state\",\"state\":null}\n")
+            .await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["event"], "warm_state");
+        assert_eq!(frames.late_warm_states, 0);
+        // (any other frame is read as it comes)
+        frames.late_warm_states = 1;
+        worker.write_all(b"{\"id\":\"r2\",\"event\":\"done\"}\n").await.unwrap();
+        assert_eq!(frames.read().await.unwrap()["id"], "r2");
     }
 
     /// A frame cut off by the worker's end is refused, not taken as the end alone.

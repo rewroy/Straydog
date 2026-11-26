@@ -639,6 +639,18 @@ void pregather_wait(Device& d, size_t through) {
         throw std::runtime_error("Straydog gather ahead failed");
     }
 }
+// What banks::VISIBLE_KEPT keeps of the GPUs' view of host memory beside the page locks (crates/straydog-engine/src/banks.rs): a K/V growth's
+// old and new planes at once, a layer-order pass's rows, a GiB for what nothing counts.
+constexpr uint64_t visible_kept_bytes = uint64_t(3) << 30;
+// The GPU's view of host memory as this process holds it now (Windows: DXGI's NON_LOCAL group, which page-locked memory the GPU reads is
+// charged to one to one): the page-locked bytes, the budget and what may be reserved; not `known` where there is no such figure (another
+// system, HIP).
+struct HostView { bool known = false; uint64_t usage = 0, budget = 0, reservable = 0; };
+HostView host_view_now(const Device& d) {
+    HostView view;
+    view.known = sd_host_visible(int(d.ordinal), &view.usage, &view.budget, &view.reservable) == 1 && view.reservable > 0;
+    return view;
+}
 // A layer's streamed experts are asked for: the next layer's experts that neither its slots nor its tier hold are gathered by the CPU's workers into
 // the mirror, on a thread of its own, while this thread settles the layer and queues the next one's dense work; the next layer copies them from
 // the mirror by DMA (hybrid_stream_missing). Only where the guess is the set: a batch whose routes cover nearly every expert (rows x 10 routes at
@@ -672,14 +684,36 @@ void pregather_start(Device& d) {
             for (size_t expert = 0; expert < plan.experts; ++expert) gathered += plan.slot_of[expert] < 0 && !expert_tiered(plan, expert);
             room = std::max(room, gathered);
         }
+        // The mirror is made only where what the process holds of the GPU's view of host memory, the mirror and what is kept fit what it may
+        // reserve: past it, an RTX 4060's work faulted with an illegal memory access, with VRAM and the commit to spare (20.2 GiB of banks and
+        // tier and 1.5 of state of 23.6 reservable, the mirror made at the first wide batch after a start's first request). Without it the
+        // experts go over the bus as they did before the gather ahead. One line in the log says which it was, with the figures.
+        const size_t bytes = room * d.slots.bytes;
+        const double gib = double(uint64_t(1) << 30);
+        const HostView view = host_view_now(d);
+        if (view.known && view.usage + bytes + visible_kept_bytes > view.reservable) {
+            std::fprintf(stderr, "Straydog gather ahead: off, no mirror of %.2f GiB: the GPU's view of host memory holds %.2f GiB of %.2f GiB reservable "
+                                 "(budget %.2f GiB), %.2f GiB kept; the experts go over the bus as they do without it\n", double(bytes) / gib,
+                         double(view.usage) / gib, double(view.reservable) / gib, double(view.budget) / gib, double(visible_kept_bytes) / gib);
+            pg.disabled = true;
+            return;
+        }
         // (a machine that refuses this much page-locked memory goes on without gathering ahead)
-        if (hipHostMalloc(reinterpret_cast<void**>(&pg.mirror), room * d.slots.bytes, hipHostMallocDefault) != hipSuccess) {
+        const hipError_t made = hipHostMalloc(reinterpret_cast<void**>(&pg.mirror), bytes, hipHostMallocDefault);
+        if (made != hipSuccess) {
             (void)hipGetLastError();
+            std::fprintf(stderr, "Straydog gather ahead: off, the mirror of %.2f GiB was refused (%s)\n", double(bytes) / gib, gpu_error_text(made));
             pg.mirror = nullptr; pg.disabled = true;
             return;
         }
-        std::memset(pg.mirror, 0, room * d.slots.bytes);   // (the slots' padding past each expert's bytes, as the staging mirror's)
+        std::memset(pg.mirror, 0, bytes);   // (the slots' padding past each expert's bytes, as the staging mirror's)
         pg.capacity = room;
+        if (view.known) {
+            const HostView now = host_view_now(d);
+            std::fprintf(stderr, "Straydog gather ahead: a mirror of %.2f GiB page-locked; the GPU's view of host memory holds %.2f GiB of %.2f GiB "
+                                 "reservable (%.2f GiB before it, budget %.2f GiB), %.2f GiB kept\n", double(bytes) / gib, double(now.usage) / gib,
+                         double(now.reservable) / gib, double(view.usage) / gib, double(now.budget) / gib, double(visible_kept_bytes) / gib);
+        }
     }
     if (!pg.read) check(hipEventCreateWithFlags(&pg.read, hipEventDisableTiming));
     if (!pg.worker) pg.worker = std::make_unique<Background>(d.ordinal);

@@ -1433,6 +1433,8 @@ pub struct Model {
     /// tiers the devices read, kept alive here.
     tier_budget: u64,
     tier_sizes: Vec<u64>,
+    /// The most one expert of each layer takes in a tier ([`crate::banks::tier_expert_bytes`]): what a tier is counted at.
+    tier_expert: Vec<u64>,
     tiers: Vec<crate::banks::ExpertTier>,
     /// The experts each layer's tier was made of (by layer), for a tier a pass gave back to be made again ([`Model::pass_relock`]).
     tier_chosen: Option<Vec<Vec<usize>>>,
@@ -1756,6 +1758,7 @@ impl Model {
             captured_hidden: None,
             tier_budget: 0,
             tier_sizes: Vec::new(),
+            tier_expert: Vec::new(),
             tiers: Vec::new(),
             tier_chosen: None,
             tier_left: (0, 0),
@@ -2474,8 +2477,9 @@ impl Model {
         if let Some(prior) = prior.filter(|prior| prior.total() > 0) {
             crate::banks::order_by_host_routes(&mut self.lock_pending, |layer| prior.host_routes(layer));
             // The host tier: where the budget holds fewer than every layer, the most routed experts of every layer in its place ([`host_tier_on`]).
-            if host_tier_on() && self.tier_sizes.len() == 48 {
-                let expert_bytes: Vec<u64> = self.tier_sizes.iter().map(|bytes| bytes / 512).collect();
+            if host_tier_on() && self.tier_sizes.len() == 48 && self.tier_expert.len() == 48 {
+                // (each expert at what its tier copy takes, the blocks around it with it: the tier stays within the budget it was given)
+                let expert_bytes = self.tier_expert.clone();
                 // (ranked by the routes that went to the host, not all of them: an expert VRAM's slots hold is neither the CPU's to read in a
                 // decode nor a prompt's to move, and a tier of the most routed overall held copies of those; the two tiers apart, as the
                 // expert store keeps them, experts.rs)
@@ -2752,8 +2756,26 @@ impl Model {
                        less; {} of its layers made", gib(asked), gib(fell), self.tiers.len());
         }
         self.hold_banks();
+        if let Some(view) = self.host_view() {
+            eprintln!("Straydog host banks: the locking over, {view}");
+        }
         // (the layers left unlocked are read into memory behind the requests, before their faults would read them one at a time)
         self.read_back_banks("after the locking");
+    }
+
+    /// What the GPUs' view of host memory holds now (Windows, CUDA: DXGI's NON_LOCAL group, which page-locked memory the GPU reads is charged
+    /// to): the page-locked bytes the process holds of it, against what it may reserve and the cap the plan locked within
+    /// ([`crate::banks::visible_lock_cap`]), of the device with the least room. None where Windows gives no such figure. For the log, at the end
+    /// of the locking and with a failure: past what may be reserved, the GPU's work fails as an illegal memory access.
+    pub fn host_view(&self) -> Option<String> {
+        let gib = |bytes: u64| format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64);
+        let (ordinal, (usage, budget, reservable)) = self.group.ordinals().into_iter()
+            .filter_map(|ordinal| crate::gpu::host_visible(ordinal).map(|view| (ordinal, view)))
+            .filter(|(_, (_, _, reservable))| *reservable > 0)
+            .min_by_key(|(_, (usage, _, reservable))| reservable.saturating_sub(*usage))?;
+        let cap = if self.visible_cap == u64::MAX { "none".to_string() } else { gib(self.visible_cap) };
+        Some(format!("the GPU's view of host memory (GPU {ordinal}) holds {} page-locked of {} reservable (budget {}); the banks' cap {cap}",
+                     gib(usage), gib(reservable), gib(budget)))
     }
 
     /// Count the bytes of the banks page-locked in place (the locked layers that are not held as copies) for the working set's limit.
@@ -2869,6 +2891,9 @@ impl Model {
         let sizes = (0..48)
             .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| banks.iter().map(|bank| bank.len() as u64).sum::<u64>()))
             .collect::<Result<Vec<_>>>()?;
+        let tier_expert = (0..48)
+            .map(|layer| Self::host_banks(&self.weights, layer).map(|banks| crate::banks::tier_expert_bytes(banks.map(|bank| bank.len() as u64 / 512))))
+            .collect::<Result<Vec<_>>>()?;
         let banks_total = sizes.iter().sum();
         let (vram_used, vram_budget) = self.group.memory()?;
         let vram_room = vram_budget.saturating_sub(vram_used);
@@ -2880,7 +2905,9 @@ impl Model {
         } else {
             None
         };
-        let by_visible = crate::banks::visible_lock_cap(reservable, pinned_state);
+        // (and beside what the devices page-lock after the start: the staging slots' mirror and the gather ahead's, at their largest)
+        let besides = if reservable.is_some() { crate::banks::visible_besides(self.group.slot_bytes(), 512, crate::gpu::gather_ahead_on()) } else { 0 };
+        let by_visible = crate::banks::visible_lock_cap(reservable, pinned_state.saturating_add(besides));
         self.visible_cap = by_visible;
         let budget = by_memory.min(by_free).min(by_visible);
         // Whole layers from the last: reading went through those most recently, so they are the likeliest to be cached.
@@ -2895,8 +2922,9 @@ impl Model {
         let why = if layers.len() == 48 {
             "none left".to_string()
         } else if by_visible < by_memory.min(by_free) {
-            format!("the GPUs' view of host memory allows {} (banks::visible_lock_cap: {} reservable less {} of sequence state and {} kept)",
-                    gib(by_visible), gib(reservable.unwrap_or(0)), gib(pinned_state), gib(crate::banks::VISIBLE_KEPT))
+            format!("the GPUs' view of host memory allows {} (banks::visible_lock_cap: {} reservable less {} of sequence state, {} of the slots' \
+                     and the gather ahead's mirrors and {} kept)",
+                    gib(by_visible), gib(reservable.unwrap_or(0)), gib(pinned_state), gib(besides), gib(crate::banks::VISIBLE_KEPT))
         } else if by_memory <= by_free {
             format!("the lock budget of {} was used", gib(by_memory))
         } else if commit.is_some_and(|(available, commit)| commit < available) {
@@ -2922,6 +2950,7 @@ impl Model {
         self.banks_bytes = banks_total;
         self.tier_budget = budget;
         self.tier_sizes = sizes.clone();
+        self.tier_expert = tier_expert;
         self.lock_pending = layers;
         self.pinned_now.store(pinned_state, std::sync::atomic::Ordering::Relaxed);
         // Paging must be observed even while a request holds up bank locking. The quota alone waits for the locks.
@@ -4822,7 +4851,7 @@ impl Model {
     /// The bytes locking `layer` again takes: its tier's experts where the host tier made one ([`Model::tier_chosen`]), its banks otherwise.
     fn relock_bytes(&self, layer: usize) -> Result<u64> {
         match &self.tier_chosen {
-            Some(chosen) => Ok(self.tier_sizes.get(layer).map_or(0, |bytes| bytes / 512) * chosen.get(layer).map_or(0, Vec::len) as u64),
+            Some(chosen) => Ok(self.tier_expert.get(layer).copied().unwrap_or(0) * chosen.get(layer).map_or(0, Vec::len) as u64),
             None => Ok(Self::host_banks(&self.weights, layer)?.iter().map(|bank| bank.len() as u64).sum::<u64>()),
         }
     }
@@ -8035,17 +8064,17 @@ mod layer_prefill_tests {
     }
 
     /// Decides: with the banks' lock under the GPUs' view of host memory (Windows), a 99K prompt's pass takes the rows whose page-locks fit
-    /// what the lock left (VISIBLE_KEPT): 49,152 rows (1.9 GiB) a pass where one pass of 98,304 page-locked 3.75 GiB; with no cap, as before.
+    /// what the lock left them (ROWS_VISIBLE): 49,152 rows (1.9 GiB) a pass where one pass of 98,304 page-locked 3.75 GiB; with no cap, as before.
     #[test]
     fn a_pass_s_page_locked_rows_fit_what_the_banks_left_of_the_gpus_view() {
         use super::{layer_prefill_rows_lockable, WIDTH};
-        use crate::banks::{rows_visible_room, visible_lock_cap, VISIBLE_KEPT};
+        use crate::banks::{rows_visible_room, visible_lock_cap, ROWS_VISIBLE};
         let row = WIDTH as u64 * 4;
         let cap = visible_lock_cap(Some(22 << 30), 2 << 30);
-        assert_eq!(rows_visible_room(cap), VISIBLE_KEPT);
+        assert_eq!(rows_visible_room(cap), ROWS_VISIBLE);
         let rows = layer_prefill_rows_lockable(98_304, rows_visible_room(cap));
         assert_eq!(rows, 49_152);
-        assert!(rows as u64 * row <= VISIBLE_KEPT);
+        assert!(rows as u64 * row <= ROWS_VISIBLE);
         assert_eq!(rows_visible_room(visible_lock_cap(None, 2 << 30)), u64::MAX);
         assert_eq!(layer_prefill_rows_lockable(98_304, rows_visible_room(u64::MAX)), 98_304);
     }

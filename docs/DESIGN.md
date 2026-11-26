@@ -44,8 +44,10 @@ by bubblewrap, and not yet on native Linux.
   - The engine runs in a worker process without network access: bubblewrap on Linux, an
     AppContainer of its own on Windows. The worker is the same executable.
   - Every model and drafter file is pinned by size, SHA-256 and fs-verity digest. The pins are
-    compiled into the executable, and every file is authenticated whole when it is downloaded. A later start
-    trusts a file whose verity tree is younger than it, and reads what it places without hashing it again.
+    compiled into the executable, and every file is authenticated whole when it is downloaded. A start that reads a
+    file through and checks it keeps a mark beside its tree (its size, times and file id); a later start reads what it
+    places without hashing it again only while the file is as marked. The server reads the marks and passes them to the
+    worker (`--file-mark`): on Windows the worker's AppContainer could not read a mark written after its grants.
   - Bytes read from the drive after loading (table rows, experts outside RAM, banks left to the
     page cache) are checked block by block against the file's Merkle tree before use.
   - The trees live in the data directory (`.straydog` in the model's by default). Only the

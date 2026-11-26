@@ -1227,6 +1227,11 @@ impl Group {
         self.backends[0].ordinal
     }
 
+    /// The largest expert slot of the group's devices ([`crate::gpu::Backend::slot_bytes`]).
+    pub fn slot_bytes(&self) -> u64 {
+        self.backends.iter().map(crate::gpu::Backend::slot_bytes).max().unwrap_or(0)
+    }
+
     /// The ordinals of the group's devices, in the group's order.
     pub fn ordinals(&self) -> Vec<usize> {
         self.backends.iter().map(|backend| backend.ordinal).collect()
