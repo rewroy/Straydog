@@ -640,8 +640,14 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         // (and how they were read ahead: into how many buffers, around the page cache or through it. One buffer puts a layer's read after
         // the copy before it has gone up: a PC with 1.8 GiB of commit left read a 2,076-token prompt's 48 layers in 11.3 s, its reads and
         // gathers one after the other)
+        // (with what the choice was made of: the bytes the pass reads from the files against the memory available then. An RTX 4060 PC's
+        // first requests read around the cache, 42-74 GB from the drive, and the log could not say why)
+        let chosen_by = match (number("prefill_bank_reread_bytes"), number("prefill_bank_available_bytes")) {
+            (Some(reread), Some(available)) => format!(" ({:.1} GB to read from the files, {:.1} GB available)", reread / 1e9, available / 1e9),
+            _ => String::new(),
+        };
         let ahead = match (timings["prefill_bank_buffers"].as_u64(), timings["prefill_bank_direct"].as_bool()) {
-            (Some(buffers), Some(direct)) => format!(", read ahead into {buffers} buffer{} {} the page cache", if buffers == 1 { "" } else { "s" },
+            (Some(buffers), Some(direct)) => format!(", read ahead into {buffers} buffer{} {} the page cache{chosen_by}", if buffers == 1 { "" } else { "s" },
                                                      if direct { "around" } else { "through" }),
             _ => ", not read ahead".into(),
         };
@@ -2378,6 +2384,11 @@ mod tests {
         let four = request_summary(&event(json!({"prefill_bank_loads": 48, "prefill_bank_load_seconds": 2.0, "prefill_bank_buffers": 4,
                                                  "prefill_bank_direct": false})), None);
         assert!(four.contains("for their reads, read ahead into 4 buffers through the page cache"), "{four}");
+        // (and what that was chosen by, where the engine says)
+        let why = request_summary(&event(json!({"prefill_bank_loads": 48, "prefill_bank_load_seconds": 2.0, "prefill_bank_buffers": 4,
+                                                "prefill_bank_direct": true, "prefill_bank_reread_bytes": 31.1e9,
+                                                "prefill_bank_available_bytes": 20.5e9})), None);
+        assert!(why.contains("read ahead into 4 buffers around the page cache (31.1 GB to read from the files, 20.5 GB available)"), "{why}");
         assert!(!moved.contains(", banks "), "no loads counted: no clause");
         // (the rows held in VRAM, or on the host with why)
         let held = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536, "prefill_rows_vram": true})), None);

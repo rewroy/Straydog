@@ -5107,9 +5107,11 @@ impl Model {
         let checkpoints: Vec<usize> = plan.iter().map(|(at, _)| *at).collect();
         let layers = 48 + usize::from(self.speculative > 0);
         let mut bank_reader = crate::layer_bank::Prefetch::new(&self.weights, layers, self.registered.clone());
-        if let Some((buffers, direct)) = bank_reader.as_ref().map(crate::layer_bank::Prefetch::shape) {
+        if let Some((buffers, direct, reread, available)) = bank_reader.as_ref().map(crate::layer_bank::Prefetch::shape) {
             self.last_metrics.insert("prefill_bank_buffers".into(), json!(buffers));
             self.last_metrics.insert("prefill_bank_direct".into(), json!(direct));
+            self.last_metrics.insert("prefill_bank_reread_bytes".into(), json!(reread));
+            self.last_metrics.insert("prefill_bank_available_bytes".into(), json!(available));
         }
         for stop in layer_prefill_stops(position, end, &checkpoints, segment) {
             if cancelled() { return Ok(false); }
