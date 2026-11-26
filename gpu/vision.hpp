@@ -65,13 +65,16 @@ __global__ void vision_rope_split(const float* qkv, const float* bias, size_t pa
     v[out + half] = __float2half(row[2 * width + at + half] + bias[2 * width + at + half]);
 }
 
+// A softmax row's threads, in both kernels and their launch.
+constexpr unsigned vision_softmax_threads = 256;
+
 // Softmax of each row of `cols` scores (row blockIdx.x of head blockIdx.y, heads `stride` rows
 // apart), into FP16.
 __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, __half* probs) {
     const size_t at = (size_t(blockIdx.y) * stride + blockIdx.x) * cols;
     const float* row = scores + at;
     __half* out = probs + at;
-    __shared__ float partial[256];
+    __shared__ float partial[vision_softmax_threads];
     float top = -INFINITY;
     for (size_t i = threadIdx.x; i < cols; i += blockDim.x) top = fmaxf(top, row[i]);
     partial[threadIdx.x] = top;
@@ -100,11 +103,11 @@ __global__ void vision_softmax(const float* scores, size_t cols, size_t stride, 
 // 230 of the encoder's 444 ms read three times, 194 so. Its own kernel: the registers it holds
 // slowed a longer row's, 15,960 patches 4.22 -> 4.48 s on CUDA, when one kernel took both.)
 constexpr unsigned vision_softmax_kept = 32;
-__global__ void __launch_bounds__(256) vision_softmax_kept_row(const float* scores, size_t cols, size_t stride, __half* probs) {
+__global__ void __launch_bounds__(vision_softmax_threads) vision_softmax_kept_row(const float* scores, size_t cols, size_t stride, __half* probs) {
     const size_t at = (size_t(blockIdx.y) * stride + blockIdx.x) * cols;
     const float* row = scores + at;
     __half* out = probs + at;
-    __shared__ float partial[256];
+    __shared__ float partial[vision_softmax_threads];
     float value[vision_softmax_kept];
     float top = -INFINITY;
 #pragma unroll
@@ -148,10 +151,10 @@ __global__ void __launch_bounds__(256) vision_softmax_kept_row(const float* scor
 
 // The softmax of `rows` rows of `cols` scores for each of `heads` heads (the kept row's kernel where it fits).
 static void vision_softmax_rows(Device& d, const float* scores, size_t rows, size_t heads, size_t cols, size_t stride, __half* probs) {
-    if (cols <= size_t(256) * vision_softmax_kept)
-        vision_softmax_kept_row<<<dim3(unsigned(rows), unsigned(heads)), 256, 0, d.stream>>>(scores, cols, stride, probs);
+    if (cols <= size_t(vision_softmax_threads) * vision_softmax_kept)
+        vision_softmax_kept_row<<<dim3(unsigned(rows), unsigned(heads)), vision_softmax_threads, 0, d.stream>>>(scores, cols, stride, probs);
     else
-        vision_softmax<<<dim3(unsigned(rows), unsigned(heads)), 256, 0, d.stream>>>(scores, cols, stride, probs);
+        vision_softmax<<<dim3(unsigned(rows), unsigned(heads)), vision_softmax_threads, 0, d.stream>>>(scores, cols, stride, probs);
 }
 
 // silu(gate) * up of each row of [gate | up] (`ffn` each), into FP16.
