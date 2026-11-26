@@ -668,10 +668,16 @@ read. The state was saved in 0.3 s after the reply, and the file is 323 MB.
   changed, another user's, another build's) is deleted with one warning, and the start goes on
   without it.
 - **Restoring.** After `ready` the server opens, on a thread of its own, the file of this build and
-  key prefix that was used last (and marks it used), and hands the state to the worker. A request
-  that arrives first is never held up: the server hands nothing over once a request has begun, the
-  worker takes the state only while no request has had the engine, and it says in the log what
-  became of it (`Straydog prefix: restored 4020 tokens (308 MB) in 0.9 s`).
+  key prefix that was used last (and marks it used), and hands the state to the worker. The worker
+  restores it behind `ready` while no request has had the engine. A first request that comes while
+  the file is still being opened waits for it (at most 20 s), and the state goes to the worker ahead
+  of it; that request takes the state itself where its prompt begins with the block's tokens and
+  the model holds less of them (and no kept conversation holds more), and reads only the rest. The
+  requests that come first after a start are the ones that begin with the block (an app's warm-up,
+  or the message that restarted the server): dropped for them, the block was read again. On an
+  RTX 5070 Ti PC a request sent as the server became ready had its first token in 1.03 s instead of
+  8.9-9.6 s (5,644 tokens). The log says what became of the state (`Straydog prefix: restored 4020
+  tokens (308 MB) in 0.9 s`, or `... by the first request in ...`).
 - **Off.** `prefix_cache = false` in the config file, or `--no-prefix-cache`. Linux saves nothing.
 
 ### 6.5 The conversation's state across starts (Windows, an option, off by default)
