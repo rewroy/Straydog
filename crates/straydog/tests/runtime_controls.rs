@@ -428,6 +428,20 @@ fn main() {
         std::env::remove_var("STRAYDOG_FAULT_FALLBACK");
         println!("runtime_controls: a GPU fault started the next worker without page locks, and the next start of this version too");
 
+        // A worker started again has its command made again where the server gives a relaunch (its files' marks as they are then): here the
+        // start's command fails every request, and the one made again answers.
+        let healthy = scratch.join("relaunch-healthy");
+        std::fs::write(&healthy, "").unwrap();
+        let relaunched = (std::env::current_exe().unwrap(), vec!["fatal".into(), PathBuf::from(&healthy).into_os_string()]);
+        let engine = wait_ready(Runtime::start_served(&settings, Box::new(|_| Ok((std::env::current_exe().unwrap(), vec!["fatal".into()]))),
+                                                      Arc::new(move || Ok(relaunched.clone())))).await;
+        let mut failed = engine.generate(hi()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), failed.events.next()).await.unwrap().unwrap();
+        assert_eq!(event["event"].as_str(), Some("error"), "{event}");
+        assert!(serves(&engine, hi()).await, "the worker started again ran the start's command, not the one made again");
+        engine.close().await;
+        println!("runtime_controls: a worker started again ran its command made again");
+
         // A worker that fails to start: the runtime fails with its reason, at once.
         let engine = Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["fails".into()]));
         let message = tokio::time::timeout(Duration::from_secs(10), engine.failed()).await

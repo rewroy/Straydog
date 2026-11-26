@@ -54,6 +54,9 @@ const ACCESS_DENIED: &str = "(os error 5)";
 /// What runs before the worker starts and yields its command (building missing verity trees,
 /// then the isolation command over them), reporting (stage, done, total).
 pub type Prepare = Box<dyn FnOnce(&(dyn Fn(&str, u64, u64) + Sync)) -> Result<Command, String> + Send>;
+/// The worker's command made again, for a worker started again after it failed ([`Runtime::start_served`]): its arguments carry the files'
+/// marks as they are then (the first worker marks the files it read through and checked, after the command of the start was made).
+pub type Relaunch = Arc<dyn Fn() -> Result<Command, String> + Send + Sync>;
 
 /// One startup progress frame or the state the server reports.
 #[derive(Debug, Clone)]
@@ -1070,22 +1073,29 @@ impl Runtime {
 
     /// [`Runtime::start`] once `prepare` has run (shown as loading) and given the command.
     pub fn start_prepared(settings: &Settings, prepare: Prepare) -> Runtime {
-        Runtime::driven(settings, prepare, CANCEL_PATIENCE, refusal_of(settings))
+        Runtime::driven(settings, prepare, CANCEL_PATIENCE, refusal_of(settings), None)
+    }
+
+    /// [`Runtime::start_prepared`], a worker started again after it failed having its command made again by `relaunch`: the server's own,
+    /// whose files' marks a first worker wrote after the start's command was made. A worker started again with the start's read the whole
+    /// model through and hashed it again: on an RTX 4060 PC 75 s, where the starts after it took 5-7 s.
+    pub fn start_served(settings: &Settings, prepare: Prepare, relaunch: Relaunch) -> Runtime {
+        Runtime::driven(settings, prepare, CANCEL_PATIENCE, refusal_of(settings), Some(relaunch))
     }
 
     /// Tests only: [`Runtime::start`] with its worker given `patience` to end a cancelled generation.
     #[doc(hidden)]
     pub fn start_with_cancel_patience(settings: &Settings, command: Command, patience: Duration) -> Runtime {
-        Runtime::driven(settings, Box::new(move |_| Ok(command)), patience, refusal_of(settings))
+        Runtime::driven(settings, Box::new(move |_| Ok(command)), patience, refusal_of(settings), None)
     }
 
     /// Tests only: [`Runtime::start`] with `refusal` in place of the search for why the OS refused the worker.
     #[doc(hidden)]
     pub fn start_with_refusal(settings: &Settings, command: Command, refusal: Refusal) -> Runtime {
-        Runtime::driven(settings, Box::new(move |_| Ok(command)), CANCEL_PATIENCE, refusal)
+        Runtime::driven(settings, Box::new(move |_| Ok(command)), CANCEL_PATIENCE, refusal, None)
     }
 
-    fn driven(settings: &Settings, prepare: Prepare, cancel_patience: Duration, refusal: Refusal) -> Runtime {
+    fn driven(settings: &Settings, prepare: Prepare, cancel_patience: Duration, refusal: Refusal, relaunch: Option<Relaunch>) -> Runtime {
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Idle),
             failure: watch::Sender::new(None),
@@ -1112,6 +1122,7 @@ impl Runtime {
             restarts: Mutex::new(Vec::new()),
             fallback: Mutex::new(false),
             fallback_marker: settings.data_dir.join("gpu-fault"),
+            relaunch,
         };
         driver.read_fallback();
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
@@ -1191,6 +1202,8 @@ struct Driver {
     /// start of this version (`<data-dir>/gpu-fault`).
     fallback: Mutex<bool>,
     fallback_marker: PathBuf,
+    /// The command made again for a worker started again ([`Runtime::start_served`]); none: the start's command.
+    relaunch: Option<Relaunch>,
 }
 
 /// What a worker is started with after its GPU work faulted, where [`fault_fallback_on`]: no page-locked banks (no host tier, no layer the
@@ -1279,7 +1292,7 @@ impl Driver {
 
     async fn run(self, prepare: Prepare, mut jobs: mpsc::UnboundedReceiver<Job>,
                  mut controls: mpsc::UnboundedReceiver<Control>) {
-        let command = self.prepare(prepare).await;
+        let mut command = self.prepare(prepare).await;
         let mut launched = match &command {
             Ok(command) => self.launch(command.clone()).await,
             Err(message) => Err((format!("Straydog failed to start ({message}); see the server log and restart the server"),
@@ -1329,6 +1342,12 @@ impl Driver {
                     // (clients see it loading from now; the old worker's processes gone first, and with them what they held of the GPUs)
                     self.set(Phase::Loading(json!({"stage": "restarting"})));
                     released(&process.holders).await;
+                    if let (Some(relaunch), Ok(_)) = (&self.relaunch, &command) {
+                        match relaunch() {
+                            Ok(fresh) => command = Ok(fresh),
+                            Err(message) => tracing::warn!("Straydog starts its worker again with the start's command ({message})"),
+                        }
+                    }
                     launched = match &command {
                         Ok(command) => self.launch(command.clone()).await,
                         Err(_) => unreachable!("a worker ran, so its command was prepared"),
