@@ -168,9 +168,22 @@ impl Prefetch {
             .flat_map(|plan| plan.roles.iter().map(|role| role.file_index)).collect();
         files.sort_unstable();
         files.dedup();
+        // They are kept on a thread of their own, beside the pass's first reads, whose checks take the bounded cache until each level is
+        // kept: kept first, they held the first bank's read for 0.32-0.66 s (565 MiB on Linux, read, zeroed and checked), and a PC's pass
+        // began with a 0.85 s wait. Their room is taken now, whether or not they are kept in the end.
         let leaves = weights.tree_leaves_to_keep(&files);
-        let kept = if leaves_fit(leaves, bytes as u64, room) { weights.keep_tree_leaves(&files, leaves).unwrap_or(0) } else { 0 };
-        let available = room.saturating_sub(kept);
+        let keeping = leaves_fit(leaves, bytes as u64, room).then(|| {
+            let verifiers = weights.tree_verifiers_to_keep(&files);
+            std::thread::Builder::new().name("tree-leaves".into()).spawn(move || {
+                let mut kept = 0u64;
+                for verifier in verifiers {
+                    // (a level that does not verify stays unkept: every read is still checked through the bounded cache)
+                    kept += verifier.keep_level0(leaves.saturating_sub(kept)).unwrap_or(0);
+                }
+            }).is_ok()
+        }).unwrap_or(false);
+        // (the thread holds the verifiers it keeps, not the pass: it may outlive a short pass, which does not wait for it)
+        let available = room.saturating_sub(if keeping { leaves } else { 0 });
         let mut free = Vec::new();
         // (development: STRAYDOG_LAYER_BANK_BUFFERS=N reads ahead into N buffers at most, to see a pass the memory left one or two)
         let most = std::env::var("STRAYDOG_LAYER_BANK_BUFFERS").ok().and_then(|value| value.trim().parse::<usize>().ok())
