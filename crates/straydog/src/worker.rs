@@ -1927,6 +1927,27 @@ pub(crate) fn not_held(digests: &[[u8; 32]]) -> Failure {
     Failure { message: images::not_held(digests), fatal: false, kind: Some(images::NOT_HELD) }
 }
 
+/// Where a request was when its generation failed fatally, for a log line beside the failure's: a GPU fault is found at a later wait than the work that made it, so its file
+/// and line say where it was found, and this says what the request was doing (the prompt's read or the reply, how far) and what the host had
+/// given the GPUs by then (the layers whose banks it reads in place, each GPU's budget). An RTX 4060 PC's second message failed so six times
+/// in a row with nothing in the log but the wait that found it.
+fn failure_place(read: (usize, usize), generated: usize, prompt: usize, model: &Model) -> String {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    let doing = if generated > 0 || (read.1 > 0 && read.0 >= read.1) {
+        format!("in the reply after {generated} tokens")
+    } else {
+        format!("in the prompt's read after {} of {} new tokens", read.0, read.1)
+    };
+    let mut place = format!("{doing}, a prompt of {prompt} tokens");
+    if model.partial {
+        place += &format!(", {} of 48 layers' banks locked", model.locked_layers());
+    }
+    for (ordinal, used, budget) in model.vram_budgets().unwrap_or_default() {
+        place += &format!(", GPU {ordinal} {:.2} of {:.2} GiB", gib(used), gib(budget));
+    }
+    place
+}
+
 pub(crate) fn engine_failed(message: impl Into<String>, site: &str) -> Failure {
     let message = message.into();
     // A void pass leaves the devices sound: the request fails and the engine resets, so the next
@@ -2146,6 +2167,8 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let mut stream = text.stream();
     let mut generated = 0usize;
     let mut first_text: Option<f64> = None;
+    // (the prompt's progress as last reported, for a failure's line: where in the request it came)
+    let mut read = (0usize, 0usize);
     let mut decode_error: Option<Failure> = None;
     let cancelled = || cancel.load(Ordering::SeqCst);
     let constraint = Constraint::from_request(body.get("constraint").unwrap_or(&Py::Null), text.token_bytes(), &END_TOKENS, thinking)
@@ -2222,7 +2245,10 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         });
         let result = engine.model.generate_constrained(
             &agreed, max_new, &sampling, seed, &cancelled,
-            &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
+            &mut |done, total| {
+                read = (done, total);
+                output.send(&json!({"id": id, "event": "progress", "done": done, "total": total}))
+            },
             turn, checkpoint,
             &mut |token| {
                 let _ = tokens_out.send(token);
@@ -2236,7 +2262,14 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         }
         result
     });
-    result.map_err(|message| engine_failed(message, concat!(file!(), ":", line!(), " model.generate")))?;
+    result.map_err(|message| {
+        let failure = engine_failed(message, concat!(file!(), ":", line!(), " model.generate"));
+        // (a line of its own: the message is left as it is, as what it ends with decides how the failure is taken)
+        if failure.fatal {
+            eprintln!("Straydog failure place: {}", failure_place(read, generated, agreed.len(), &engine.model));
+        }
+        failure
+    })?;
     if let Some(failure) = decode_error {
         return Err(failure);
     }

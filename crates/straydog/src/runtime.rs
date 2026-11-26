@@ -557,14 +557,16 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// DSpark's confidences met on served drafts: a line every 4096 drafts tried, some minutes of an agent's use. The machine's memory as a start
 /// finds it is a line a start. A read's phases (STRAYDOG_PREFILL_PHASES) are what that switch asks for: written only with it set. A failed
 /// request whose reset failed too keeps its original failure here: the request's own error says only that the reset failed (a GPU fault is
-/// found at the reset's wait), and the operation that faulted, with its file and line, was otherwise only in a --verbose log.
+/// found at the reset's wait), and the operation that faulted, with its file and line, was otherwise only in a --verbose log; and so does the
+/// line that says where in the request a fatal failure came (the prompt's read or the reply, the banks locked, the GPUs' budgets).
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
      "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:",
-     "Straydog DSpark calibration", "Straydog memory at the start", "PHASES ", "Straydog could not reset after a failed generation"]
+     "Straydog DSpark calibration", "Straydog memory at the start", "PHASES ", "Straydog could not reset after a failed generation",
+     "Straydog failure place: "]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -2315,6 +2317,8 @@ mod tests {
         assert!(stays_in_the_log("Straydog could not reset after a failed generation: Straydog GPU: an illegal memory access was encountered \
                                   (kernels.cpp:4374, code 700); original failure: Straydog GPU: an illegal memory access was encountered \
                                   (hybrid_slots.hpp:1200, code 700)"));
+        assert!(stays_in_the_log("Straydog failure place: in the reply after 0 tokens, a prompt of 6602 tokens, 48 of 48 layers' banks locked, \
+                                  GPU 0 4.71 of 5.38 GiB"));
         assert!(stays_in_the_log("PHASES   host a MoE layer (432): counts wait 0.10 ms, hints 0.20 ms, gather 9.40 ms, CPU routes 1.00 ms, settle 0.10 ms"));
         assert!(stays_in_the_log("Straydog memory at the start: free 0.8 GB, file cache 85.4 GB, available 17.7 GB, swap in use 1.4 GB"));
         assert!(stays_in_the_log("Straydog DSpark calibration on served drafts (skill 1.12, extra 0.74): slot 1: 0.9 812/861 (0.97 by calibration)"));
