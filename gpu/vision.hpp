@@ -157,6 +157,109 @@ static void vision_softmax_rows(Device& d, const float* scores, size_t rows, siz
         vision_softmax<<<dim3(unsigned(rows), unsigned(heads)), vision_softmax_threads, 0, d.stream>>>(scores, cols, stride, probs);
 }
 
+#if defined(__HIPCC__)
+typedef _Float16 vflash_half8 __attribute__((ext_vector_type(8)));
+typedef _Float16 vflash_half4 __attribute__((ext_vector_type(4)));
+typedef float vflash_float8 __attribute__((ext_vector_type(8)));
+constexpr unsigned vflash_keys = 64;   // keys a block stages a step: four of the waves' 16
+constexpr unsigned vflash_ld = 72;     // halves an LDS row of 64 takes (fewer bank conflicts)
+constexpr unsigned vflash_vt = vflash_keys + 8;
+
+// The encoder's full attention for heads of 64 dimensions on RDNA4, without the scores in memory: grid (tiles of 64 queries, heads),
+// 128 threads, each wave 16 queries. With the keys as rows, S^T = K Q^T leaves each lane one query's scores (column lane % 16) for
+// eight keys, so the online softmax's maximum and sum need one exchange with the lane 16 away; and those scores, in FP16, are as they
+// stand the B operand of O^T += V^T P^T (the keys taken in the order the first product's rows give them, the same for both operands).
+// FP16 operands, F32 sums and softmax, as the GEMMs and vision_softmax: other bits than theirs (the probabilities are rounded before
+// they are normalized, and summed in another order). q holds the softmax's scale already (vision_rope_split); q, k and v are each
+// head's n rows of 64, `out` the rows of all heads (`width` values a row).
+__global__ void __launch_bounds__(128) vision_flash(const __half* q, const __half* k, const __half* v, size_t n, size_t width, __half* out) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned t = threadIdx.x, lane = t % 32, wave = t / 32, g = lane / 16, c = lane % 16;
+    const size_t head = blockIdx.y, query = size_t(blockIdx.x) * 64 + wave * 16 + c;
+    const _Float16* qh = reinterpret_cast<const _Float16*>(q) + head * n * 64;
+    const _Float16* kh = reinterpret_cast<const _Float16*>(k) + head * n * 64;
+    const _Float16* vh = reinterpret_cast<const _Float16*>(v) + head * n * 64;
+    __shared__ __attribute__((aligned(16))) _Float16 ks[vflash_keys][vflash_ld];
+    __shared__ __attribute__((aligned(16))) _Float16 vt[64][vflash_vt];
+    // (the k index of a 16x16x16 operand's element i in lane group g)
+    auto kof = [g](unsigned i) { return g * 4 + (i / 4) * 8 + i % 4; };
+    vflash_half8 qb[4];
+    #pragma unroll
+    for (unsigned s = 0; s < 4; ++s) {
+        #pragma unroll
+        for (unsigned i = 0; i < 8; ++i) qb[s][i] = query < n ? qh[query * 64 + s * 16 + kof(i)] : _Float16(0);
+    }
+    vflash_float8 o[4] = {};   // O^T: tile s holds dimensions s*16 + g*8 + i of the lane's query
+    float m = -INFINITY, l = 0;
+    for (size_t k0 = 0; k0 < n; k0 += vflash_keys) {
+        __syncthreads();
+        for (unsigned idx = t; idx < vflash_keys * 8; idx += 128) {
+            const unsigned row = idx / 8, part = idx % 8;
+            const size_t key = k0 + row;
+            uint4 kv = {0, 0, 0, 0}, vv = {0, 0, 0, 0};
+            if (key < n) {
+                kv = *reinterpret_cast<const uint4*>(kh + key * 64 + part * 8);
+                vv = *reinterpret_cast<const uint4*>(vh + key * 64 + part * 8);
+            }
+            *reinterpret_cast<uint4*>(&ks[row][part * 8]) = kv;
+            _Float16 values[8];
+            memcpy(values, &vv, 16);
+            #pragma unroll
+            for (unsigned j = 0; j < 8; ++j) vt[part * 8 + j][row] = values[j];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned sub = 0; sub < vflash_keys / 16; ++sub) {
+            const size_t first = k0 + sub * 16;
+            if (first >= n) break;
+            vflash_float8 st = {};
+            #pragma unroll
+            for (unsigned s = 0; s < 4; ++s) {
+                const _Float16* row = &ks[sub * 16 + c][s * 16 + g * 4];
+                const vflash_half4 lo = *reinterpret_cast<const vflash_half4*>(row), hi = *reinterpret_cast<const vflash_half4*>(row + 8);
+                const vflash_half8 a = {lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+                st = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, qb[s], st);
+            }
+            float top = m;
+            #pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                if (first + g * 8 + i >= n) st[i] = -INFINITY;
+                top = fmaxf(top, st[i]);
+            }
+            top = fmaxf(top, __shfl_xor(top, 16));
+            const float rescale = expf(m - top);
+            float sum = 0;
+            vflash_half8 p;
+            #pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                const float e = expf(st[i] - top);
+                sum += e;
+                p[i] = _Float16(e);
+            }
+            sum += __shfl_xor(sum, 16);
+            l = l * rescale + sum;
+            m = top;
+            #pragma unroll
+            for (unsigned s = 0; s < 4; ++s) {
+                o[s] *= rescale;
+                const vflash_half8 a = *reinterpret_cast<const vflash_half8*>(&vt[s * 16 + c][sub * 16 + g * 8]);
+                o[s] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, p, o[s]);
+            }
+        }
+    }
+    if (query < n) {
+        const float scale = 1.0f / l;
+        _Float16* row = reinterpret_cast<_Float16*>(out) + query * width + head * 64;
+        #pragma unroll
+        for (unsigned s = 0; s < 4; ++s) {
+            #pragma unroll
+            for (unsigned i = 0; i < 8; ++i) row[s * 16 + g * 8 + i] = _Float16(o[s][i] * scale);
+        }
+    }
+#endif
+}
+#endif
+
 // silu(gate) * up of each row of [gate | up] (`ffn` each), into FP16.
 __global__ void vision_swiglu(const float* gate_up, size_t rows, size_t ffn, __half* out) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -196,6 +299,14 @@ __global__ void vision_bf16_to_half(uint16_t* values, size_t count) {
 }
 
 // output[steps][rows] (F32 or FP16) = input[steps][cols] . weights[rows][cols]^T (+ beta * output)
+#if defined(__HIPCC__)
+// Whether the attention takes vision_flash: RDNA4 and heads of 64, unless STRAYDOG_VISION_FLASH=0 (the scores in memory, as before).
+static bool vision_flash_on(const Device& d, size_t dim) {
+    static const bool off = [] { const char* value = std::getenv("STRAYDOG_VISION_FLASH"); return value && value[0] == '0' && !value[1]; }();
+    return d.rdna4 && dim == 64 && !off;
+}
+#endif
+
 static void vision_gemm(Device& d, const void* weights, size_t rows, size_t cols, const __half* input, size_t steps, void* output,
                         bool half_output, float beta) {
     const float alpha = 1;
@@ -268,21 +379,28 @@ static void vision_encode(Device& d, const sd_vision& model, const __half* patch
         vision_gemm(d, w.qkv, 3 * width, width, f16(s.normed), n, f32(s.phase), false, 0);
         vision_rope_split<<<op_blocks(n * heads * dim / 2), 256, 0, d.stream>>>(f32(s.phase), static_cast<const float*>(w.qkv_bias), n, grid_w,
             heads, dim, model.rope_theta, 1.0f / sqrtf(float(dim)), f16(s.q), f16(s.k), f16(s.v));
-        float* scores = f32(s.phase);
-        __half* probs = f16(s.phase + s.probs);
-        for (size_t first = 0; first < n; first += s.query_rows) {
-            const size_t rows = std::min(s.query_rows, n - first);
-            const float alpha = 1, zero = 0;
-            // scores[h][row][patch] = q[h][first + row] . k[h][patch]
-            blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(n), int(rows), int(dim), &alpha,
-                f16(s.k), HIP_R_16F, int(dim), (long long)(n * dim), f16(s.q) + first * dim, HIP_R_16F, int(dim), (long long)(n * dim),
-                &zero, scores, HIP_R_32F, int(n), (long long)(s.query_rows * n), int(heads), HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
-            vision_softmax_rows(d, scores, rows, heads, n, s.query_rows, probs);
-            // attended[first + row][h * dim ..] = probs[h][row] . v[h]
-            blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_N, HIPBLAS_OP_N, int(dim), int(rows), int(n), &alpha,
-                f16(s.v), HIP_R_16F, int(dim), (long long)(n * dim), probs, HIP_R_16F, int(n), (long long)(s.query_rows * n),
-                &zero, f16(s.attended) + first * width, HIP_R_16F, int(width), (long long)dim, int(heads), HIPBLAS_COMPUTE_32F,
-                HIPBLAS_GEMM_DEFAULT));
+#if defined(__HIPCC__)
+        if (vision_flash_on(d, dim)) {
+            vision_flash<<<dim3(unsigned((n + 63) / 64), unsigned(heads)), 128, 0, d.stream>>>(f16(s.q), f16(s.k), f16(s.v), n, width, f16(s.attended));
+        } else
+#endif
+        {
+            float* scores = f32(s.phase);
+            __half* probs = f16(s.phase + s.probs);
+            for (size_t first = 0; first < n; first += s.query_rows) {
+                const size_t rows = std::min(s.query_rows, n - first);
+                const float alpha = 1, zero = 0;
+                // scores[h][row][patch] = q[h][first + row] . k[h][patch]
+                blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_T, HIPBLAS_OP_N, int(n), int(rows), int(dim), &alpha,
+                    f16(s.k), HIP_R_16F, int(dim), (long long)(n * dim), f16(s.q) + first * dim, HIP_R_16F, int(dim), (long long)(n * dim),
+                    &zero, scores, HIP_R_32F, int(n), (long long)(s.query_rows * n), int(heads), HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+                vision_softmax_rows(d, scores, rows, heads, n, s.query_rows, probs);
+                // attended[first + row][h * dim ..] = probs[h][row] . v[h]
+                blas_check(hipblasGemmStridedBatchedEx(d.blas, HIPBLAS_OP_N, HIPBLAS_OP_N, int(dim), int(rows), int(n), &alpha,
+                    f16(s.v), HIP_R_16F, int(dim), (long long)(n * dim), probs, HIP_R_16F, int(n), (long long)(s.query_rows * n),
+                    &zero, f16(s.attended) + first * width, HIP_R_16F, int(width), (long long)dim, int(heads), HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT));
+            }
         }
         vision_gemm(d, w.out, width, width, f16(s.attended), n, x, false, 1);
         vision_add_bias<<<op_blocks(n * width), 256, 0, d.stream>>>(x, static_cast<const float*>(w.out_bias), n, width);
