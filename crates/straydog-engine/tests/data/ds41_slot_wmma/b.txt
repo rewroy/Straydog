@@ -1,0 +1,62 @@
+g bias and gathers no Engram rows there.
+
+## 8. Qwen3.8-Flash-Next
+
+Qwen3.8-Flash-Next is served from eight pinned bundles: Unsloth's UD-IQ3_XXS, UD-IQ2_XS, UD-IQ1_M and
+UD-IQ1_S (Dynamic V3.1; three or four shards, the first holding the metadata alone, the last the engram table,
+which UD-IQ1_S, UD-IQ1_M and UD-IQ2_XS share), offered first, and ISTA-DASLab's GSQ-RCO IQ3_S, IQ3_XXS, IQ2_XS
+and Q2_0, two shards each. Unsloth's keep their attention in Q5_K/Q6_K and their shared experts and SSM output in
+Q8_0: about 1.2 GB more read each token than ISTA-DASLab's bundle of the same size, about 1.1 ms on two R9700s. They
+come with the tokenizer and template files of the official release, and optionally with its MTP drafter.
+An Unsloth bundle reads its engram (PLE) table from its own last shard (IQ4_NL) unless `--engram`
+(`STRAYDOG_ENGRAM`) names one of Unsloth's engram files (BF16, Q8_0, Q5_1: one tensor in a file of its
+own, pinned like the shards), in the bundle's directory or an `engram` directory beside it, read in the
+last shard's place (`bundle::table_in`); without its shard, the most exact file there. Q5_1 rows decode on the host like the others.
+`straydog fetch-mtp` builds the drafter from the official tensors, byte for byte the pinned file.
+Its experts are quantized to Q2_0, which changes only how many drafts are accepted.
+
+Its regression oracle is the pinned GPU generations (`straydog-engine/tests/model_gpu.rs`). For
+each placement it pins every request's greedy tokens, metrics, logits and final hidden state, bit
+for bit. A deliberate numerical change is checked against an F32-GEMM run, then pinned anew
+(`STRAYDOG_GOLDEN_UPDATE=1`).
+
+**Placement.**
+- **Two R9700s:** they hold the weights of every bundle with every layer in parts (below), with the
+  K/V in host memory at 262144 tokens.
+- **Smaller budgets:** host K/V and a smaller prefill batch come first, then partial residency.
+  What a budget must hold for it is the placement's own arithmetic (`model::partial_slot_bytes`):
+  the device's workspaces, the recurrent state, the prefill rows, the K/V stage and the pinned dense
+  weights, 4.1 GiB in all for IQ2_XS at 262144 tokens; `straydog setup` counts with the same
+  function, and what is over goes to the expert slots.
+- **Partial residency:** the CPU computes experts beyond VRAM from the host tier. Which
+  experts run where depends on timing, so decode is not bit-reproducible from run to run.
+  The PLE and output-head operands join the authenticated load before the expert pool is sized,
+  so those fixed dense weights are counted before the pool takes the remaining VRAM.
+  - On a CPU with AVX-512 and VBMI, or AVX2, the activations are rounded to 8-bit integers (gate and up: one scale a 256-value block;
+    down: one a 64-value block) and the products summed exactly in integers, then scaled in F32 a block (`gpu/cpu_int8.hpp`), as
+    the GPU's GEMVs already round theirs. IQ2_XXS's grid rows hold only 8, 25 and 43, so all 256 rows fit in eight registers as
+    2-bit codes and a block's rows are looked up there; Q2_0's codes come out of one GFNI affine transform where the CPU has it.
+    Where the CPU has VNNI (AVX512-VNNI with the AVX-512 kernels: Intel's 10th and 11th generation, Zen 4 and 5; AVX-VNNI with the
+    AVX2 kernels: Intel's 12th generation on, Zen 5), one vpdpwssd takes an IQ2 chunk's scaled pair sums and their add, and one
+    vpdpbusd a Q2_0 row's products, their sums and its bias: the same integers (a pair of products stays under 2^15). On the 7500F,
+    six threads, IQ2_XXS layers: cold 35.5-38.3 -> 33.7 us a route, hot 29.9 -> 27.3; one thread, the down 34.1 -> 27.5 us. Served at
+    5.5 GiB, one build with VNNI off and on, two pairs: the CPU's time a token 8.7 / 8.2 -> 8.2 / 7.8 ms, 49.5 / 50.3 -> 50.3 /
+    50.9 tok/s. The 7500F has no AVX-VNNI; the AVX2 kernels' integers with it were checked there with the same instructions' EVEX
+    forms (44 -> 42 us a route held to AVX2). A
+    row's accumulators stay in registers (an array of them went to memory, four 512-bit stores a block). Ryzen 5 7500F, Qwen3.8
+    UD-IQ1_S, a route with the experts cold, F32 -> Q8: on six threads 48.0 -> 35.2 us on its IQ2_XXS layers and 46.0 -> 36.9 us on
+    its IQ2_S layers; on one thread 226 -> 168 and 209 -> 165 us. Teacher-forced on six prompts, the KL against an F32 run is 0.0022 (two F32 runs differ by
+    0.0009). The AVX2 kernels (Intel's 12th to 14th generation, Zen 3) compute the same lanes in two 256-bit halves, so the same
+    bits. They read a block's grid rows, sign masks (a 64-bit mask a sign field, from a table) and scales straight from its bytes, with
+    no prepared block written and read back. On the 7500F held to AVX2 (`STRAYDOG_CPU_AVX512=0`), six threads, cold: 73.7 -> 47.4 us
+    (IQ2_XXS layers), 84.9 -> 59.0 us (IQ2_S), the down alone 18.7 -> 10.0 (one thread 93 -> 32); served at 5.5 GiB, 42.1 -> 48.4
+    tok/s. Formats
+    without integer kernels, and CPUs without AVX2, keep F32; `STRAYDOG_CPU_INT8=0` keeps it everywhere.
+  - A prompt batch streams each expert the slots do not hold over the bus, whatever its rows; the CPU computes a route at a time.
+    So the experts with the fewest rows go to the CPU (`prompt_cpu_share`, `gpu/resident_moe.hpp`): while the bus streams the rest,
+    the CPU computes their routes from the batch's rows (copied back as the experts go the other way), and their results reach their
+    routes' output rows after the GPU's GEMMs. It takes them while its time for their routes stays under a share of the GPU's for
+    what is left, each cost measured in the last batches; the share moves each batch toward the CPU finishing at nine tenths of
+    the GPU's time. On a layer whose banks are not page-locked the CPU's workers first gather each streamed expert into pinned
+    memory, and its own routes wait behind those gathers on the same workers: there an expert goes to the CPU only when its
+    routes cost less than its gather (measured). On th
