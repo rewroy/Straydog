@@ -88,7 +88,7 @@ fn run(model: &mut Model, tokens: &[u32], batch: Option<usize>, name: &str) -> O
             model.group.backends[0].test_prefill_capacity(batch as u64).unwrap();
             let mut logits = None;
             for (first, end) in chunks(tokens.len(), batch) {
-                logits = model.forward(&tokens[first..end], end == tokens.len()).unwrap();
+                logits = model.forward(&tokens[first..end], end == tokens.len()).unwrap().0;
             }
             model.group.end_long_prefill().unwrap();
             (logits.expect("reference head was not run"), batch)
