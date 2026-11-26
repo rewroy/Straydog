@@ -435,8 +435,9 @@ pub struct Verifier {
     /// The hash of each level-0 block, from the checked level 1 (empty when level 0 is one
     /// block, which the digest checks).
     level0: Vec<Hash>,
-    /// A checked, owned copy of every level-0 block, when the row-file budget holds it.
-    resident: Option<Box<[u8]>>,
+    /// A checked, owned copy of every level-0 block, when a budget holds it: kept once, at the start (the row files) or by a layer-order pass
+    /// that reads copies of the file ([`Verifier::keep_level0`]), and kept from then on.
+    resident: std::sync::OnceLock<Box<[u8]>>,
     /// Checked level-0 blocks, bounded, CLOCK-evicted.
     cache: Mutex<Level0>,
     pub tree_reads: AtomicU64,
@@ -494,7 +495,7 @@ impl Verifier {
         // (verifications on many threads read its blocks at once)
         let tree = crate::storage::concurrent(&tree).unwrap_or(tree);
         Ok(Verifier {
-            geometry, tree, digest: *digest, level0, resident: None,
+            geometry, tree, digest: *digest, level0, resident: std::sync::OnceLock::new(),
             cache: Mutex::new(Level0 { blocks: HashMap::new(), order: Vec::new(), hand: 0, capacity }),
             tree_reads: AtomicU64::new(0),
         })
@@ -509,11 +510,28 @@ impl Verifier {
     /// Called before readers share the verifier. The old bounded cache remains the fallback;
     /// no partially checked copy is published on a read, allocation or authentication failure.
     pub fn preload_level0(&mut self, budget: u64) -> Result<u64, String> {
-        let bytes = self.geometry.levels.first().copied().unwrap_or(0) * BLOCK as u64;
+        self.keep_level0(budget)
+    }
+
+    /// The bytes of the leaf level: what [`Verifier::keep_level0`] keeps.
+    pub fn level0_bytes(&self) -> u64 {
+        self.geometry.levels.first().copied().unwrap_or(0) * BLOCK as u64
+    }
+
+    /// Whether the leaf level is kept whole.
+    pub fn level0_kept(&self) -> bool {
+        self.resident.get().is_some()
+    }
+
+    /// [`Verifier::preload_level0`] while readers share the verifier: they check against the bounded cache until the copy is published, and
+    /// against it from then on (its bytes are those the cache would take from the tree). The leaf level's bytes, kept now or before, or 0
+    /// where `budget` does not hold them, nothing published on a failure.
+    pub fn keep_level0(&self, budget: u64) -> Result<u64, String> {
+        let bytes = self.level0_bytes();
         if bytes == 0 || bytes > budget {
             return Ok(0);
         }
-        if self.resident.is_some() {
+        if self.resident.get().is_some() {
             return Ok(bytes);
         }
         let Ok(length) = usize::try_from(bytes) else { return Ok(0) };
@@ -529,8 +547,9 @@ impl Verifier {
                 return Err(format!("tree block (0, {index}) does not verify"));
             }
         }
-        self.resident = Some(blocks.into_boxed_slice());
-        let cache = self.cache.get_mut().unwrap();
+        // (another thread may have kept it meanwhile: either copy holds the same checked bytes)
+        let _ = self.resident.set(blocks.into_boxed_slice());
+        let mut cache = self.cache.lock().unwrap();
         cache.blocks.clear();
         cache.blocks.shrink_to_fit();
         cache.order.clear();
@@ -573,7 +592,7 @@ impl Verifier {
                 }
                 continue;
             }
-            let (entries, entry) = match self.resident.as_deref() {
+            let (entries, entry) = match self.resident.get().map(|blocks| &blocks[..]) {
                 Some(entries) => (entries, (number * 32) as usize),
                 None => {
                     let tree_block = number / FAN;
@@ -632,6 +651,139 @@ impl Verifier {
         }
         cache.blocks.insert(tree_block, (block.clone(), true));
         Ok(block)
+    }
+}
+
+/// When a file last changed in any way, its bytes or what is said of it (its permissions, attributes, times), as no tool sets back: its change time
+/// (`ctime` on Unix, `FILE_BASIC_INFO.ChangeTime` on Windows). A copy that keeps a file's times still changes it; so does a grant.
+pub fn changed_at(file: &File) -> Option<std::time::SystemTime> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec().max(0) as u32))
+    }
+    #[cfg(windows)]
+    {
+        basic_info(file).and_then(|info| from_file_time(info.ChangeTime))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        file.metadata().ok()?.modified().ok()
+    }
+}
+
+#[cfg(windows)]
+fn basic_info(file: &File) -> Option<windows_sys::Win32::Storage::FileSystem::FILE_BASIC_INFO> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO};
+    let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the struct lives through the call, which is told its size; the handle is the file's own.
+    let done = unsafe { GetFileInformationByHandleEx(file.as_raw_handle() as _, FileBasicInfo, (&mut info as *mut FILE_BASIC_INFO).cast(), std::mem::size_of::<FILE_BASIC_INFO>() as u32) };
+    (done != 0).then_some(info)
+}
+
+/// A FILETIME (100 ns since 1601) as a time.
+#[cfg(windows)]
+fn from_file_time(ticks: i64) -> Option<std::time::SystemTime> {
+    const BEFORE_1970: i64 = 116_444_736_000_000_000;
+    let since = ticks.checked_sub(BEFORE_1970).filter(|since| *since >= 0)?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new((since / 10_000_000) as u64, ((since % 10_000_000) * 100) as u32))
+}
+
+/// A file as it is now, for its mark ([`stamp_path`]): its size, its write time, its change time ([`changed_at`]) and which file it is (Windows: the
+/// volume's serial number and the file's index; Unix: the device and the inode). The same mark is the same file, unchanged in any way.
+pub fn file_stamp(file: &File) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        Some(format!("{} {}.{} {}.{} {}:{}", metadata.len(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec(), metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let basic = basic_info(file)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as in `basic_info`.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return None;
+        }
+        let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Some(format!("{size} {} {} {:08x}:{index:016x}", basic.LastWriteTime, basic.ChangeTime, info.dwVolumeSerialNumber))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let metadata = file.metadata().ok()?;
+        Some(format!("{} {:?}", metadata.len(), metadata.modified().ok()))
+    }
+}
+
+/// Where a tree keeps the mark of its file as it was when it was last read through and checked against its pin: beside it. A start reads the file
+/// unhashed only where the file's mark now is that one ([`marked_as_checked`]).
+pub fn stamp_path(tree: &Path) -> std::path::PathBuf {
+    let mut name = tree.as_os_str().to_owned();
+    name.push(".stamp");
+    std::path::PathBuf::from(name)
+}
+
+/// Whether `file` is as it was when it was last read through and checked against its pin, by the mark kept beside `tree`. Not its times against the
+/// tree's: on Windows a write time is set back by any copy that keeps it, and a change time moves on with a grant of the file to the worker's
+/// profile, which came after its tree was built. Nothing that changes a file in any way (its bytes, its times, its permissions, which file it is)
+/// keeps its mark; a start that finds another reads it through and checks it, once, and its mark is then written again.
+pub fn marked_as_checked(file: &File, tree: &Path) -> bool {
+    matches_mark(file, std::fs::read_to_string(stamp_path(tree)).ok().as_deref())
+}
+
+/// Whether `file` is as `kept` (a mark kept beside its tree, [`keep_stamp`]) says it was when it was last read through and checked: false without one.
+pub fn matches_mark(file: &File, kept: Option<&str>) -> bool {
+    match (file_stamp(file), kept) {
+        (Some(now), Some(kept)) => kept.trim() == now,
+        _ => false,
+    }
+}
+
+/// The mark kept beside `tree`, if there is one.
+pub fn kept_stamp(tree: &Path) -> Option<String> {
+    std::fs::read_to_string(stamp_path(tree)).ok().map(|kept| kept.trim().to_string()).filter(|kept| !kept.is_empty())
+}
+
+/// `stamp` kept beside `tree`, whole or not at all.
+pub fn keep_stamp(tree: &Path, stamp: &str) -> std::io::Result<()> {
+    let path = stamp_path(tree);
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    std::fs::write(&partial, format!("{stamp}\n"))?;
+    std::fs::rename(&partial, &path)
+}
+
+/// No mark kept beside `tree`: its file is to be read through and checked at the next start.
+pub fn forget_stamp(tree: &Path) {
+    let _ = std::fs::remove_file(stamp_path(tree));
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::*;
+
+    /// Decides: a mark given to the worker matches the file it opens as the mark beside the tree does, and nothing else does.
+    #[test]
+    fn a_given_mark_matches_as_the_kept_one_does() {
+        let directory = std::env::temp_dir().join(format!("straydog-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (path, tree) = (directory.join("shard.gguf"), directory.join("shard.gguf.tree"));
+        std::fs::write(&path, b"weights").unwrap();
+        let file = File::open(&path).unwrap();
+        assert!(kept_stamp(&tree).is_none());
+        assert!(!marked_as_checked(&file, &tree) && !matches_mark(&file, None));
+        keep_stamp(&tree, &file_stamp(&file).unwrap()).unwrap();
+        let kept = kept_stamp(&tree).unwrap();
+        assert!(marked_as_checked(&file, &tree) && matches_mark(&file, Some(&kept)) && matches_mark(&file, Some(&format!("{kept}\n"))));
+        assert!(!matches_mark(&file, Some("7 0.0 0.0 0:0")) && !matches_mark(&file, Some("")));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }
 
@@ -835,6 +987,35 @@ mod resident_tests {
         assert_eq!(resident.tree_reads.load(Ordering::Relaxed), reads);
     }
 
+    /// A verifier readers share keeps its leaf level while they check (a layer-order pass's copies): before, during and after, every check of
+    /// the file's bytes passes and a changed byte fails; once kept, no check takes a tree block from the tree's file, and keeping it again
+    /// reads nothing more.
+    #[test]
+    fn a_shared_verifier_keeps_its_leaf_level_while_readers_check() {
+        let fixture = Fixture::new("shared", (3 * FAN as usize + 5) * BLOCK + 11);
+        let shared = std::sync::Arc::new(fixture.verifier());
+        let required = shared.level0_bytes();
+        assert!(!shared.level0_kept());
+        assert_eq!(shared.keep_level0(required - 1).unwrap(), 0);
+        assert!(!shared.level0_kept());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let shared = shared.clone();
+                let data = &fixture.data;
+                scope.spawn(move || for _ in 0..8 { shared.verify(0, data).unwrap(); });
+            }
+            assert_eq!(shared.keep_level0(required).unwrap(), required);
+        });
+        assert!(shared.level0_kept());
+        let reads = shared.tree_reads.load(Ordering::Relaxed);
+        shared.verify(0, &fixture.data).unwrap();
+        let mut changed = fixture.data.clone();
+        changed[2 * FAN as usize * BLOCK + 3] ^= 1;
+        assert!(shared.verify(0, &changed).is_err());
+        assert_eq!(shared.keep_level0(required).unwrap(), required);
+        assert_eq!(shared.tree_reads.load(Ordering::Relaxed), reads);
+    }
+
     #[test]
     fn a_bad_late_leaf_never_publishes_a_partly_checked_copy() {
         let fixture = Fixture::new("late-leaf", (2 * FAN as usize + 1) * BLOCK);
@@ -846,7 +1027,7 @@ mod resident_tests {
         byte[0] ^= 1;
         write_at(&tree, &byte, bad).unwrap();
         assert!(verifier.preload_level0(u64::MAX).unwrap_err().contains("(0, 2)"));
-        assert!(verifier.resident.is_none());
+        assert!(!verifier.level0_kept());
         verifier.verify(0, &fixture.data[..BLOCK]).unwrap();
         let at = 2 * FAN as usize * BLOCK;
         assert!(verifier.verify(at as u64, &fixture.data[at..at + BLOCK]).is_err());

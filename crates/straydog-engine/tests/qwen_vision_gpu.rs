@@ -2,7 +2,8 @@
 //! decode rows read, against each other and against the text path.
 //!
 //! cargo test -p straydog-engine --features hip --test qwen_vision_gpu -- --test-threads=1, with STRAYDOG_MODEL (a bundle
-//! directory), STRAYDOG_QUANT (its quantization) and optionally STRAYDOG_VRAM_GIB; under the GPU lock.
+//! directory), STRAYDOG_QUANT (its quantization) and optionally STRAYDOG_VRAM_GIB; under the GPU lock. STRAYDOG_PROMPT_CPU=0 also
+//! checks the table's row to the bit.
 #![cfg(any(feature = "hip", feature = "cuda"))]
 
 mod common;
@@ -59,7 +60,11 @@ fn rope_positions_agree_on_every_path() {
     model.set_images(vec![ImageSpan { start: 0, grid: (0, 0), rows: Arc::new(Vec::new()) }]);
     let (table, table_logits) = reply(&mut model, &prompt, 4);
     assert_eq!(table, plain);
-    assert_eq!(table_logits[0], plain_logits[0], "the prompt's last row through the table");
+    // (to the bit only with the CPU's share of a prompt batch fixed: partly resident, it is learned from the passes' times, and two
+    // replies differ in the last bits with or without the table)
+    if std::env::var("STRAYDOG_PROMPT_CPU").is_ok_and(|value| value == "0") {
+        assert_eq!(table_logits[0], plain_logits[0], "the prompt's last row through the table");
+    }
     model.set_images(Vec::new());
 
     // A sequence with an image: the reply's decode rows (the delta) are what the same tokens in a batch (the table) are.
@@ -73,7 +78,9 @@ fn rope_positions_agree_on_every_path() {
     prompt.extend((0..64u32).map(|offset| IMAGE_TOKEN | (12345 + offset)));
     prompt.push(VISION_END);
     prompt.extend(tokenizer.encode("\nWrite a long poem about the sea, in plain words.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n").unwrap());
-    // What a batch's logits and a decode's differ by anyway, on the same text with no image: on HIP (FP16 batches, INT8 decode) 0.35-0.71.
+    // What a batch's logits and a decode's differ by anyway, on the same text with no image: on HIP (FP16 batches, INT8 decode) 0.32
+    // (00c53480) to 0.71. Printed beside the image's: its rows (out of the model's range, as these are) differ by more, 1.19 and 1.26
+    // after the first token on v0.1.16 and 00c53480 alike, so it bounds nothing.
     model.set_images(Vec::new());
     let plain_prompt: Vec<u32> = prompt.iter().map(|token| if *token >= IMAGE_TOKEN { 2000 } else { *token }).collect();
     let (plain_tokens, plain_logits) = reply(&mut model, &plain_prompt, 12);
@@ -82,22 +89,27 @@ fn rope_positions_agree_on_every_path() {
         let longer: Vec<u32> = plain_prompt.iter().chain(&plain_tokens[..kept]).copied().collect();
         floor = floor.max(close(&reply(&mut model, &longer, 1).1[0], &plain_logits[kept]));
     }
+    // What the image's positions do: the same text past it read without their delta. A decode that took the wrong positions would be
+    // about that far from the batch, so the batch and the decode must be much closer than that.
     let span = ImageSpan { start, grid, rows: Arc::new(rows) };
     model.set_images(vec![span.clone()]);
     let (tokens, logits) = reply(&mut model, &prompt, 12);
     assert_eq!(tokens.len(), 12);
-    for kept in [1, 4, 7, 11] {
-        let longer: Vec<u32> = prompt.iter().chain(&tokens[..kept]).copied().collect();
-        let (next, next_logits) = reply(&mut model, &longer, 1);
-        println!("after {kept} tokens: the batch's logits apart from the decode's by {}", close(&next_logits[0], &logits[kept]));
-        assert_eq!(next[0], tokens[kept], "after {kept} tokens read in a batch");
-        assert!(close(&next_logits[0], &logits[kept]) < 3.0 * floor, "after {kept}: logits apart by {} (plain text by {floor})", close(&next_logits[0], &logits[kept]));
-    }
-    // And the same text past the image is not what it is without its positions' delta: the rope position does something here.
     let without_delta: Vec<f32> = {
         let text_only: Vec<u32> = prompt.iter().map(|token| if *token >= IMAGE_TOKEN { 2000 } else { *token }).collect();
         model.set_images(Vec::new());
         reply(&mut model, &text_only, 1).1.remove(0)
     };
-    assert!(close(&without_delta, &logits[0]) > 0.0);
+    let positions_do = close(&without_delta, &logits[0]);
+    println!("plain text's batch and decode apart by {floor}; the image's positions move the logits by {positions_do}");
+    assert!(positions_do > 0.0);
+    model.set_images(vec![span.clone()]);
+    for kept in [1, 4, 7, 11] {
+        let longer: Vec<u32> = prompt.iter().chain(&tokens[..kept]).copied().collect();
+        let (next, next_logits) = reply(&mut model, &longer, 1);
+        let apart = close(&next_logits[0], &logits[kept]);
+        println!("after {kept} tokens: the batch's logits apart from the decode's by {apart}");
+        assert_eq!(next[0], tokens[kept], "after {kept} tokens read in a batch");
+        assert!(apart < 0.5 * positions_do, "after {kept}: logits apart by {apart}, the positions' own effect {positions_do}");
+    }
 }

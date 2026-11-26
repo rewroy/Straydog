@@ -704,12 +704,17 @@ the request that goes on from it.
   events `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN`, which tokio holds off the process's end
   for), or a line `stop` on standard input with `--stop-on-stdin`. A program that starts the server
   with no console has nothing else to send: that pipe is held by the program alone, which is why it
-  needs no address, no key and no console. Nothing is written per request. A state shorter than the
-  file an earlier run kept, when no request of this run went on from that file, leaves the file as it
-  is: a health check after a start, or an app's warm-up of its system prompt, is not the conversation
-  the person comes back to. DeepSeek-V4.1 keeps no conversation under 1024 tokens either, as Qwen3.8.
-- **The file.** `<data dir>/conversation/<bundle>.sdconv`, one a bundle, replaced whole (a `.part`
-  file, synced, then renamed over the old one). As the system block's (6.4) with two sealed parts:
+  needs no address, no key and no console. Nothing is written per request. DeepSeek-V4.1 keeps no
+  conversation under 1024 tokens, as Qwen3.8.
+- **Which file** (`conversation::slot_for`). A bundle keeps up to four conversations. A stop writes the
+  one it held into the file of the kept conversation it went on from (the longest), else an empty
+  one, else the one written or taken longest ago; and writes nothing when all of it is the start of a
+  kept one (a health check after a start, an app's warm-up of its system prompt). One file did not
+  do: an app's tests on the same server are often the last thing before a stop, and on 11-24 a
+  107,795-token test conversation kept in the single file stood in for every later one, a person's
+  64K conversation among them (a shorter state did not replace a file no request had taken).
+- **The file.** `<data dir>/conversation/<bundle>.sdconv`, and `<bundle>.<slot>.sdconv` for the
+  slots after the first, each replaced whole (a `.part` file, synced, then renamed over the old one). As the system block's (6.4) with two sealed parts:
 
   ```
   0    8   STRAYCNV         56   8   the state's bytes, S
@@ -1687,14 +1692,15 @@ layer (§6.2).
   64.5 to 67.3 tok/s; a 1-row pass 16.8 to 16.2 ms at 20K, a 4-row one 27.2 to 26.5 ms), greedy
   tokens part from the F32 run about as early as before, and 0.6 GB of VRAM comes free.
   `STRAYDOG_HC_Q8=0` keeps them BF16.
-- **The decode head in one wait (CUDA).** A plain decode step's head was the HyperConnection mix (a launch, a wait and the mixed row
+- **The decode head in one wait.** A plain decode step's head was the HyperConnection mix (a launch, a wait and the mixed row
   copied to the host), then the projection (the row copied back, a launch, a wait, and 248320 logits into a vector the host zeroed,
   scanned for non-finite values and copied again): 1.11 ms a token on an RTX 5070 Ti, of which the Q6_K head's GEMV is 0.63 (521 MB
   at 829 GB/s, as fast as a plain streaming kernel reads the same bytes: the kernel was never what held it). `sd_decode_head`
   launches the mix, the projection and a non-finite check of the logits one after the other and waits once: 0.89 ms, the logits the
   two calls' bits (`decode_head_gpu`). The rest is the launches' and the two copies' latency under WDDM, about 150 us, and the copy of
-  the logits out of the staging memory into the vector, 50 us; the vector is the step before's, given back by the draw. HIP keeps
-  the two calls. `examples/head_bench.rs` times the GEMV alone.
+  the logits out of the staging memory into the vector, 50 us; the vector is the step before's, given back by the draw. On an R9700
+  (UD-IQ1_S at --vram 5.5, served, two runs each) the step's head went from 1.2-1.3 to 1.0 ms a token and decode from 46.5 to 47.3
+  tokens/s (chat) and 51.0 to 51.5 (code). `examples/head_bench.rs` times the GEMV alone.
 - **Prefill batch.** On two R9700s the resident Qwen3.8 reads a prompt in batches of 4096, from 48 GiB of
   budgets in all (`resident_batch`). On 2026-10-29 4096 rows took the first token of a 20K and a 60K prompt
   7-12% longer than 2048 (5.7 to 6.5 s, 15.8 to 17.2 s), and the derived batch was 2048 until
@@ -1708,7 +1714,7 @@ layer (§6.2).
   takes `DERIVED_BATCH` (0) as the batch to derive and narrow, any other as asked, which is tried at
   its rows with the K/V in VRAM, then in host memory at the rows halved to 1024 (as before 4096 was the
   default; the `one-gpu-partial` golden's 4096 on a 24 GiB card stays 4096).
-- **A long read's wider batches.** A read of `WIDE_READ_TOKENS` (16384) new tokens or more is read in batches of up to
+- **A long read's wider batches.** A read of `WIDE_READ_TOKENS` (8192; `STRAYDOG_PREFILL_WIDE_FROM`) new tokens or more is read in batches of up to
   `Model::wide_batch_size` rows when the batch was derived, the layers are in parts (§8 above) and the VRAM left holds the
   workspaces of more (`wide_placement`; the ready line says the rows, or what they lack, and the request line the batches it
   ran in; `STRAYDOG_PREFILL_WIDE=off` or N rows). What a batch pays once, whatever its rows, is the FP16 expansion of every
@@ -1721,7 +1727,12 @@ layer (§6.2).
   of the layer once, so a width between two chunks gains nothing and costs the experts' second read over fewer rows: two
   R9700s, `--vram 30`, a fresh 242K read, 50.0 s at 4096 rows, 50.97 s at 5120 (2 x 2560), 50.05 s at 6144 (2 x 3072),
   49.1 s at 8192 (2 x 4096; 48.9 after a pause, three reads in a row 50.5, 49.12, 49.13), 95K 18.4 and 18.1 s (4096, 8192),
-  32K 6.0 s at 8192 once its staging is pinned. Widths are therefore the multiples of 4096: 12288 and 8192.
+  32K 6.0 s at 8192 once its staging is pinned. Widths are therefore the multiples of 4096, and the width is 8192, not 12288: a
+  batch's halves of 4096 rows let each device send its rows beside its own work (a DeltaNet layer's projections of its rows, the
+  MoE's chunks of its rows: `qwen_gather_fork`), halves of 6144 let neither, and every exchange kernel of a 12288-row read sat on
+  the stream alone (a 32K trace: ~1.0 s a device of 6.65). UD-IQ1_M, the prefill example, two runs each, 12288 against 8192 rows:
+  240K 38.94/39.41 against 38.40/38.43 s, 120K 18.83/19.02 against 18.48/18.50, 60K 9.41/9.52 against 9.21/9.23, 20K 4.35/4.34
+  against 4.28/4.31; chunks of 3072 laid on a 12288 batch's halves gave the fork but no gain (39.29/39.38 s).
   What a row of a batch cost in VRAM on each device was 350908 bytes: the experts' workspace 197208 (49302 floats), the decoder's
   61456, the MTP rows 40960 and embeddings 10240, the sums' inbox 20480 (two slots of a row's 2560 floats) and the peer link's
   20564 (inputs, partials and routes), 1.34 GiB at 4096 rows and 2.68 at 8192. Beside the weights, with the drafter and K/V in
@@ -1955,6 +1966,11 @@ with a model of its own reads no file it was not given.
   Answers carry `reasoning_content` deltas, structured `tool_calls`, and `usage` with
   `prompt_tokens_details.cached_tokens`, plus the engine's `timings`. Sampling controls the
   engine does not implement are accepted only at their neutral value; anything else is a 400.
+- **Stream comments and cut replies.** A stream also sends SSE comments, which clients skip: `: prefill done/total` at
+  most once a second while the prompt is read, and `: writing` after 5 s with nothing to send while a tool call is held
+  until it is whole (for a client that does not take its pieces). A proxy that closes an idle connection keeps the answer.
+  A reply cut inside a tool call (max_tokens, a stop string) neither runs the call nor sends its markup as text; the
+  answer is the text before it, and `finish_reason` says why it ended.
 - **Turns.** A request that ends with a tool message continues the assistant's reply; one that
   ends with a user message starts a new one. That is all the cache needs from a client.
 - **Errors** are OpenAI-style objects. Before a stream's first byte, the status says it (400,

@@ -5,12 +5,17 @@
 //! stop the app asked for, Ctrl+C, Windows ending the session), for the state of the conversation the worker held last: the sequence at the place its
 //! last reply began, with the recurrent state, K/V and indexer's blocks of its positions ([`straydog_engine::model::Model::export_conversation`]).
 //! The server seals it for the user ([`crate::conversation_store`], AES-256-GCM under a key DPAPI or the kernel's keyring keeps) in
-//! `<data dir>/conversation`, one file for a bundle, written
-//! whole at the stop and at no other time: the drive sees one write a stop, and nothing is written while requests run.
+//! `<data dir>/conversation`, up to [`KEPT_SLOTS`] files for a bundle (the conversations of the last stops), each written whole at a stop and at
+//! no other time: the drive sees one write a stop, and nothing is written while requests run.
 //!
-//! At the next start the file is opened lazily. The server reads its tokens, a part of their own, and tells the worker; the state stays on the drive.
-//! The first request whose prompt begins with those tokens asks for the state (the worker's `conversation_wanted` event), the server reads and opens it
-//! and sends it, and the worker continues the request from it. A request that does not begin with them leaves the file as it is, for a later one.
+//! Which file a stop writes ([`slot_for`]): the one whose conversation the worker's went on from, else an empty one, else the one used longest
+//! ago; none when the worker's conversation is all in a kept one already (a health check's, or an app's warm-up of its system prompt, after a start).
+//! One file would not do: an app's tests on the same server were the last thing before a stop, and the conversation the person was in was lost
+//! with them (a 108K-token test conversation kept on 11-24 stood in for every later one, the person's 64K among them).
+//!
+//! At the next start the files are opened lazily. The server reads their tokens, a part of their own, and tells the worker; the states stay on the
+//! drive. The first request whose prompt begins with one's tokens asks for its state (the worker's `conversation_wanted` event, with the slot), the
+//! server reads and opens it and sends it, and the worker continues the request from it. A request that begins with none leaves them as they are.
 //!
 //! Which file a start takes is decided by a key made as the system block's is, but without the engine's version and build
 //! ([`crate::prefix::lasting_description`]): the bundle and everything the worker's placement decided that changes the state's layout or its
@@ -37,7 +42,42 @@ pub struct Keeper {
 #[cfg(any(windows, target_os = "linux"))]
 struct On {
     settings: Settings,
-    store: crate::conversation_store::Store,
+    /// The files of the slots, the first one the name a single kept conversation had.
+    stores: Vec<crate::conversation_store::Store>,
+}
+
+/// The most conversations a bundle keeps: the person's, past the tests an app may run on the same server after it (some 1.3 GB at 100K tokens each
+/// on DeepSeek-V4.1).
+pub const KEPT_SLOTS: usize = 4;
+
+/// A conversation an earlier run kept: its slot, its tokens, and when it was last written or taken.
+#[derive(Clone, Debug)]
+pub struct Kept {
+    pub slot: usize,
+    pub tokens: Vec<u32>,
+    pub at: std::time::SystemTime,
+}
+
+/// The slot a stop writes the worker's conversation (`held`, its tokens) into, of `slots`: the kept one it went on from (the longest), an empty
+/// one, else the one written or taken longest ago. None when it adds nothing: all of it is the start of a kept one, as a health check's or an app's
+/// warm-up of its system prompt is.
+pub fn slot_for(held: &[u32], kept: &[Kept], slots: usize) -> Option<usize> {
+    if held.is_empty() || kept.iter().any(|one| one.tokens.starts_with(held)) {
+        return None;
+    }
+    if let Some(one) = kept.iter().filter(|one| held.starts_with(&one.tokens)).max_by_key(|one| one.tokens.len()) {
+        return Some(one.slot);
+    }
+    if let Some(free) = (0..slots).find(|slot| kept.iter().all(|one| one.slot != *slot)) {
+        return Some(free);
+    }
+    kept.iter().min_by_key(|one| one.at).map(|one| one.slot)
+}
+
+/// The tokens a state the engine exported is held at.
+pub fn state_tokens(state: &[u8]) -> Result<Vec<u32>, String> {
+    let parsed = straydog_engine::prefix::parse(state)?;
+    Ok(straydog_engine::prefix::tokens_of(parsed.payload, parsed.tokens))
 }
 
 /// What the state saved at a stop took, for the line in the log.
@@ -62,9 +102,12 @@ impl Keeper {
     #[cfg(any(windows, target_os = "linux"))]
     pub fn new(settings: &Settings) -> Keeper {
         let label = format!("{}-{}-{}", settings.bundle.model, settings.bundle.provider, settings.bundle.quant);
-        let store = crate::conversation_store::Store::new(&settings.data_dir.join("conversation"), &label);
-        if store.begin(settings.keep_conversation) {
-            tracing::info!("Straydog conversation: the option is off, deleted {}", store.path().display());
+        let directory = settings.data_dir.join("conversation");
+        let stores: Vec<_> = (0..KEPT_SLOTS).map(|slot| crate::conversation_store::Store::slot(&directory, &label, slot)).collect();
+        for store in &stores {
+            if store.begin(settings.keep_conversation) {
+                tracing::info!("Straydog conversation: the option is off, deleted {}", store.path().display());
+            }
         }
         if !settings.keep_conversation {
             return Keeper { on: None };
@@ -72,7 +115,7 @@ impl Keeper {
         // (where the runtime directory and the home are not the server's to write, as under a service, the keyring's lock goes beside the file)
         #[cfg(target_os = "linux")]
         crate::prefix_store::keyring_lock_beside(&settings.data_dir.join("conversation"));
-        Keeper { on: Some(Arc::new(On { settings: settings.clone(), store })) }
+        Keeper { on: Some(Arc::new(On { settings: settings.clone(), stores })) }
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -95,20 +138,26 @@ impl Keeper {
         }
     }
 
-    /// Open the file an earlier run kept as far as a start needs, on a thread of its own: its tokens. A file that does not open, for whatever is wrong
-    /// with it, is deleted with one line in the log, and the start goes on as without it.
-    pub fn restore(&self, ready: &Value) -> Option<tokio::task::JoinHandle<Option<Vec<u32>>>> {
+    /// Open the files earlier runs kept as far as a start needs, on a thread of its own: their tokens. A file that does not open, for whatever is
+    /// wrong with it, is deleted with one line in the log, and the start goes on as without it.
+    pub fn restore(&self, ready: &Value) -> Option<tokio::task::JoinHandle<Vec<Kept>>> {
         #[cfg(any(windows, target_os = "linux"))]
         {
             let (on, ready) = (self.on.clone()?, ready.clone());
             Some(tokio::task::spawn_blocking(move || {
-                let (key, layout) = on.key(&ready)?;
-                let started = std::time::Instant::now();
-                let tokens = on.store.tokens_or_delete(crate::prefix_store::user_wrap(), &key, layout)?;
-                let bytes = std::fs::metadata(on.store.path()).map_or(0, |meta| meta.len());
-                tracing::info!("Straydog conversation: {} tokens kept by the last run ({} MB on the drive, opened in {:.2} s); the first request that begins with them goes on from there",
-                               tokens.len(), bytes >> 20, started.elapsed().as_secs_f64());
-                Some(tokens)
+                let Some((key, layout)) = on.key(&ready) else { return Vec::new() };
+                let mut kept = Vec::new();
+                for (slot, store) in on.stores.iter().enumerate() {
+                    let started = std::time::Instant::now();
+                    let Some(tokens) = store.tokens_or_delete(crate::prefix_store::user_wrap(), &key, layout) else { continue };
+                    let meta = std::fs::metadata(store.path()).ok();
+                    let bytes = meta.as_ref().map_or(0, |meta| meta.len());
+                    let at = meta.and_then(|meta| meta.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
+                    tracing::info!("Straydog conversation: {} tokens kept by an earlier run ({} MB on the drive, slot {slot}, opened in {:.2} s); the first request that begins with them goes on from there",
+                                   tokens.len(), bytes >> 20, started.elapsed().as_secs_f64());
+                    kept.push(Kept { slot, tokens, at });
+                }
+                kept
             }))
         }
         #[cfg(not(any(windows, target_os = "linux")))]
@@ -118,20 +167,21 @@ impl Keeper {
         }
     }
 
-    /// The kept state, read and opened (blocking): for the request that begins with the kept tokens. A file that no longer opens is deleted, as at the
-    /// start. The seconds it took.
-    pub fn state(&self, ready: &Value) -> Result<(Vec<u8>, f64), String> {
+    /// The state kept in `slot`, read and opened (blocking): for the request that begins with its tokens. A file that no longer opens is deleted, as
+    /// at the start. The seconds it took.
+    pub fn state(&self, ready: &Value, slot: usize) -> Result<(Vec<u8>, f64), String> {
         #[cfg(any(windows, target_os = "linux"))]
         {
             let on = self.on.as_ref().ok_or("the option is off")?;
+            let store = on.stores.get(slot).ok_or("no such slot")?;
             let (key, layout) = on.key(ready).ok_or("this engine keeps no conversation")?;
             let started = std::time::Instant::now();
-            let state = on.store.state_or_delete(crate::prefix_store::user_wrap(), &key, layout)?;
+            let state = store.state_or_delete(crate::prefix_store::user_wrap(), &key, layout)?;
             Ok((state, started.elapsed().as_secs_f64()))
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
-            let _ = ready;
+            let _ = (ready, slot);
             Err("the option keeps nothing here".into())
         }
     }
@@ -142,7 +192,7 @@ impl Keeper {
         #[cfg(any(windows, target_os = "linux"))]
         {
             let Some(on) = self.on.as_ref() else { return 0 };
-            let drive = free_on_drive(on.store.path());
+            let drive = free_on_drive(on.stores[0].path());
             let memory = memory_left().map_or(u64::MAX, |left| left.saturating_sub(MEMORY_MARGIN));
             // (a file that is there is replaced when the new one is whole: both are on the drive for a moment)
             drive.saturating_sub(DRIVE_MARGIN).min(memory).min(crate::frames::BODY_LIMIT)
@@ -153,23 +203,21 @@ impl Keeper {
         }
     }
 
-    /// Seal `state` (the engine's, which holds its own tokens) and write the file over the one an earlier run kept (blocking); what it took.
-    pub fn save(&self, ready: &Value, state: Vec<u8>) -> Result<Saved, String> {
+    /// Seal `state` (the engine's, which holds its own tokens) and write the file of `slot` over what it held (blocking); what it took.
+    pub fn save(&self, ready: &Value, slot: usize, state: Vec<u8>) -> Result<Saved, String> {
         #[cfg(any(windows, target_os = "linux"))]
         {
             let on = self.on.as_ref().ok_or("the option is off")?;
+            let store = on.stores.get(slot).ok_or("no such slot")?;
             let (key, layout) = on.key(ready).ok_or("this engine keeps no conversation")?;
-            let tokens = {
-                let parsed = straydog_engine::prefix::parse(&state)?;
-                straydog_engine::prefix::tokens_of(parsed.payload, parsed.tokens)
-            };
+            let tokens = state_tokens(&state)?;
             let count = tokens.len();
-            let (_, bytes) = on.store.save(crate::prefix_store::user_wrap(), layout, &key, &tokens, state)?;
+            let (_, bytes) = store.save(crate::prefix_store::user_wrap(), layout, &key, &tokens, state)?;
             Ok(Saved { tokens: count, bytes })
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
-            let _ = (ready, state);
+            let _ = (ready, slot, state);
             Err("the option keeps nothing here".into())
         }
     }
@@ -218,6 +266,33 @@ pub fn saved_line(saved: &Saved, seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kept(slot: usize, tokens: &[u32], at_seconds: u64) -> Kept {
+        Kept { slot, tokens: tokens.to_vec(), at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(at_seconds) }
+    }
+
+    /// Decides: a stop writes the conversation it held into the slot it went on from, an empty slot, or the one used longest ago, and writes nothing
+    /// when all of it is in a kept one; so tests that run after the person's conversation take the other slots and leave it kept.
+    #[test]
+    fn a_stop_keeps_the_persons_conversation_past_later_ones() {
+        let (system, person, test) = ([1, 2, 3], [1, 2, 3, 10, 11, 12, 13], [1, 2, 3, 20, 21]);
+        assert_eq!(slot_for(&person, &[], 4), Some(0), "nothing kept: the first slot");
+        assert_eq!(slot_for(&system, &[kept(0, &person, 10)], 4), None, "a warm-up of the system prompt adds nothing");
+        assert_eq!(slot_for(&person[..5], &[kept(0, &person, 10)], 4), None, "nor a conversation that is the start of a kept one");
+        assert_eq!(slot_for(&[1, 2, 3, 10, 11, 12, 13, 14], &[kept(2, &test, 30), kept(0, &person, 10)], 4), Some(0), "it went on from the person's");
+        assert_eq!(slot_for(&test, &[kept(0, &person, 10)], 4), Some(1), "a test after it takes an empty slot");
+        let full = [kept(0, &person, 40), kept(1, &[1, 2, 3, 30], 10), kept(2, &[1, 2, 3, 31], 20), kept(3, &[1, 2, 3, 32], 30)];
+        assert_eq!(slot_for(&test, &full, 4), Some(1), "all slots taken: the one used longest ago");
+        assert_eq!(slot_for(&[], &full, 4), None);
+        // (tonight's order, 11-24/25: a test of 108K kept, the person's 64K, then the team's tests at three stops)
+        let mut slots: Vec<Kept> = vec![kept(0, &[1, 2, 3, 99], 0)];
+        for (at, held) in [(1, &person[..]), (2, &test[..]), (3, &[1, 2, 3, 40][..]), (4, &[1, 2, 3, 41][..])] {
+            let slot = slot_for(held, &slots, 4).unwrap();
+            slots.retain(|one| one.slot != slot);
+            slots.push(kept(slot, held, at));
+        }
+        assert!(slots.iter().any(|one| one.tokens == person), "the person's conversation is kept: {slots:?}");
+    }
 
     /// The line the log carries once a conversation is kept says what and how big and how long.
     #[test]

@@ -34,6 +34,14 @@ pub type Model = Session<Engines>;
 /// conversation switched away from comes back from there), one where the last long system prompt
 /// ended (a new conversation with it starts from there).
 pub const CHECKPOINTS: usize = 4;
+
+/// The checkpoints a server keeps ([`CHECKPOINTS`]), or `STRAYDOG_CHECKPOINTS` (2 to 32) for a measurement: a client that runs helpers side
+/// by side (three or more conversations of 50K-130K tokens at once) pushed the others' checkpoints out at four and 2 GiB, and each came
+/// back to the root and read its conversation again (11-26: 44 requests read 1,690,269 new tokens).
+pub fn checkpoint_slots() -> usize {
+    std::env::var("STRAYDOG_CHECKPOINTS").ok().and_then(|value| value.trim().parse::<usize>().ok()).filter(|slots| (2..=32).contains(slots))
+        .unwrap_or(CHECKPOINTS)
+}
 /// Host memory the checkpoints take at most, together and at any moment, up to a context of 262144
 /// tokens (a 20K-token conversation's ~140 MB): the oldest give theirs up before a new one is taken,
 /// and one alone over it is not taken. Enough for one at the full 262144-token context (~0.85 GB: the
@@ -50,7 +58,9 @@ pub const CHECKPOINT_BYTES: u64 = 2 << 30;
 /// checkpoint. At 262144 tokens and below this is [`CHECKPOINT_BYTES`]. The expert host tier gives up
 /// what this takes.
 pub fn checkpoint_budget(hp: &Hparams, context: usize) -> u64 {
-    CHECKPOINT_BYTES.max(2 * full_snapshot_bytes(hp, context))
+    // (STRAYDOG_CHECKPOINT_GIB: a larger budget for a measurement, taken from the expert host tier as the default is)
+    let asked = std::env::var("STRAYDOG_CHECKPOINT_GIB").ok().and_then(|value| value.trim().parse::<u64>().ok()).filter(|gib| (1..=64).contains(gib));
+    asked.map_or(CHECKPOINT_BYTES, |gib| gib << 30).max(2 * full_snapshot_bytes(hp, context))
 }
 
 /// VRAM left free on each card, as the runtime reports it, when the spare is lent to the expert
@@ -69,7 +79,7 @@ const ROOM_STEP: usize = 4;
 const CHECKPOINT_STEP: usize = 8 << 20;
 /// The machine's available memory below which the expert stores give host tier arenas back between requests, and the margin above it
 /// they give back to ([`Engines::tend_memory`]): the tier is sized from the whole memory (served::HOST_SHARE), and what the other
-/// programs then take beyond the rest is the page cache's, then the swap's (Homelab, 2026-11-23: 143 MB available, the box's own pages
+/// programs then take beyond the rest is the page cache's, then the swap's (a served machine, 2026-11-23: 143 MB available, the box's own pages
 /// read again and again, and a request's first token 393-469 s away).
 const HOST_FLOOR: u64 = 3 << 30;
 const HOST_MARGIN: u64 = 4 << 30;
@@ -417,12 +427,12 @@ impl served::Engines for Engines {
     }
 
     fn checkpoints(&self) -> usize {
-        CHECKPOINTS
+        self.saved.len()
     }
 
     /// A snapshot of every engine's state into host memory, or every engine's back from it.
     fn checkpoint(&mut self, slot: usize, save: bool) -> Result<(), String> {
-        if slot >= CHECKPOINTS {
+        if slot >= self.saved.len() {
             return Err("no such Straydog checkpoint".into());
         }
         if !save {
@@ -552,7 +562,7 @@ impl served::Engines for Engines {
     /// Another start's [`export_checkpoint`](Self::export_checkpoint) into checkpoint `slot`: each engine's snapshot checked against it
     /// (Engine::check_snapshot), the budget making room as a save does. Without its drafter's rings: drafting starts cold.
     fn import_checkpoint(&mut self, slot: usize, bytes: &[u8], tokens: &[u32]) -> Result<usize, String> {
-        if slot >= CHECKPOINTS {
+        if slot >= self.saved.len() {
             return Err("no such Straydog checkpoint".into());
         }
         let cut = || "a kept conversation cut short".to_string();
@@ -683,7 +693,7 @@ impl Engines {
     /// whether none is left. One whose copy fails is given up (the error returned).
     fn finish_checkpoints(&mut self, most: usize) -> Result<bool, String> {
         let mut left = most;
-        for slot in 0..CHECKPOINTS {
+        for slot in 0..self.saved.len() {
             let Some(snapshots) = self.saved[slot].as_mut() else { continue };
             let copied = self.engines.iter_mut().zip(snapshots.iter_mut())
                 .try_fold(0, |copied, (engine, snapshot)| Ok::<_, String>(copied + engine.finish_snapshot(snapshot, left - copied)?));
@@ -706,7 +716,7 @@ impl Engines {
     /// reaching that far writes over ([`Engine::finish_snapshot_below`]), as after a reset. One whose
     /// copy fails is given up.
     fn finish_checkpoints_below(&mut self, tokens: usize) -> Result<(), String> {
-        for slot in 0..CHECKPOINTS {
+        for slot in 0..self.saved.len() {
             let Some(snapshots) = self.saved[slot].as_mut() else { continue };
             if !snapshots.iter().any(Snapshot::pending) {
                 continue;
@@ -736,7 +746,7 @@ impl Engines {
     /// [`Engines::finish_checkpoints`] of the checkpoints taken above `position` alone: those a sequence
     /// going back to it leaves (the others' rows stay on the devices). One whose copy fails is given up.
     fn finish_checkpoints_above(&mut self, position: usize) -> Result<(), String> {
-        for slot in 0..CHECKPOINTS {
+        for slot in 0..self.saved.len() {
             let Some(snapshots) = self.saved[slot].as_mut() else { continue };
             if snapshots.first().is_none_or(|snapshot| snapshot.position() <= position) {
                 continue;
@@ -1094,7 +1104,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     })?;
     let drafting = match (dspark_files, dspark_plan, drafter) {
         (Some(files), Some(plan), Some(drafter)) => Some(Drafting {
-            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, fixed_width: fixed_width(), rings: (0..CHECKPOINTS).map(|_| None).collect(),
+            drafter, policy: Policy::default(), engine: plan.engine, resident: plan.resident, on: true, deciding: false, drafted: false, fixed_width: fixed_width(), rings: (0..checkpoint_slots()).map(|_| None).collect(),
             _files: files,
         }),
         _ => None,
@@ -1135,7 +1145,7 @@ pub fn place(root: &Path, id: bundle::Id, data_dir: &Path, settings: &Settings,
     let verify_rows = if drafts { engines.iter().map(Engine::verify_rows).min().unwrap_or(1) } else { 1 };
     Ok(Session::new(Placed {
         engines: Engines { engines, devices_per_expert: groups[0].0.len(), verify_rows,
-                           saved: (0..CHECKPOINTS).map(|_| None).collect(), order: Vec::new(), kept: None,
+                           saved: (0..checkpoint_slots()).map(|_| None).collect(), order: Vec::new(), kept: None,
                            budget: checkpoints, marked: Vec::new(), step: CHECKPOINT_STEP, files, drafting, vision_read: false },
         files, vocabulary: hp.vocabulary, layers, experts: hp.experts, context: settings.context, batch,
         end: vec![end], turn_start, root_end, card, placement, state_bytes,

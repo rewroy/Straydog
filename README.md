@@ -142,6 +142,10 @@ the mapping's pages back in: on an RTX 5070 Ti at `--vram 5.5` (UD-IQ2_XS, a 19 
 and a new 2,076-token conversation read in 5.6 s instead of 5.4. `STRAYDOG_HOST_TIER=0`
 locks whole layers; `=1` takes the tier on any build.
 
+A served DeepSeek keeps four conversations in 2 GiB of host memory. For a client that runs several long conversations at once,
+`STRAYDOG_CHECKPOINTS=8 STRAYDOG_CHECKPOINT_GIB=6` keeps them (six ~95K-token conversations taking turns: 93 s instead of 1,125),
+at 4 GiB of the host tier.
+
 Like llama-server, `straydog` with no subcommand is the server (http://127.0.0.1:8080).
 `-m` takes the bundle's directory or its first shard; `-md` the MTP drafter's directory
 or its GGUF.
@@ -150,7 +154,7 @@ and `--config FILE` reads them from a TOML file (with no `--config` and no model
 `setup` wrote). Options beat variables, which beat the file. `--print-config` shows the
 settings in effect and where each came from.
 
-### Keeping a conversation across starts (Windows)
+### Keeping a conversation across starts (Windows, Linux)
 
 An engine that starts again, as an app's update makes it, holds none of the conversation it held:
 the next request of a long conversation reads all of it again (36,169 tokens took 84 s on an
@@ -164,16 +168,22 @@ does not.
   starts the server and has no console to send Ctrl+C to). Nothing is written while requests run or
   per request: the drive sees one write a stop. A state larger than the memory or the drive has room
   for is not written, and the log says so in one line.
-- **Where, and sealed how.** `<data dir>/conversation`, one file a bundle, a new one replacing the
-  old. The state is sealed with AES-256-GCM under a random key that DPAPI wraps for your Windows
+- **How many.** Up to four conversations a bundle, a file each. A stop writes the conversation it held
+  over the one it went on from, else into an empty file, else over the one used longest ago, and
+  writes nothing when it adds nothing to a kept one (a health check, an app's warm-up of its system
+  prompt). A request takes back the one it goes on from.
+- **Where, and sealed how.** `<data dir>/conversation`, up to four files a bundle. The state is sealed with AES-256-GCM under a random key that DPAPI wraps for your Windows
   account, as the engine's other saved state is (the system block's, `prefix`): another user cannot
-  open it, and a changed byte refuses it. Its tokens are a sealed part of their own.
-- **At the next start** the file is opened lazily: its tokens are read, and the state stays on the
-  drive until the first request whose prompt begins with them. That request reads it from the file
+  open it, and a changed byte refuses it. Its tokens are a sealed part of their own. On Linux the
+  key is held by the kernel's keyring for your user and lasts until a reboot: a state kept before
+  one no longer opens, and is deleted.
+- **At the next start** the files are opened lazily: their tokens are read, and each state stays on
+  the drive until the first request whose prompt begins with its tokens. That request reads it from the file
   and goes on from there; the request line says `reused 38968 from kept, loaded in 1.8 s`. A
-  request that does not begin with them leaves the file as it is, for a later one. A file of
-  another build, bundle or placement of the engine is deleted, as is one that does not open, and
-  with the option off at the start the file is deleted.
+  request that does not begin with them leaves the file as it is, for a later one. A conversation
+  goes on across an update of the engine; a file of another bundle, context or placement is deleted,
+  as is one that does not open, and with the option off at the start the files are deleted: a second
+  server of the same bundle for a test takes its own `--data-dir`.
 - **What it costs and saves.** The file is about 28 KB a token (1.0 GB for 36,000 tokens), written
   in 2 to 2.5 s at the stop (the stop takes 3.5 to 4.7 s). On an RTX 5070 Ti held to 5.5 GiB a
   conversation of 38,975 tokens was read in 48.9 s from nothing, and in 1.8 s of loading and 2.2 s to

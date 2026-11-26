@@ -28,6 +28,14 @@ use straydog_engine::sampling::Sampling;
 use straydog_engine::text::{Text, TextError};
 use straydog_engine::weights::Weights;
 
+/// A token's text for the reply: the template's `</think>` (its one added token, `close`) is never the reply's text. The first of a
+/// reply that reasons ends the reasoning (the caller marks the place); one the model writes again after that, or in a reply that does
+/// not reason, is dropped as well, where it went out as text ("Hello! It's great to meet you.</think>He", DeepSeek-V4.1, 11-24). The same characters
+/// written as ordinary tokens (a reasoning that quotes the tag) are other tokens and stay.
+pub(crate) fn reply_text(delta: String, token: u32, close: Option<u32>) -> String {
+    if close == Some(token) { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta }
+}
+
 /// The largest frame either way: any request body the API takes ([`straydog_api::BODY_LIMIT`])
 /// with room for the frame around it. At 16 MiB a conversation's tenth screenshot (a 64 MiB body
 /// was taken) failed the runtime, and the server stopped serving.
@@ -83,6 +91,9 @@ pub struct WorkerArgs {
     /// Straydog's data directory: the shards' verity trees (read only).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+    /// The marks kept beside the trees, NAME=MARK, as the server read them: the files a start reads unhashed where each is still as marked.
+    #[arg(long = "file-mark", hide = true)]
+    pub file_marks: Vec<String>,
     /// The routed experts' host tier of a bundle read on demand [default: planned from host memory].
     #[arg(long)]
     pub host_expert_bytes: Option<u64>,
@@ -590,12 +601,13 @@ fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64,
 /// file without the state, and where the state will arrive if a request has asked for it. A static, for the request loop that reads the frames and the
 /// request that waits for one are different threads, and the engine is behind the lock the request holds.
 struct KeptConversation {
-    tokens: Option<Vec<u32>>,
+    /// The conversations earlier runs kept that no request of this one has taken: each by the server's slot of its file, with its tokens.
+    tokens: Vec<(usize, Vec<u32>)>,
     /// Where the state arrives, with the seconds the server took to read and open it.
     waiting: Option<std::sync::mpsc::Sender<Result<(Vec<u8>, f64), String>>>,
 }
 
-static KEPT: Mutex<KeptConversation> = Mutex::new(KeptConversation { tokens: None, waiting: None });
+static KEPT: Mutex<KeptConversation> = Mutex::new(KeptConversation { tokens: Vec::new(), waiting: None });
 
 fn kept() -> std::sync::MutexGuard<'static, KeptConversation> {
     KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -606,8 +618,9 @@ const KEPT_PATIENCE: Duration = Duration::from_secs(120);
 /// The host memory a load of the kept state leaves free besides its copies: the commit the rest of the engine asks for as it goes.
 const KEPT_MARGIN: u64 = 2 << 30;
 
-/// The server named the tokens of the conversation its last run kept: this run takes the first request that begins with them from there.
-fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
+/// The server named the tokens of a conversation an earlier run kept, in the file of `slot`: this run takes the first request that begins with them
+/// from there.
+fn keep_tokens(bytes: &[u8], slot: usize) -> Result<(), String> {
     if bytes.is_empty() || bytes.len() % 4 != 0 {
         return Err(format!("{} bytes are no list of tokens", bytes.len()));
     }
@@ -615,7 +628,9 @@ fn keep_tokens(bytes: &[u8]) -> Result<(), String> {
     if let Some(token) = tokens.iter().find(|&&token| !kept_token(token)) {
         return Err(format!("a token outside the vocabulary that is no image's position ({token})"));
     }
-    kept().tokens = Some(tokens);
+    let mut kept = kept();
+    kept.tokens.retain(|(held, _)| *held != slot);
+    kept.tokens.push((slot, tokens));
     Ok(())
 }
 
@@ -648,23 +663,28 @@ impl KeepsConversation for straydog_engine::model::Model {
     }
 }
 
-/// The tokens of the conversation an earlier run kept, while no request has taken it: the ids its replies were written in, which
-/// a prompt that goes on from it is to keep ([`take_kept`] takes it only where the prompt begins with all of them).
-pub(crate) fn kept_tokens() -> Option<Vec<u32>> {
-    kept().tokens.clone()
+/// The tokens of the conversations earlier runs kept, while no request has taken them: the ids their replies were written in, which
+/// a prompt that goes on from one is to keep ([`take_kept`] takes one only where the prompt begins with all of them).
+pub(crate) fn kept_tokens() -> Vec<Vec<u32>> {
+    kept().tokens.iter().map(|(_, tokens)| tokens.clone()).collect()
+}
+
+/// The kept conversation a prompt goes on from: the slot and length of the longest whose tokens the prompt begins with, a token left to run.
+fn kept_for(kept: &[(usize, Vec<u32>)], prompt: &[u32]) -> Option<(usize, usize)> {
+    kept.iter()
+        .filter(|(_, tokens)| prompt.len() > tokens.len() && prompt[..tokens.len()] == tokens[..])
+        .max_by_key(|(_, tokens)| tokens.len())
+        .map(|(slot, tokens)| (*slot, tokens.len()))
 }
 
 pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id: &str, cancel: &AtomicBool, prompt: &[u32]) -> Option<f64> {
-    let wanted = {
-        let kept = kept();
-        let tokens = kept.tokens.as_ref()?;
-        // (the prompt begins with all of them, and a token is left to run)
-        (prompt.len() > tokens.len() && prompt[..tokens.len()] == tokens[..]).then_some(tokens.len())?
-    };
+    // (the prompt begins with all of a kept conversation's tokens, and a token is left to run)
+    let (slot, wanted) = kept_for(&kept().tokens, prompt)?;
+    let drop_kept = || kept().tokens.retain(|(held, _)| *held != slot);
     let not_loaded = |why: String| eprintln!("Straydog conversation: not loaded ({why})");
     if model.held_prefix(prompt) >= wanted {
         // (the model holds this much of it already: the state would add nothing)
-        kept().tokens = None;
+        drop_kept();
         return None;
     }
     // (the file's bytes in the server, the same in this process, and the copies of its parts: three of the state's size at once)
@@ -687,7 +707,7 @@ pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id:
     let started = Instant::now();
     let (sender, receiver) = std::sync::mpsc::channel();
     kept().waiting = Some(sender);
-    output.send(&json!({"id": id, "event": "conversation_wanted", "tokens": wanted}));
+    output.send(&json!({"id": id, "event": "conversation_wanted", "tokens": wanted, "slot": slot}));
     let arrived = loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(arrived) => break arrived,
@@ -708,7 +728,7 @@ pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id:
         Ok(arrived) => arrived,
         Err(why) => {
             // (the file is gone or cannot be read: asking again would only ask the same)
-            kept().tokens = None;
+            drop_kept();
             not_loaded(why);
             return None;
         }
@@ -716,14 +736,14 @@ pub(crate) fn take_kept(model: &mut impl KeepsConversation, output: &Output, id:
     let importing = Instant::now();
     match model.import_conversation(&state, prompt.len() + 1) {
         Ok(tokens) => {
-            kept().tokens = None;
+            drop_kept();
             let seconds = started.elapsed().as_secs_f64();
             eprintln!("Straydog conversation: loaded {tokens} tokens ({} MB) in {seconds:.1} s (the server read it in {read_seconds:.1} s, it came in {:.1} s, the import took {:.1} s)",
                       state.len() >> 20, (arrived_at - read_seconds).max(0.0), importing.elapsed().as_secs_f64());
             Some(seconds)
         }
         Err(why) => {
-            kept().tokens = None;
+            drop_kept();
             not_loaded(why);
             None
         }
@@ -799,23 +819,20 @@ impl Plan {
         error
     }
 
+    /// (Windows: the startup budgets, which only Windows lowers below the caps given)
+    #[cfg(windows)]
     pub(crate) fn startup_vram_reduced(&self) -> bool {
-        #[cfg(windows)]
-        return self.original_vram_caps.as_ref().is_some_and(|caps| caps.iter().zip(&self.budgets).any(|(given, actual)| actual < given));
-        #[cfg(not(windows))]
-        false
+        self.original_vram_caps.as_ref().is_some_and(|caps| caps.iter().zip(&self.budgets).any(|(given, actual)| actual < given))
     }
 
+    #[cfg(windows)]
     pub(crate) fn report_startup_vram(&self, actual: &[(usize, u64)]) -> Result<(), String> {
-        #[cfg(windows)]
         if let Some(caps) = self.original_vram_caps.as_deref() {
             validate_vram_caps(Some(caps), actual.len())?;
             for (index, &(ordinal, budget)) in actual.iter().enumerate() {
                 if let Some(line) = explicit_startup_line(ordinal, caps[index], budget) { eprintln!("{line}"); }
             }
         }
-        #[cfg(not(windows))]
-        let _ = actual;
         Ok(())
     }
 }
@@ -1267,6 +1284,9 @@ fn placement_key(gpus: &[(usize, String)], vram: &str, context: usize, drafter: 
 }
 
 pub fn main(args: WorkerArgs) -> Result<(), String> {
+    // (the machine's memory as every start finds it, before it reads or places anything: a start beside another model's file cache read and
+    // checked 3.3 times slower, 11-25)
+    eprintln!("Straydog memory at the start: {}", straydog_engine::host::machine_memory_note(None));
     straydog_engine::host::set_prefetch_memory_limits(args.host_memory_limit_files.clone());
     // (Windows: a worker has no window, so the system may count it as background and lower its clocks: it asks not to be)
     if !straydog_engine::host::full_speed() {
@@ -1337,8 +1357,12 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     }
     // With the shards' verity trees, what is read again after loading is checked block by block.
     if let Some(data_dir) = &args.data_dir {
-        weights.open_trees(data_dir)?;
+        let marks: std::collections::HashMap<String, String> = args.file_marks.iter()
+            .filter_map(|entry| entry.split_once('=')).map(|(name, mark)| (name.to_string(), mark.to_string())).collect();
+        weights.open_trees_with_marks(data_dir, &marks)?;
     }
+    // (the files this start reads through and checks: the server marks them once they are loaded, for the next start to read them unhashed)
+    let read_through = weights.read_through();
     let open_seconds = opened.elapsed().as_secs_f64();
     loading.report("prepare", 0, 0);
     let resource = |name: &str| weights.resources.get(name).cloned().ok_or(format!("missing resource {name}"));
@@ -1422,12 +1446,13 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "placement": {"resident": model.resident, "partial": model.partial, "host_kv": model.host_kv,
                       "prefill_batch_size": model.prefill_batch_size, "vram_budgets": ready_budgets,
                       // (a long read's wider batches: their rows, from how many new tokens, and what they lacked when they were not made)
-                      "prefill_wide_rows": model.wide_batch_size, "prefill_wide_from": straydog_engine::model::WIDE_READ_TOKENS,
+                      "prefill_wide_rows": model.wide_batch_size, "prefill_wide_from": straydog_engine::model::wide_read_tokens(),
                       "prefill_wide_note": model.wide_note,
                       "split_mode": if split == SplitMode::Layer { "layer" } else { "experts" },
                       "note": model.placement_note},
         "load_seconds": seconds,
         "gpu": model.info()?,
+        "verified": read_through.iter().map(|(name, stamp)| json!({"name": name, "stamp": stamp})).collect::<Vec<_>>(),
     });
     let gpus: Vec<(usize, String)> = args.devices.iter()
         .map(|&ordinal| (ordinal, straydog_gpu::device_info(ordinal).map_or_else(|_| "unknown GPU".into(), |(name, _, _)| name)))
@@ -1793,7 +1818,11 @@ pub(crate) fn serve<S: Served + 'static>(engine: Arc<Mutex<S>>, text: Arc<Text>,
                     Ok(body) => body,
                     Err(message) => break Err(message),
                 };
-                if let Err(message) = keep_tokens(&body) {
+                let slot = match request.get("slot") {
+                    Some(pyjson::Value::Int(slot)) if *slot >= 0 => *slot as usize,
+                    _ => 0,
+                };
+                if let Err(message) = keep_tokens(&body, slot) {
                     eprintln!("Straydog conversation: not kept ({message})");
                 }
             }
@@ -1880,6 +1909,13 @@ pub(crate) struct Failure {
     pub fatal: bool,
     /// What the client is told it is, where it can act on that: [`images::NOT_HELD`].
     pub kind: Option<&'static str>,
+}
+
+/// The tokens a reply may have: what was asked for, or the room the context leaves after the prompt when that is less. A prompt that
+/// does not fit is left to be refused as it was. (Refused before, an agent with an output limit of its own lost its turn at a
+/// 215,346-token prompt of 262,144 with max_tokens 65,536.)
+pub(crate) fn fitted_max_new(prompt: usize, asked: i128, context: usize) -> i128 {
+    if prompt < context { asked.min(context as i128 - prompt as i128) } else { asked }
 }
 
 pub(crate) fn refused(message: impl Into<String>) -> Failure {
@@ -2094,6 +2130,9 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
         Some(Py::Int(value)) if *value >= 0 => *value as u64,
         Some(_) => return Err(refused("invalid Straydog seed")),
     };
+    // (a max_tokens past the context gets the room there is, and the reply ends at the context as its length: refused, an agent with
+    // an output limit of its own lost its turn at a 215,346-token prompt of 262,144 with max_tokens 65,536)
+    let max_new = fitted_max_new(ids.len(), max_new, context);
     if ids.is_empty() || max_new < 1 || max_new > context as i128 || ids.len() as i128 + max_new > context as i128 {
         return Err(refused("Straydog prompt plus output exceeds the allocated context"));
     }
@@ -2116,6 +2155,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     // without it and a reasoning_end event marks the place. The same text otherwise written (the
     // reasoning quoting a tag) stays the reasoning's.
     let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
+    let any_close = text.added_token(THINK_CLOSE);
     // The held tokens can be more than the tokenizer's for the same text, and with no `max_tokens` the reply's room was all that `ids` left: a
     // client that sends none, as some do, ended the worker on "exceeds the allocated context" on the first such reply.
     let agreed = engine.model.agree_with_held(&ids, &text.token_bytes());
@@ -2164,7 +2204,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
                 match stream.push(token) {
                     Ok(delta) => {
                         let ended = *think_close == Some(token);
-                        let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                        let delta = reply_text(delta, token, any_close);
                         if !delta.is_empty() {
                             first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
                             output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": *generated}));
@@ -2241,6 +2281,27 @@ fn reasoning_closed(prompt: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Decides: a prompt goes on from the longest kept conversation it begins with, with a token left to run; none when it begins with none.
+    #[test]
+    fn a_prompt_takes_the_longest_kept_conversation_it_begins_with() {
+        let kept = vec![(0, vec![1, 2, 3]), (2, vec![1, 2, 3, 4, 5]), (3, vec![1, 9])];
+        assert_eq!(super::kept_for(&kept, &[1, 2, 3, 4, 5, 6]), Some((2, 5)));
+        assert_eq!(super::kept_for(&kept, &[1, 2, 3, 4, 5]), Some((0, 3)), "a token is left to run");
+        assert_eq!(super::kept_for(&kept, &[1, 9, 9]), Some((3, 2)));
+        assert_eq!(super::kept_for(&kept, &[7, 8]), None);
+        assert_eq!(super::kept_for(&[], &[1, 2]), None);
+    }
+
+    /// The template's `</think>` token is never a reply's text: dropped from its delta wherever it comes (the reasoning's end, or again
+    /// after it), while another token's text that holds the same characters stays.
+    #[test]
+    fn the_think_close_token_is_never_reply_text() {
+        let close = Some(7u32);
+        assert_eq!(super::reply_text("you.</think>".to_string(), 7, close), "you.");
+        assert_eq!(super::reply_text("</think>".to_string(), 7, close), "");
+        assert_eq!(super::reply_text("a </think> b".to_string(), 8, close), "a </think> b");
+        assert_eq!(super::reply_text("</think>".to_string(), 7, None), "</think>");
+    }
     /// A kept conversation's token list may hold an image's positions (their ids from its digest), and nothing else past the vocabulary.
     #[test]
     fn a_kept_list_may_hold_image_positions() {
@@ -2763,6 +2824,15 @@ mod tests {
         assert!(!engine_failed(format!("no memory for its positions {}", straydog_engine::model::IMAGE_REFUSED), "site").fatal);
         // (a prompt found too long before anything ran leaves the engine as it was)
         assert!(!engine_failed("Straydog prompt plus output exceeds the allocated context", "site").fatal);
+    }
+
+    /// A max_tokens past the context gets the room left; one that fits, or a prompt that does not fit, is as asked.
+    #[test]
+    fn a_max_tokens_past_the_context_gets_the_room_left() {
+        assert_eq!(super::fitted_max_new(215_346, 65_536, 262_144), 46_798);
+        assert_eq!(super::fitted_max_new(1_000, 500, 262_144), 500);
+        assert_eq!(super::fitted_max_new(262_144, 100, 262_144), 100, "a prompt that fills the context is refused as before");
+        assert_eq!(super::fitted_max_new(37, 300_000, 262_144), 262_107);
     }
 
     #[test]

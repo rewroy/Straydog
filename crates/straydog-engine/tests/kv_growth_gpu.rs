@@ -18,7 +18,10 @@ use straydog_engine::weights::Weights;
 fn open(root: &std::ffi::OsStr, quantization: &str) -> Model { open_with(root, None, quantization) }
 
 fn open_with(root: &std::ffi::OsStr, drafter: Option<&std::ffi::OsStr>, quantization: &str) -> Model {
-    let budget = 24u64 << 30;
+    // (small enough that the K/V of the whole context is the host's: 24 GiB held it on the device once its rows were made smaller;
+    // STRAYDOG_KV_GROWTH_GIB another budget)
+    let gib = std::env::var("STRAYDOG_KV_GROWTH_GIB").ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(12);
+    let budget = gib << 30;
     let mut group = Group::new(&[0], &[budget], SplitMode::Experts).unwrap();
     group.configure_gemm(2, true).unwrap();
     let weights = Weights::open(&PathBuf::from(root), straydog_engine::bundle::Id::find(Some(straydog_engine::bundle::MODEL), None, quantization).unwrap(), drafter.map(PathBuf::from).as_deref(), straydog_engine::host::host_memory_bytes(), &|_, _, _| {}).unwrap();

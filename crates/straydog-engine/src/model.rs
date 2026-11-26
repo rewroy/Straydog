@@ -53,10 +53,11 @@ const VERIFIED_PREFILL: usize = 16;
 /// 32 rows costs about what its eight passes do. One GPU whose passes wait for the CPU's experts (RTX 5070 Ti, 16 of 48 layers
 /// page-locked) read 60 tokens in 520 ms as batches and 630 ms as passes: it keeps the batches.
 const PARTIAL_PROMPT_PASSES: usize = 32;
-/// Longest prompt (its new tokens) whose re-pick of the slots is not waited for before the reply begins (CUDA). The wait was 0.09 s of
+/// Longest prompt (its new tokens) whose re-pick of the slots is not waited for before the reply begins. The wait was 0.09 s of
 /// 0.24 s to the first token of a 23-token prompt on two RTX 3090, and 0.28 s of 0.76 s for 60 tokens on an RTX 5070 Ti, where the 64
-/// tokens that followed took 1.60 s with the swaps landing meanwhile and 1.65 s after waiting for them. A longer prompt's wait is a small
-/// part of its read, and its routes say more about the reply's.
+/// tokens that followed took 1.60 s with the swaps landing meanwhile and 1.65 s after waiting for them; on an R9700 at --vram 5.5, 51
+/// tokens 0.47 -> 0.38 s and 8 tokens 0.20 -> 0.15 s, decode the same. A longer prompt's wait is a small part of its read, and its
+/// routes say more about the reply's.
 const REFRESH_AHEAD_PROMPT: usize = 128;
 /// The CPU's routes a row in a prompt batch's first pass from which the slots are taken not to hold the prompt's experts, and the rest of
 /// the batch is read as a batch ([`Model::forward`]). A prompt the slots know leaves the CPU a route a row or none.
@@ -599,12 +600,12 @@ fn prompt_passes_overlapped() -> bool {
 }
 
 /// A prompt of at most this many new tokens re-picks the expert slots from its routes without waiting for the swaps' copies: the experts on
-/// their way are the CPU's or staged until they land. [`REFRESH_AHEAD_PROMPT`] on CUDA, 0 elsewhere (every prompt waits, not measured
-/// there); STRAYDOG_PROMPT_REFRESH_AHEAD (development) names it for both.
+/// their way are the CPU's or staged until they land. [`REFRESH_AHEAD_PROMPT`]; STRAYDOG_PROMPT_REFRESH_AHEAD (development) names
+/// another length, 0 none.
 fn prompt_refresh_ahead() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| std::env::var("STRAYDOG_PROMPT_REFRESH_AHEAD").ok().and_then(|rows| rows.parse().ok())
-        .unwrap_or(if cfg!(feature = "cuda") { REFRESH_AHEAD_PROMPT } else { 0 }))
+        .unwrap_or(REFRESH_AHEAD_PROMPT))
 }
 
 /// STRAYDOG_DRAFTER_RESIDENT=1 (development): a partially resident model's MTP layer holds its whole bank in VRAM.
@@ -4015,11 +4016,10 @@ impl Model {
 
     fn head_logits(&mut self, row: &[f32], step: bool) -> Result<Vec<f32>> {
         let mut clock = Instant::now();
-        // (CUDA: the head's mix and projection in one wait, into the last step's allocation; elsewhere a wait and a copy to the host
-        // between them)
+        // (the head's mix and projection in one wait, into the last step's allocation, where both are on the last device; else a wait
+        // and a copy to the host between them)
         let mut logits = std::mem::take(&mut self.logits_spare);
-        let fused = cfg!(feature = "cuda")
-            && self.with_operands(Model::head_operands, |group, operands| group.decode_head(operands, row, &mut logits))?;
+        let fused = self.with_operands(Model::head_operands, |group, operands| group.decode_head(operands, row, &mut logits))?;
         if !fused {
             let mixed = self.with_operands(
                 |model| Ok(model.head_operands()?[..3].to_vec()),
@@ -4597,7 +4597,7 @@ impl Model {
         }
         // A long read's batches are as wide as the workspaces were made (the batch asked for is the default's: a short read, an image, the warm-up
         // pass and a batch given are not widened).
-        if self.wide_batch_size > batch && tokens.len() - position >= WIDE_READ_TOKENS && self.images.is_empty() && self.warm_stop.is_none() {
+        if self.wide_batch_size > batch && tokens.len() - position >= wide_read_tokens() && self.images.is_empty() && self.warm_stop.is_none() {
             batch = self.wide_batch_size;
         }
         // (a batch that rests narrow widens as soon as a read takes more than one of it, besides the last token's own: putting the slots back
@@ -5275,8 +5275,8 @@ impl Model {
         Ok(true)
     }
 
-    /// The end of a long prefill: where the reply's re-pick does not wait for its copies (CUDA, [`prompt_refresh_ahead`]), the slot pool comes
-    /// back empty and that re-pick fills it while the reply begins; elsewhere it is refilled here, waited for, as before.
+    /// The end of a long prefill: where the reply's re-pick does not wait for its copies ([`prompt_refresh_ahead`] above 0), the slot pool
+    /// comes back empty and that re-pick fills it while the reply begins; with STRAYDOG_PROMPT_REFRESH_AHEAD=0 it is refilled here, waited for.
     fn end_long_prefill(&mut self) -> Result<()> {
         if prompt_refresh_ahead() > 0 {
             self.slots_refill_ahead = true;
@@ -5831,10 +5831,12 @@ impl Model {
     }
 
     /// Whether a verification's first layer and its PLE layer follow each other on the device (see [`Group::front_chained`]): a fully resident
-    /// model's, and a partially resident one's on CUDA, where the first layer's hybrid handshake ends in a wait and nothing is read back or
-    /// uploaded between the layers. `STRAYDOG_FRONT_CHAIN=0` keeps the rows going through the host there.
+    /// model's, and a partially resident one's, where the first layer's hybrid handshake ends in a wait and nothing is read back or uploaded
+    /// between the layers. `STRAYDOG_FRONT_CHAIN=0` keeps the rows going through the host there. On HIP too (11-24, an R9700 at --vram 5.5,
+    /// Qwen3.8 UD-IQ1_S, MTP drafts): `check` found 0 floats differing in 100 passes, the PLE layer 0.20 -> 0.04 ms a pass and the first layer
+    /// 0.62 -> 0.59.
     fn front_chained(&self) -> bool {
-        self.group.front_chained() && (!self.partial || (cfg!(feature = "cuda") && front_chain_wanted()))
+        self.group.front_chained() && (!self.partial || front_chain_wanted())
     }
 
     /// The rows through the first layer, the PLE layer and the spans. With `keep`, a partially resident model's rows may stay on the device
@@ -7017,10 +7019,19 @@ fn partial_pair(cuda: bool, devices: usize, budget: u64) -> bool {
 /// The rows a long read's batches may be, widest first, where the workspaces hold them (`wide_placement`).
 /// A multiple of the experts' chunk (4096 rows, `MOE_CHUNK_ROWS`): between two, the experts of a batch are read from VRAM in two chunks that are each
 /// narrower than 4096 and the batch pays them over more rows (two R9700s, `--vram 30`, a fresh 242K read: 50.0 s at 4096 rows, 5120 rows (2 x 2560)
-/// 51.0 s, 6144 (2 x 3072) 50.05 s, 8192 (2 x 4096) 49.1 s).
-const WIDE_ROWS: [usize; 2] = [12288, 8192];
-/// The new tokens a read has from which its batches are the wide ones: two wide batches (a 20K read in 3.78 s against 3.81 at 4096 rows).
-pub const WIDE_READ_TOKENS: usize = 16_384;
+/// 51.0 s, 6144 (2 x 3072) 50.05 s, 8192 (2 x 4096) 49.1 s). Not 12288: its halves of 6144 rows let neither the DeltaNet layers' sends nor the
+/// MoE's gather fork run beside the device's own work (qwen_parts.hpp: halves of 4096 do), and 8192 read 240K tokens in 38.40/38.43 s against
+/// 38.94/39.41, 120K 18.48/18.50 against 18.83/19.02, 60K 9.21/9.23 against 9.41/9.52, 20K 4.28/4.31 against 4.35/4.34 (UD-IQ1_M, 11-24).
+const WIDE_ROWS: [usize; 1] = [8192];
+/// The new tokens a read has from which its batches are the wide ones: one wide batch. At 16384 (two of 12288's) the reads below it kept
+/// 4096-row batches, whose halves of 2048 rows let no exchange run beside the work; from 8192 (UD-IQ1_M on two R9700, two runs each)
+/// 8,192 tokens 2.66/2.58 -> 2.56/2.52 s, 10,000 1.83/1.84 -> 1.80/1.81, 12,000 2.15/2.16 -> 2.14/2.14, 14,000 2.52/2.54 -> 2.47/2.48.
+pub const WIDE_READ_TOKENS: usize = 8_192;
+/// [`WIDE_READ_TOKENS`], or STRAYDOG_PREFILL_WIDE_FROM (development) in its place.
+pub fn wide_read_tokens() -> usize {
+    static TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TOKENS.get_or_init(|| std::env::var("STRAYDOG_PREFILL_WIDE_FROM").ok().and_then(|value| value.parse().ok()).unwrap_or(WIDE_READ_TOKENS))
+}
 /// [`Settings::prefill_batch_size`] when the batch is not given: derived from the GPU budgets.
 pub const DERIVED_BATCH: usize = 0;
 

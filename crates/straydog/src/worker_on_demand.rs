@@ -149,6 +149,8 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
     let (loaded, ready) = mpsc::channel::<Result<(Value, Arc<Text>), String>>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
+            // (the kernel's reclaiming from here to the warm-up's end; the memory as the start found it is the worker's first line)
+            let memory_at_start = straydog_engine::host::reclaim_counts();
             let initialized = load(args, data_dir, &settings, report, place).and_then(|(served, frame, text)| {
                 #[cfg(windows)]
                 if plan.startup_vram_reduced() {
@@ -203,8 +205,9 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                                 match served.model.warm_step(WARM_STEP, WARM_IN_FLIGHT) {
                                     Ok(Warmed::Going) => {}
                                     Ok(Warmed::Listed) => {
-                                        eprintln!("Straydog warmed up in {:.1} s; {}; {}", since.elapsed().as_secs_f64(),
-                                                  reads_note(reads_at, since.elapsed(), paused), waits_note(served.model.warm_waits()));
+                                        eprintln!("Straydog warmed up in {:.1} s; {}; {}; memory {}", since.elapsed().as_secs_f64(),
+                                                  reads_note(reads_at, since.elapsed(), paused), waits_note(served.model.warm_waits()),
+                                                  straydog_engine::host::machine_memory_note(Some(memory_at_start)));
                                         listed = Some(Instant::now());
                                         reads_at = straydog_engine::experts::reader_totals();
                                         paused = std::time::Duration::ZERO;
@@ -478,11 +481,12 @@ impl<E: Engines> Loaded<E> {
         // (after a start, the kept conversation's tokens are what its replies were written in: a prompt encoded afresh split one of
         // them otherwise and never began with all of them, so a conversation of more than one turn was never taken. Kept to where
         // the prompt then begins with all of them, and goes on from that conversation.)
-        if let Some(tokens) = crate::worker::kept_tokens() {
+        for tokens in crate::worker::kept_tokens() {
             let (from_kept, kept_starts) = written(&tokens, &parts, reach, encoded)?;
             if from_kept.len() > tokens.len() && from_kept.starts_with(&tokens) && !ids.starts_with(&tokens) {
                 spans = spans.iter().zip(kept_starts).map(|(&(index, _), start)| (index, start)).collect();
                 ids = from_kept;
+                break;
             }
         }
         let encode_seconds = started.elapsed().as_secs_f64();
@@ -527,6 +531,9 @@ impl<E: Engines> Loaded<E> {
             Some(Py::Int(value)) if *value >= 0 => *value as u64,
             Some(_) => return Err(refused("invalid Straydog seed")),
         };
+        // (a max_tokens past the context gets the room there is, and the reply ends at the context as its length: refused, an agent with
+        // an output limit of its own lost its turn at a 215,346-token prompt of 262,144 with max_tokens 65,536)
+        let max_new = crate::worker::fitted_max_new(ids.len(), max_new, context);
         if ids.is_empty() || max_new < 1 || max_new > context as i128 || ids.len() as i128 + max_new > context as i128 {
             return Err(refused("Straydog prompt plus output exceeds the allocated context"));
         }
@@ -544,6 +551,7 @@ impl<E: Engines> Loaded<E> {
         // go without it and a reasoning_end event marks the place. The same text otherwise written (the
         // reasoning quoting a tag) stays the reasoning's.
         let mut think_close = if thinking { text.added_token(THINK_CLOSE) } else { None };
+        let any_close = text.added_token(THINK_CLOSE);
         let result = self.model.generate_constrained(
             &ids, max_new, &sampling, seed, &cancelled,
             &mut |done, total| output.send(&json!({"id": id, "event": "progress", "done": done, "total": total})),
@@ -552,7 +560,7 @@ impl<E: Engines> Loaded<E> {
                 match stream.push(token) {
                     Ok(delta) => {
                         let ended = think_close == Some(token);
-                        let delta = if ended { delta.strip_suffix(THINK_CLOSE).map(str::to_string).unwrap_or(delta) } else { delta };
+                        let delta = crate::worker::reply_text(delta, token, any_close);
                         if !delta.is_empty() {
                             first_text.get_or_insert_with(|| started.elapsed().as_secs_f64());
                             output.send(&json!({"id": id, "event": "delta", "content": delta, "tokens": generated}));

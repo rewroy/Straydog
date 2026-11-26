@@ -26,6 +26,8 @@ enum Script {
     Events(Vec<Value>),
     /// These events, then nothing until the stream is dropped.
     Hang(Vec<Value>),
+    /// These events, each after this wait (tokio's clock: a test with it paused takes no time).
+    Paced(Vec<Value>, Duration),
     Refuse(SubmitError),
 }
 
@@ -85,12 +87,19 @@ impl Engine for Mock {
         let interrupts = self.interrupts.clone();
         let guard = DropGuard(self.dropped.clone());
         Box::pin(async move {
-            let (events, tail) = match script {
-                Script::Events(events) => (events, stream::empty().boxed()),
-                Script::Hang(events) => (events, stream::pending().boxed()),
+            let (events, tail, wait) = match script {
+                Script::Events(events) => (events, stream::empty().boxed(), None),
+                Script::Hang(events) => (events, stream::pending().boxed(), None),
+                Script::Paced(events, wait) => (events, stream::empty().boxed(), Some(wait)),
                 Script::Refuse(error) => return Err(error),
             };
             let events = stream::iter(events)
+                .then(move |event| async move {
+                    if let Some(wait) = wait {
+                        tokio::time::sleep(wait).await;
+                    }
+                    event
+                })
                 .chain(tail)
                 .map(move |event| {
                     let _ = &guard;
@@ -263,6 +272,26 @@ fn field<'a>(request: &'a pyjson::Value, key: &str) -> &'a pyjson::Value {
     request.get(key).unwrap_or_else(|| panic!("no {key} in the worker request"))
 }
 
+/// A tool call written for longer than the quiet span sends SSE comments meanwhile, so a proxy or client that closes an idle
+/// connection keeps it: arguments over 13 s at one piece a second give two comments, and the call comes whole at the end.
+#[tokio::test(start_paused = true)]
+async fn a_long_tool_call_keeps_the_stream_alive() {
+    let mut events = vec![delta("Reading it.\n</think>\n\n"), delta("<tool_call>\n<function=read_file>\n<parameter=path>\n")];
+    events.extend((0..12).map(|_| delta("a")));
+    events.push(delta("\n</parameter>\n</function>\n</tool_call>"));
+    events.push(done("stop"));
+    let mock = Mock::new(vec![Script::Paced(events, Duration::from_secs(1))]);
+    let (status, events) = stream(&mock, ask(json!({"tools": read_file()}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let comments: Vec<&Sse> = events.iter().filter(|event| matches!(event, Sse::Comment(_))).collect();
+    assert_eq!(comments, [&Sse::Comment("writing".into()), &Sse::Comment("writing".into())], "{events:?}");
+    assert_eq!(events.last(), Some(&Sse::Done));
+    let mut deltas = deltas(&events);
+    fix_ids(&mut deltas[1]["tool_calls"]);
+    assert_eq!(deltas[1]["tool_calls"], json!([{"index": 0, "id": "call", "type": "function",
+                                               "function": {"name": "read_file", "arguments": r#"{"path": "aaaaaaaaaaaa"}"#}}]));
+}
+
 #[tokio::test]
 async fn streams_reasoning_answer_and_tool_calls() {
     let mock = Mock::new(vec![Script::Events(vec![
@@ -423,7 +452,7 @@ async fn non_streaming_answers() {
         {"id": "call", "type": "function", "function": {"name": "read_file", "arguments": r#"{"path": "a.rs"}"#}}]}));
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
 
-    // A close the model left out is read; the same text cut by the token limit is not a call.
+    // A close the model left out is read; the same text cut by the token limit is neither a call nor text.
     let open = "<tool_call>\n<function=read_file>\n<parameter=path>\na.rs";
     let mock = Mock::new(vec![Script::Events(vec![delta(open), done("stop")])]);
     let (_, body) = complete(&mock, ask(json!({"tools": read_file(), "reasoning_effort": "none"}))).await;
@@ -432,7 +461,7 @@ async fn non_streaming_answers() {
     let mock = Mock::new(vec![Script::Events(vec![delta(open), done("length")])]);
     let (_, body) = complete(&mock, ask(json!({"tools": read_file(), "reasoning_effort": "none"}))).await;
     assert_eq!(body["choices"][0]["finish_reason"], "length");
-    assert_eq!(body["choices"][0]["message"]["content"], open);
+    assert_eq!(body["choices"][0]["message"], json!({"role": "assistant", "content": ""}));
 
     // With tool_choice none the tools leave the prompt, and markup stays text.
     let mock = Mock::new(vec![Script::Events(vec![delta(markup), done("stop")])]);
@@ -880,6 +909,15 @@ async fn health_and_models_follow_the_engine() {
     let mut failed = refused(500, "server_error", "the GPU stopped responding");
     failed.1["status"] = "error".into();
     assert_eq!(fetch(app(&mock), get("/health")).await, failed);
+    // With a key, a request without it is told that the engine failed, and not what it said: that names the model and the worker's last words.
+    let mut keyed = config();
+    keyed.api_key = Some("sk-local".into());
+    let mut told_less = refused(500, "server_error", "the engine failed to start");
+    told_less.1["status"] = "error".into();
+    assert_eq!(fetch(router(mock.clone(), keyed.clone()), get("/health")).await, told_less);
+    let mut with_key = get("/health");
+    with_key.headers_mut().insert("authorization", "Bearer sk-local".parse().unwrap());
+    assert_eq!(fetch(router(mock.clone(), keyed), with_key).await, failed);
 
     assert_eq!(fetch(app(&mock), get("/v1/nothing")).await, refused(404, "not_found_error", "no such route"));
     let wrong_method = refused(405, "invalid_request_error", "method not allowed");

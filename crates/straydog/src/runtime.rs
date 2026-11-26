@@ -23,8 +23,10 @@ use crate::conversation::Keeper;
 use crate::prefix::{Cache, Due, Restored};
 use crate::worker::FRAME_BYTES;
 
-/// Generations accepted at once: the running one and three waiting.
-const QUEUE: usize = 4;
+/// Generations accepted at once: the running one and the rest waiting their turn. A client that runs helpers side by side sends several
+/// requests at once (an agent's explore helpers, five and more): with three waiting, the fifth was refused (503 server_busy) and its helper
+/// failed, where a server that queues them has each wait. A waiting request holds only its body.
+const QUEUE: usize = 64;
 const STDERR_TAIL: usize = 8192;
 /// Finished generations the dashboard keeps.
 const RECENT: usize = 120;
@@ -221,10 +223,25 @@ pub fn worker_args(settings: &Settings) -> Vec<OsString> {
         push("host-memory-limit-file", file.display().to_string());
     }
     push("data-dir", settings.data_dir.display().to_string());
+    // (the marks kept beside the trees, of the files as they were when last read through and checked: the worker compares each with the file
+    // it opens. Read here: a worker contained on Windows reads only the files granted to it, and a mark is written after the grants, so it
+    // found none and every start read the whole model through: 76.7 GB in 17.6 s of a 19.4 s start on a PC, at each of its starts)
+    for (name, mark) in kept_marks(settings) {
+        push("file-mark", format!("{name}={mark}"));
+    }
     if let Some(gib) = settings.expert_ram {
         push("host-expert-bytes", ((gib * (1u64 << 30) as f64) as u64).to_string());
     }
     args
+}
+
+/// The marks kept beside the pinned files' trees, by the files' names ([`straydog_engine::verity::kept_stamp`]): none where a file has none.
+fn kept_marks(settings: &Settings) -> Vec<(String, String)> {
+    use straydog_engine::bundle;
+    bundle::verity_pins_in(&settings.model, settings.bundle).unwrap_or_default().into_iter()
+        .filter_map(|(asset, _)| Some((asset.name.clone(), straydog_engine::verity::kept_stamp(&bundle::tree_path(&settings.data_dir, &asset))?)))
+        .filter(|(name, mark)| !name.contains('=') && !mark.contains('\n'))
+        .collect()
 }
 
 /// The verity trees the worker reads: the pinned shards' in the data directory.
@@ -537,14 +554,15 @@ fn exit_status(status: &std::process::ExitStatus) -> String {
 /// few seconds through a day of serving, and each request's line already says how many hints were taken and left. The expert store's account
 /// of its evictions against an LRU's and the best possible ones stays: a line every 2^20 uses of decode and verify passes, a few minutes
 /// of decoding. A row table's account of its cache (Engram's rows) stays too: a line every 2^20 rows asked, ~20K tokens. So does what
-/// DSpark's confidences met on served drafts: a line every 4096 drafts tried, some minutes of an agent's use.
+/// DSpark's confidences met on served drafts: a line every 4096 drafts tried, some minutes of an agent's use. The machine's memory as a start
+/// finds it is a line a start. A read's phases (STRAYDOG_PREFILL_PHASES) are what that switch asks for: written only with it set.
 fn stays_in_the_log(line: &str) -> bool {
     ["Straydog warm", "Straydog filled", "Straydog stopped warming", "Straydog cannot warm", "Straydog host banks", "Straydog speed first",
      "Straydog prefix", "Straydog conversation", "Straydog layer trace:", "Straydog CPU experts", "Straydog GPU read-only host registration:",
      "Straydog VRAM:", "WARN Straydog VRAM:", "WARN Straydog host banks", "WARN Straydog cannot lock more banks", "Straydog drafts:",
      "Straydog row proofs:", "Straydog layer split", "Straydog expert slots by device", "Straydog pipelined", "Straydog state digest", "Straydog pass:",
      "Straydog assist profile:", "Straydog expert reuse", "Straydog vision", "Straydog row cache:",
-     "Straydog DSpark calibration"]
+     "Straydog DSpark calibration", "Straydog memory at the start", "PHASES "]
         .iter().any(|start| line.starts_with(start))
 }
 
@@ -606,9 +624,17 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         // (the layers' banks the pass loaded: their loads' time, of it the CPU's gathers of banks not page-locked and the waits for the staging's
         // copies, and the time the pass waited for a layer's bank to be read: where a pass whose experts take 1.5 ms each spends it, as an RTX
         // 4060 PC's 5,089-token prompt did, 80.8 s where another 4060 took 16.9 s for as many)
+        // (and how they were read ahead: into how many buffers, around the page cache or through it. One buffer puts a layer's read after
+        // the copy before it has gone up: a PC with 1.8 GiB of commit left read a 2,076-token prompt's 48 layers in 11.3 s, its reads and
+        // gathers one after the other)
+        let ahead = match (timings["prefill_bank_buffers"].as_u64(), timings["prefill_bank_direct"].as_bool()) {
+            (Some(buffers), Some(direct)) => format!(", read ahead into {buffers} buffer{} {} the page cache", if buffers == 1 { "" } else { "s" },
+                                                     if direct { "around" } else { "through" }),
+            _ => ", not read ahead".into(),
+        };
         let banks = match (number("prefill_bank_loads"), number("prefill_bank_load_seconds")) {
             (Some(loads), Some(load)) if loads > 0.0 => format!(", banks {loads:.0} loads in {load:.1} s (gathers {:.1} s, staging waits {:.1} s), \
-                                                             waited {:.1} s for their reads", number("prefill_bank_gather_seconds").unwrap_or(0.0),
+                                                             waited {:.1} s for their reads{ahead}", number("prefill_bank_gather_seconds").unwrap_or(0.0),
                                                             number("prefill_bank_staging_wait_seconds").unwrap_or(0.0),
                                                             number("prefill_bank_wait_seconds").unwrap_or(0.0)),
             _ => String::new(),
@@ -1048,13 +1074,14 @@ impl Runtime {
             shared: shared.clone(),
             timeout: Duration::from_secs_f64(settings.startup_timeout),
             expected: (settings.ctx_size as u64, settings.bundle),
+            trees: (settings.model.clone(), settings.data_dir.clone()),
             verbose: settings.verbose,
             warm_directory: Some(settings.data_dir.join("warm")),
             cancel_patience,
             refusal,
             prefix: Cache::new(settings),
             keeper: Keeper::new(settings),
-            unclaimed: AtomicUsize::new(0),
+            kept: Default::default(),
             saves: Mutex::new(Vec::new()),
             restarts: Mutex::new(Vec::new()),
         };
@@ -1112,6 +1139,8 @@ struct Driver {
     shared: Arc<Shared>,
     timeout: Duration,
     expected: (u64, straydog_engine::bundle::Id),
+    /// The model's directory and the data directory its trees are in: where the marks of the files a worker read through and checked are kept.
+    trees: (PathBuf, PathBuf),
     verbose: bool,
     /// Where the expert store's contents are kept between runs (`<data-dir>/warm`), if anywhere.
     warm_directory: Option<PathBuf>,
@@ -1123,8 +1152,8 @@ struct Driver {
     prefix: Cache,
     /// What the run keeps of the conversation's state, for the next start, when the person asked for it (Windows).
     keeper: Keeper,
-    /// The tokens of the conversation an earlier run kept while no request of this run has gone on from it (0: there is none, or one did).
-    unclaimed: AtomicUsize,
+    /// The conversations earlier runs kept, by slot, with when each was last written or taken: which file a stop writes ([`crate::conversation::slot_for`]).
+    kept: std::sync::Mutex<Vec<crate::conversation::Kept>>,
     /// The saves under way, each on a thread of its own: the server waits for them before it ends.
     saves: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// When the worker was started again after it failed ([`RESTARTS`] within [`RESTART_WINDOW`] at the most).
@@ -1360,22 +1389,28 @@ impl Driver {
     /// stays on the drive until a request that begins with them asks for it ([`Driver::hand_conversation`]).
     async fn tell_kept_tokens(&self, process: &mut Process) {
         let Some(opening) = self.ready_frame().and_then(|ready| self.keeper.restore(&ready)) else { return };
-        let Ok(Some(tokens)) = opening.await else { return };
-        self.unclaimed.store(tokens.len(), Ordering::Relaxed);
-        let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into()))]);
-        if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&tokens)).await {
-            tracing::warn!("Straydog could not tell its worker the conversation the last run kept: {message}");
+        let Ok(kept) = opening.await else { return };
+        for one in &kept {
+            let header = frame(vec![("id", pyjson::Value::Str("kept-tokens".into())), ("command", pyjson::Value::Str("conversation_tokens".into())),
+                                    ("slot", pyjson::Value::Int(one.slot as i128))]);
+            if let Err(message) = process.send_with_body(&header, &straydog_engine::prefix::token_bytes(&one.tokens)).await {
+                tracing::warn!("Straydog could not tell its worker a conversation an earlier run kept: {message}");
+            }
         }
+        *self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = kept;
     }
 
     /// A request begins with the tokens of the kept conversation, and its worker asks for the state: read from the drive, opened, and sent. The worker
     /// is told why when it cannot be (the request then goes on without it). Err only when the worker is unusable.
-    async fn hand_conversation(&self, process: &mut Process) -> Result<(), String> {
-        self.unclaimed.store(0, Ordering::Relaxed);
+    async fn hand_conversation(&self, process: &mut Process, slot: usize) -> Result<(), String> {
+        // (a conversation taken is one the person is in: the last a full set of slots gives up)
+        for one in self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter_mut().filter(|one| one.slot == slot) {
+            one.at = std::time::SystemTime::now();
+        }
         let state = match self.ready_frame() {
             Some(ready) => {
                 let keeper = self.keeper.clone();
-                tokio::task::spawn_blocking(move || keeper.state(&ready)).await.map_err(|error| error.to_string()).and_then(|state| state)
+                tokio::task::spawn_blocking(move || keeper.state(&ready, slot)).await.map_err(|error| error.to_string()).and_then(|state| state)
             }
             None => Err("the engine is not ready".to_string()),
         };
@@ -1420,12 +1455,21 @@ impl Driver {
         }.await;
         let state = match given {
             Ok(Ok((state, held))) => {
-                let unclaimed = self.unclaimed.load(Ordering::Relaxed);
-                if !replaces_kept(held, unclaimed) {
-                    tracing::info!("Straydog conversation: the {unclaimed} tokens the last run kept stay kept (this run's {held} did not go on from them)");
-                    return;
+                let tokens = match crate::conversation::state_tokens(&state) {
+                    Ok(tokens) => tokens,
+                    Err(message) => {
+                        tracing::warn!("Straydog conversation: not kept ({message})");
+                        return;
+                    }
+                };
+                let kept = self.kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                match crate::conversation::slot_for(&tokens, &kept, crate::conversation::KEPT_SLOTS) {
+                    Some(slot) => (state, slot),
+                    None => {
+                        tracing::info!("Straydog conversation: this run's {held} tokens are all in a conversation kept already; the kept ones stay");
+                        return;
+                    }
                 }
-                state
             }
             Ok(Err(reason)) => {
                 // (the memory or the drive it would take is the only thing a person may want to know of; a worker that holds none is the usual case)
@@ -1441,8 +1485,9 @@ impl Driver {
                 return;
             }
         };
+        let (state, slot) = state;
         let keeper = self.keeper.clone();
-        match tokio::task::spawn_blocking(move || keeper.save(&ready, state)).await {
+        match tokio::task::spawn_blocking(move || keeper.save(&ready, slot, state)).await {
             Ok(Ok(saved)) => tracing::info!("{}", crate::conversation::saved_line(&saved, started.elapsed().as_secs_f64())),
             Ok(Err(message)) => tracing::warn!("Straydog conversation: not kept ({message})"),
             Err(error) => tracing::warn!("Straydog conversation: not kept ({error})"),
@@ -1700,6 +1745,15 @@ impl Driver {
                     tracing::info!("Straydog load steps: {}", steps.join(", "));
                 }
                 ready["loaded_seconds"] = started.elapsed().as_secs_f64().into();
+                // (the files the worker read through and checked against their pins: marked beside their trees, where each is still as it found it)
+                let verified: Vec<(String, String)> = ready["verified"].as_array().into_iter().flatten()
+                    .filter_map(|entry| Some((entry["name"].as_str()?.to_string(), entry["stamp"].as_str()?.to_string())))
+                    .collect();
+                if !verified.is_empty() {
+                    for name in straydog_provision::keep_stamps(&self.trees.0, self.expected.1, &self.trees.1, &verified) {
+                        tracing::info!("Straydog checked {name} as it read it: the next start reads it unhashed");
+                    }
+                }
                 self.set(Phase::Ready(ready));
                 Ok(process)
             }
@@ -1710,6 +1764,10 @@ impl Driver {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let tail = String::from_utf8_lossy(&self.shared.stderr_tail.lock().unwrap()).to_string();
                 let reason = start_reason(&tail, message);
+                // (a file the worker found unlike its pin keeps no mark: the next start reads it through again)
+                if let Some(name) = reason.split(straydog_engine::load::DIGEST_MISMATCH).nth(1).and_then(|rest| rest.split_whitespace().next()) {
+                    straydog_provision::forget_stamp(&self.trees.0, self.expected.1, &self.trees.1, name);
+                }
                 // Refused by the OS: find out why, as the user (a drive that keeps no file
                 // permissions, a path the worker's profile may not read) and say so.
                 let why = if was_refused(&reason) {
@@ -1781,7 +1839,8 @@ impl Driver {
                     let kind = event["event"].as_str().unwrap_or("").to_string();
                     if kind == "conversation_wanted" {
                         // (the request waits for it: the kept conversation is read from the drive and sent, and the events go on)
-                        self.hand_conversation(process).await?;
+                        let slot = event["slot"].as_u64().unwrap_or(0) as usize;
+                        self.hand_conversation(process, slot).await?;
                         continue;
                     }
                     if kind == "done" {
@@ -1951,14 +2010,6 @@ impl Engine for Runtime {
     }
 }
 
-/// Whether the conversation a worker holds at a stop (`held` tokens) takes the place of the file an earlier run kept, of `unclaimed` tokens
-/// that no request of this run went on from (0 when there is none, or one did). The latest conversation is the one taken back, unless it is
-/// shorter than the earlier one it never touched: a server's health check after a start, or an app's warm-up of its system prompt, is the last
-/// thing such a run did, and the conversation the person was in is the one they come back to.
-fn replaces_kept(held: usize, unclaimed: usize) -> bool {
-    held >= unclaimed
-}
-
 /// The tokens of the conversation a worker's `conversation_state` header gives (a count: Qwen3.8's and DeepSeek-V4.1's workers both send one).
 fn held_tokens(header: &Value) -> usize {
     header["tokens"].as_u64().map_or(0, |tokens| tokens as usize)
@@ -1968,17 +2019,11 @@ fn held_tokens(header: &Value) -> usize {
 mod tests {
     use super::*;
 
-    /// Decides: a stop keeps the latest conversation unless it is shorter than an earlier run's that this run never went on from.
+    /// Decides: the count of a worker's conversation is read from its header, as it sends it.
     #[test]
-    fn a_shorter_conversation_does_not_take_the_place_of_one_never_taken() {
-        assert!(replaces_kept(5924, 0), "nothing kept, or the kept one was taken: the latest is kept");
-        assert!(!replaces_kept(5924, 61_004), "a warm-up's system prompt after a start leaves the conversation the run never touched");
-        assert!(replaces_kept(70_000, 61_004), "a longer conversation of this run is the latest");
-        assert!(replaces_kept(61_004, 61_004));
-        // (as a worker sends it: the count of the tokens)
+    fn the_held_tokens_are_the_headers_count() {
         let header = json!({"id": "kept-state", "event": "conversation_state", "tokens": 1360, "digest": "ab", "bytes": 9 << 20});
         assert_eq!(held_tokens(&header), 1360);
-        assert!(!replaces_kept(held_tokens(&header), 2560));
     }
 
     /// Decides: the log line of a worker that stopped carries its last stderr lines (Rust's "memory allocation of N bytes failed" among
@@ -2185,7 +2230,15 @@ mod tests {
         // (and the banks it loaded: their loads' time, the gathers and staging waits in it, and the waits for their reads)
         let banks = request_summary(&event(json!({"prefill_bank_loads": 96, "prefill_bank_load_seconds": 60.2, "prefill_bank_gather_seconds": 41.0,
                                                   "prefill_bank_staging_wait_seconds": 3.1, "prefill_bank_wait_seconds": 12.4})), None);
-        assert!(banks.contains("2048 rows a batch, banks 96 loads in 60.2 s (gathers 41.0 s, staging waits 3.1 s), waited 12.4 s for their reads"), "{banks}");
+        assert!(banks.contains("2048 rows a batch, banks 96 loads in 60.2 s (gathers 41.0 s, staging waits 3.1 s), waited 12.4 s for their reads, \
+                                not read ahead"), "{banks}");
+        // (and how they were read ahead)
+        let one = request_summary(&event(json!({"prefill_bank_loads": 48, "prefill_bank_load_seconds": 5.0, "prefill_bank_gather_seconds": 4.5,
+                                                "prefill_bank_wait_seconds": 4.6, "prefill_bank_buffers": 1, "prefill_bank_direct": true})), None);
+        assert!(one.contains("waited 4.6 s for their reads, read ahead into 1 buffer around the page cache"), "{one}");
+        let four = request_summary(&event(json!({"prefill_bank_loads": 48, "prefill_bank_load_seconds": 2.0, "prefill_bank_buffers": 4,
+                                                 "prefill_bank_direct": false})), None);
+        assert!(four.contains("for their reads, read ahead into 4 buffers through the page cache"), "{four}");
         assert!(!moved.contains(", banks "), "no loads counted: no clause");
         // (the rows held in VRAM, or on the host with why)
         let held = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536, "prefill_rows_vram": true})), None);
@@ -2228,6 +2281,9 @@ mod tests {
         assert!(stays_in_the_log("Straydog drafts: 0 18.2 ms/token, 1 16.9, 2 17.4 (accepted 0.93, 0.71); keeping 1"));
         assert!(stays_in_the_log("Straydog drafts: 0 41.0 ms/token, 1 23.8, 2 18.5, 3 16.5 (accepted 0.77, 0.56, 0.33); now 3 (was 1)"));
         assert!(stays_in_the_log("Straydog host banks: 14 of 48 layers page-locked"));
+        assert!(stays_in_the_log("PHASES device 0: 9 batches, 432 layers; stream time 5210.4 ms = 578.9 ms a batch"));
+        assert!(stays_in_the_log("PHASES   host a MoE layer (432): counts wait 0.10 ms, hints 0.20 ms, gather 9.40 ms, CPU routes 1.00 ms, settle 0.10 ms"));
+        assert!(stays_in_the_log("Straydog memory at the start: free 0.8 GB, file cache 85.4 GB, available 17.7 GB, swap in use 1.4 GB"));
         assert!(stays_in_the_log("Straydog DSpark calibration on served drafts (skill 1.12, extra 0.74): slot 1: 0.9 812/861 (0.97 by calibration)"));
         // (why a picture was slow: the vision encoder on the CPU, as the GPU could not, and what the GPU took)
         assert!(stays_in_the_log("Straydog vision: on the CPU, as the GPU could not: no room for 412 MB more in this device's budget"));

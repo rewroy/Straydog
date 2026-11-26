@@ -135,6 +135,8 @@ pub struct Weights {
     /// Per file: its verity tree is younger than it. A tree is built from the whole file and checked against the pin (at download
     /// or at the first start), so a file not changed since needs no reading through at a start.
     tree_current: Vec<bool>,
+    /// Each file's mark when its tree was opened ([`verity::file_stamp`]).
+    stamps: Vec<Option<String>>,
     vectors: Mutex<HashMap<String, Arc<Vector>>>,
     /// Per file, once made: the handles the copy mode reads its banks' copies through ([`Weights::bank_file`]).
     bank_files: Mutex<HashMap<usize, Arc<crate::banks::BankFile>>>,
@@ -143,8 +145,8 @@ pub struct Weights {
     embeddings: Mutex<EmbeddingCache>,
 }
 
-/// A file's size and modification time, compared before each generation.
-type Signature = (u64, Option<SystemTime>);
+/// A file's size, modification time and change time ([`verity::changed_at`]), compared before each generation.
+type Signature = (u64, Option<SystemTime>, Option<SystemTime>);
 
 /// A shard's read-only mapping, or nothing where the shard was let go of ([`Weights::cache_rows`]): then it reads as an empty slice.
 struct Mapped(Option<Mmap>);
@@ -159,7 +161,7 @@ impl std::ops::Deref for Mapped {
 
 fn signature(file: &File) -> std::io::Result<Signature> {
     let metadata = file.metadata()?;
-    Ok((metadata.len(), metadata.modified().ok()))
+    Ok((metadata.len(), metadata.modified().ok(), verity::changed_at(file)))
 }
 
 fn error(message: impl Into<String>) -> String {
@@ -247,19 +249,11 @@ fn header(file: &File, name: &str, first: &str) -> Result<straydog_gguf::ModelHe
     straydog_gguf::inspect_header(snapshot, size).map_err(|exc| format!("Straydog GGUF preflight: {exc}"))
 }
 
-/// A file no younger than its verity tree (and its size unchanged is the tree's own check, at `Verifier::open`). This is what lets a start
-/// read the file unhashed, so on Unix it reads the change time, which no tool can set back as it can a modification time. It catches accidents
-/// and careless edits, not someone who can write the data directory too: they can make a tree look newer.
+/// Whether a start may read a file unhashed: it is as it was when it was last read through and checked against its pin, by the mark kept beside
+/// its tree ([`verity::marked_as_checked`]). It catches accidents and careless edits (a copy that keeps a file's times, a restore from a backup),
+/// not someone who can write the data directory too: they can write a mark.
 fn tree_is_current(file: &File, tree: &Path) -> bool {
-    let tree = std::fs::metadata(tree).and_then(|metadata| metadata.modified()).ok();
-    #[cfg(unix)]
-    let file = file.metadata().ok().map(|metadata| {
-        use std::os::unix::fs::MetadataExt;
-        std::time::UNIX_EPOCH + std::time::Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec().max(0) as u32)
-    });
-    #[cfg(not(unix))]
-    let file = file.metadata().and_then(|metadata| metadata.modified()).ok();
-    matches!((file, tree), (Some(file), Some(tree)) if file <= tree)
+    verity::marked_as_checked(file, tree)
 }
 
 impl Weights {
@@ -303,6 +297,7 @@ impl Weights {
             row_tables: HashMap::new(),
             verifiers: Vec::new(),
             tree_current: Vec::new(),
+            stamps: Vec::new(),
             vectors: Mutex::new(HashMap::new()),
             bank_files: Mutex::new(HashMap::new()),
             narrow: std::sync::OnceLock::new(),
@@ -377,8 +372,19 @@ impl Weights {
     /// their pinned digests): from then on the PLE table's rows are checked block by block as they
     /// are read, and partial residency's page-locked expert banks once locked.
     pub fn open_trees(&mut self, data_dir: &Path) -> Result<(), String> {
+        self.open_trees_marked(data_dir, None)
+    }
+
+    /// [`Weights::open_trees`] with the marks of the files as the server found them beside their trees, by asset name, in place of reading them:
+    /// a contained worker on Windows reads only the files granted to it, and a mark is written after the grants.
+    pub fn open_trees_with_marks(&mut self, data_dir: &Path, marks: &HashMap<String, String>) -> Result<(), String> {
+        self.open_trees_marked(data_dir, Some(marks))
+    }
+
+    fn open_trees_marked(&mut self, data_dir: &Path, marks: Option<&HashMap<String, String>>) -> Result<(), String> {
         let mut verifiers = vec![None; self.files.len()];
         let mut current = vec![false; self.files.len()];
+        let mut stamps = vec![None; self.files.len()];
         let table = self.table.as_ref().map(|table| -> Result<_, String> {
             let digest = bundle::verity_digest(&table.asset.sha256)?.ok_or_else(|| format!("{} has no pinned verity digest", table.asset.name))?;
             Ok((table.asset.clone(), digest))
@@ -386,14 +392,29 @@ impl Weights {
         for (asset, digest) in bundle::verity_pins(self.bundle)?.into_iter().chain(table) {
             let Some(index) = self.assets.iter().position(|name| *name == asset.name) else { continue };
             let tree = bundle::tree_path(data_dir, &asset);
-            current[index] = tree_is_current(&self.files[index], &tree);
+            current[index] = match marks {
+                Some(marks) => verity::matches_mark(&self.files[index], marks.get(&asset.name).map(String::as_str)),
+                None => tree_is_current(&self.files[index], &tree),
+            };
+            stamps[index] = verity::file_stamp(&self.files[index]);
             let verifier = verity::Verifier::open(&tree, asset.bytes, &verity::parse_digest(&digest)?, TREE_CACHE_BYTES)
                 .map_err(|error| format!("Straydog verity tree of {}: {error}", asset.name))?;
             verifiers[index] = Some(Arc::new(verifier));
         }
         self.verifiers = verifiers;
         self.tree_current = current;
+        self.stamps = stamps;
         Ok(())
+    }
+
+    /// The files a start reads through and checks against their pins, as their marks were when their trees were opened ([`verity::file_stamp`]): for
+    /// the server to keep beside their trees once the load has checked them, so that the next start reads them unhashed. Only the files the load
+    /// reads ([`Weights::files_to_read`]): a file it does not read whole, as the drafter's while the drafter is not in use, was not checked.
+    pub fn read_through(&self) -> Vec<(String, String)> {
+        (0..self.files_to_read().len())
+            .filter(|&file| self.verifiers.get(file).is_some_and(Option::is_some) && !self.file_checked(file))
+            .filter_map(|file| Some((self.assets[file].clone(), self.stamps.get(file)?.clone()?)))
+            .collect()
     }
 
     /// Whether a file was read through and checked against its pin, and not changed since.
@@ -403,6 +424,21 @@ impl Weights {
 
     pub(crate) fn verifier_of(&self, file: usize) -> Option<&Arc<verity::Verifier>> {
         self.verifiers.get(file).and_then(Option::as_ref)
+    }
+
+    /// The bytes of `files`' tree leaf levels not kept whole yet ([`Weights::keep_tree_leaves`]).
+    pub(crate) fn tree_leaves_to_keep(&self, files: &[usize]) -> u64 {
+        files.iter().filter_map(|file| self.verifier_of(*file)).filter(|verifier| !verifier.level0_kept()).map(|verifier| verifier.level0_bytes()).sum()
+    }
+
+    /// Keep `files`' tree leaf levels whole from now on, as far as `budget` goes, each whole or not at all ([`verity::Verifier::keep_level0`]): the
+    /// bytes newly kept.
+    pub(crate) fn keep_tree_leaves(&self, files: &[usize], budget: u64) -> Result<u64, String> {
+        let mut kept = 0u64;
+        for verifier in files.iter().filter_map(|file| self.verifier_of(*file)).filter(|verifier| !verifier.level0_kept()) {
+            kept += verifier.keep_level0(budget.saturating_sub(kept))?;
+        }
+        Ok(kept)
     }
 
     /// Whether a tensor's reads after loading are checked against its file's verity tree.

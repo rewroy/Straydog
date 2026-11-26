@@ -15,7 +15,9 @@ straydog-engine = { path = "../straydog-engine" }
 straydog-gpu = { path = "../straydog-gpu" }
 subtle = "2.6"
 
+tokio = { version = "1", features = ["time"] }
+
 [dev-dependencies]
 http-body-util = "0.1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }

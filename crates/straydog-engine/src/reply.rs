@@ -194,6 +194,9 @@ pub struct ToolCallSplitter {
     pub repaired: bool,
     /// [`ToolCallSplitter::finish`] released markup that held no call it could read, as text.
     pub unread: bool,
+    /// Bytes of markup [`ToolCallSplitter::finish`] left out of the text: a call the reply was cut in, which is neither run nor
+    /// shown (as text it reached the client's screen and its next request, the model's own markup half written).
+    pub left_out: usize,
     /// The calls as they are being written ([`ToolCallSplitter::writing`]); none unless asked for.
     writer: Option<CallWriter>,
 }
@@ -243,6 +246,7 @@ impl ToolCallSplitter {
             cut: false,
             repaired: false,
             unread: false,
+            left_out: 0,
             writer: None,
         }
     }
@@ -317,6 +321,10 @@ impl ToolCallSplitter {
             Some((calls, dropped, prose)) => {
                 self.dropped = dropped;
                 (carry + &prose, calls)
+            }
+            None if self.cut => {
+                self.left_out = markup.len();
+                (carry, Vec::new())
             }
             None => {
                 self.unread = true;
@@ -1256,19 +1264,23 @@ mod tests {
         assert_eq!(calls.len(), 2);
     }
 
-    /// A call the token limit cut short must not run as if it were whole: a write of half a file.
+    /// A call the token limit cut short must not run as if it were whole (a write of half a file), nor reach the answer's text as
+    /// markup: it is left out.
     #[test]
-    fn a_call_cut_short_stays_text() {
+    fn a_call_cut_short_is_neither_run_nor_text() {
         let open = "<tool_call>\n<function=read_file>\n<parameter=path>\nhalf of a";
         let (text, calls, splitter) = repaired(open, true);
-        assert!(calls.is_empty() && splitter.unread);
-        assert_eq!(text, open);
+        assert!(calls.is_empty() && !splitter.unread && text.is_empty());
+        assert_eq!(splitter.left_out, open.len());
         // cut inside a value quoting closes: what precedes the quote must not run as the whole value
         for quote in ["</parameter>\n</function>\nmore of the file", "</parameter>\n</function>\n</tool_call>\nmore of the file"] {
             let quoted = format!("<tool_call>\n<function=read_file>\n<parameter=path>\nfirst half\n{quote}");
             let (text, calls, splitter) = repaired(&quoted, true);
-            assert!(calls.is_empty() && splitter.unread && text == quoted, "{text:?} {calls:?}");
+            assert!(calls.is_empty() && text.is_empty() && splitter.left_out == quoted.len(), "{text:?} {calls:?}");
         }
+        // the same markup, not cut, is the answer's text as before
+        let (text, calls, splitter) = repaired(open, false);
+        assert!(calls.len() == 1 || (splitter.unread && text == open), "{text:?} {calls:?}");
     }
 
     /// A value that holds markup is a value, or the reply is text: never a call cut short at the markup it quotes.

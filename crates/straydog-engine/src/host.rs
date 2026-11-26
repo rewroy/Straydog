@@ -151,6 +151,61 @@ pub fn available_bytes() -> u64 {
     0
 }
 
+/// The kernel's counts, since it started, of the pages it scanned to take back for programs that wanted memory, of the pages it moved
+/// to swap, and of the faults that read from the drive: a start that finds the memory full of another program's file cache takes it
+/// back as it goes (two R9700s, 2026-11-25: after two starts of an 83.6 GB model whose files stayed cached, a start of DeepSeek checked
+/// its row proofs 3.3 times slower, 4.9 s against 1.5, and warmed up in 196 s, not ~33). Zero where the system does not say.
+pub fn reclaim_counts() -> [u64; 3] {
+    #[cfg(target_os = "linux")]
+    {
+        vmstat_counts(&std::fs::read_to_string("/proc/vmstat").unwrap_or_default())
+    }
+    #[cfg(not(target_os = "linux"))]
+    [0; 3]
+}
+
+/// [`reclaim_counts`] from the text of `/proc/vmstat`.
+#[cfg(any(target_os = "linux", test))]
+fn vmstat_counts(vmstat: &str) -> [u64; 3] {
+    let count = |name: &str| vmstat.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.trim().parse::<u64>().ok()).unwrap_or(0);
+    [count("pgscan_direct"), count("pswpout"), count("pgmajfault")]
+}
+
+/// The machine's memory for a start's log: what is free, what the file cache holds, what is available and the swap in use (Linux; on
+/// Windows what is available and the page file's room), and, from `since` ([`reclaim_counts`] taken earlier), what the kernel scanned
+/// to take back, moved to swap and read back on faults in between.
+pub fn machine_memory_note(since: Option<[u64; 3]>) -> String {
+    #[cfg(target_os = "linux")]
+    let held = meminfo_note(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default());
+    #[cfg(windows)]
+    let held = { let (available, page_file) = windows_available(); format!("available {:.1} GB, page file room {:.1} GB", available as f64 / 1e9, page_file as f64 / 1e9) };
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let held = String::from("not known");
+    // (the counts are Linux's: elsewhere they would read as nothing taken back, which is not known)
+    match since {
+        Some(at) if cfg!(target_os = "linux") => format!("{held}; since the start {}", reclaim_note(at, reclaim_counts())),
+        _ => held,
+    }
+}
+
+/// The memory part of [`machine_memory_note`] from the text of `/proc/meminfo`.
+#[cfg(any(target_os = "linux", test))]
+fn meminfo_note(meminfo: &str) -> String {
+    let field = |name: &str| meminfo.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(':')?.split_whitespace().next()?.parse::<u64>().ok());
+    let gb = |kib: u64| kib as f64 * 1024.0 / 1e9;
+    match (field("MemFree"), field("Cached"), field("MemAvailable"), field("SwapTotal"), field("SwapFree")) {
+        (Some(free), Some(cached), Some(available), Some(swap), Some(swap_free)) => format!("free {:.1} GB, file cache {:.1} GB, available {:.1} GB, swap in use {:.1} GB",
+                                                                                           gb(free), gb(cached), gb(available), gb(swap.saturating_sub(swap_free))),
+        _ => String::from("not known"),
+    }
+}
+
+/// What the kernel did between two [`reclaim_counts`].
+fn reclaim_note(at: [u64; 3], now: [u64; 3]) -> String {
+    let [scanned, swapped, faults] = [0, 1, 2].map(|index| now[index].saturating_sub(at[index]));
+    format!("{scanned} pages scanned for programs that wanted memory, {swapped} moved to swap, {faults} faults read from the drive")
+}
+
 /// The memory the expert banks may hold now beside `pinned` bytes of page-locked state, `locked` bytes of them page-locked already: on
 /// Windows this process's working set (the locked banks and state in it) and what is available (the standby list, where its trimmed bank
 /// pages wait, counts as available; the pages it holds do not); elsewhere what is available, the page cache included, within the cgroup's
@@ -1427,5 +1482,20 @@ mod fault_read_tests {
         let own = |count: u64| FaultReads { count, system: false };
         assert_eq!(own(5_000_000_000).since(own(4_999_999_000)), (1000, false));
         assert_eq!(own(3).since(own(7)), (0, false));
+    }
+}
+
+#[cfg(test)]
+mod memory_note_tests {
+    /// What a start logs of the machine's memory, from the kernel's own words.
+    #[test]
+    fn memory_and_reclaim_read_from_the_kernels_text() {
+        let meminfo = "MemTotal:       131260900 kB\nMemFree:          775568 kB\nMemAvailable:   17279888 kB\nBuffers:           19288 kB\nCached:         83370720 kB\nSwapCached:  1000 kB\nSwapTotal:       8388604 kB\nSwapFree:        6990000 kB\n";
+        assert_eq!(super::meminfo_note(meminfo), "free 0.8 GB, file cache 85.4 GB, available 17.7 GB, swap in use 1.4 GB");
+        assert_eq!(super::meminfo_note("MemFree: 1 kB\n"), "not known", "a field missing is not a zero");
+        let vmstat = "pgscan_kswapd 10\npgscan_direct 3800\npgscan_direct_throttle 0\npswpin 5\npswpout 350\npgmajfault 2360\n";
+        assert_eq!(super::vmstat_counts(vmstat), [3800, 350, 2360], "pgscan_direct is not pgscan_direct_throttle");
+        assert_eq!(super::reclaim_note([800, 50, 360], [3800, 350, 2360]),
+                   "3000 pages scanned for programs that wanted memory, 300 moved to swap, 2000 faults read from the drive");
     }
 }

@@ -841,6 +841,28 @@ mod tests {
             let verity = settings.data_dir.join("verity");
             assert!(exposure.directories.contains(&verity));
             assert!(pins.iter().all(|(asset, _)| exposure.files.contains(&verity.join(format!("{}.verity", asset.name)))));
+            // (a mark kept beside a tree goes to the worker as an argument, which a worker contained on Windows reads where it could not
+            // read the file: the first shard's only, as only it has one)
+            let marks = |settings: &Settings| -> Vec<String> {
+                let args: Vec<String> = crate::runtime::worker_args(settings).iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+                args.windows(2).filter(|pair| pair[0] == "--file-mark").map(|pair| pair[1].clone()).collect()
+            };
+            assert!(marks(&settings).is_empty());
+            let first = &pins[0].0;
+            straydog_engine::verity::keep_stamp(&bundle::tree_path(&settings.data_dir, first), "4096 133 134 0a0b:01").unwrap();
+            assert_eq!(marks(&settings), vec![format!("{}=4096 133 134 0a0b:01", first.name)]);
+            // (and the worker's own parser reads it back whole: a mark holds spaces)
+            #[derive(clap::Parser)]
+            struct Worker {
+                #[command(flatten)]
+                args: crate::worker::WorkerArgs,
+            }
+            // (worker_args begins with the subcommand, which stands as the program's name here)
+            let line = crate::runtime::worker_args(&settings);
+            assert_eq!(line[0], "worker");
+            let parsed = <Worker as clap::Parser>::try_parse_from(line).unwrap().args;
+            assert_eq!(parsed.file_marks, vec![format!("{}=4096 133 134 0a0b:01", first.name)]);
+            std::fs::remove_file(straydog_engine::verity::stamp_path(&bundle::tree_path(&settings.data_dir, first))).unwrap();
         }
     }
 
