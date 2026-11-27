@@ -196,6 +196,44 @@ fn cpu_rows_int8(kind: u32, level: i32, rows: &[u8], count: usize, x: &[f32]) ->
     (status == 0).then_some(out)
 }
 
+/// Two routes of one expert through the pair kernels (sd_cpu_rows_int8_pair): rows prepared and weights made once for both x.
+fn cpu_rows_int8_pair(kind: u32, level: i32, rows: &[u8], count: usize, x0: &[f32], x1: &[f32]) -> Option<(Vec<f32>, Vec<f32>)> {
+    let (mut out0, mut out1) = (vec![0f32; count], vec![0f32; count]);
+    // SAFETY: `count` rows of len/count bytes each against two x of their width.
+    let status = unsafe {
+        ffi::sd_cpu_rows_int8_pair(kind as i32, level, rows.as_ptr(), (rows.len() / count) as u64, count as u32, x0.as_ptr(), x1.as_ptr(),
+                                   x0.len() as u64, out0.as_mut_ptr(), out1.as_mut_ptr())
+    };
+    (status == 0).then_some((out0, out1))
+}
+
+/// Two routes of one expert take one decoding of its rows (the AVX-512 pair kernels, with VNNI and without): each route's sums are, bit
+/// for bit, those of the route alone, for IQ2_XXS and IQ2_S gate and up rows, an even and an odd count of rows; where there is no pair
+/// kernel (AVX2, the scalar reference) the hook says so.
+#[test]
+fn a_pair_of_routes_sums_as_each_route_alone() {
+    load_tables();
+    let mut random = Random(23);
+    let avx512 = std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512vbmi");
+    for kind in [16u32, 22] {
+        let (values, _) = formats::block(kind).unwrap();
+        let cols = 2560;
+        for rows in [1usize, 2, 5, 32] {
+            let data: Vec<u8> = (0..rows * cols / values).flat_map(|_| generated_block(kind, &mut random)).collect();
+            let x0: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
+            let x1: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
+            for level in [2, 3].into_iter().filter(|_| avx512) {
+                let (out0, out1) = cpu_rows_int8_pair(kind, level, &data, rows, &x0, &x1).expect("a pair kernel at AVX-512");
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&out0), bits(&cpu_rows_int8(kind, level, &data, rows, &x0).unwrap()), "kind {kind} rows {rows} level {level} x0");
+                assert_eq!(bits(&out1), bits(&cpu_rows_int8(kind, level, &data, rows, &x1).unwrap()), "kind {kind} rows {rows} level {level} x1");
+            }
+            assert!(cpu_rows_int8_pair(kind, 0, &data, rows, &x0, &x1).is_none(), "the scalar reference has no pair kernel");
+        }
+    }
+}
+
 /// The integer CPU path (gpu/cpu_int8.hpp) on the formats it has kernels for, at Qwen3.8's expert shapes: x rounded to 8-bit integers a
 /// block (256 values for gate and up, 64 for Q2_0's down), the products summed exactly in integers. The AVX-512 kernels, with GFNI
 /// and without, equal the scalar ones bit for bit. Against F64 sums of the decoded rows with x itself, the error is x's rounding (at most half a block's step a value, times

@@ -321,9 +321,11 @@ inline void prepare_iq2_s(const uint8_t* b, IntPrepared& p) {
 }
 // One 64-value chunk c of a prepared row against x's chunk q: its sixteen lanes added to `lanes`. With VNNI, vpdpwssd takes the
 // scaled pair sums and the add in one instruction (the same integers: |weight times q| <= 43 * 127, a pair under 2^15).
-template<bool vnni>
-SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,avx512vnni")
-inline __m512i chunk_lanes(const uint8_t* grid, bool coded, const IntPrepared& p, unsigned c, __m512i q, __m512i lanes) {
+// What of a chunk does not depend on x: its 64 weights (unsigned), the scales of its groups and its sign bits (put on x, not the weights).
+// Two routes of one expert make these once (iq2_int_rows512_pair) and take them against both their x.
+struct ChunkWeights { __m512i weights, scales; __mmask64 signs; };
+SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2")
+inline ChunkWeights chunk_weights(const uint8_t* grid, bool coded, const IntPrepared& p, unsigned c) {
     uint64_t signs; std::memcpy(&signs, p.signs + 8 * c, 8);
     __m512i weights;
     if (coded) {
@@ -332,12 +334,23 @@ inline __m512i chunk_lanes(const uint8_t* grid, bool coded, const IntPrepared& p
         const __m512i fields = _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_set1_epi64(0x0E0C0A0806040200), rows), _mm512_set1_epi8(3));
         weights = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(_mm_setr_epi8(8, 25, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)), fields);
     } else weights = grid64(grid, p.offset + 8 * c);
-    const __m512i signed_q = _mm512_mask_sub_epi8(q, __mmask64(signs), _mm512_setzero_si512(), q);
     // (each 128 bits: sixteen values of one group: the chunk's groups 4c .. 4c + 3)
     const __m512i scales = _mm512_permutexvar_epi16(_mm512_load_si512(chunk_groups[c]), _mm512_load_si512(p.scale));
-    const __m512i pairs = _mm512_maddubs_epi16(weights, signed_q);
-    if constexpr (vnni) return _mm512_dpwssd_epi32(lanes, pairs, scales);
-    else return _mm512_add_epi32(lanes, _mm512_madd_epi16(pairs, scales));
+    return {weights, scales, __mmask64(signs)};
+}
+// A chunk's weights against x's chunk q: its sixteen lanes added to `lanes`.
+template<bool vnni>
+SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,avx512vnni")
+inline __m512i chunk_dot(const ChunkWeights& w, __m512i q, __m512i lanes) {
+    const __m512i signed_q = _mm512_mask_sub_epi8(q, w.signs, _mm512_setzero_si512(), q);
+    const __m512i pairs = _mm512_maddubs_epi16(w.weights, signed_q);
+    if constexpr (vnni) return _mm512_dpwssd_epi32(lanes, pairs, w.scales);
+    else return _mm512_add_epi32(lanes, _mm512_madd_epi16(pairs, w.scales));
+}
+template<bool vnni>
+SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,avx512vnni")
+inline __m512i chunk_lanes(const uint8_t* grid, bool coded, const IntPrepared& p, unsigned c, __m512i q, __m512i lanes) {
+    return chunk_dot<vnni>(chunk_weights(grid, coded, p, c), q, lanes);
 }
 // A block's integer lanes times its F32 scale, added to the row's F32 lanes.
 SD_TARGET("avx512f,avx512bw,avx2")
@@ -381,6 +394,56 @@ void iq2_int_rows512(const uint8_t* row, size_t stride, const Q8K* x, size_t blo
     if constexpr (N > 1) out[1] = total512(acc1);
     if constexpr (N > 2) out[2] = total512(acc2);
     if constexpr (N > 3) out[3] = total512(acc3);
+}
+// iq2_int_rows512 of up to two rows for two routes of one expert (x0 and x1): each block's rows are prepared and each chunk's weights made
+// once, then taken against both. Each route's sums are those iq2_int_rows512 makes of it, bit for bit (the same integers, added in the same
+// order). The weights' decoding is most of a route's integer work: a core ran it compute-bound (a 7500F, 148 us a route hot against 159 cold).
+template<int kind, int N, bool vnni>
+SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,f16c,avx512vnni")
+void iq2_int_rows512_pair(const uint8_t* row, size_t stride, const Q8K* x0, const Q8K* x1, size_t blocks, float* out0, float* out1) {
+    static_assert(N == 1 || N == 2);
+    constexpr size_t bytes = kind == 16 ? 66 : 82;
+    const uint8_t* grid = iq_table(kind);
+    const __m512i low = _mm512_loadu_si512(sign_table.value), high = _mm512_loadu_si512(sign_table.value + 64);
+    const uint16_t* codes = kind == 16 ? iq2_xxs_codes() : nullptr;
+    CodeTable table;
+    if (codes) for (int k = 0; k < 8; ++k) table.part[k] = _mm512_loadu_si512(codes + 32 * k);
+    // (separate locals, as iq2_int_rows512 keeps them: route 0's rows a and b, route 1's)
+    __m512 acc0a = _mm512_setzero_ps(), acc0b = acc0a, acc1a = acc0a, acc1b = acc0a;
+    IntPrepared prepared[N];
+    for (size_t b = 0; b < blocks; ++b) {
+        prefetch_next<bytes, N>(row, stride, b);
+        for (int r = 0; r < N; ++r) {
+            const uint8_t* block = row + size_t(r) * stride + b * bytes;
+            if constexpr (kind == 16) prepare_iq2_xxs(block, prepared[r], low, high, codes ? &table : nullptr);
+            else prepare_iq2_s(block, prepared[r]);
+        }
+        __m512i lanes0a = _mm512_setzero_si512(), lanes0b = lanes0a, lanes1a = lanes0a, lanes1b = lanes0a;
+        for (unsigned c = 0; c < 4; ++c) {
+            const __m512i q0 = _mm512_load_si512(x0[b].q + 64 * c), q1 = _mm512_load_si512(x1[b].q + 64 * c);
+            const ChunkWeights wa = chunk_weights(grid, codes != nullptr, prepared[0], c);
+            lanes0a = chunk_dot<vnni>(wa, q0, lanes0a);
+            lanes1a = chunk_dot<vnni>(wa, q1, lanes1a);
+            if constexpr (N > 1) {
+                const ChunkWeights wb = chunk_weights(grid, codes != nullptr, prepared[1], c);
+                lanes0b = chunk_dot<vnni>(wb, q0, lanes0b);
+                lanes1b = chunk_dot<vnni>(wb, q1, lanes1b);
+            }
+        }
+        const float d0 = x0[b].d * 0.125f, d1 = x1[b].d * 0.125f;
+        const uint8_t* block = row + b * bytes;
+        const float ha = half_f16c(block);
+        acc0a = scaled_lanes(lanes0a, ha * d0, acc0a);
+        acc1a = scaled_lanes(lanes1a, ha * d1, acc1a);
+        if constexpr (N > 1) {
+            const float hb = half_f16c(block + stride);
+            acc0b = scaled_lanes(lanes0b, hb * d0, acc0b);
+            acc1b = scaled_lanes(lanes1b, hb * d1, acc1b);
+        }
+    }
+    out0[0] = total512(acc0a);
+    out1[0] = total512(acc1a);
+    if constexpr (N > 1) { out0[1] = total512(acc0b); out1[1] = total512(acc1b); }
 }
 // Q2_0's 2-bit codes, each 128 bits m = 0..3 taking bits 2m and 2m + 1 of the block's 16 code bytes: a 16-bit variable shift and a
 // mask, or (GFNI) one affine transform whose matrix in each 64 bits moves those two bits down (3 uops on Intel against 1).
@@ -595,6 +658,13 @@ void iq2_xxs_int_vnni(const uint8_t* row, size_t stride, size_t count, const Q8K
 void iq2_s_int_vnni(const uint8_t* row, size_t stride, size_t count, const Q8K* x, size_t blocks, float* out) {
     by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { iq2_int_rows512<22, decltype(n)::value, true>(rows, stride, x, blocks, o); });
 }
+// Two routes of one expert, rows two at a time (iq2_int_rows512_pair).
+template<int kind, bool vnni>
+void iq2_int_pair512(const uint8_t* row, size_t stride, size_t count, const Q8K* x0, const Q8K* x1, size_t blocks, float* out0, float* out1) {
+    size_t r = 0;
+    for (; r + 2 <= count; r += 2) iq2_int_rows512_pair<kind, 2, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
+    if (r < count) iq2_int_rows512_pair<kind, 1, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
+}
 void q2_0_int_avx512(const uint8_t* row, size_t stride, size_t count, const Q8S* x, size_t blocks, float* out) {
     by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { q2_0_int_rows512<decltype(n)::value, false, false>(rows, stride, x, blocks, o); });
 }
@@ -629,6 +699,21 @@ void q2_0_int_avxvnni(const uint8_t* row, size_t stride, size_t count, const Q8S
 // none.
 using GateKernel = void (*)(const uint8_t*, size_t, size_t, const Q8K*, size_t, float*);
 using DownKernel = void (*)(const uint8_t*, size_t, size_t, const Q8S*, size_t, float*);
+// Two routes of one expert at once (rows, stride, count, x0, x1, blocks, out0, out1): AVX-512 only, null elsewhere (the routes then take
+// GateKernel one after the other, as before).
+using GatePairKernel = void (*)(const uint8_t*, size_t, size_t, const Q8K*, const Q8K*, size_t, float*, float*);
+GatePairKernel gate_pair_kernel(int kind, int level) {
+#ifdef SD_X86
+    if (level >= 2) {
+        static const bool vnni = cpu_has("avx512vnni");
+        const bool use = level == 2 && vnni;
+        if (kind == 16) return use ? iq2_int_pair512<16, true> : iq2_int_pair512<16, false>;
+        if (kind == 22) return use ? iq2_int_pair512<22, true> : iq2_int_pair512<22, false>;
+    }
+#endif
+    (void)kind; (void)level;
+    return nullptr;
+}
 GateKernel gate_int_kernel(int kind, int level) {
 #ifdef SD_X86
     if (level >= 2) {

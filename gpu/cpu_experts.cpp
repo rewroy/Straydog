@@ -913,6 +913,25 @@ int sd_cpu_rows_int8(int kind, int level, const uint8_t* row, uint64_t stride, u
         throw std::runtime_error("no integer kernel for this Straydog CPU expert format");
     } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
 }
+// Test hook: sd_cpu_rows_int8 for two routes of one expert at once, x0 and x1 (the engine's pair kernels): 1 where the format has none at
+// this level (nothing is written).
+int sd_cpu_rows_int8_pair(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x0, const float* x1,
+                          uint64_t cols, float* out0, float* out1) {
+    try {
+        if (!row || !x0 || !x1 || !out0 || !out1 || !count || !cols || cols % 256) throw std::runtime_error("invalid Straydog integer rows");
+#ifdef SD_X86
+        if (level > 3 || (level >= 2 && !(cpu_has("avx512") && cpu_has("avx512vbmi"))) || (level == 1 && !cpu_has("avx2")))
+            throw std::runtime_error("no such integer kernels here");
+#endif
+        const GatePairKernel pair = gate_pair_kernel(kind, level);
+        if (!pair) return 1;
+        std::vector<Q8K> q0(cols / 256), q1(cols / 256);
+        quantize_k(level)(x0, cols / 256, q0.data());
+        quantize_k(level)(x1, cols / 256, q1.data());
+        pair(row, stride, count, q0.data(), q1.data(), cols / 256, out0, out1);
+        return 0;
+    } catch (const std::exception& e) { cpu_error = e.what(); return -1; }
+}
 // Test hook: count rows (stride bytes apart) of one format against x, through the fused
 // kernel at level (2 = AVX-512, 1 = AVX2) or the per-row decoded scalar path (0).
 int sd_cpu_rows(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols,
@@ -1053,10 +1072,17 @@ int run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* coun
         // The integer path where its formats allow: gate and up against x in 256-value blocks, down against each expert's products
         // in 64-value blocks.
         GateKernel gate_int[2] = {};
+        // (two routes of one expert, as the rows of a verification or a prompt often route, take one decoding of its rows between them:
+        // STRAYDOG_CPU_PAIR=0 keeps one route after another, for a comparison)
+        static const bool pairs = [] { const char* value = std::getenv("STRAYDOG_CPU_PAIR"); return !(value && value[0] == '0' && !value[1]); }();
+        GatePairKernel gate_pair[2] = {};
         DownKernel down_int = nullptr;
         if (engine->int8) {
             if (hidden % 256 == 0)
-                for (int role = 0; role < 2; ++role) gate_int[role] = gate_int_kernel(kinds[role], engine->int_level);
+                for (int role = 0; role < 2; ++role) {
+                    gate_int[role] = gate_int_kernel(kinds[role], engine->int_level);
+                    if (pairs) gate_pair[role] = gate_pair_kernel(kinds[role], engine->int_level);
+                }
             if (inter % 64 == 0) down_int = down_int_kernel(kinds[2], engine->int_level);
         }
         if (gate_int[0] || gate_int[1]) {
@@ -1095,10 +1121,18 @@ int run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* coun
                 const int role = local < inter ? 0 : 1;
                 const size_t end = std::min(last, u * 2 * inter + size_t(role + 1) * inter);
                 const uint8_t* bank = (role == 0 ? gate : up)[distinct[u]] + (local % inter) * bytes[role];
-                for (uint32_t m = first[u]; m < first[u + 1]; ++m) {
+                for (uint32_t m = first[u]; m < first[u + 1];) {
                     const uint32_t i = route_of[m], r = row_of[i];
                     const Q8K* x_int = gate_int[0] || gate_int[1] ? engine->x_int.data() + r * (hidden / 256) : nullptr;
+                    if (gate_pair[role] && m + 1 < first[u + 1]) {
+                        const uint32_t next = route_of[m + 1];
+                        gate_pair[role](bank, bytes[role], end - row, x_int, engine->x_int.data() + row_of[next] * (hidden / 256), hidden / 256,
+                                        gate_up + i * 2 * inter + local, gate_up + next * 2 * inter + local);
+                        m += 2;
+                        continue;
+                    }
                     project_rows(role, bank, end - row, xs[r], lane_input(r), x_int, hidden, gate_up + i * 2 * inter + local);
+                    ++m;
                 }
                 row = end;
             }
