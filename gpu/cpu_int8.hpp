@@ -489,6 +489,38 @@ void q2_0_int_rows512(const uint8_t* row, size_t stride, const Q8S* x, size_t bl
     if constexpr (N > 2) out[2] = total512(acc2);
     if constexpr (N > 3) out[3] = total512(acc3);
 }
+// q2_0_int_rows512 for two routes of one expert (x0 and x1, each route's products): each block's codes and scale made once and taken
+// against both, each route's sums bit for bit those of the route alone.
+template<int N, bool gfni, bool vnni>
+SD_TARGET("avx512f,avx512bw,avx2,f16c,gfni,avx512vnni")
+void q2_0_int_rows512_pair(const uint8_t* row, size_t stride, const Q8S* x0, const Q8S* x1, size_t blocks, float* out0, float* out1) {
+    const __m512i ones = _mm512_set1_epi16(1);
+    __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    for (size_t b = 0; b < blocks; ++b) {
+        prefetch_next<18, N>(row, stride, b);
+        const __m512i q0 = _mm512_load_si512(x0[b].q), q1 = _mm512_load_si512(x1[b].q);
+        const __m512i bias0 = _mm512_load_si512(x0[b].lanes), bias1 = _mm512_load_si512(x1[b].lanes);
+        const __m512i minus0 = _mm512_sub_epi32(_mm512_setzero_si512(), bias0), minus1 = _mm512_sub_epi32(_mm512_setzero_si512(), bias1);
+        const uint8_t* block = row + 18 * b;
+#define SD_Q2_PAIR_LANES(codes, q, minus, bias) (vnni ? _mm512_dpbusd_epi32(minus, codes, q) \
+                             : _mm512_sub_epi32(_mm512_madd_epi16(_mm512_maddubs_epi16(codes, q), ones), bias))
+#define SD_Q2_PAIR(r, acc0, acc1) { \
+            const __m512i codes = q2_int_codes<gfni>(block + (r) * stride); \
+            const float h = half_f16c(block + (r) * stride); \
+            acc0 = scaled_lanes(SD_Q2_PAIR_LANES(codes, q0, minus0, bias0), h * x0[b].d, acc0); \
+            acc1 = scaled_lanes(SD_Q2_PAIR_LANES(codes, q1, minus1, bias1), h * x1[b].d, acc1); }
+        SD_Q2_PAIR(0, a0, b0)
+        if constexpr (N > 1) SD_Q2_PAIR(1, a1, b1)
+        if constexpr (N > 2) SD_Q2_PAIR(2, a2, b2)
+        if constexpr (N > 3) SD_Q2_PAIR(3, a3, b3)
+#undef SD_Q2_PAIR
+#undef SD_Q2_PAIR_LANES
+    }
+    out0[0] = total512(a0); out1[0] = total512(b0);
+    if constexpr (N > 1) { out0[1] = total512(a1); out1[1] = total512(b1); }
+    if constexpr (N > 2) { out0[2] = total512(a2); out1[2] = total512(b2); }
+    if constexpr (N > 3) { out0[3] = total512(a3); out1[3] = total512(b3); }
+}
 // --- AVX2 kernels: the AVX-512 kernels' sixteen lanes as two 256-bit halves (lanes 0-7 and 8-15), the same integers and the same F32
 // operations in the same order, so the same bits. For CPUs without AVX-512 (Intel's 12th to 14th generation, Zen 3 and before) ---
 
@@ -665,6 +697,18 @@ void iq2_int_pair512(const uint8_t* row, size_t stride, size_t count, const Q8K*
     for (; r + 2 <= count; r += 2) iq2_int_rows512_pair<kind, 2, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
     if (r < count) iq2_int_rows512_pair<kind, 1, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
 }
+// Two routes of one expert's down rows, four rows at a time (q2_0_int_rows512_pair).
+template<bool gfni, bool vnni>
+void q2_0_int_pair512(const uint8_t* row, size_t stride, size_t count, const Q8S* x0, const Q8S* x1, size_t blocks, float* out0, float* out1) {
+    size_t r = 0;
+    for (; r + 4 <= count; r += 4) q2_0_int_rows512_pair<4, gfni, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
+    switch (count - r) {
+        case 3: q2_0_int_rows512_pair<3, gfni, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r); break;
+        case 2: q2_0_int_rows512_pair<2, gfni, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r); break;
+        case 1: q2_0_int_rows512_pair<1, gfni, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r); break;
+        default: break;
+    }
+}
 void q2_0_int_avx512(const uint8_t* row, size_t stride, size_t count, const Q8S* x, size_t blocks, float* out) {
     by_fours(row, stride, count, out, [&](auto n, const uint8_t* rows, float* o) { q2_0_int_rows512<decltype(n)::value, false, false>(rows, stride, x, blocks, o); });
 }
@@ -730,6 +774,19 @@ GateKernel gate_int_kernel(int kind, int level) {
     (void)level;
     if (kind == 16) return iq2_xxs_int_scalar;
     if (kind == 22) return iq2_s_int_scalar;
+    return nullptr;
+}
+// Two routes of one expert's down at once: AVX-512 only, null elsewhere.
+using DownPairKernel = void (*)(const uint8_t*, size_t, size_t, const Q8S*, const Q8S*, size_t, float*, float*);
+DownPairKernel down_pair_kernel(int kind, int level) {
+#ifdef SD_X86
+    if (level >= 2 && kind == 42) {
+        static const bool gfni = cpu_has("gfni"), vnni = cpu_has("avx512vnni");
+        if (level == 2 && gfni) return vnni ? q2_0_int_pair512<true, true> : q2_0_int_pair512<true, false>;
+        return q2_0_int_pair512<false, false>;
+    }
+#endif
+    (void)kind; (void)level;
     return nullptr;
 }
 DownKernel down_int_kernel(int kind, int level) {

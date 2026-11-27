@@ -207,18 +207,17 @@ fn cpu_rows_int8_pair(kind: u32, level: i32, rows: &[u8], count: usize, x0: &[f3
     (status == 0).then_some((out0, out1))
 }
 
-/// Two routes of one expert take one decoding of its rows (the AVX-512 pair kernels, with VNNI and without): each route's sums are, bit
-/// for bit, those of the route alone, for IQ2_XXS and IQ2_S gate and up rows, an even and an odd count of rows; where there is no pair
-/// kernel (AVX2, the scalar reference) the hook says so.
+/// Two routes of one expert take one decoding of its rows (the AVX-512 pair kernels, with GFNI and VNNI and without): each route's sums
+/// are, bit for bit, those of the route alone, for IQ2_XXS and IQ2_S gate and up rows and Q2_0 down rows, even and odd counts of rows;
+/// where there is no pair kernel (the scalar reference) the hook says so.
 #[test]
 fn a_pair_of_routes_sums_as_each_route_alone() {
     load_tables();
     let mut random = Random(23);
     let avx512 = std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
         && std::is_x86_feature_detected!("avx512vbmi");
-    for kind in [16u32, 22] {
+    for (kind, cols) in [(16u32, 2560usize), (22, 2560), (42, 640)] {
         let (values, _) = formats::block(kind).unwrap();
-        let cols = 2560;
         for rows in [1usize, 2, 5, 32] {
             let data: Vec<u8> = (0..rows * cols / values).flat_map(|_| generated_block(kind, &mut random)).collect();
             let x0: Vec<f32> = (0..cols).map(|_| random.activation()).collect();

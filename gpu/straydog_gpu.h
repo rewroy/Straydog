@@ -794,8 +794,8 @@ const uint8_t* sd_iq_grid(int kind, size_t* bytes);
 int sd_cpu_decode(int kind, int wide, const uint8_t* block, float* out);
 int sd_cpu_rows(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out);
 int sd_cpu_rows_int8(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x, uint64_t cols, float* out);
-/* sd_cpu_rows_int8 for two routes of one expert at once (x0, x1 -> out0, out1), the engine's pair kernels; 1 where the format has none at
-   this level. */
+/* sd_cpu_rows_int8 for two routes of one expert at once (x0, x1 -> out0, out1; gate and up rows, or Q2_0 down rows), the engine's pair
+   kernels; 1 where the format has none at this level. */
 int sd_cpu_rows_int8_pair(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x0, const float* x1,
                           uint64_t cols, float* out0, float* out1);
 int sd_quantize_q2_0(const uint16_t* input, uint64_t count, uint8_t* output);

@@ -918,13 +918,21 @@ int sd_cpu_rows_int8(int kind, int level, const uint8_t* row, uint64_t stride, u
 int sd_cpu_rows_int8_pair(int kind, int level, const uint8_t* row, uint64_t stride, uint32_t count, const float* x0, const float* x1,
                           uint64_t cols, float* out0, float* out1) {
     try {
-        if (!row || !x0 || !x1 || !out0 || !out1 || !count || !cols || cols % 256) throw std::runtime_error("invalid Straydog integer rows");
+        if (!row || !x0 || !x1 || !out0 || !out1 || !count || !cols || cols % 64) throw std::runtime_error("invalid Straydog integer rows");
 #ifdef SD_X86
         if (level > 3 || (level >= 2 && !(cpu_has("avx512") && cpu_has("avx512vbmi"))) || (level == 1 && !cpu_has("avx2")))
             throw std::runtime_error("no such integer kernels here");
 #endif
+        if (const DownPairKernel down = down_pair_kernel(kind, level)) {
+            std::vector<Q8S> q0(cols / 64), q1(cols / 64);
+            quantize_s(level)(x0, cols / 64, q0.data());
+            quantize_s(level)(x1, cols / 64, q1.data());
+            down(row, stride, count, q0.data(), q1.data(), cols / 64, out0, out1);
+            return 0;
+        }
         const GatePairKernel pair = gate_pair_kernel(kind, level);
         if (!pair) return 1;
+        if (cols % 256) throw std::runtime_error("invalid Straydog integer rows");
         std::vector<Q8K> q0(cols / 256), q1(cols / 256);
         quantize_k(level)(x0, cols / 256, q0.data());
         quantize_k(level)(x1, cols / 256, q1.data());
@@ -1077,13 +1085,17 @@ int run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* coun
         static const bool pairs = [] { const char* value = std::getenv("STRAYDOG_CPU_PAIR"); return !(value && value[0] == '0' && !value[1]); }();
         GatePairKernel gate_pair[2] = {};
         DownKernel down_int = nullptr;
+        DownPairKernel down_pair = nullptr;
         if (engine->int8) {
             if (hidden % 256 == 0)
                 for (int role = 0; role < 2; ++role) {
                     gate_int[role] = gate_int_kernel(kinds[role], engine->int_level);
                     if (pairs) gate_pair[role] = gate_pair_kernel(kinds[role], engine->int_level);
                 }
-            if (inter % 64 == 0) down_int = down_int_kernel(kinds[2], engine->int_level);
+            if (inter % 64 == 0) {
+                down_int = down_int_kernel(kinds[2], engine->int_level);
+                if (pairs) down_pair = down_pair_kernel(kinds[2], engine->int_level);
+            }
         }
         if (gate_int[0] || gate_int[1]) {
             engine->x_int.resize(size_t(rows) * (hidden / 256));
@@ -1172,6 +1184,13 @@ int run_rows(void* handle, const int* kinds, uint32_t rows, const uint32_t* coun
                 const uint8_t* bank = down[distinct[u]] + begin * bytes[2];
                 for (uint32_t m = first[u]; m < first[u + 1]; ++m) {
                     const uint32_t i = route_of[m];
+                    if (down_pair && m + 1 < first[u + 1]) {
+                        const uint32_t next = route_of[++m];
+                        down_pair(bank, bytes[2], last - begin, engine->products_int.data() + i * (inter / 64),
+                                  engine->products_int.data() + next * (inter / 64), inter / 64, down_rows + i * hidden + begin,
+                                  down_rows + next * hidden + begin);
+                        continue;
+                    }
                     if (down_int) {
                         down_int(bank, bytes[2], last - begin, engine->products_int.data() + i * (inter / 64), inter / 64,
                                  down_rows + i * hidden + begin);
