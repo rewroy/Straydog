@@ -1,17 +1,18 @@
 //! The state of a system block (the system prompt with its tools), kept for the next start of the engine.
 //!
 //! The first request of an app that starts the engine carries the same block every time, a few thousand tokens that a small card reads in
-//! twenty seconds. The engine saves its state at the end of that block (its root checkpoint). On Windows the server asks the worker for that
-//! state once per run, after the reply, seals it for the user ([`crate::prefix_store`]) in `<data dir>/prefix`, and at the next start, after
-//! the worker is ready, opens the file that start's settings key and hands the state to the worker in the background: a request that comes
-//! first never waits for it, and the worker takes it only while no request has had the engine. Elsewhere none of this is done.
+//! twenty seconds. The engine saves its state at the end of that block (its root checkpoint). On Windows and Linux the server asks the worker
+//! for that state once per run, after the reply, seals it for the user ([`crate::prefix_store`]: DPAPI, or a key the kernel's keyring holds
+//! for the boot) in `<data dir>/prefix`, and at the next start, after the worker is ready, opens the file that start's settings key and hands
+//! the state to the worker: behind ready, or ahead of a first request that came while it was read (runtime.rs serve), which takes it where
+//! its prompt begins with the block. An on-demand bundle's worker (DeepSeek-V4.1) takes it as a root checkpoint. Elsewhere none of this is done.
 //!
 //! Which file a start takes is decided by a key: SHA-256 of the bundle, the engine's version and build, everything the worker's placement
 //! decided that changes the state's layout or its numbers, and the tokens the state is held at ([`description`] lists them but the tokens).
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::path::PathBuf;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -84,7 +85,7 @@ pub fn lasting_description(settings: &Settings, ready: &Value) -> Option<String>
 
 /// A state saved, opened: what the worker is to be handed.
 pub struct Restored {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     opened: crate::prefix_store::Opened,
     /// What reading and opening it took, in seconds.
     pub seconds: f64,
@@ -92,11 +93,11 @@ pub struct Restored {
 
 impl Restored {
     pub fn state(&self) -> &[u8] {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             self.opened.state()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             &[]
         }
@@ -105,11 +106,11 @@ impl Restored {
 
 /// What the server keeps of a run's system block: where it saves the state and how it is keyed, and what the run has done about it.
 pub struct Cache {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     on: Option<Arc<On>>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct On {
     settings: Settings,
     directory: PathBuf,
@@ -118,7 +119,7 @@ struct On {
     state: Mutex<State>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Default)]
 struct State {
     /// The root the last request made: its tokens, and their digest.
@@ -128,7 +129,7 @@ struct State {
 }
 
 /// What a start's state is keyed on, and where it is kept.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct Identity {
     store: crate::prefix_store::Store,
     prefix: [u8; 32],
@@ -139,13 +140,13 @@ pub struct Due {
     /// The tokens the state is held at, and their digest, as the worker says them.
     pub tokens: u64,
     pub digest: String,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     identity: Identity,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     digest_bytes: [u8; 32],
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl On {
     /// The identity of this start: its store, and the prefix of its keys. None when the worker offers no states, or the executable could not
     /// be read.
@@ -170,15 +171,20 @@ impl On {
         for deleted in identity.store.prune(None) {
             tracing::debug!("Straydog prefix: deleted {}", deleted.display());
         }
-        let opened = identity.store.take_newest(&crate::prefix_store::Dpapi, &identity.prefix, straydog_engine::prefix::VERSION)?;
+        let opened = identity.store.take_newest(crate::prefix_store::user_wrap(), &identity.prefix, straydog_engine::prefix::VERSION)?;
         Some(Restored { opened, seconds: started.elapsed().as_secs_f64() })
     }
 }
 
 impl Cache {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn new(settings: &Settings) -> Cache {
-        let on = (settings.prefix_cache && !settings.bundle.is_on_demand()).then(|| {
+        // (an on-demand bundle's worker takes a system block's state as a root checkpoint, `Session::import_root`)
+        let on = settings.prefix_cache.then(|| {
+            // (where the runtime directory and the home are not the server's to write, as under a service, the keyring's lock goes beside
+            // the files, as the kept conversation's does)
+            #[cfg(target_os = "linux")]
+            crate::prefix_store::keyring_lock_beside(&settings.data_dir.join("prefix"));
             Arc::new(On {
                 settings: settings.clone(),
                 directory: settings.data_dir.join("prefix"),
@@ -189,7 +195,7 @@ impl Cache {
         Cache { on }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     pub fn new(_settings: &Settings) -> Cache {
         Cache {}
     }
@@ -197,12 +203,12 @@ impl Cache {
     /// Start opening the state this start may be handed (the newest file whose key prefix is this start's), on a thread of its own. The server
     /// hands the result to the worker unless a request has begun by then. The files that no start of this build can use are deleted first.
     pub fn restore(&self, ready: &Value) -> Option<tokio::task::JoinHandle<Option<Restored>>> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let (on, ready) = (self.on.clone()?, ready.clone());
             Some(tokio::task::spawn_blocking(move || on.open_newest(&ready)))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = ready;
             None
@@ -211,7 +217,7 @@ impl Cache {
 
     /// A request ended with this event: note the root it made, if it made one.
     pub fn note_done(&self, event: &Value) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(on) = &self.on {
             let timings = &event["timings"];
             let digest = timings["root_digest"].as_str().and_then(crate::prefix_store::digest_from_hex);
@@ -222,14 +228,14 @@ impl Cache {
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let _ = event;
     }
 
     /// The state to ask the worker for now, if the last request made a root and this run has not saved a state, and no file holds it already.
     /// At most once a run: whatever comes of it, it is not asked for again.
     pub fn due(&self, ready: &Value) -> Option<Due> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let on = self.on.as_ref()?;
             let (tokens, digest) = {
@@ -248,7 +254,7 @@ impl Cache {
             let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             Some(Due { tokens, digest: hex, identity, digest_bytes: digest })
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = ready;
             None
@@ -260,11 +266,11 @@ impl Due {
     /// Seal `state` and write its file, on a thread of its own, then prune the store; the log says how it went.
     pub fn save(self, state: Vec<u8>) -> tokio::task::JoinHandle<()> {
         tokio::task::spawn_blocking(move || {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 let started = std::time::Instant::now();
                 let Due { tokens, identity, digest_bytes, .. } = self;
-                match identity.store.save(&crate::prefix_store::Dpapi, straydog_engine::prefix::VERSION, &identity.prefix, &digest_bytes, state) {
+                match identity.store.save(crate::prefix_store::user_wrap(), straydog_engine::prefix::VERSION, &identity.prefix, &digest_bytes, state) {
                     Ok((path, bytes)) => {
                         tracing::info!("Straydog prefix: saved {tokens} tokens ({} MB) in {:.1} s", bytes >> 20, started.elapsed().as_secs_f64());
                         for deleted in identity.store.prune(Some(&path)) {
@@ -274,7 +280,7 @@ impl Due {
                     Err(message) => tracing::warn!("Straydog prefix: not saved ({message})"),
                 }
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             drop((self, state));
         })
     }

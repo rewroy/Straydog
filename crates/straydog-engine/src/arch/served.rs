@@ -913,6 +913,8 @@ impl<E: Engines> Session<E> {
         let mut fed = reused;
         // (the seconds the checkpoints took: copies of the whole state, made before the first token)
         let mut checkpoint_seconds = 0.0;
+        // (the root this request made: the server keeps its state for the next start, [`export_root`](Self::export_root))
+        let mut made_root = None;
         if let Some(root) = self.root_mark(tokens, reused) {
             // (the beginning this system prompt shares with one read before, where it ends otherwise: a root of its own)
             if let Some(stem) = stem(agreed, fed, root) {
@@ -931,6 +933,7 @@ impl<E: Engines> Session<E> {
             self.save_checkpoint(true)?;
             checkpoint_seconds += saving.elapsed().as_secs_f64();
             fed = root;
+            made_root = Some(root);
         }
         if let Some(start) = self.turn_mark(tokens, fed) {
             // (a turn where the request resumed, or at the root just saved, takes the state as it is: nothing is read)
@@ -1022,6 +1025,10 @@ impl<E: Engines> Session<E> {
         .as_object()
         .unwrap()
         .clone();
+        if let Some(root) = made_root {
+            self.last_metrics.insert("root_checkpoint".into(), json!(root));
+            self.last_metrics.insert("root_digest".into(), json!(crate::prefix::tokens_digest(&tokens[..root])));
+        }
         if let Some((runs, widths, draft_ms)) = draft_stats {
             self.last_metrics.insert("engine_draft_runs".into(), json!(runs));
             self.last_metrics.insert("engine_draft_widths".into(), json!(widths));
@@ -1170,6 +1177,34 @@ impl<E: Engines> Session<E> {
         bytes.extend_from_slice(&crate::prefix::token_bytes(&tokens));
         bytes.extend_from_slice(&state);
         Ok(Some((tokens, bytes)))
+    }
+
+    /// The system block's state for the next start: the newest root checkpoint the engines hold, as [`export_conversation`]'s bytes are
+    /// (the tokens, then the engines' checkpoint), and its tokens. None without one.
+    pub fn export_root(&mut self) -> Result<Option<(Vec<u32>, Vec<u8>)>, String> {
+        let engines = &self.engines;
+        let Some(checkpoint) = self.checkpoints.iter().rev().find(|checkpoint| checkpoint.root && engines.holds(checkpoint.slot)) else {
+            return Ok(None);
+        };
+        let (slot, tokens) = (checkpoint.slot, checkpoint.tokens.clone());
+        let state = self.engines.export_checkpoint(slot)?;
+        let mut bytes = crate::prefix::header(tokens.len(), 0, &[(KEPT_TOKENS, 4 * tokens.len() as u64), (KEPT_CHECKPOINT, state.len() as u64)]);
+        bytes.extend_from_slice(&crate::prefix::token_bytes(&tokens));
+        bytes.extend_from_slice(&state);
+        Ok(Some((tokens, bytes)))
+    }
+
+    /// Take another start's [`export_root`](Self::export_root) as the root checkpoint of its tokens, as
+    /// [`import_conversation`](Self::import_conversation) takes a conversation: a request that begins with them goes on from there, and
+    /// the budget gives the root up last. The tokens it holds.
+    pub fn import_root(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let held = self.import_conversation(bytes)?;
+        if let Some(checkpoint) = self.checkpoints.last_mut() {
+            checkpoint.root = true;
+        }
+        let kept = self.checkpoints.iter().rev().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);
+        self.engines.keep_checkpoint(kept);
+        Ok(held)
     }
 
     /// About the host bytes a kept conversation of `tokens` takes once read ([`Engines::state_bytes`]; 0: not known).
