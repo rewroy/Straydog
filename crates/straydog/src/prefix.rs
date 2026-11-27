@@ -181,10 +181,11 @@ impl Cache {
     pub fn new(settings: &Settings) -> Cache {
         // (an on-demand bundle's worker takes a system block's state as a root checkpoint, `Session::import_root`)
         let on = settings.prefix_cache.then(|| {
-            // (where the runtime directory and the home are not the server's to write, as under a service, the keyring's lock goes beside
-            // the files, as the kept conversation's does)
+            // (where the runtime directory and the home are not the server's to write, as under a service, the keyring's lock goes in the
+            // folder the kept conversation's goes in, made for the user alone: the place is set once, by whichever store comes first, and
+            // a served DeepSeek's prefix folder made with the umask's mode held neither store's lock)
             #[cfg(target_os = "linux")]
-            crate::prefix_store::keyring_lock_beside(&settings.data_dir.join("prefix"));
+            crate::prefix_store::keyring_lock_beside(&settings.data_dir.join("conversation"));
             Arc::new(On {
                 settings: settings.clone(),
                 directory: settings.data_dir.join("prefix"),

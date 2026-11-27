@@ -568,6 +568,15 @@ impl Store {
         let path = self.directory.join(self.name(prefix, &key_of(prefix, tokens)));
         let part = PathBuf::from(format!("{}.part", path.display()));
         let written = (|| -> std::io::Result<()> {
+            // (for the user alone where the system says whose a folder is: the files are sealed, and the folder may hold the keyring's lock)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(&self.directory)?;
+                // (and one made before with the umask's mode, as a served DeepSeek's first build made it, is made so)
+                std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700))?;
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(&self.directory)?;
             let mut file = std::fs::File::create(&part)?;
             file.write_all(&header)?;
@@ -701,6 +710,12 @@ mod tests {
         let opened = open(&path, &Flip, &prefix, 1).unwrap();
         assert_eq!((opened.state(), opened.tokens), (&plain[..], tokens));
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|entry| !entry.file_name().to_string_lossy().ends_with(".part")), "no part is left");
+        // (the folder a save makes is the user's alone: it may hold the keyring's lock beside the files)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
