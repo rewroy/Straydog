@@ -601,7 +601,7 @@ token) and past a forced call's opening (§6.3).
   - Qwen3.8's head otherwise gives a verification's rows as an argmax or a top k picked on the GPU, which cannot be masked:
     a request that suppresses reads the rows' whole logits instead. No `suppress`, nothing changes.
 
-### 6.4 The system block's state across starts (Windows)
+### 6.4 The system block's state across starts (Windows and Linux)
 
 An app that starts the engine and then sends its first request sends the same system block every
 time: its system prompt with its tools, a few thousand tokens. On a small card that block is most
@@ -679,7 +679,13 @@ read. The state was saved in 0.3 s after the reply, and the file is 323 MB.
   RTX 5070 Ti PC a request sent as the server became ready had its first token in 1.03 s instead of
   8.9-9.6 s (5,644 tokens). The log says what became of the state (`Straydog prefix: restored 4020
   tokens (308 MB) in 0.9 s`, or `... by the first request in ...`).
-- **Off.** `prefix_cache = false` in the config file, or `--no-prefix-cache`. Linux saves nothing.
+- **On Linux** the key is wrapped under a key the kernel's keyring holds for the user, which lasts the boot
+  (as the kept conversation's, 6.5): a file from before a reboot does not unwrap and is deleted.
+- **DeepSeek-V4.1** (an on-demand bundle) keeps the state as its root checkpoint (`Session::export_root`,
+  `import_root`): on two R9700s (UD-IQ2_XXS) a first start's first request read its 6,080-token block in
+  33.6 s, and after a restart a new conversation sent as the server became ready had its first token in
+  2.75 s, the block's tokens reused.
+- **Off.** `prefix_cache = false` in the config file, or `--no-prefix-cache`.
 
 ### 6.5 The conversation's state across starts (Windows, an option, off by default)
 
