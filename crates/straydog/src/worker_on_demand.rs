@@ -52,6 +52,11 @@ enum Job {
     Warm(Value),
     /// The kept conversation's state at a stop (`--keep-conversation`), within so many bytes.
     ConversationState(u64, mpsc::Sender<Result<Option<(Value, Vec<u8>)>, String>>),
+    /// The system block's state, the newest root checkpoint (`Session::export_root`), for the next start.
+    PrefixState(mpsc::Sender<Result<Option<(Value, Vec<u8>)>, String>>),
+    /// A system block's state an earlier start saved, taken as a root checkpoint (`Session::import_root`); the seconds the server took
+    /// to read it, and when its frame came.
+    Prefix(Vec<u8>, f64, Instant),
 }
 
 /// Warm-up experts started per step while the model is idle (a step every millisecond), and
@@ -119,6 +124,21 @@ impl Served for Handle {
         let (reply, result) = mpsc::channel();
         self.0.send(Job::ConversationState(limit, reply)).map_err(|_| "the Straydog model thread has stopped".to_string())?;
         result.recv().map_err(|_| "the Straydog model thread has stopped".to_string())?
+    }
+
+    fn prefix_state(&mut self) -> Result<Option<(Value, Vec<u8>)>, String> {
+        let (reply, result) = mpsc::channel();
+        self.0.send(Job::PrefixState(reply)).map_err(|_| "the Straydog model thread has stopped".to_string())?;
+        result.recv().map_err(|_| "the Straydog model thread has stopped".to_string())?
+    }
+
+    /// The model's thread takes the state in its turn, before any request the request loop reads after the frame: the server hands it
+    /// over behind ready or ahead of the first request (runtime.rs serve), and a request that begins with the block goes on from it.
+    fn prefix_in_background(engine: &Arc<Mutex<Self>>, state: Vec<u8>, read_seconds: f64, arrived: Instant) {
+        let handle = engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if handle.0.send(Job::Prefix(state, read_seconds, arrived)).is_err() {
+            eprintln!("Straydog prefix: not restored (the model thread has stopped)");
+        }
     }
 }
 
@@ -267,6 +287,20 @@ fn run<E: Engines + 'static>(args: &WorkerArgs, plan: &Plan, output: Output, rep
                     Job::ConversationState(limit, reply) => {
                         let _ = reply.send(served.conversation_state(limit));
                     }
+                    Job::PrefixState(reply) => {
+                        let _ = reply.send(served.model.export_root().map(|root| root.map(|(tokens, bytes)| {
+                            (json!({"tokens": tokens.len(), "digest": straydog_engine::prefix::tokens_digest(&tokens)}), bytes)
+                        })));
+                    }
+                    Job::Prefix(state, read_seconds, arrived) => {
+                        let taking = Instant::now();
+                        match served.model.import_root(&state) {
+                            Ok(tokens) => eprintln!("Straydog prefix: restored {tokens} tokens ({} MB) in {:.1} s, {:.1} s after its frame",
+                                                    state.len() >> 20, taking.elapsed().as_secs_f64(),
+                                                    read_seconds + arrived.elapsed().as_secs_f64()),
+                            Err(message) => eprintln!("Straydog prefix: not restored ({message})"),
+                        }
+                    }
                     Job::Warm(state) => match served.model.warm(&state) {
                         Ok((vram, host)) => {
                             eprintln!("Straydog warming up with {vram} experts for VRAM, {host} for the host tier");
@@ -316,6 +350,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
     // (a template that renders the latest_reminder role: the app's notes beside a user's message, apart from what the user said)
     let reminders = source.contains("latest_reminder");
     let template = ChatTemplate::new(&source).map_err(|exc| exc.0)?;
+    let system_after_first = template.takes_system_after_first();
     let efforts = architecture == "deepseek41";
     report("warm", 0, 0);
     let warming = Instant::now();
@@ -342,6 +377,7 @@ fn load<E: Engines>(args: &WorkerArgs, data_dir: &Path, settings: &Settings, rep
         "gpu": model.info()?,
         "vision": model.engines.vision(),
         "latest_reminder": reminders,
+        "system_after_first": system_after_first,
         // (what the kept conversation's file is keyed on beside the bundle and the build: Session::export_conversation's layout)
         "prefix": {"version": straydog_engine::prefix::VERSION, "layout": format!("{KEPT_LAYOUT} layers {}", model.placement["layers"])},
     });

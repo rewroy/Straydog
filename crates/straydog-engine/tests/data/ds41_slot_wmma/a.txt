@@ -1,0 +1,102 @@
+# Straydog — design
+
+Straydog is a local inference engine and a server with an OpenAI-compatible API, shipped as one
+executable per GPU backend (HIP on Linux, CUDA on Windows and on Linux). It serves pinned GGUF
+bundles of two models:
+
+- **DeepSeek-V4.1-Flash** (748B total, 16B active), the main one;
+- **Qwen3.8-Flash-Next**, with its MTP drafter, also the model for a small GPU (5-6 GB of VRAM)
+  and 32 GB of RAM.
+
+This document describes what the code does now. It does not keep the project's history; git
+does. The roundings are listed in the README's Numerics, which this document does not repeat.
+
+Updated: 2026-11-08. Both models run on Linux with ROCm. Qwen3.8 and `straydog setup` have run on
+Windows with CUDA; DeepSeek-V4.1 has not. Both models have run on Linux with CUDA under WSL2, isolated
+by bubblewrap, and not yet on native Linux.
+
+## 1. Goals
+
+- **One long-lived server keeps the model loaded.** Clients start, update and restart without
+  reloading it.
+- **Any OpenAI-compatible client works.** Nothing in the server is specific to one client.
+- **One executable.** It holds the server, the engine, the isolated worker and provisioning. The
+  only outside pieces are the GPU vendor's runtime and driver.
+- **Native code on every per-token and per-pass host step.**
+- **Speed judged where users feel it:** the wait before the first token, prefill, and decode in
+  real conversations (long agent sessions with tools), reported in tokens/s.
+
+## 2. Contracts
+
+- **No client logic.** Straydog serves the OpenAI-compatible API and nothing shaped for one
+  client. The conversation cache, the reasoning replay and the tool-call split are not client
+  logic: they follow from the official chat template and the OpenAI message format.
+  Client integrations, client-shaped benchmarks and a client's secrets belong to the client.
+- **Exactness.**
+  - Weights are decoded exactly as ggml defines each GGUF type, and products accumulate in F32.
+  - Every routed expert a token selects is computed.
+  - Every rounding that buys speed is named in the README's Numerics, with its switch where it
+    has one.
+  - A speculative verification pass is bitwise identical to token-by-token decode in the same
+    placement, so drafts never change an answer.
+  - An unsupported tensor type is an error, never a silent conversion.
+- **Isolation.**
+  - The engine runs in a worker process without network access: bubblewrap on Linux, an
+    AppContainer of its own on Windows. The worker is the same executable.
+  - Every model and drafter file is pinned by size, SHA-256 and fs-verity digest. The pins are
+    compiled into the executable, and every file is authenticated whole when it is downloaded. A start that reads a
+    file through and checks it keeps a mark beside its tree (its size, times and file id); a later start reads what it
+    places without hashing it again only while the file is as marked. The server reads the marks and passes them to the
+    worker (`--file-mark`): on Windows the worker's AppContainer could not read a mark written after its grants.
+  - Bytes read from the drive after loading (table rows, experts outside RAM, banks left to the
+    page cache) are checked block by block against the file's Merkle tree before use.
+  - The trees live in the data directory (`.straydog` in the model's by default). Only the
+    server writes them, never the worker, and they are checked against the compiled-in digests
+    whenever they are opened.
+  - The drive is read-only to the engine: no swap, weight or K/V files.
+    - The worker never writes.
+    - On Windows the runtime writes two things derived from conversations: the state of the system
+      block (its tools included), sealed for the user (DPAPI and AES-256-GCM), at most once per
+      run and two per bundle (section 6.4); and, only when the person turns on
+      `keep_conversation`, the state of the conversation held last, sealed the same way, once, at a
+      stop on purpose, one file a bundle (section 6.5).
+  - Straydog's own secret, its API key, never reaches the worker.
+- **Measurement.**
+  - A performance change is judged by alternating A/B runs (base, new, new, base) on the same
+    machine, under a GPU lock, from the same warm state.
+  - A change that alters the generated text is judged on its p10 as well as its median.
+  - A numerical change is compared with an F32 run (for DeepSeek-V4.1 also with llama.cpp's
+    logits) by KL divergence and top-1 agreement.
+
+## 3. Processes and source layout
+
+```
+straydog ──HTTP──▶ clients
+   │  runtime: one worker, a bounded queue (4), cancellation
+   │  stdio, JSON lines (one frame per event; ~8 µs per token)
+   ▼
+straydog worker   (same executable, isolated; never opens a socket)
+   tokenizer, template, weights, placement, generation loop
+   │  C ABI (sd_*)
+   ▼
+GPU library (C++ / HIP / CUDA, linked statically)
+```
+
+The server never loads the model, and a worker failure never takes the server down. The worker
+sees only what isolation exposes:
+- the executable and the GPU runtime;
+- the pinned model and drafter files;
+- the GPU device nodes;
+- a short list of environment variables: the system's and the GPU runtime's, and the engine's switches (the `DS41_*` controls
+  named below, `STRAYDOG_ENGRAM`, `STRAYDOG_EXPERT_FLOOR`, `STRAYDOG_CPU_INT8`, `STRAYDOG_CPU_AVX512`, `STRAYDOG_PROMPT_CPU`, `STRAYDOG_HOST_REGISTER_READ_ONLY`, `STRAYDOG_DIRECT`), one list for bubblewrap and
+  the AppContainer (`straydog_isolation::ENGINE_VARIABLES`).
+
+```
+crates/
+  straydog/            the executable: CLI, config, setup, server, runtime, dashboard
+  straydog-engine/     tokenizer, template, GGUF, weights, formats, ops, architectures,
+                       expert store, row tables, sampling, constraints, worker
+  straydog-gpu/        bindings to the C ABI; build.rs compiles gpu/ with CMake (HIP or CUDA)
+  straydog-gguf/       GGUF structure checks
+  straydog-api/        the OpenAI-compatible API over an Engine trait
+  straydog-isolation/  bubb

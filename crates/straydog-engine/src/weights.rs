@@ -426,19 +426,14 @@ impl Weights {
         self.verifiers.get(file).and_then(Option::as_ref)
     }
 
-    /// The bytes of `files`' tree leaf levels not kept whole yet ([`Weights::keep_tree_leaves`]).
+    /// The bytes of `files`' tree leaf levels not kept whole yet ([`Weights::tree_verifiers_to_keep`]).
     pub(crate) fn tree_leaves_to_keep(&self, files: &[usize]) -> u64 {
         files.iter().filter_map(|file| self.verifier_of(*file)).filter(|verifier| !verifier.level0_kept()).map(|verifier| verifier.level0_bytes()).sum()
     }
 
-    /// Keep `files`' tree leaf levels whole from now on, as far as `budget` goes, each whole or not at all ([`verity::Verifier::keep_level0`]): the
-    /// bytes newly kept.
-    pub(crate) fn keep_tree_leaves(&self, files: &[usize], budget: u64) -> Result<u64, String> {
-        let mut kept = 0u64;
-        for verifier in files.iter().filter_map(|file| self.verifier_of(*file)).filter(|verifier| !verifier.level0_kept()) {
-            kept += verifier.keep_level0(budget.saturating_sub(kept))?;
-        }
-        Ok(kept)
+    /// `files`' verifiers whose tree leaf levels are not kept whole yet, for a thread of their own to keep ([`verity::Verifier::keep_level0`]).
+    pub(crate) fn tree_verifiers_to_keep(&self, files: &[usize]) -> Vec<Arc<verity::Verifier>> {
+        files.iter().filter_map(|file| self.verifier_of(*file)).filter(|verifier| !verifier.level0_kept()).cloned().collect()
     }
 
     /// Whether a tensor's reads after loading are checked against its file's verity tree.

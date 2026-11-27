@@ -86,6 +86,15 @@ impl ChatTemplate {
         Ok(ChatTemplate { environment, raised })
     }
 
+    /// Whether the template takes a system message after the first, where the conversation has it (a client's own notes): Qwen3.8's raises
+    /// "System message must be at the beginning." for one, and an app that sent its notes so had a request refused at each start before it
+    /// sent them as the user's. The servers' `/props` say it (`system_after_first`).
+    pub fn takes_system_after_first(&self) -> bool {
+        let messages = pyjson::parse(r#"[{"role": "system", "content": "a"}, {"role": "user", "content": "b"}, {"role": "system", "content": "c"}]"#)
+            .expect("a fixed list of messages");
+        self.render(&messages, &Value::Array(Vec::new()), false, "medium").is_ok()
+    }
+
     /// The prompt for `messages` and `tools`, ending with the assistant's generation prompt
     /// (templates that take `enable_thinking` and a `reasoning_effort` of low, medium or xhigh).
     pub fn render(&self, messages: &Value, tools: &Value, thinking: bool, effort: &str) -> Result<String, ChatError> {
@@ -238,4 +247,37 @@ fn from_jinja(value: &JinjaValue) -> Result<Value, minijinja::Error> {
         }
         _ => return Err(unsupported()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatTemplate;
+
+    /// Decides: a template that raises for a system message past the first says it takes none (Qwen3.8's words); one that renders every
+    /// message where it is takes them.
+    #[test]
+    fn a_template_says_whether_it_takes_a_system_message_after_the_first() {
+        let refusing = ChatTemplate::new("{% for message in messages %}{% if message.role == 'system' and not loop.first %}\
+            {{ raise_exception('System message must be at the beginning.') }}{% endif %}<|{{ message.role }}|>{{ message.content }}{% endfor %}").unwrap();
+        assert!(!refusing.takes_system_after_first());
+        let taking = ChatTemplate::new("{% for message in messages %}<|{{ message.role }}|>{{ message.content }}{% endfor %}").unwrap();
+        assert!(taking.takes_system_after_first());
+    }
+
+    /// DeepSeek-V4.1's own template places a system message where the conversation has it.
+    #[test]
+    fn deepseeks_template_takes_a_system_message_after_the_first() {
+        assert!(ChatTemplate::new(crate::arch::deepseek41::CHAT_TEMPLATE).unwrap().takes_system_after_first());
+    }
+
+    /// A bundle's own template (STRAYDOG_MODEL's chat_template.jinja, where it is set): one that raises for a later system message, as
+    /// Qwen3.8's does, says it takes none.
+    #[test]
+    fn a_bundles_template_that_raises_for_one_says_it_takes_none() {
+        let Some(path) = std::env::var_os("STRAYDOG_MODEL").map(|model| std::path::PathBuf::from(model).join("chat_template.jinja")) else { return };
+        let Ok(source) = std::fs::read_to_string(&path) else { return };
+        let raises = source.contains("System message must be at the beginning");
+        assert_eq!(ChatTemplate::new(&source).unwrap().takes_system_after_first(), !raises, "{}", path.display());
+        println!("{}: takes a system message after the first: {}", path.display(), !raises);
+    }
 }

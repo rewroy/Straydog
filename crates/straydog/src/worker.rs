@@ -305,6 +305,12 @@ impl Served for Engine {
     }
 
     fn prefix_in_background(engine: &Arc<Mutex<Engine>>, state: Vec<u8>, read_seconds: f64, arrived: Instant) {
+        let tokens = match straydog_engine::prefix::parse(&state) {
+            Ok(parsed) => straydog_engine::prefix::tokens_of(parsed.payload, parsed.tokens),
+            Err(message) => return eprintln!("Straydog prefix: not restored ({message})"),
+        };
+        let state = Arc::new(state);
+        *pending_prefix() = Some(PendingPrefix { state: state.clone(), tokens, read_seconds, arrived });
         let weak = Arc::downgrade(engine);
         let spawned = std::thread::Builder::new().name("straydog-prefix".into()).spawn(move || restore_prefix(&weak, &state, read_seconds, arrived));
         if let Err(error) = spawned {
@@ -575,6 +581,8 @@ fn engine_for_prefix(engine: &Mutex<Engine>) -> Option<std::sync::MutexGuard<'_,
 /// a model that has served one holds a sequence this state would only displace. One line in the log says what became of it.
 fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64, arrived: Instant) {
     let not_restored = |why: &str| eprintln!("Straydog prefix: not restored ({why})");
+    // (a request that came first has the state, and takes it itself where its prompt begins with it: take_prefix)
+    let taken = || pending_prefix().as_ref().is_none_or(|pending| !std::ptr::eq(pending.state.as_slice(), state));
     let Some(alive) = engine.upgrade() else { return };
     let parsed = match straydog_engine::prefix::parse(state) {
         Ok(parsed) => parsed,
@@ -583,6 +591,7 @@ fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64,
     // (a moment under the engine's lock: what the state must match)
     let plan = match engine_for_prefix(&alive) {
         Some(engine) => engine.model.prefix_plan(parsed.tokens, parsed.hidden),
+        None if taken() => return,
         None => return not_restored("a request began first"),
     };
     let image = match plan.and_then(|plan| plan.decode(&parsed)) {
@@ -590,10 +599,69 @@ fn restore_prefix(engine: &Weak<Mutex<Engine>>, state: &[u8], read_seconds: f64,
         Err(message) => return not_restored(&message),
     };
     // (and another: the sequence it becomes)
-    let Some(mut engine) = engine_for_prefix(&alive) else { return not_restored("a request began first") };
+    let Some(mut engine) = engine_for_prefix(&alive) else {
+        if !taken() {
+            not_restored("a request began first");
+        }
+        return;
+    };
+    // (under the engine's lock with no request yet: the state is this restore's from here)
+    if pending_prefix().take().is_none() {
+        return;
+    }
     match engine.model.install_prefix(image, state) {
         Ok(tokens) => eprintln!("Straydog prefix: restored {tokens} tokens ({} MB) in {:.1} s", state.len() >> 20, read_seconds + arrived.elapsed().as_secs_f64()),
         Err(message) => not_restored(&message),
+    }
+}
+
+/// A system block's state the server sent at the start, until one of two takes it: the restore behind "ready" ([`restore_prefix`]), which installs it
+/// only while no request has come, or the first request ([`take_prefix`]). A static, as [`KEPT`] is: the frame arrives on the request loop's
+/// thread, and the request that takes it holds the engine.
+struct PendingPrefix {
+    state: Arc<Vec<u8>>,
+    /// The tokens it is held at.
+    tokens: Vec<u32>,
+    read_seconds: f64,
+    arrived: Instant,
+}
+
+static PENDING_PREFIX: Mutex<Option<PendingPrefix>> = Mutex::new(None);
+
+fn pending_prefix() -> std::sync::MutexGuard<'static, Option<PendingPrefix>> {
+    PENDING_PREFIX.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The first request takes the system block's state the restore behind "ready" has not installed: where its prompt begins with the state's tokens,
+/// a token is left to run, and the model holds less of them, it imports the state and goes on from there, instead of reading those tokens again. The
+/// restore gives way to any request, and the requests that came first after a start were the ones that began with the state: an RTX 4060 PC read the
+/// same 6,096-token system block again in 41-89 s, five starts out of six, where restoring it took 8.1 s. The seconds the import took, or None.
+fn take_prefix(model: &mut straydog_engine::model::Model, prompt: &[u32]) -> Option<f64> {
+    let pending = pending_prefix().take()?;
+    let wanted = pending.tokens.len();
+    if prompt.len() <= wanted || prompt[..wanted] != pending.tokens[..] {
+        eprintln!("Straydog prefix: not restored (the first request does not begin with it)");
+        return None;
+    }
+    if model.held_prefix(prompt) >= wanted {
+        return None;
+    }
+    // (a conversation an earlier run kept, which the prompt goes on from and which holds more of it: take_kept takes that one)
+    if kept_for(&kept().tokens, prompt).is_some_and(|(_, kept)| kept > wanted) {
+        eprintln!("Straydog prefix: not restored (a kept conversation holds more of the first request)");
+        return None;
+    }
+    let started = Instant::now();
+    match model.import_prefix(&pending.state) {
+        Ok(tokens) => {
+            eprintln!("Straydog prefix: restored {tokens} tokens ({} MB) by the first request in {:.1} s, {:.1} s after its frame",
+                      pending.state.len() >> 20, started.elapsed().as_secs_f64(), pending.read_seconds + pending.arrived.elapsed().as_secs_f64());
+            Some(started.elapsed().as_secs_f64())
+        }
+        Err(message) => {
+            eprintln!("Straydog prefix: not restored by the first request ({message})");
+            None
+        }
     }
 }
 
@@ -1370,6 +1438,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
     let template = String::from_utf8(resource("chat_template.jinja")?).map_err(|exc| exc.to_string())?;
     let reminders = template.contains("latest_reminder");
     let template = ChatTemplate::new(&template).map_err(|exc| exc.0)?;
+    let system_after_first = template.takes_system_after_first();
     let settings = Settings {
         context: args.context,
         state_budget_bytes: args.state_ram_bytes,
@@ -1439,6 +1508,7 @@ pub fn main(args: WorkerArgs) -> Result<(), String> {
         "prefix": {"version": straydog_engine::prefix::VERSION, "layout": model.prefix_layout()},
         "vision": vision.is_ok(),
         "latest_reminder": reminders,
+        "system_after_first": system_after_first,
         // (the engram table read: its precision and file, Unsloth's Qwen3.8)
         "engram": straydog_engine::bundle::table_in(&args.model, id).ok().flatten()
             .map(|(table, path)| json!({"precision": table.precision, "file": path.file_name().map(|name| name.to_string_lossy().into_owned())})),
@@ -2185,6 +2255,7 @@ fn run(engine: &mut Engine, text: &Text, output: &Output, id: &str, body: &pyjso
     let any_close = text.added_token(THINK_CLOSE);
     // The held tokens can be more than the tokenizer's for the same text, and with no `max_tokens` the reply's room was all that `ids` left: a
     // client that sends none, as some do, ended the worker on "exceeds the allocated context" on the first such reply.
+    let _ = take_prefix(&mut engine.model, &ids);
     let agreed = engine.model.agree_with_held(&ids, &text.token_bytes());
     let agreed = if agreed.len() < context { agreed } else { ids.clone() };
     // (the images past such a place have moved with it)

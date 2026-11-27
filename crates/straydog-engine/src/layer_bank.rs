@@ -138,6 +138,10 @@ pub(crate) struct Prefetch {
     reader: Arc<Reader>,
     buffers: usize,
     direct: bool,
+    /// What the choice around or through the page cache was made of: the bytes the pass reads from the files (the layers not registered)
+    /// and the memory available then ([`reads_direct`]).
+    reread: u64,
+    available: u64,
     /// Buffers no read holds, each of [`Plan::bytes`] of the largest layer.
     free: Vec<Buffer>,
     /// The reads under way, in layer order.
@@ -156,7 +160,8 @@ impl Prefetch {
         // (the bytes of the layers not registered now, which this pass reads from the file: whether to read them around the page cache)
         let unregistered: u64 = (0..layers).filter(|layer| !registered.is_registered(*layer))
             .filter_map(|layer| Plan::new(weights, layer, false)).map(|plan| plan.bytes as u64).sum();
-        let direct = reads_direct(bank_reads(), unregistered, crate::host::prefetch_available_bytes());
+        let available_now = crate::host::prefetch_available_bytes();
+        let direct = reads_direct(bank_reads(), unregistered, available_now);
         let plans: Vec<_> = (0..layers).map(|layer| Plan::new(weights, layer, direct)).collect();
         let bytes = plans.iter().flatten().map(|plan| plan.bytes).max()?;
         let room = crate::host::read_ahead_room();
@@ -168,9 +173,22 @@ impl Prefetch {
             .flat_map(|plan| plan.roles.iter().map(|role| role.file_index)).collect();
         files.sort_unstable();
         files.dedup();
+        // They are kept on a thread of their own, beside the pass's first reads, whose checks take the bounded cache until each level is
+        // kept: kept first, they held the first bank's read for 0.32-0.66 s (565 MiB on Linux, read, zeroed and checked), and a PC's pass
+        // began with a 0.85 s wait. Their room is taken now, whether or not they are kept in the end.
         let leaves = weights.tree_leaves_to_keep(&files);
-        let kept = if leaves_fit(leaves, bytes as u64, room) { weights.keep_tree_leaves(&files, leaves).unwrap_or(0) } else { 0 };
-        let available = room.saturating_sub(kept);
+        let keeping = leaves_fit(leaves, bytes as u64, room) && {
+            let verifiers = weights.tree_verifiers_to_keep(&files);
+            std::thread::Builder::new().name("tree-leaves".into()).spawn(move || {
+                let mut kept = 0u64;
+                for verifier in verifiers {
+                    // (a level that does not verify stays unkept: every read is still checked through the bounded cache)
+                    kept += verifier.keep_level0(leaves.saturating_sub(kept)).unwrap_or(0);
+                }
+            }).is_ok()
+        };
+        // (the thread holds the verifiers it keeps, not the pass: it may outlive a short pass, which does not wait for it)
+        let available = room.saturating_sub(if keeping { leaves } else { 0 });
         let mut free = Vec::new();
         // (development: STRAYDOG_LAYER_BANK_BUFFERS=N reads ahead into N buffers at most, to see a pass the memory left one or two)
         let most = std::env::var("STRAYDOG_LAYER_BANK_BUFFERS").ok().and_then(|value| value.trim().parse::<usize>().ok())
@@ -184,7 +202,8 @@ impl Prefetch {
         }
         if free.is_empty() { return None; }
         let buffers = free.len();
-        Some(Self { plans, reader: Reader::shared(), free, pending: std::collections::VecDeque::new(), next: 0, registered, buffers, direct })
+        Some(Self { plans, reader: Reader::shared(), free, pending: std::collections::VecDeque::new(), next: 0, registered, buffers, direct,
+                    reread: unregistered, available: available_now })
     }
 
     /// Where the reads stand when `layer` found none of its own (for the request's metrics): the layer, the read at the front, the next layer
@@ -193,10 +212,10 @@ impl Prefetch {
         format!("layer {layer}: reading {:?}, next {}, {} free", self.pending.iter().map(|(at, _)| *at).collect::<Vec<_>>(), self.next, self.free.len())
     }
 
-    /// The buffers the pass reads ahead into (at most [`READS_AHEAD`], as the memory available allowed), and whether it reads around the page
-    /// cache: for the request's metrics.
-    pub(crate) fn shape(&self) -> (usize, bool) {
-        (self.buffers, self.direct)
+    /// The buffers the pass reads ahead into (at most [`READS_AHEAD`], as the memory available allowed), whether it reads around the page
+    /// cache, and what that was chosen by (the bytes it reads from the files, the memory available then): for the request's metrics.
+    pub(crate) fn shape(&self) -> (usize, bool, u64, u64) {
+        (self.buffers, self.direct, self.reread, self.available)
     }
 
     /// Reads ahead from `layer` on, as far as the free buffers go: every layer not registered in place now and with a plan, in order

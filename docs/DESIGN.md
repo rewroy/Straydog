@@ -47,7 +47,8 @@ by bubblewrap, and not yet on native Linux.
     compiled into the executable, and every file is authenticated whole when it is downloaded. A start that reads a
     file through and checks it keeps a mark beside its tree (its size, times and file id); a later start reads what it
     places without hashing it again only while the file is as marked. The server reads the marks and passes them to the
-    worker (`--file-mark`): on Windows the worker's AppContainer could not read a mark written after its grants.
+    worker (`--file-mark`): on Windows the worker's AppContainer could not read a mark written after its grants. A worker
+    started again after it failed is given the marks as they are then, its first one's among them.
   - Bytes read from the drive after loading (table rows, experts outside RAM, banks left to the
     page cache) are checked block by block against the file's Merkle tree before use.
   - The trees live in the data directory (`.straydog` in the model's by default). Only the
@@ -600,7 +601,7 @@ token) and past a forced call's opening (§6.3).
   - Qwen3.8's head otherwise gives a verification's rows as an argmax or a top k picked on the GPU, which cannot be masked:
     a request that suppresses reads the rows' whole logits instead. No `suppress`, nothing changes.
 
-### 6.4 The system block's state across starts (Windows)
+### 6.4 The system block's state across starts (Windows and Linux)
 
 An app that starts the engine and then sends its first request sends the same system block every
 time: its system prompt with its tools, a few thousand tokens. On a small card that block is most
@@ -668,11 +669,23 @@ read. The state was saved in 0.3 s after the reply, and the file is 323 MB.
   changed, another user's, another build's) is deleted with one warning, and the start goes on
   without it.
 - **Restoring.** After `ready` the server opens, on a thread of its own, the file of this build and
-  key prefix that was used last (and marks it used), and hands the state to the worker. A request
-  that arrives first is never held up: the server hands nothing over once a request has begun, the
-  worker takes the state only while no request has had the engine, and it says in the log what
-  became of it (`Straydog prefix: restored 4020 tokens (308 MB) in 0.9 s`).
-- **Off.** `prefix_cache = false` in the config file, or `--no-prefix-cache`. Linux saves nothing.
+  key prefix that was used last (and marks it used), and hands the state to the worker. The worker
+  restores it behind `ready` while no request has had the engine. A first request that comes while
+  the file is still being opened waits for it (at most 20 s), and the state goes to the worker ahead
+  of it; that request takes the state itself where its prompt begins with the block's tokens and
+  the model holds less of them (and no kept conversation holds more), and reads only the rest. The
+  requests that come first after a start are the ones that begin with the block (an app's warm-up,
+  or the message that restarted the server): dropped for them, the block was read again. On an
+  RTX 5070 Ti PC a request sent as the server became ready had its first token in 1.03 s instead of
+  8.9-9.6 s (5,644 tokens). The log says what became of the state (`Straydog prefix: restored 4020
+  tokens (308 MB) in 0.9 s`, or `... by the first request in ...`).
+- **On Linux** the key is wrapped under a key the kernel's keyring holds for the user, which lasts the boot
+  (as the kept conversation's, 6.5): a file from before a reboot does not unwrap and is deleted.
+- **DeepSeek-V4.1** (an on-demand bundle) keeps the state as its root checkpoint (`Session::export_root`,
+  `import_root`): on two R9700s (UD-IQ2_XXS) a first start's first request read its 6,080-token block in
+  33.6 s, and after a restart a new conversation sent as the server became ready had its first token in
+  2.75 s, the block's tokens reused.
+- **Off.** `prefix_cache = false` in the config file, or `--no-prefix-cache`.
 
 ### 6.5 The conversation's state across starts (Windows, an option, off by default)
 

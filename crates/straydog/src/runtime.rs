@@ -54,6 +54,9 @@ const ACCESS_DENIED: &str = "(os error 5)";
 /// What runs before the worker starts and yields its command (building missing verity trees,
 /// then the isolation command over them), reporting (stage, done, total).
 pub type Prepare = Box<dyn FnOnce(&(dyn Fn(&str, u64, u64) + Sync)) -> Result<Command, String> + Send>;
+/// The worker's command made again, for a worker started again after it failed ([`Runtime::start_served`]): its arguments carry the files'
+/// marks as they are then (the first worker marks the files it read through and checked, after the command of the start was made).
+pub type Relaunch = Arc<dyn Fn() -> Result<Command, String> + Send + Sync>;
 
 /// One startup progress frame or the state the server reports.
 #[derive(Debug, Clone)]
@@ -637,8 +640,14 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
         // (and how they were read ahead: into how many buffers, around the page cache or through it. One buffer puts a layer's read after
         // the copy before it has gone up: a PC with 1.8 GiB of commit left read a 2,076-token prompt's 48 layers in 11.3 s, its reads and
         // gathers one after the other)
+        // (with what the choice was made of: the bytes the pass reads from the files against the memory available then. An RTX 4060 PC's
+        // first requests read around the cache, 42-74 GB from the drive, and the log could not say why)
+        let chosen_by = match (number("prefill_bank_reread_bytes"), number("prefill_bank_available_bytes")) {
+            (Some(reread), Some(available)) => format!(" ({:.1} GB to read from the files, {:.1} GB available)", reread / 1e9, available / 1e9),
+            _ => String::new(),
+        };
         let ahead = match (timings["prefill_bank_buffers"].as_u64(), timings["prefill_bank_direct"].as_bool()) {
-            (Some(buffers), Some(direct)) => format!(", read ahead into {buffers} buffer{} {} the page cache", if buffers == 1 { "" } else { "s" },
+            (Some(buffers), Some(direct)) => format!(", read ahead into {buffers} buffer{} {} the page cache{chosen_by}", if buffers == 1 { "" } else { "s" },
                                                      if direct { "around" } else { "through" }),
             _ => ", not read ahead".into(),
         };
@@ -670,9 +679,15 @@ fn partial_summary(detail: &Value, timings: &Value) -> String {
     let memory = match (detail["resident_gib"].as_f64(), detail["available_gib"].as_f64()) {
         (Some(resident), Some(available)) => {
             // (what the drive gave back for faults while it ran: Windows counts every process's)
+            // (and of them the reply's, after the prompt had been read: an RTX 4060 PC's first replies took 68 ms a token of CPU, and whether
+            // their experts' pages came from the drive the line could not say)
             let read_back = detail["fault_read_pages"].as_u64().map_or_else(String::new, |pages| {
-                let whose = if detail["fault_reads_system"] == true { " (every process)" } else { "" };
-                format!(", {:.2} GB read back from the drive{whose}", pages as f64 * 4096.0 / 1e9)
+                let whose = if detail["fault_reads_system"] == true { "every process" } else { "" };
+                let reply = detail["fault_read_pages_reply"].as_u64()
+                    .map_or_else(String::new, |reply| format!("{}{:.2} GB of them in the reply", if whose.is_empty() { "" } else { "; " },
+                                                              reply as f64 * 4096.0 / 1e9));
+                let note = if whose.is_empty() && reply.is_empty() { String::new() } else { format!(" ({whose}{reply})") };
+                format!(", {:.2} GB read back from the drive{note}", pages as f64 * 4096.0 / 1e9)
             });
             let limit = detail["working_set_limit_gib"].as_f64().map_or_else(String::new, |gib| format!(", working set limit {gib:.1} GiB"));
             let kv = match (detail["kv_positions"].as_u64(), detail["kv_gib"].as_f64()) {
@@ -1070,22 +1085,29 @@ impl Runtime {
 
     /// [`Runtime::start`] once `prepare` has run (shown as loading) and given the command.
     pub fn start_prepared(settings: &Settings, prepare: Prepare) -> Runtime {
-        Runtime::driven(settings, prepare, CANCEL_PATIENCE, refusal_of(settings))
+        Runtime::driven(settings, prepare, CANCEL_PATIENCE, refusal_of(settings), None)
+    }
+
+    /// [`Runtime::start_prepared`], a worker started again after it failed having its command made again by `relaunch`: the server's own,
+    /// whose files' marks a first worker wrote after the start's command was made. A worker started again with the start's read the whole
+    /// model through and hashed it again: on an RTX 4060 PC 75 s, where the starts after it took 5-7 s.
+    pub fn start_served(settings: &Settings, prepare: Prepare, relaunch: Relaunch) -> Runtime {
+        Runtime::driven(settings, prepare, CANCEL_PATIENCE, refusal_of(settings), Some(relaunch))
     }
 
     /// Tests only: [`Runtime::start`] with its worker given `patience` to end a cancelled generation.
     #[doc(hidden)]
     pub fn start_with_cancel_patience(settings: &Settings, command: Command, patience: Duration) -> Runtime {
-        Runtime::driven(settings, Box::new(move |_| Ok(command)), patience, refusal_of(settings))
+        Runtime::driven(settings, Box::new(move |_| Ok(command)), patience, refusal_of(settings), None)
     }
 
     /// Tests only: [`Runtime::start`] with `refusal` in place of the search for why the OS refused the worker.
     #[doc(hidden)]
     pub fn start_with_refusal(settings: &Settings, command: Command, refusal: Refusal) -> Runtime {
-        Runtime::driven(settings, Box::new(move |_| Ok(command)), CANCEL_PATIENCE, refusal)
+        Runtime::driven(settings, Box::new(move |_| Ok(command)), CANCEL_PATIENCE, refusal, None)
     }
 
-    fn driven(settings: &Settings, prepare: Prepare, cancel_patience: Duration, refusal: Refusal) -> Runtime {
+    fn driven(settings: &Settings, prepare: Prepare, cancel_patience: Duration, refusal: Refusal, relaunch: Option<Relaunch>) -> Runtime {
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Idle),
             failure: watch::Sender::new(None),
@@ -1112,8 +1134,13 @@ impl Runtime {
             restarts: Mutex::new(Vec::new()),
             fallback: Mutex::new(false),
             fallback_marker: settings.data_dir.join("gpu-fault"),
+            relaunch,
         };
         driver.read_fallback();
+        if unlocked_from_start() && !*driver.fallback.lock().unwrap() {
+            tracing::info!("Straydog starts its worker without page-locked banks or the gather ahead (the Windows default: a GPU's work faulted \
+                            with them; STRAYDOG_START_LOCKS=on starts them)");
+        }
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
     }
@@ -1191,6 +1218,8 @@ struct Driver {
     /// start of this version (`<data-dir>/gpu-fault`).
     fallback: Mutex<bool>,
     fallback_marker: PathBuf,
+    /// The command made again for a worker started again ([`Runtime::start_served`]); none: the start's command.
+    relaunch: Option<Relaunch>,
 }
 
 /// What a worker is started with after its GPU work faulted, where [`fault_fallback_on`]: no page-locked banks (no host tier, no layer the
@@ -1207,6 +1236,26 @@ fn fault_fallback_on() -> bool {
     cfg!(windows) || std::env::var("STRAYDOG_FAULT_FALLBACK").is_ok_and(|value| value == "1")
 }
 
+/// Whether the workers start as a GPU fault starts them ([`FALLBACK_VARIABLES`]) from the first: the Windows default; STRAYDOG_START_LOCKS=on
+/// starts them with page-locked banks and the gather ahead (Linux's default), =off without them anywhere. A switch of the pair the server's
+/// own environment sets is kept as it is. The larger room for the locks did not stop the RTX 4060 PC's faults: its next version faulted the
+/// same way with 5.97 GiB page-locked of 23.56 GiB reservable. Each of its seven faults, under two versions, was a worker's second request
+/// (a short one going on from the first) after the first's banks were being locked, its host tier copied or its pages read back behind it,
+/// in the prompt's read of the streamed experts; every worker started without them served the requests that came after.
+fn unlocked_from_start() -> bool {
+    match std::env::var("STRAYDOG_START_LOCKS").as_deref() {
+        Ok("on") => false,
+        Ok("off") => true,
+        _ => cfg!(windows),
+    }
+}
+
+/// The variables a worker starts with: [`FALLBACK_VARIABLES`] after a GPU fault, those of them the server's environment leaves unset where
+/// [`unlocked_from_start`], none otherwise.
+fn start_variables(faulted: bool, unlocked: bool, set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    FALLBACK_VARIABLES.iter().copied().filter(|(name, _)| faulted || (unlocked && !set(name))).collect()
+}
+
 /// Whether a worker's failure is its GPU work's fault, as the message names it (the GPU layer's errors end in "(file:line, code N)"): an
 /// illegal or misaligned address, an address space or instruction that is not the kernel's, or a launch that failed. Such an error stays
 /// with the GPU's context: what found it was the next wait, not the work that made it.
@@ -1219,6 +1268,11 @@ fn gpu_fault(message: &str) -> bool {
 fn build_name() -> String {
     format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("STRAYDOG_COMMIT"))
 }
+
+/// How long the first request after a start waits for the system block's state still being read (the file decrypted and opened): the
+/// state saves reading the block again (on an RTX 4060 PC 6,096 tokens took 41-89 s; restored, 8.1 s with its read), and a read that takes
+/// longer than this is no longer one that pays.
+const PREFIX_WAIT: Duration = Duration::from_secs(20);
 
 /// A worker that failed (an error it called fatal, its exit, a cancelled generation it did not end) is started again, the request it
 /// failed for told so and those queued served by the new one, up to this many times within [`RESTART_WINDOW`]; one more failure ends
@@ -1274,7 +1328,7 @@ impl Driver {
 
     async fn run(self, prepare: Prepare, mut jobs: mpsc::UnboundedReceiver<Job>,
                  mut controls: mpsc::UnboundedReceiver<Control>) {
-        let command = self.prepare(prepare).await;
+        let mut command = self.prepare(prepare).await;
         let mut launched = match &command {
             Ok(command) => self.launch(command.clone()).await,
             Err(message) => Err((format!("Straydog failed to start ({message}); see the server log and restart the server"),
@@ -1308,6 +1362,12 @@ impl Driver {
                     break process.holders;
                 }
                 Served::Failed(message) => {
+                    // (the server is stopping, its queue closed, and the worker ended with it: a service's stop signals every process of the
+                    // service, the worker too, and one started again here was loaded only to be ended, while the stop waited for it)
+                    if jobs.is_closed() {
+                        tracing::info!("{message}; the server is stopping, so its worker is not started again");
+                        break process.holders;
+                    }
                     if !self.restart_allowed() {
                         // (the reason goes to the server's last line; other clients see that it failed, nothing of why)
                         let message = format!("{message}; restart the server");
@@ -1324,6 +1384,12 @@ impl Driver {
                     // (clients see it loading from now; the old worker's processes gone first, and with them what they held of the GPUs)
                     self.set(Phase::Loading(json!({"stage": "restarting"})));
                     released(&process.holders).await;
+                    if let (Some(relaunch), Ok(_)) = (&self.relaunch, &command) {
+                        match relaunch() {
+                            Ok(fresh) => command = Ok(fresh),
+                            Err(message) => tracing::warn!("Straydog starts its worker again with the start's command ({message})"),
+                        }
+                    }
                     launched = match &command {
                         Ok(command) => self.launch(command.clone()).await,
                         Err(_) => unreachable!("a worker ran, so its command was prepared"),
@@ -1438,8 +1504,17 @@ impl Driver {
                     continue;
                 }
             };
-            // (once a request has begun the worker holds a sequence of its own, which a state handed now would only displace)
-            restoring = None;
+            // The first request after a start, while the system block's state is still being read: it waits for the read and the state goes to
+            // the worker ahead of it, whose first request takes it where its prompt begins with the block (worker.rs take_prefix). Dropped as
+            // before, it was read again: on an RTX 5070 Ti PC a request 0.1 s after ready had its first token in 8.9-9.6 s, where one 5 s after
+            // ready, the state handed by then, had it in 0.78 s. A read past PREFIX_WAIT is left, and the request goes on without it.
+            if let Some(pending) = restoring.take() {
+                match tokio::time::timeout(PREFIX_WAIT, pending).await {
+                    Ok(Ok(Some(restored))) => self.hand_prefix(process, restored).await,
+                    Ok(_) => {}
+                    Err(_) => tracing::info!("Straydog prefix: not handed to the first request (still being read after {} s)", PREFIX_WAIT.as_secs()),
+                }
+            }
             changed = true;
             let skipped = self.shared.cancelled.lock().unwrap().remove(&job.id);
             let result = if skipped { Ok(()) } else { self.generation(process, &job, controls).await };
@@ -1469,8 +1544,8 @@ impl Driver {
         }
     }
 
-    /// Hand the worker the state of a system block an earlier run saved, which is opened by now: in the background, a request that comes
-    /// first never waits for it (the worker takes it only while no request has had the engine), and the worker's own line says what became of it.
+    /// Hand the worker the state of a system block an earlier run saved, which is opened by now: behind ready, or ahead of the first request
+    /// where that came while it was read ([`PREFIX_WAIT`]); the worker's own line says what became of it.
     async fn hand_prefix(&self, process: &mut Process, restored: Restored) {
         if restored.state().len() as u64 > crate::frames::BODY_LIMIT {
             return;
@@ -1757,7 +1832,7 @@ impl Driver {
             .args(&args)
             .env_clear()
             .envs(worker_environment())
-            .envs(if *self.fallback.lock().unwrap() { &FALLBACK_VARIABLES[..] } else { &[] }.iter().copied())
+            .envs(start_variables(*self.fallback.lock().unwrap(), unlocked_from_start(), |name| std::env::var_os(name).is_some()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2073,7 +2148,8 @@ impl Engine for Runtime {
                 processing: self.shared.jobs.load(Ordering::SeqCst) > 0,
                 placement: json!({"placement": ready["placement"], "speculative_drafts": ready["speculative_drafts"],
                                   "gpu": ready["gpu"], "sampling": ready["sampling"], "vision": ready["vision"] == true,
-                                  "vision_refusal": ready["vision_refusal"], "latest_reminder": ready["latest_reminder"] == true}),
+                                  "vision_refusal": ready["vision_refusal"], "latest_reminder": ready["latest_reminder"] == true,
+                                  "system_after_first": ready["system_after_first"].as_bool()}),
             },
             Phase::Failed(message) => EngineState::Failed(message.clone()),
         }
@@ -2304,6 +2380,12 @@ mod tests {
                                                              "kv_positions": 262144, "kv_gib": 6.5, "kv_host": true})), 12), None);
         assert!(windows.contains("; memory: 23.4 GiB resident, 4.0 GiB available, 1741229 page faults, 7.60 GB read back from the drive (every process), working set limit 27.0 GiB, K/V 262144 positions 6.50 GiB in host memory"), "{windows}");
         assert!(windows.contains("; drafts probe: 12 passes at another width") && windows.lines().count() == 1, "{windows}");
+        // (and the reply's share of them, where the engine counted from the prompt's end)
+        let split = request_summary(&event(detail(json!({"fault_read_pages": 1_855_000, "fault_reads_system": true,
+                                                           "fault_read_pages_reply": 560_000})), 0), None);
+        assert!(split.contains("7.60 GB read back from the drive (every process; 2.29 GB of them in the reply)"), "{split}");
+        let linux_split = request_summary(&event(detail(json!({"fault_read_pages": 2_441, "fault_read_pages_reply": 0})), 0), None);
+        assert!(linux_split.contains("0.01 GB read back from the drive (0.00 GB of them in the reply)"), "{linux_split}");
         // (Linux: the process's own major faults, no working set limit; a K/V the VRAM holds)
         let linux = request_summary(&event(detail(json!({"fault_read_pages": 2_000, "fault_reads_system": false,
                                                            "kv_positions": 32768, "kv_gib": 0.81, "kv_host": false})), 0), None);
@@ -2344,6 +2426,11 @@ mod tests {
         let four = request_summary(&event(json!({"prefill_bank_loads": 48, "prefill_bank_load_seconds": 2.0, "prefill_bank_buffers": 4,
                                                  "prefill_bank_direct": false})), None);
         assert!(four.contains("for their reads, read ahead into 4 buffers through the page cache"), "{four}");
+        // (and what that was chosen by, where the engine says)
+        let why = request_summary(&event(json!({"prefill_bank_loads": 48, "prefill_bank_load_seconds": 2.0, "prefill_bank_buffers": 4,
+                                                "prefill_bank_direct": true, "prefill_bank_reread_bytes": 31.1e9,
+                                                "prefill_bank_available_bytes": 20.5e9})), None);
+        assert!(why.contains("read ahead into 4 buffers around the page cache (31.1 GB to read from the files, 20.5 GB available)"), "{why}");
         assert!(!moved.contains(", banks "), "no loads counted: no clause");
         // (the rows held in VRAM, or on the host with why)
         let held = request_summary(&event(json!({"prefill_layer_passes": 4, "prefill_layer_rows": 65536, "prefill_rows_vram": true})), None);
@@ -2640,6 +2727,21 @@ mod tests {
         assert!(!gpu_fault("Straydog GPU: out of memory (a stand-in)"));
         assert!(!gpu_fault("Straydog generation request id mismatch"));
         assert!(!gpu_fault("Straydog GPU: the launch timed out and was terminated (kernels.cpp:700, code 702)"));
+    }
+
+    /// A worker starts without page locks and the gather ahead after a GPU fault whatever the server's environment says, and from the first where
+    /// that is the default (Windows) with a switch the environment sets kept as it is; otherwise as it would.
+    #[test]
+    fn the_workers_start_unlocked_after_a_fault_and_where_that_is_the_default() {
+        let none = |_: &str| false;
+        let unlocked = vec![("STRAYDOG_LOCK_BUDGET", "0"), ("STRAYDOG_PREGATHER", "0")];
+        assert_eq!(start_variables(true, false, none), unlocked);
+        assert_eq!(start_variables(false, true, none), unlocked);
+        assert_eq!(start_variables(false, false, none), Vec::<(&str, &str)>::new());
+        // (a person who set the lock budget keeps theirs at a start, not after a fault)
+        let budget = |name: &str| name == "STRAYDOG_LOCK_BUDGET";
+        assert_eq!(start_variables(false, true, budget), vec![("STRAYDOG_PREGATHER", "0")]);
+        assert_eq!(start_variables(true, true, budget), unlocked);
     }
 
     /// A warm-up state (or an error to its ask) that comes after the server stopped waiting for it is passed over by the next read,

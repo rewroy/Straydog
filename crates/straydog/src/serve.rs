@@ -104,16 +104,21 @@ pub fn main(matches: &ArgMatches, config_file: Option<&Path>, print_config: bool
             tracing::error!("Straydog cannot listen: {message}");
             message
         })?;
+        // (a worker started again has its command made again: the files' marks the first one wrote go with it)
+        let relaunch: runtime::Relaunch = {
+            let settings = settings.clone();
+            Arc::new(move || runtime::worker_command(&settings))
+        };
         let engine = Arc::new(match command {
-            Some(command) => Runtime::start(&settings, command),
+            Some(command) => Runtime::start_served(&settings, Box::new(move |_| Ok(command)), relaunch),
             None => {
                 let prepared = settings.clone();
-                Runtime::start_prepared(&settings, Box::new(move |progress| {
+                Runtime::start_served(&settings, Box::new(move |progress| {
                     for name in straydog_provision::ensure_trees(&prepared.model, prepared.bundle, &prepared.data_dir, progress)? {
                         tracing::info!("Straydog verified {name} (its verity tree is built)");
                     }
                     runtime::worker_command(&prepared)
-                }))
+                }), relaunch)
             }
         });
         let api = straydog_api::ApiConfig {

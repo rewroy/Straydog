@@ -128,9 +128,25 @@ fn faulting(log: &Path) {
     }
 }
 
-/// Whether `engine` answers `body` (a delta, then its end).
+/// `body` submitted to `engine` as a client does after its worker failed: refused as "Loading model" while the worker started again loads
+/// (the runtime is loading from the moment it begins the restart), and sent again until taken. A request sent at once raced the restart:
+/// under load it was refused, or waited past its test's bound.
+async fn submit(engine: &Runtime, body: pyjson::Value) -> straydog_api::Generation {
+    let started = Instant::now();
+    loop {
+        match engine.generate(body.clone()).await {
+            Ok(generation) => return generation,
+            Err(straydog_api::SubmitError::Unavailable(message)) if message == "Loading model" && started.elapsed() < Duration::from_secs(60) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(other) => panic!("not taken: {other:?}"),
+        }
+    }
+}
+
+/// Whether `engine` answers `body` (a delta, then its end), taken as [`submit`] takes it.
 async fn serves(engine: &Runtime, body: pyjson::Value) -> bool {
-    let mut next = engine.generate(body).await.unwrap();
+    let mut next = submit(engine, body).await;
     let mut answered = false;
     while let Some(event) = tokio::time::timeout(Duration::from_secs(20), next.events.next()).await.unwrap() {
         match event["event"].as_str() {
@@ -140,6 +156,22 @@ async fn serves(engine: &Runtime, body: pyjson::Value) -> bool {
         }
     }
     answered
+}
+
+/// A worker that ends as soon as a chat comes, as one a service's stop signals beside its server; each launch writes a line to LOG.
+fn ends_at_chat(log: &Path) {
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+    writeln!(file, "launched").unwrap();
+    drop(file);
+    ready();
+    for line in std::io::stdin().lock().lines() {
+        let frame: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if frame["command"].as_str() == Some("chat") {
+            // (after the server has been told to stop: the test closes the runtime right after it sends the chat)
+            std::thread::sleep(Duration::from_millis(500));
+            std::process::exit(1);
+        }
+    }
 }
 
 fn ready() {
@@ -223,6 +255,7 @@ fn main() {
         Some("hung") => return hung(args.get(2).map(Path::new)),
         Some("fatal") => return fatal(args.get(2).map(Path::new)),
         Some("faulting") => return faulting(Path::new(&args[2])),
+        Some("ends-at-chat") => return ends_at_chat(Path::new(&args[2])),
         // As a worker that finds its GPUs' memory held fails: its reason on stderr, status 1.
         Some("fails") => {
             eprintln!("Straydog VRAM budget is unavailable");
@@ -363,7 +396,7 @@ fn main() {
         let told = event["message"].as_str().unwrap_or("");
         assert!(told.contains("out of memory (a stand-in)") && told.contains("starting its worker again"), "{told}");
         let restarted = Instant::now();
-        let mut next = engine.generate(hi()).await.unwrap();
+        let mut next = submit(&engine, hi()).await;
         let mut answered = false;
         while let Some(event) = tokio::time::timeout(Duration::from_secs(20), next.events.next()).await.unwrap() {
             match event["event"].as_str() {
@@ -381,7 +414,7 @@ fn main() {
         // One that keeps failing: three restarts, then the fourth failure fails the runtime (with the reason, told to restart the server).
         let engine = wait_ready(Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["fatal".into()]))).await;
         for attempt in 0..4 {
-            let mut failed = engine.generate(hi()).await.unwrap();
+            let mut failed = submit(&engine, hi()).await;
             let event = tokio::time::timeout(Duration::from_secs(20), failed.events.next()).await.unwrap().unwrap();
             assert_eq!(event["event"].as_str(), Some("error"), "attempt {attempt}: {event}");
             let told = event["message"].as_str().unwrap_or("");
@@ -395,8 +428,25 @@ fn main() {
         println!("runtime_controls: a worker that kept failing was started again three times, then failed the runtime");
         engine.close().await;
 
-        // A worker whose GPU work faults (STRAYDOG_FAULT_FALLBACK=1 stands in for Windows): the next starts without page locks or the gather
-        // ahead and serves, and so does the next start of this version from its first worker; another version's marker is no reason to.
+        // Where the workers start without page locks and the gather ahead from the first (STRAYDOG_START_LOCKS=off stands in for Windows'
+        // default), the first worker starts so, and the stand-in that faults with them serves.
+        std::env::set_var("STRAYDOG_START_LOCKS", "off");
+        let unlocked = scratch.join("unlocked");
+        std::fs::create_dir_all(unlocked.join("data")).unwrap();
+        let unlocked_settings = config::resolve(Options { model: Some(unlocked.clone()), quant: Some(QUANT.into()), ctx_size: Some(CONTEXT),
+                                                          data_dir: Some(unlocked.join("data")), ..Options::default() }).unwrap();
+        let unlocked_launches = unlocked.join("launches");
+        let engine = wait_ready(Runtime::start(&unlocked_settings, (std::env::current_exe().unwrap(),
+                                                                    vec!["faulting".into(), PathBuf::from(&unlocked_launches).into_os_string()]))).await;
+        assert!(serves(&engine, hi()).await, "the first request of a worker started without page locks was not answered");
+        engine.close().await;
+        assert_eq!(std::fs::read_to_string(&unlocked_launches).unwrap(), "0 0\n");
+        println!("runtime_controls: where that is the default, the first worker started without page locks or the gather ahead");
+
+        // A worker whose GPU work faults (STRAYDOG_FAULT_FALLBACK=1 stands in for Windows, its workers started with page locks first:
+        // STRAYDOG_START_LOCKS=on): the next starts without page locks or the gather ahead and serves, and so does the next start of this
+        // version from its first worker; another version's marker is no reason to.
+        std::env::set_var("STRAYDOG_START_LOCKS", "on");
         std::env::set_var("STRAYDOG_FAULT_FALLBACK", "1");
         let faults = scratch.join("faults");
         std::fs::create_dir_all(faults.join("data")).unwrap();
@@ -426,7 +476,34 @@ fn main() {
         engine.close().await;
         assert!(std::fs::read_to_string(fault_settings.data_dir.join("gpu-fault")).unwrap().starts_with(env!("CARGO_PKG_VERSION")));
         std::env::remove_var("STRAYDOG_FAULT_FALLBACK");
+        std::env::remove_var("STRAYDOG_START_LOCKS");
         println!("runtime_controls: a GPU fault started the next worker without page locks, and the next start of this version too");
+
+        // A worker started again has its command made again where the server gives a relaunch (its files' marks as they are then): here the
+        // start's command fails every request, and the one made again answers.
+        let healthy = scratch.join("relaunch-healthy");
+        std::fs::write(&healthy, "").unwrap();
+        let relaunched = (std::env::current_exe().unwrap(), vec!["fatal".into(), PathBuf::from(&healthy).into_os_string()]);
+        let engine = wait_ready(Runtime::start_served(&settings, Box::new(|_| Ok((std::env::current_exe().unwrap(), vec!["fatal".into()]))),
+                                                      Arc::new(move || Ok(relaunched.clone())))).await;
+        let mut failed = engine.generate(hi()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), failed.events.next()).await.unwrap().unwrap();
+        assert_eq!(event["event"].as_str(), Some("error"), "{event}");
+        assert!(serves(&engine, hi()).await, "the worker started again ran the start's command, not the one made again");
+        engine.close().await;
+        println!("runtime_controls: a worker started again ran its command made again");
+
+        // A worker that ends while the server stops (its queue closed with a request under way): it is not started again.
+        let launches = scratch.join("stop-launches");
+        let engine = wait_ready(Runtime::start(&settings, (std::env::current_exe().unwrap(),
+                                                           vec!["ends-at-chat".into(), PathBuf::from(&launches).into_os_string()]))).await;
+        let pending = engine.generate(hi()).await.unwrap();
+        let started = Instant::now();
+        engine.close().await;
+        drop(pending);
+        assert_eq!(std::fs::read_to_string(&launches).unwrap(), "launched\n", "a worker was started again while the server stopped");
+        println!("runtime_controls: a worker that ended while the server stopped was not started again; closing took {:.1} s",
+                 started.elapsed().as_secs_f64());
 
         // A worker that fails to start: the runtime fails with its reason, at once.
         let engine = Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["fails".into()]));
