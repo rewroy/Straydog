@@ -179,6 +179,7 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
         let (mut passes, mut rounds, mut drafted, mut widths, mut accepted_all, mut drafting) = (0, 0, 0, [0usize; 4], 0, 0.0);
         let mut verified = false;
         let before = counted(engines);
+        engines.iter_mut().for_each(|engine| drop(engine.take_profile()));
         let started = std::time::Instant::now();
         while emitted.len() < count {
             let next = emitted[emitted.len() - 1];
@@ -243,6 +244,22 @@ fn generate(engines: &mut [Engine<'_, files::Files>], files: &files::Files, draf
         decode.hits += after.hits - before.hits;
         decode.host_hits += after.host_hits - before.host_hits;
         decode.drive_reads += after.drive_reads - before.drive_reads;
+        // (the host's side of the decode: the store's time and waits, and with DS41_PROFILE the engine's phases)
+        let per = |seconds: f64| 1e3 * seconds / passes.max(1) as f64;
+        println!("  host a pass: store {:.2} ms (acquire and fills), waits {:.2} ms for reads and {:.2} ms for slots, {:.1} write-backs",
+                 per(after.store_seconds - before.store_seconds), per(after.wait_seconds - before.wait_seconds),
+                 per(after.slot_wait_seconds - before.slot_wait_seconds), (after.writebacks - before.writebacks) as f64 / passes.max(1) as f64);
+        let mut phases = std::collections::BTreeMap::<&str, f64>::new();
+        for engine in engines.iter_mut() {
+            for (phase, spent) in engine.take_profile() {
+                *phases.entry(phase).or_default() += spent;
+            }
+        }
+        if !phases.is_empty() {
+            let mut line: Vec<(&str, f64)> = phases.into_iter().collect();
+            line.sort_by(|a, b| b.1.total_cmp(&a.1));
+            println!("  host phases, ms a pass: {}", line.iter().map(|(phase, spent)| format!("{phase} {:.2}", per(*spent))).collect::<Vec<_>>().join(", "));
+        }
         let mut hash_state = 0xcbf2_9ce4_8422_2325u64;
         hash(&mut hash_state, &emitted.iter().map(|&token| f32::from_bits(token)).collect::<Vec<_>>());
         hash(&mut all_hash, &[f32::from_bits(hash_state as u32), f32::from_bits((hash_state >> 32) as u32)]);
