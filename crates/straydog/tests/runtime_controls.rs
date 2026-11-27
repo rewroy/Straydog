@@ -428,8 +428,25 @@ fn main() {
         println!("runtime_controls: a worker that kept failing was started again three times, then failed the runtime");
         engine.close().await;
 
-        // A worker whose GPU work faults (STRAYDOG_FAULT_FALLBACK=1 stands in for Windows): the next starts without page locks or the gather
-        // ahead and serves, and so does the next start of this version from its first worker; another version's marker is no reason to.
+        // Where the workers start without page locks and the gather ahead from the first (STRAYDOG_START_LOCKS=off stands in for Windows'
+        // default), the first worker starts so, and the stand-in that faults with them serves.
+        std::env::set_var("STRAYDOG_START_LOCKS", "off");
+        let unlocked = scratch.join("unlocked");
+        std::fs::create_dir_all(unlocked.join("data")).unwrap();
+        let unlocked_settings = config::resolve(Options { model: Some(unlocked.clone()), quant: Some(QUANT.into()), ctx_size: Some(CONTEXT),
+                                                          data_dir: Some(unlocked.join("data")), ..Options::default() }).unwrap();
+        let unlocked_launches = unlocked.join("launches");
+        let engine = wait_ready(Runtime::start(&unlocked_settings, (std::env::current_exe().unwrap(),
+                                                                    vec!["faulting".into(), PathBuf::from(&unlocked_launches).into_os_string()]))).await;
+        assert!(serves(&engine, hi()).await, "the first request of a worker started without page locks was not answered");
+        engine.close().await;
+        assert_eq!(std::fs::read_to_string(&unlocked_launches).unwrap(), "0 0\n");
+        println!("runtime_controls: where that is the default, the first worker started without page locks or the gather ahead");
+
+        // A worker whose GPU work faults (STRAYDOG_FAULT_FALLBACK=1 stands in for Windows, its workers started with page locks first:
+        // STRAYDOG_START_LOCKS=on): the next starts without page locks or the gather ahead and serves, and so does the next start of this
+        // version from its first worker; another version's marker is no reason to.
+        std::env::set_var("STRAYDOG_START_LOCKS", "on");
         std::env::set_var("STRAYDOG_FAULT_FALLBACK", "1");
         let faults = scratch.join("faults");
         std::fs::create_dir_all(faults.join("data")).unwrap();
@@ -459,6 +476,7 @@ fn main() {
         engine.close().await;
         assert!(std::fs::read_to_string(fault_settings.data_dir.join("gpu-fault")).unwrap().starts_with(env!("CARGO_PKG_VERSION")));
         std::env::remove_var("STRAYDOG_FAULT_FALLBACK");
+        std::env::remove_var("STRAYDOG_START_LOCKS");
         println!("runtime_controls: a GPU fault started the next worker without page locks, and the next start of this version too");
 
         // A worker started again has its command made again where the server gives a relaunch (its files' marks as they are then): here the

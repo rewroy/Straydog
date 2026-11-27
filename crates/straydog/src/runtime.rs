@@ -1137,6 +1137,10 @@ impl Runtime {
             relaunch,
         };
         driver.read_fallback();
+        if unlocked_from_start() && !*driver.fallback.lock().unwrap() {
+            tracing::info!("Straydog starts its worker without page-locked banks or the gather ahead (the Windows default: a GPU's work faulted \
+                            with them; STRAYDOG_START_LOCKS=on starts them)");
+        }
         let driver = tokio::spawn(driver.run(prepare, jobs, controls));
         Runtime { shared, queue, control, driver: Mutex::new(Some(driver)) }
     }
@@ -1230,6 +1234,26 @@ const FALLBACK_VARIABLES: [(&str, &str); 2] = [("STRAYDOG_LOCK_BUDGET", "0"), ("
 /// fault has come of them.
 fn fault_fallback_on() -> bool {
     cfg!(windows) || std::env::var("STRAYDOG_FAULT_FALLBACK").is_ok_and(|value| value == "1")
+}
+
+/// Whether the workers start as a GPU fault starts them ([`FALLBACK_VARIABLES`]) from the first: the Windows default; STRAYDOG_START_LOCKS=on
+/// starts them with page-locked banks and the gather ahead (Linux's default), =off without them anywhere. A switch of the pair the server's
+/// own environment sets is kept as it is. The larger room for the locks did not stop the RTX 4060 PC's faults: its next version faulted the
+/// same way with 5.97 GiB page-locked of 23.56 GiB reservable. Each of its seven faults, under two versions, was a worker's second request
+/// (a short one going on from the first) after the first's banks were being locked, its host tier copied or its pages read back behind it,
+/// in the prompt's read of the streamed experts; every worker started without them served the requests that came after.
+fn unlocked_from_start() -> bool {
+    match std::env::var("STRAYDOG_START_LOCKS").as_deref() {
+        Ok("on") => false,
+        Ok("off") => true,
+        _ => cfg!(windows),
+    }
+}
+
+/// The variables a worker starts with: [`FALLBACK_VARIABLES`] after a GPU fault, those of them the server's environment leaves unset where
+/// [`unlocked_from_start`], none otherwise.
+fn start_variables(faulted: bool, unlocked: bool, set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    FALLBACK_VARIABLES.iter().copied().filter(|(name, _)| faulted || (unlocked && !set(name))).collect()
 }
 
 /// Whether a worker's failure is its GPU work's fault, as the message names it (the GPU layer's errors end in "(file:line, code N)"): an
@@ -1808,7 +1832,7 @@ impl Driver {
             .args(&args)
             .env_clear()
             .envs(worker_environment())
-            .envs(if *self.fallback.lock().unwrap() { &FALLBACK_VARIABLES[..] } else { &[] }.iter().copied())
+            .envs(start_variables(*self.fallback.lock().unwrap(), unlocked_from_start(), |name| std::env::var_os(name).is_some()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2703,6 +2727,21 @@ mod tests {
         assert!(!gpu_fault("Straydog GPU: out of memory (a stand-in)"));
         assert!(!gpu_fault("Straydog generation request id mismatch"));
         assert!(!gpu_fault("Straydog GPU: the launch timed out and was terminated (kernels.cpp:700, code 702)"));
+    }
+
+    /// A worker starts without page locks and the gather ahead after a GPU fault whatever the server's environment says, and from the first where
+    /// that is the default (Windows) with a switch the environment sets kept as it is; otherwise as it would.
+    #[test]
+    fn the_workers_start_unlocked_after_a_fault_and_where_that_is_the_default() {
+        let none = |_: &str| false;
+        let unlocked = vec![("STRAYDOG_LOCK_BUDGET", "0"), ("STRAYDOG_PREGATHER", "0")];
+        assert_eq!(start_variables(true, false, none), unlocked);
+        assert_eq!(start_variables(false, true, none), unlocked);
+        assert_eq!(start_variables(false, false, none), Vec::<(&str, &str)>::new());
+        // (a person who set the lock budget keeps theirs at a start, not after a fault)
+        let budget = |name: &str| name == "STRAYDOG_LOCK_BUDGET";
+        assert_eq!(start_variables(false, true, budget), vec![("STRAYDOG_PREGATHER", "0")]);
+        assert_eq!(start_variables(true, true, budget), unlocked);
     }
 
     /// A warm-up state (or an error to its ask) that comes after the server stopped waiting for it is passed over by the next read,
