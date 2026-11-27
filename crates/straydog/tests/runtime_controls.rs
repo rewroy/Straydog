@@ -128,9 +128,25 @@ fn faulting(log: &Path) {
     }
 }
 
-/// Whether `engine` answers `body` (a delta, then its end).
+/// `body` submitted to `engine` as a client does after its worker failed: refused as "Loading model" while the worker started again loads
+/// (the runtime is loading from the moment it begins the restart), and sent again until taken. A request sent at once raced the restart:
+/// under load it was refused, or waited past its test's bound.
+async fn submit(engine: &Runtime, body: pyjson::Value) -> straydog_api::Generation {
+    let started = Instant::now();
+    loop {
+        match engine.generate(body.clone()).await {
+            Ok(generation) => return generation,
+            Err(straydog_api::SubmitError::Unavailable(message)) if message == "Loading model" && started.elapsed() < Duration::from_secs(60) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(other) => panic!("not taken: {other:?}"),
+        }
+    }
+}
+
+/// Whether `engine` answers `body` (a delta, then its end), taken as [`submit`] takes it.
 async fn serves(engine: &Runtime, body: pyjson::Value) -> bool {
-    let mut next = engine.generate(body).await.unwrap();
+    let mut next = submit(engine, body).await;
     let mut answered = false;
     while let Some(event) = tokio::time::timeout(Duration::from_secs(20), next.events.next()).await.unwrap() {
         match event["event"].as_str() {
@@ -380,7 +396,7 @@ fn main() {
         let told = event["message"].as_str().unwrap_or("");
         assert!(told.contains("out of memory (a stand-in)") && told.contains("starting its worker again"), "{told}");
         let restarted = Instant::now();
-        let mut next = engine.generate(hi()).await.unwrap();
+        let mut next = submit(&engine, hi()).await;
         let mut answered = false;
         while let Some(event) = tokio::time::timeout(Duration::from_secs(20), next.events.next()).await.unwrap() {
             match event["event"].as_str() {
@@ -398,7 +414,7 @@ fn main() {
         // One that keeps failing: three restarts, then the fourth failure fails the runtime (with the reason, told to restart the server).
         let engine = wait_ready(Runtime::start(&settings, (std::env::current_exe().unwrap(), vec!["fatal".into()]))).await;
         for attempt in 0..4 {
-            let mut failed = engine.generate(hi()).await.unwrap();
+            let mut failed = submit(&engine, hi()).await;
             let event = tokio::time::timeout(Duration::from_secs(20), failed.events.next()).await.unwrap().unwrap();
             assert_eq!(event["event"].as_str(), Some("error"), "attempt {attempt}: {event}");
             let told = event["message"].as_str().unwrap_or("");
