@@ -207,9 +207,9 @@ fn cpu_rows_int8_pair(kind: u32, level: i32, rows: &[u8], count: usize, x0: &[f3
     (status == 0).then_some((out0, out1))
 }
 
-/// Two routes of one expert take one decoding of its rows (the AVX-512 pair kernels, with GFNI and VNNI and without): each route's sums
-/// are, bit for bit, those of the route alone, for IQ2_XXS and IQ2_S gate and up rows and Q2_0 down rows, even and odd counts of rows;
-/// where there is no pair kernel (the scalar reference) the hook says so.
+/// Two routes of one expert take one decoding of its rows (the AVX-512 pair kernels, with GFNI and VNNI and without, and AVX2's for gate
+/// and up): each route's sums are, bit for bit, those of the route alone, for IQ2_XXS and IQ2_S gate and up rows and Q2_0 down rows, even
+/// and odd counts of rows; where there is no pair kernel (the scalar reference) the hook says so.
 #[test]
 fn a_pair_of_routes_sums_as_each_route_alone() {
     load_tables();
@@ -222,8 +222,10 @@ fn a_pair_of_routes_sums_as_each_route_alone() {
             let data: Vec<u8> = (0..rows * cols / values).flat_map(|_| generated_block(kind, &mut random)).collect();
             let x0: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
             let x1: Vec<f32> = (0..cols).map(|_| random.activation()).collect();
-            for level in [2, 3].into_iter().filter(|_| avx512) {
-                let (out0, out1) = cpu_rows_int8_pair(kind, level, &data, rows, &x0, &x1).expect("a pair kernel at AVX-512");
+            let avx2 = std::is_x86_feature_detected!("avx2");
+            // (AVX2 pairs gate and up only: its Q2_0 down decodes in two shifts, little to share)
+            for level in [(1, avx2 && kind != 42), (2, avx512), (3, avx512)].into_iter().filter(|(_, here)| *here).map(|(level, _)| level) {
+                let (out0, out1) = cpu_rows_int8_pair(kind, level, &data, rows, &x0, &x1).expect("a pair kernel at this level");
                 let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 assert_eq!(bits(&out0), bits(&cpu_rows_int8(kind, level, &data, rows, &x0).unwrap()), "kind {kind} rows {rows} level {level} x0");
                 assert_eq!(bits(&out1), bits(&cpu_rows_int8(kind, level, &data, rows, &x1).unwrap()), "kind {kind} rows {rows} level {level} x1");

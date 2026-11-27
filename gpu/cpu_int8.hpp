@@ -324,8 +324,10 @@ inline void prepare_iq2_s(const uint8_t* b, IntPrepared& p) {
 // What of a chunk does not depend on x: its 64 weights (unsigned), the scales of its groups and its sign bits (put on x, not the weights).
 // Two routes of one expert make these once (iq2_int_rows512_pair) and take them against both their x.
 struct ChunkWeights { __m512i weights, scales; __mmask64 signs; };
+// (forced inline, as the three below: MSVC left a struct of vectors returned by value to a call through memory, and the IQ2 gate and up of
+// one route took 440 us in place of 86 on a Ryzen 7 9700X)
 SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2")
-inline ChunkWeights chunk_weights(const uint8_t* grid, bool coded, const IntPrepared& p, unsigned c) {
+SD_INLINE ChunkWeights chunk_weights(const uint8_t* grid, bool coded, const IntPrepared& p, unsigned c) {
     uint64_t signs; std::memcpy(&signs, p.signs + 8 * c, 8);
     __m512i weights;
     if (coded) {
@@ -341,7 +343,7 @@ inline ChunkWeights chunk_weights(const uint8_t* grid, bool coded, const IntPrep
 // A chunk's weights against x's chunk q: its sixteen lanes added to `lanes`.
 template<bool vnni>
 SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,avx512vnni")
-inline __m512i chunk_dot(const ChunkWeights& w, __m512i q, __m512i lanes) {
+SD_INLINE __m512i chunk_dot(const ChunkWeights& w, __m512i q, __m512i lanes) {
     const __m512i signed_q = _mm512_mask_sub_epi8(q, w.signs, _mm512_setzero_si512(), q);
     const __m512i pairs = _mm512_maddubs_epi16(w.weights, signed_q);
     if constexpr (vnni) return _mm512_dpwssd_epi32(lanes, pairs, w.scales);
@@ -349,7 +351,7 @@ inline __m512i chunk_dot(const ChunkWeights& w, __m512i q, __m512i lanes) {
 }
 template<bool vnni>
 SD_TARGET("avx512f,avx512bw,avx512vbmi,avx2,avx512vnni")
-inline __m512i chunk_lanes(const uint8_t* grid, bool coded, const IntPrepared& p, unsigned c, __m512i q, __m512i lanes) {
+SD_INLINE __m512i chunk_lanes(const uint8_t* grid, bool coded, const IntPrepared& p, unsigned c, __m512i q, __m512i lanes) {
     return chunk_dot<vnni>(chunk_weights(grid, coded, p, c), q, lanes);
 }
 // A block's integer lanes times its F32 scale, added to the row's F32 lanes.
@@ -544,20 +546,32 @@ struct SignMasks {
 constexpr SignMasks sign_masks;
 // IQ2_XXS's group g (32 values) read straight from its block against x's 32 values: the four grid rows its index bytes name, the
 // signs of its four 7-bit fields, its one scale; eight of the AVX-512 kernels' lanes (no prepared block in between).
+// What of a 32-value group does not depend on x: its four grid rows, the masks of its negative values and its scales. Two routes of one
+// expert make it once (iq2_int_rows256_pair).
+struct GroupWeights256 { __m256i weights, negative, scales; };
+// A group's weights against x's 32 values: eight lanes added to `lanes`.
 template<bool vnni>
 SD_TARGET("avx2,fma,f16c,avxvnni")
-SD_INLINE __m256i iq2_xxs_group256(const uint8_t* grid, const uint8_t* block, unsigned g, __m256i q, __m256i lanes) {
+SD_INLINE __m256i group_dot256(const GroupWeights256& w, __m256i q, __m256i lanes) {
+    const __m256i signed_q = _mm256_sub_epi8(_mm256_xor_si256(q, w.negative), w.negative);
+    const __m256i pairs = _mm256_maddubs_epi16(w.weights, signed_q);
+    if constexpr (vnni) return _mm256_dpwssd_avx_epi32(lanes, pairs, w.scales);
+    else return _mm256_add_epi32(lanes, _mm256_madd_epi16(pairs, w.scales));
+}
+SD_TARGET("avx2,fma,f16c")
+SD_INLINE GroupWeights256 iq2_xxs_weights256(const uint8_t* grid, const uint8_t* block, unsigned g) {
     const uint8_t* group = block + 2 + 8 * g;
     const uint32_t aux = load32(group + 4);
     const __m256i weights = _mm256_set_epi64x(int64_t(grid_row(grid, 8u * group[3])), int64_t(grid_row(grid, 8u * group[2])),
                                               int64_t(grid_row(grid, 8u * group[1])), int64_t(grid_row(grid, 8u * group[0])));
     const __m256i negative = _mm256_set_epi64x(int64_t(sign_masks.value[(aux >> 21) & 127]), int64_t(sign_masks.value[(aux >> 14) & 127]),
                                                int64_t(sign_masks.value[(aux >> 7) & 127]), int64_t(sign_masks.value[aux & 127]));
-    const __m256i signed_q = _mm256_sub_epi8(_mm256_xor_si256(q, negative), negative);
-    const __m256i scale = _mm256_set1_epi16(int16_t(2 * (aux >> 28) + 1));
-    const __m256i pairs = _mm256_maddubs_epi16(weights, signed_q);
-    if constexpr (vnni) return _mm256_dpwssd_avx_epi32(lanes, pairs, scale);
-    else return _mm256_add_epi32(lanes, _mm256_madd_epi16(pairs, scale));
+    return {weights, negative, _mm256_set1_epi16(int16_t(2 * (aux >> 28) + 1))};
+}
+template<bool vnni>
+SD_TARGET("avx2,fma,f16c,avxvnni")
+SD_INLINE __m256i iq2_xxs_group256(const uint8_t* grid, const uint8_t* block, unsigned g, __m256i q, __m256i lanes) {
+    return group_dot256<vnni>(iq2_xxs_weights256(grid, block, g), q, lanes);
 }
 // A sign byte as eight bytes, 0xFF where its bit is set (IQ2_S's sign bytes).
 struct ByteMasks {
@@ -570,9 +584,8 @@ struct ByteMasks {
 constexpr ByteMasks byte_masks;
 // IQ2_S's group g (32 values) read straight from its block: four ten-bit grid indices (a byte each and two bits of qh[g]), four
 // sign bytes, the scale nibbles of its two 16-value halves; eight of the AVX-512 kernels' lanes.
-template<bool vnni>
-SD_TARGET("avx2,fma,f16c,avxvnni")
-SD_INLINE __m256i iq2_s_group256(const uint8_t* grid, const uint8_t* block, unsigned g, __m256i q, __m256i lanes) {
+SD_TARGET("avx2,fma,f16c")
+SD_INLINE GroupWeights256 iq2_s_weights256(const uint8_t* grid, const uint8_t* block, unsigned g) {
     const uint8_t* qs = block + 2 + 4 * g;
     const unsigned high = block[66 + g];
     auto row = [&](unsigned l) { return int64_t(grid_row(grid, 8u * (qs[l] | ((high << (8 - 2 * l)) & 0x300)))); };
@@ -580,12 +593,14 @@ SD_INLINE __m256i iq2_s_group256(const uint8_t* grid, const uint8_t* block, unsi
     const uint8_t* signs = block + 34 + 4 * g;
     const __m256i negative = _mm256_set_epi64x(int64_t(byte_masks.value[signs[3]]), int64_t(byte_masks.value[signs[2]]),
                                                int64_t(byte_masks.value[signs[1]]), int64_t(byte_masks.value[signs[0]]));
-    const __m256i signed_q = _mm256_sub_epi8(_mm256_xor_si256(q, negative), negative);
     const unsigned nibbles = block[74 + g];
     const __m256i scales = _mm256_set_m128i(_mm_set1_epi16(int16_t(2 * (nibbles >> 4) + 1)), _mm_set1_epi16(int16_t(2 * (nibbles & 15) + 1)));
-    const __m256i pairs = _mm256_maddubs_epi16(weights, signed_q);
-    if constexpr (vnni) return _mm256_dpwssd_avx_epi32(lanes, pairs, scales);
-    else return _mm256_add_epi32(lanes, _mm256_madd_epi16(pairs, scales));
+    return {weights, negative, scales};
+}
+template<bool vnni>
+SD_TARGET("avx2,fma,f16c,avxvnni")
+SD_INLINE __m256i iq2_s_group256(const uint8_t* grid, const uint8_t* block, unsigned g, __m256i q, __m256i lanes) {
+    return group_dot256<vnni>(iq2_s_weights256(grid, block, g), q, lanes);
 }
 // (vnni: AVX-VNNI's vpdpwssd and vpdpbusd, Intel's 12th generation on and Zen 5, as the AVX-512 kernels use VNNI)
 template<int kind, int N, bool vnni>
@@ -629,6 +644,34 @@ void iq2_int_rows256(const uint8_t* row, size_t stride, const Q8K* x, size_t blo
     if constexpr (N > 1) out[1] = total256(low1, high1);
     if constexpr (N > 2) out[2] = total256(low2, high2);
     if constexpr (N > 3) out[3] = total256(low3, high3);
+}
+// iq2_int_rows256 of one row for two routes of one expert (x0 and x1): each group's grid rows, sign masks and scales made once and taken
+// against both, each route's sums bit for bit those of the route alone. (One row: sixteen YMM registers hold two routes' lanes and sums.)
+template<int kind, bool vnni>
+SD_TARGET("avx2,fma,f16c,avxvnni")
+void iq2_int_rows256_pair(const uint8_t* row, size_t stride, const Q8K* x0, const Q8K* x1, size_t blocks, float* out0, float* out1) {
+    constexpr size_t bytes = kind == 16 ? 66 : 82;
+    const uint8_t* grid = iq_table(kind);
+    __m256 low0 = _mm256_setzero_ps(), high0 = low0, low1 = low0, high1 = low0;
+    for (size_t b = 0; b < blocks; ++b) {
+        prefetch_next<bytes, 1>(row, stride, b);
+        const uint8_t* block = row + b * bytes;
+        __m256i l0 = _mm256_setzero_si256(), h0 = l0, l1 = l0, h1 = l0;
+        for (unsigned c = 0; c < 4; ++c) {
+            const GroupWeights256 wl = kind == 16 ? iq2_xxs_weights256(grid, block, 2 * c) : iq2_s_weights256(grid, block, 2 * c);
+            l0 = group_dot256<vnni>(wl, _mm256_load_si256(reinterpret_cast<const __m256i*>(x0[b].q + 64 * c)), l0);
+            l1 = group_dot256<vnni>(wl, _mm256_load_si256(reinterpret_cast<const __m256i*>(x1[b].q + 64 * c)), l1);
+            const GroupWeights256 wh = kind == 16 ? iq2_xxs_weights256(grid, block, 2 * c + 1) : iq2_s_weights256(grid, block, 2 * c + 1);
+            h0 = group_dot256<vnni>(wh, _mm256_load_si256(reinterpret_cast<const __m256i*>(x0[b].q + 64 * c + 32)), h0);
+            h1 = group_dot256<vnni>(wh, _mm256_load_si256(reinterpret_cast<const __m256i*>(x1[b].q + 64 * c + 32)), h1);
+        }
+        const float half = half_f16c(block);
+        const __m256 scale0 = _mm256_set1_ps(half * (x0[b].d * 0.125f)), scale1 = _mm256_set1_ps(half * (x1[b].d * 0.125f));
+        low0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(l0), scale0, low0); high0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(h0), scale0, high0);
+        low1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(l1), scale1, low1); high1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(h1), scale1, high1);
+    }
+    out0[0] = total256(low0, high0);
+    out1[0] = total256(low1, high1);
 }
 // Q2_0's down: the 16 code bytes in both 128-bit halves, each 128 bits m taking bits 2m and 2m + 1 (a 32-bit shift: what crosses a
 // byte lands above the two bits kept).
@@ -697,6 +740,11 @@ void iq2_int_pair512(const uint8_t* row, size_t stride, size_t count, const Q8K*
     for (; r + 2 <= count; r += 2) iq2_int_rows512_pair<kind, 2, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
     if (r < count) iq2_int_rows512_pair<kind, 1, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
 }
+// Two routes of one expert, AVX2: a row at a time (iq2_int_rows256_pair).
+template<int kind, bool vnni>
+void iq2_int_pair256(const uint8_t* row, size_t stride, size_t count, const Q8K* x0, const Q8K* x1, size_t blocks, float* out0, float* out1) {
+    for (size_t r = 0; r < count; ++r) iq2_int_rows256_pair<kind, vnni>(row + r * stride, stride, x0, x1, blocks, out0 + r, out1 + r);
+}
 // Two routes of one expert's down rows, four rows at a time (q2_0_int_rows512_pair).
 template<bool gfni, bool vnni>
 void q2_0_int_pair512(const uint8_t* row, size_t stride, size_t count, const Q8S* x0, const Q8S* x1, size_t blocks, float* out0, float* out1) {
@@ -743,8 +791,8 @@ void q2_0_int_avxvnni(const uint8_t* row, size_t stride, size_t count, const Q8S
 // none.
 using GateKernel = void (*)(const uint8_t*, size_t, size_t, const Q8K*, size_t, float*);
 using DownKernel = void (*)(const uint8_t*, size_t, size_t, const Q8S*, size_t, float*);
-// Two routes of one expert at once (rows, stride, count, x0, x1, blocks, out0, out1): AVX-512 only, null elsewhere (the routes then take
-// GateKernel one after the other, as before).
+// Two routes of one expert at once (rows, stride, count, x0, x1, blocks, out0, out1): AVX-512 and AVX2, null for the scalar reference
+// (the routes then take GateKernel one after the other, as before).
 using GatePairKernel = void (*)(const uint8_t*, size_t, size_t, const Q8K*, const Q8K*, size_t, float*, float*);
 GatePairKernel gate_pair_kernel(int kind, int level) {
 #ifdef SD_X86
@@ -753,6 +801,11 @@ GatePairKernel gate_pair_kernel(int kind, int level) {
         const bool use = level == 2 && vnni;
         if (kind == 16) return use ? iq2_int_pair512<16, true> : iq2_int_pair512<16, false>;
         if (kind == 22) return use ? iq2_int_pair512<22, true> : iq2_int_pair512<22, false>;
+    }
+    if (level == 1) {
+        static const bool vnni = cpu_has("avxvnni");
+        if (kind == 16) return vnni ? iq2_int_pair256<16, true> : iq2_int_pair256<16, false>;
+        if (kind == 22) return vnni ? iq2_int_pair256<22, true> : iq2_int_pair256<22, false>;
     }
 #endif
     (void)kind; (void)level;
