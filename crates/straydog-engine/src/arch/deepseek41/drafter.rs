@@ -684,6 +684,16 @@ impl Drafter {
         Ok(Rings { rings, held: self.held.clone() })
     }
 
+    /// [`Drafter::save_rings`] for a checkpoint of the target's sequence at `position`, taken after a pass that went past it
+    /// (the target's [`Engine::capture_at`](super::engine::Engine::capture_at)): the rows of the positions from there on are
+    /// forgotten. The rows they wrote over, of the oldest positions before it, are lacking too, so drafting waits only until
+    /// the sequence has gone on past them again (as many tokens as went past the position), not for a ring's worth.
+    pub fn save_rings_before(&self, devices: &mut [Beside<'_>], position: usize) -> Result<Rings> {
+        let mut rings = self.save_rings(devices)?;
+        rings.held.forget_from(position);
+        Ok(rings)
+    }
+
     /// Put rings back as [`Drafter::save_rings`] took them: the history of the sequence then.
     pub fn restore_rings(&mut self, devices: &mut [Beside<'_>], saved: &Rings) -> Result<()> {
         let stages = self.parts[0].stages.len();

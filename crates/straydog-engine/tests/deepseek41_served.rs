@@ -270,4 +270,70 @@ fn a_switched_conversation_comes_back_from_its_checkpoint() {
     assert_eq!(text.reach(&ids, &spelled), (ids.len(), spelled.len()));
     let encoded = text.encode(&spelled).unwrap();
     eprintln!("the reply's text encoded again: the same ids for {} of {}", encoded.iter().zip(&ids).take_while(|(a, b)| a == b).count(), ids.len());
+
+    // A turn's checkpoint kept by the pass that reads past it (Engines::capture_at, as every turn above) and the one the turn's
+    // last tokens read apart leave (capture_turns off, STRAYDOG_CAPTURE=0, as for Qwen3.8): a chat's turns, the first read in two passes,
+    // resume at the same tokens from the turn's checkpoint and give the same first token either way. How a prompt is cut into
+    // passes moves its logits a little, as from a stem above (0.30 at most in the first turn, 13 of 16 greedy tokens the same,
+    // 2026-11-28), so the greedy tokens that follow, the largest difference and the state parts that differ are reported; that
+    // the kept state is the pass's own is the check above.
+    let turn1 = render(&format!("[{system}, {}]", turns[0]));
+    assert!(turn1.len() > settings.batch, "the first turn takes two passes ({} tokens)", turn1.len());
+    let turn2 = render(&format!("[{system}, {}]", turns[..3].join(", ")));
+    let turn3 = render(&format!("[{system}, {}]", turns.join(", ")));
+
+    // The state a pass keeps at a position inside it (Engines::capture_at) is, bit for bit, the one Engine::rewind leaves to the
+    // first tokens of the same pass: a verify pass over a conversation, its state kept partway, saved and restored in place,
+    // against the pass taken back to there.
+    model.forget();
+    go(&mut model, &turn1, 4);
+    let rows = model.engines.verify_rows();
+    assert!(rows >= 3, "verify passes of {rows} rows");
+    let extra = &turn2[turn2.len() - rows..];
+    let held = model.held().len();
+    let (base, kept) = (model.engines.checkpoints() - 2, model.engines.checkpoints() - 1);
+    model.engines.checkpoint(base, true).unwrap();
+    for keep in 1..rows {
+        model.engines.checkpoint(base, false).unwrap();
+        assert!(model.engines.capture_at(Some(held + keep)));
+        model.engines.verify(extra).unwrap();
+        model.engines.capture_at(None);
+        model.engines.checkpoint_captured(kept).unwrap();
+        model.engines.rewind(keep).unwrap();
+        let digests = |state: Vec<(String, Vec<f32>)>| -> Vec<String> { state.into_iter().map(|(name, values)| format!("{name} {}", digest(&values))).collect() };
+        let rewound = digests(model.engines.state().unwrap());
+        model.engines.checkpoint(kept, false).unwrap();
+        let restored = digests(model.engines.state().unwrap());
+        let differing: Vec<_> = rewound.iter().zip(&restored).filter(|(a, b)| a != b).map(|(a, _)| a.rsplit_once(' ').unwrap().0).collect();
+        eprintln!("kept at {keep} of a {rows}-row pass: {} of {} state parts differ from the pass taken back", differing.len(), rewound.len());
+        assert!(differing.is_empty() && rewound.len() == restored.len(), "keep {keep}: {:?}", &differing[..differing.len().min(8)]);
+    }
+    model.forget();
+
+    let mut runs = Vec::new();
+    for capture in [false, true] {
+        model.capture_turns = capture;
+        model.forget();
+        let mut outcomes = Vec::new();
+        for (turn, prompt) in [&turn1, &turn2, &turn3].into_iter().enumerate() {
+            let outcome = go(&mut model, prompt, 16);
+            let logits = model.prompt_logits.clone().unwrap();
+            if turn > 0 {
+                assert_eq!(model.last_metrics["resumed_from"], "turn", "capture {capture}: turn {turn} from the last turn's checkpoint");
+            }
+            assert!(model.last_metrics["prefill_tail"].is_object() != capture, "capture {capture}: turn {turn}'s last tokens read apart");
+            outcomes.push((outcome, logits));
+        }
+        runs.push(outcomes);
+    }
+    model.capture_turns = true;
+    for (turn, ((apart, apart_logits), (kept, kept_logits))) in runs[0].iter().zip(&runs[1]).enumerate() {
+        let widest = apart_logits.iter().zip(kept_logits).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let differing = kept.state.iter().zip(&apart.state).filter(|(a, b)| a != b).count();
+        eprintln!("turn {turn}: resumed at {:?}; kept inside its pass and read apart: the largest logit difference {widest}, {} of {} tokens \
+                   the same, {differing} of {} state parts differ", kept.cached, kept.tokens.iter().zip(&apart.tokens).take_while(|(a, b)| a == b).count(),
+                  apart.tokens.len(), kept.state.len());
+        assert_eq!(kept.cached, apart.cached, "turn {turn}: resumed at");
+        assert_eq!(top(kept_logits), top(apart_logits), "turn {turn}: the first token");
+    }
 }

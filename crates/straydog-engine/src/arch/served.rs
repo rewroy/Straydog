@@ -171,6 +171,16 @@ pub trait Engines {
     fn checkpoint(&mut self, _slot: usize, _save: bool) -> Result<(), String> {
         Err("these engines keep no checkpoints".into())
     }
+    /// Keep, from the next pass over `position` (past its first token, before its last), the sequence state there, for
+    /// [`Engines::checkpoint_captured`]; None: no longer. Whether these engines can (else a checkpoint there takes a pass).
+    fn capture_at(&mut self, _position: Option<usize>) -> bool {
+        false
+    }
+    /// Save the state the last pass kept at the captured position to checkpoint `slot`, as [`Engines::checkpoint`] saves the
+    /// held one.
+    fn checkpoint_captured(&mut self, _slot: usize) -> Result<(), String> {
+        Err("these engines keep no state partway into a pass".into())
+    }
     /// The checkpoint slot a budget gives up last (the conversation root's), if any.
     fn keep_checkpoint(&mut self, _slot: Option<usize>) {}
     /// Whether a checkpoint holds the whole sequence state, positional too: restored after any
@@ -456,6 +466,9 @@ pub struct Session<E: Engines> {
     /// The token a reply's generation prompt begins with (`<|im_start|>`, `<｜Assistant｜>`): the
     /// state before it is checkpointed when the engines keep checkpoints.
     turn_start: Option<u32>,
+    /// Whether that state is kept by the pass that reads past it, where the engines can ([`Engines::capture_at`]); else the
+    /// tokens after it are a pass of their own (`STRAYDOG_CAPTURE=0`, as for Qwen3.8).
+    pub capture_turns: bool,
     /// The token a user message begins with (`<｜User｜>`): the state before a prompt's first is
     /// its conversation's root (system prompt and tools), checkpointed for the next conversation.
     root_end: Option<u32>,
@@ -767,6 +780,7 @@ impl<E: Engines> Session<E> {
         Session {
             engines: placed.engines, files: placed.files, vocabulary: placed.vocabulary,
             context: placed.context, batch: placed.batch, history: Vec::new(), end: placed.end, turn_start: placed.turn_start,
+            capture_turns: std::env::var("STRAYDOG_CAPTURE").map_or(true, |value| value.trim() != "0"),
             root_end: placed.root_end, checkpoints: Vec::new(), marks: Vec::new(), agreed: 0, card: placed.card,
             placement: placed.placement, state_bytes: placed.state_bytes, load_seconds: placed.load_seconds,
             last_metrics: Map::new(), prompt_logits: None, warmth: Warm::new(placed.layers, placed.experts),
@@ -935,22 +949,41 @@ impl<E: Engines> Session<E> {
             fed = root;
             made_root = Some(root);
         }
+        // (a turn inside the last pass of what is left: that pass keeps the state there, saved after it)
+        let mut captured = None;
         if let Some(start) = self.turn_mark(tokens, fed) {
-            // (a turn where the request resumed, or at the root just saved, takes the state as it is: nothing is read)
-            if start > fed && self.feed(&tokens[fed..start], cancelled, &mut |done| progress(done, total))?.is_none() {
-                return Ok(());
+            let last_pass = fed + (total - fed - 1) / self.batch * self.batch;
+            if self.capture_turns && start > last_pass && start < total && self.engines.capture_at(Some(start)) {
+                captured = Some(start);
+            } else {
+                // (a turn where the request resumed, or at the root just saved, takes the state as it is: nothing is read)
+                if start > fed && self.feed(&tokens[fed..start], cancelled, &mut |done| progress(done, total))?.is_none() {
+                    return Ok(());
+                }
+                let saving = Instant::now();
+                self.save_checkpoint(false)?;
+                checkpoint_seconds += saving.elapsed().as_secs_f64();
+                fed = start;
             }
-            let saving = Instant::now();
-            self.save_checkpoint(false)?;
-            checkpoint_seconds += saving.elapsed().as_secs_f64();
-            fed = start;
         }
         // (the tokens after a checkpoint saved on the way are a pass of their own, whose experts the pass before had read and
         // given up again: what that pass costs, apart, is what a checkpoint taken inside one pass would save)
         let tail = (fed > reused).then(|| (total - fed, Instant::now(), self.engines.counts()));
-        let Some(logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
+        let read = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total));
+        if captured.is_some() {
+            self.engines.capture_at(None);
+        }
+        let Some(logits) = read? else {
             return Ok(());
         };
+        if let Some(start) = captured {
+            let saving = Instant::now();
+            // (without it the next turn reads more of its prompt again, nothing else)
+            if let Err(error) = self.save_checkpoint_of(false, Some(start)) {
+                eprintln!("WARN Straydog kept no checkpoint at the turn {start} tokens in: {error}");
+            }
+            checkpoint_seconds += saving.elapsed().as_secs_f64();
+        }
         if let Some(kept) = self.prompt_logits.as_mut() {
             kept.clone_from(&logits);
         }
@@ -1133,28 +1166,39 @@ impl<E: Engines> Session<E> {
     /// turn's: one of the same tokens just becomes the last; else a free slot takes it, one chosen by
     /// [`evicted`] giving its up when all are taken. The engines' budget gives the root's up last.
     fn save_checkpoint(&mut self, root: bool) -> Result<(), String> {
+        self.save_checkpoint_of(root, None)
+    }
+
+    /// [`Session::save_checkpoint`] of the held state, or of the state the last pass kept partway at `captured` tokens
+    /// ([`Engines::capture_at`]).
+    fn save_checkpoint_of(&mut self, root: bool, captured: Option<usize>) -> Result<(), String> {
+        let tokens = &self.history[..captured.unwrap_or(self.history.len())];
         // (checkpoints the engines gave up are gone: one of the same tokens is taken again)
         let engines = &self.engines;
         self.checkpoints.retain(|checkpoint| engines.holds(checkpoint.slot));
         if root {
-            for index in demoted(&self.checkpoints, &self.history) {
+            for index in demoted(&self.checkpoints, tokens) {
                 self.checkpoints[index].root = false;
             }
         }
-        if let Some(index) = self.checkpoints.iter().position(|checkpoint| checkpoint.tokens == self.history) {
+        if let Some(index) = self.checkpoints.iter().position(|checkpoint| checkpoint.tokens == tokens) {
             let mut same = self.checkpoints.remove(index);
             same.root |= root;
             self.checkpoints.push(same);
         } else {
             let slots = self.engines.checkpoints();
             if self.checkpoints.len() >= slots {
-                let given_up = evicted(&self.checkpoints, &self.history);
+                let given_up = evicted(&self.checkpoints, tokens);
                 self.checkpoints.remove(given_up);
             }
             let slot = (0..slots).find(|slot| self.checkpoints.iter().all(|checkpoint| checkpoint.slot != *slot))
                 .ok_or("no free Straydog checkpoint")?;
-            self.engines.checkpoint(slot, true)?;
-            self.checkpoints.push(Checkpoint { slot, tokens: self.history.clone(), root });
+            let tokens = tokens.to_vec();
+            match captured {
+                Some(_) => self.engines.checkpoint_captured(slot)?,
+                None => self.engines.checkpoint(slot, true)?,
+            }
+            self.checkpoints.push(Checkpoint { slot, tokens, root });
         }
         // (the root a budget gives up last: the latest conversation's)
         let kept = self.checkpoints.iter().rev().find(|checkpoint| checkpoint.root).map(|checkpoint| checkpoint.slot);

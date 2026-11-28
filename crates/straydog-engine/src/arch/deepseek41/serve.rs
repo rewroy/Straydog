@@ -461,35 +461,19 @@ impl served::Engines for Engines {
             }
             return Ok(());
         }
-        // (the slot's snapshots, or one given up for room, are taken again in place: Engine::snapshot_into)
-        let mut reuse = self.saved[slot].take();
-        self.order.retain(|&held| held != slot);
-        // Room first, the copy after: the budget bounds the host memory at its peak too. The kept
-        // slot (the conversation root's) gives its up last.
-        let required: u64 = self.engines.iter().map(Engine::snapshot_bytes).sum();
-        let kept = self.kept.filter(|&kept| kept != slot);
-        let held: Vec<(usize, u64)> = self.order.iter().filter(|&&held| Some(held) != kept).chain(kept.iter().filter(|kept| self.order.contains(kept)))
-            .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
-        let Some(given_up) = evictions(&held, required, self.budget) else { return Ok(()) };
-        for oldest in given_up {
-            let freed = self.saved[oldest].take();
-            reuse = reuse.or(freed);
-            self.order.retain(|&held| held != oldest);
+        self.save_snapshots(slot, false)
+    }
+
+    fn capture_at(&mut self, position: Option<usize>) -> bool {
+        self.engines.iter_mut().for_each(|engine| engine.capture_at(position));
+        true
+    }
+
+    fn checkpoint_captured(&mut self, slot: usize) -> Result<(), String> {
+        if slot >= self.saved.len() {
+            return Err("no such Straydog checkpoint".into());
         }
-        let mut snapshots = reuse.unwrap_or_default();
-        snapshots.resize_with(self.engines.len(), Snapshot::default);
-        for (engine, snapshot) in self.engines.iter_mut().zip(&mut snapshots) {
-            engine.snapshot_into(snapshot)?;
-        }
-        if let Some(drafting) = self.drafting.as_mut() {
-            drafting.rings[slot] = None;
-            if drafting.on {
-                drafting.rings[slot] = Some(drafting.drafter.save_rings(&mut self.engines[drafting.engine].beside()?)?);
-            }
-        }
-        self.saved[slot] = Some(snapshots);
-        self.order.push(slot);
-        Ok(())
+        self.save_snapshots(slot, true)
     }
 
     fn keep_checkpoint(&mut self, slot: Option<usize>) {
@@ -710,6 +694,47 @@ impl Engines {
             }
         }
         Ok(!self.saved.iter().flatten().flatten().any(Snapshot::pending))
+    }
+
+    /// Save every engine's state, the held one's or ([`served::Engines::checkpoint_captured`]) the one the last pass kept at the
+    /// captured position, to checkpoint `slot`: room first, the copy after (the budget bounds the host memory at its peak too;
+    /// the kept slot, the conversation root's, gives its up last).
+    fn save_snapshots(&mut self, slot: usize, captured: bool) -> Result<(), String> {
+        // (the slot's snapshots, or one given up for room, are taken again in place: Engine::snapshot_into)
+        let mut reuse = self.saved[slot].take();
+        self.order.retain(|&held| held != slot);
+        // Room first, the copy after: the budget bounds the host memory at its peak too. The kept
+        // slot (the conversation root's) gives its up last.
+        let required: u64 = self.engines.iter().map(Engine::snapshot_bytes).sum();
+        let kept = self.kept.filter(|&kept| kept != slot);
+        let held: Vec<(usize, u64)> = self.order.iter().filter(|&&held| Some(held) != kept).chain(kept.iter().filter(|kept| self.order.contains(kept)))
+            .map(|&held| (held, self.saved[held].iter().flatten().map(Snapshot::bytes).sum())).collect();
+        let Some(given_up) = evictions(&held, required, self.budget) else { return Ok(()) };
+        for oldest in given_up {
+            let freed = self.saved[oldest].take();
+            reuse = reuse.or(freed);
+            self.order.retain(|&held| held != oldest);
+        }
+        let mut snapshots = reuse.unwrap_or_default();
+        snapshots.resize_with(self.engines.len(), Snapshot::default);
+        for (engine, snapshot) in self.engines.iter_mut().zip(&mut snapshots) {
+            if captured { engine.snapshot_captured_into(snapshot)? } else { engine.snapshot_into(snapshot)? }
+        }
+        if let Some(drafting) = self.drafting.as_mut() {
+            drafting.rings[slot] = None;
+            if drafting.on {
+                // (a captured state's: the rings as they are, the positions past it forgotten)
+                let at = if captured { self.engines[drafting.engine].captured_position() } else { None };
+                let mut devices = self.engines[drafting.engine].beside()?;
+                drafting.rings[slot] = Some(match at {
+                    Some(at) => drafting.drafter.save_rings_before(&mut devices, at)?,
+                    None => drafting.drafter.save_rings(&mut devices)?,
+                });
+            }
+        }
+        self.saved[slot] = Some(snapshots);
+        self.order.push(slot);
+        Ok(())
     }
 
     /// Before a pass of `tokens` more: the pending copies of the checkpoints' rows that the sequence

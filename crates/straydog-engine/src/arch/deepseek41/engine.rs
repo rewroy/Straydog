@@ -208,6 +208,9 @@ struct SourceRows {
     /// ratio 2), after the row waiting before it: what a rewind leaves in the tail.
     pass_kv: Buffer,
     pass_gate: Buffer,
+    /// The compressor row a pass over the captured position left waiting there ([`Engine::capture_at`]).
+    mark_kv: Buffer,
+    mark_gate: Buffer,
 }
 
 /// A kv source's compressed rows or index keys lent to the device's expert store past the
@@ -762,6 +765,13 @@ pub struct Engine<'a, T: Tensors> {
     outputs: usize,
     /// The state before the last pass, when it can be taken back.
     rewind: Option<Rewind>,
+    /// The position whose state the next passes keep a copy's worth of ([`Engine::capture_at`]): the pass that runs over it
+    /// computes the window rows behind it too and keeps its compressor rows there; None: no pass does.
+    capture: Option<usize>,
+    /// The kept tokens of the running pass at [`Engine::capture`] (its first `keep`), while it runs.
+    pass_keep: Option<usize>,
+    /// The state before the last pass and the tokens of it kept, when that pass ran over the captured position.
+    captured: Option<(Rewind, usize)>,
     /// Tests only: passes left before one is made void as a part link's timeout makes it ([`Engine::void_pass_in`]).
     void_in: Option<usize>,
     /// How many of a decode row's predicted next-layer experts are prefetched (DS41_PREDICT, up to
@@ -997,6 +1007,8 @@ impl Shard {
                     tail_gate: floats(&mut gpu, hp.head_dim)?,
                     pass_kv: floats(&mut gpu, (VERIFY_ROWS + 1) * hp.head_dim)?,
                     pass_gate: floats(&mut gpu, (VERIFY_ROWS + 1) * hp.head_dim)?,
+                    mark_kv: floats(&mut gpu, hp.head_dim)?,
+                    mark_gate: floats(&mut gpu, hp.head_dim)?,
                 });
             }
         }
@@ -1316,6 +1328,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             decoder,
             outputs: 1,
             rewind: None,
+            capture: None,
+            pass_keep: None,
+            captured: None,
             void_in: None,
             hp: std::rc::Rc::new(hp),
             tensors,
@@ -1811,6 +1826,65 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.copy_state(snapshot, true)
     }
 
+    /// Keep, from the next pass that runs over `position` (past its first token, before its last), the state the sequence has
+    /// there: [`Engine::snapshot_captured_into`] copies it after that pass, as a pass ending there would have left it. The pass
+    /// computes the window rows behind it as well (a decoder layer's otherwise only reach back from the last row) and keeps each
+    /// kv source's compressor row there. So the state a checkpoint takes partway into a prompt needs no pass of its own for
+    /// the tokens after it, whose experts the pass before had read and given up again (~180 ms a request on two R9700s).
+    pub fn capture_at(&mut self, position: Option<usize>) {
+        self.capture = position;
+    }
+
+    /// The position whose state the last pass kept ([`Engine::capture_at`]), if it ran over one.
+    pub fn captured_position(&self) -> Option<usize> {
+        self.captured.as_ref().map(|(point, keep)| point.start + keep)
+    }
+
+    /// [`Engine::snapshot_into`] of the state at the captured position ([`Engine::capture_at`]) of the last pass: what
+    /// [`Engine::rewind`] to that pass's first tokens would leave, read from where the pass left it, the held sequence as it is.
+    /// The window ring holds a batch of rows beyond the window, so the rows behind the position are still there; the
+    /// compressed rows and index keys are the kept groups' (copied later, pending, as the sequence only grows past them); the
+    /// compressor row waiting there is the one the pass kept.
+    pub fn snapshot_captured_into(&mut self, snapshot: &mut Snapshot) -> Result<()> {
+        let (point, keep) = self.captured.as_ref().ok_or("no pass ran over the captured position")?;
+        let (window, dim, index_dim, ring) = (self.hp.window, self.hp.head_dim, self.hp.index_dim, self.ring);
+        let position = point.start + keep;
+        let first = position.saturating_sub(window);
+        let shard = &mut self.shards[0];
+        snapshot.windows.resize_with(shard.rings.len(), Default::default);
+        for ((&layer, buffer), (kept_layer, rows)) in shard.rings.iter().zip(&mut snapshot.windows) {
+            *kept_layer = layer;
+            fit(rows, (position - first) * dim);
+            for (at, run, done) in ring_runs(first, position, ring) {
+                shard.gpu.read_buffer(buffer, at * dim, &mut rows[done * dim..(done + run) * dim])?;
+            }
+        }
+        snapshot.rows.resize_with(shard.sources.len(), Default::default);
+        snapshot.sources.clear();
+        for ((&layer, buffers), (kept_layer, kept)) in shard.sources.iter().zip(&mut snapshot.rows) {
+            *kept_layer = layer;
+            let ratio = self.sources.get(&layer).ok_or("a kv source went missing")?.ratio;
+            let &(groups_before, tail_before) = point.sources.get(&layer).ok_or("a kv source went missing")?;
+            let (groups, tail) = (groups_before + (tail_before + keep) / ratio, (tail_before + keep) % ratio);
+            let [rows, keys, tail_kv, tail_gate] = kept;
+            fit_room(rows, groups * dim / 2);
+            fit_room(keys, groups * index_dim / 2);
+            // (with no row waiting there the tail is not read again)
+            let (from_kv, from_gate) = if tail > 0 { (&buffers.mark_kv, &buffers.mark_gate) } else { (&buffers.tail_kv, &buffers.tail_gate) };
+            for (buffer, values) in [(from_kv, tail_kv), (from_gate, tail_gate)] {
+                fit(values, dim);
+                shard.gpu.read_buffer(buffer, 0, values)?;
+            }
+            snapshot.sources.push((layer, groups, tail));
+        }
+        snapshot.pending = snapshot.rows.iter().any(|(_, kept)| kept[0].capacity() + kept[1].capacity() > 0);
+        let held = self.history.len() - (point.rows - keep);
+        fit(&mut snapshot.history, held);
+        snapshot.history.copy_from_slice(&self.history[..held]);
+        snapshot.position = position;
+        Ok(())
+    }
+
     /// [`Engine::snapshot_into`] without the compressed rows and index keys, not even room for them: a mark that only the
     /// sequence it was taken of goes back to, in place ([`Engine::rewind_to`], while it still [extends](Engine::extends)
     /// it). What it copies is the window's rows and the tails, so that one can be taken every few hundred tokens of a reply;
@@ -1972,6 +2046,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position = position;
         self.history.clone_from(&snapshot.history);
         self.rewind = None;
+        self.captured = None;
         self.primed = None;
         Ok(())
     }
@@ -2023,6 +2098,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position = position;
         self.history.clone_from(&snapshot.history);
         self.rewind = None;
+        self.captured = None;
         self.primed = None;
         // (the state's rooms past it back to the stores, as far as a restore there gives them)
         self.reserve_state(position)
@@ -2068,6 +2144,7 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.position = 0;
         self.history.clear();
         self.rewind = None;
+        self.captured = None;
         self.primed = None;
         for source in self.sources.values_mut() {
             source.groups = 0;
@@ -2377,6 +2454,14 @@ impl<'a, T: Tensors> Engine<'a, T> {
             sources: self.sources.iter().map(|(&layer, source)| (layer, (source.groups, source.tail))).collect(),
         });
         self.rewind = None;
+        self.captured = None;
+        // (a pass over the captured position keeps the state there: its first `keep` tokens' as a pass of those would leave it)
+        self.pass_keep = self.capture.filter(|&at| at > start && at < start + n).map(|at| at - start);
+        let before = self.pass_keep.map(|keep| (Rewind {
+            start,
+            rows: n,
+            sources: self.sources.iter().map(|(&layer, source)| (layer, (source.groups, source.tail))).collect(),
+        }, keep));
         let (positions, ring_rows, visible1, visible2) = pass_schedule(start, n, self.ring);
         // The previous pass queued this one-token schedule behind its logit copy.
         let skip = n == 1 && self.primed.take() == Some(start);
@@ -2582,6 +2667,8 @@ impl<'a, T: Tensors> Engine<'a, T> {
         self.history.extend_from_slice(tokens);
         self.position += n;
         self.rewind = rewind;
+        self.pass_keep = None;
+        self.captured = before;
         Ok(logits)
     }
 
@@ -2723,7 +2810,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
         match self.decoder {
             Some(decoder) if layer >= decoder => {
                 let reach = self.hp.window - 1;
-                let full = (n - self.outputs).saturating_sub((self.hp.layers.len() - 1 - layer) * reach);
+                // (a pass over the captured position computes the window rows behind it as well: the state there holds them)
+                let last = self.pass_keep.map_or(n - self.outputs, |keep| (n - self.outputs).min(keep - 1));
+                let full = last.saturating_sub((self.hp.layers.len() - 1 - layer) * reach);
                 let kv = full.saturating_sub(reach);
                 (if layer == decoder { 0 } else { kv }, kv, full)
             }
@@ -2962,6 +3051,9 @@ impl<'a, T: Tensors> Engine<'a, T> {
             groups: compressed.map_or(0, |c| (self.position + end) / c.ratio),
             ring_rows: self.ring as u64,
             saves,
+            // (the batch holding the captured position's token: its compressor row there, `compress` numbering a batch's tokens from 1)
+            capture: compressed.filter(|c| c.kv_source == layer).and(self.pass_keep).filter(|&keep| first < keep && keep <= end)
+                .map(|keep| keep - first),
         }
     }
 
@@ -3644,6 +3736,8 @@ struct AttentionPlan {
     groups: usize,
     ring_rows: u64,
     saves: bool,
+    /// The compressor row of this batch to keep for the captured position ([`Engine::capture_at`]), as `compress` numbers them.
+    capture: Option<usize>,
 }
 
 /// Work::view calls skipped while a decode token's graphs replay (DS41_COUNT_VIEWS; otherwise unused).
@@ -3805,7 +3899,7 @@ fn attention_ops(shard: &mut Shard, work: &Work, hp: &Hparams, plan: &AttentionP
     let mut compressed = None;
     if let Some(c) = plan.compressed {
         if let Some((ratio, tail, first_group)) = plan.appended {
-            compress(shard, work, hp, layer, plan.rows, freqs, ratio, tail, first_group, plan.saves)?;
+            compress(shard, work, hp, layer, plan.rows, freqs, ratio, tail, first_group, plan.saves, plan.capture)?;
         }
         if c.index_source == layer && plan.groups > 0 && n > 0 {
             let keys = shard.sources[&c.kv_source].keys;
@@ -3916,10 +4010,11 @@ fn router_ops(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usi
 /// keys (from `first_group`, with `tail` rows of an incomplete group waiting); the rows of a still
 /// incomplete group wait in its tail. With `save` (a pass that can be taken back) and groups of 2,
 /// the compressor rows (the one waiting first) are kept for a rewind. The groups appended and the
-/// rows left over.
+/// rows left over. With `capture`, the compressor row there (the batch's tokens from 1) is kept as the one a pass ending at that
+/// token would leave waiting ([`Engine::snapshot_captured_into`]).
 #[allow(clippy::too_many_arguments)]
 fn compress(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize, freqs: Buffer, ratio: usize, tail: usize,
-            first_group: usize, save: bool) -> Result<(usize, usize)> {
+            first_group: usize, save: bool, capture: Option<usize>) -> Result<(usize, usize)> {
     let dim = hp.head_dim;
     // rows 1..=n take this pass; row 0 the waiting one, when there is one
     // kv and gate read the same rows of x. One linears call rounds those rows to FP16 once.
@@ -3934,9 +4029,9 @@ fn compress(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize
     } else {
         shard.linear(&name(layer, "attn_compressor_kv"), work.x.base(), n, work.pool_kv.at(dim))?;
     }
-    let (rows, keys, tail_kv, tail_gate, pass_kv, pass_gate) = {
+    let (rows, keys, tail_kv, tail_gate, pass_kv, pass_gate, mark_kv, mark_gate) = {
         let source = &shard.sources[&layer];
-        (source.rows, source.keys, source.tail_kv, source.tail_gate, source.pass_kv, source.pass_gate)
+        (source.rows, source.keys, source.tail_kv, source.tail_gate, source.pass_kv, source.pass_gate, source.mark_kv, source.mark_gate)
     };
     if tail > 0 {
         shard.gpu.gather(tail_kv.base(), 1, work.all_rows.base(), 1, dim as u64, work.pool_kv.base())?;
@@ -3947,6 +4042,10 @@ fn compress(shard: &mut Shard, work: &Work, hp: &Hparams, layer: usize, n: usize
         let bytes = ((n + 1) * dim * 4) as u64;
         shard.gpu.copy(work.pool_kv.base() as P, pass_kv.base(), bytes)?;
         shard.gpu.copy(work.pool_gate.base() as P, pass_gate.base(), bytes)?;
+    }
+    if let Some(row) = capture.filter(|_| ratio > 1) {
+        shard.gpu.copy(work.pool_kv.at(row * dim) as P, mark_kv.base(), (dim * 4) as u64)?;
+        shard.gpu.copy(work.pool_gate.at(row * dim) as P, mark_gate.base(), (dim * 4) as u64)?;
     }
     let first_row = 1 - tail;
     let groups = (tail + n) / ratio;
