@@ -16,6 +16,19 @@ const TOOL_CALL_OPEN: &str = "<tool_call>";
 /// with a space).
 const DSML_CALLS_OPEN: &str = "\n\n<｜DSML｜ calls";
 const DSML_CALLS_CLOSE: &str = "</｜DSML｜ calls>";
+
+/// Where `text` (a reasoning that never closed) ends with a whole block of DSML tool calls, the block's start (its blank lines): the calls a
+/// DeepSeek-V4.1 reply wrote in its thinking and then ended on, without the `</think>` before them. Served on two R9700s (UD-IQ2_XXS), one
+/// of Dogmind's first requests ended so 2 to 9 times in 20 (2026-11-27, v0.1.18 and 0.1.19 alike), each block whole and the last of the text.
+pub fn dsml_calls_at_end(text: &str) -> Option<usize> {
+    let trimmed = text.trim_end();
+    if !trimmed.ends_with(DSML_CALLS_CLOSE) {
+        return None;
+    }
+    let open = trimmed.rfind(&DSML_CALLS_OPEN[2..])?;
+    // (the opening's blank lines, where the text has them; else from the tag itself, and the caller adds them)
+    Some(if trimmed[..open].ends_with("\n\n") { open - 2 } else { open })
+}
 const DSML_INVOKE_OPEN: &str = "<｜DSML｜ invoke";
 const DSML_INVOKE_CLOSE: &str = "</｜DSML｜ invoke";
 const DSML_PARAMETER_OPEN: &str = "<｜DSML｜ parameter";

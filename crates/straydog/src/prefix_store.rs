@@ -42,6 +42,11 @@ const WRAPPED_LIMIT: usize = 4096;
 /// A `.part` file older than this is what a killed write left.
 const STALE_PART: Duration = Duration::from_secs(600);
 
+/// What starts a wrap's error where the user's key could not be reached for a reason of the moment (the kernel's keyring's lock with no place
+/// or held, the keyring refusing a call): the file is not the cause, and a store keeps it. A server under a service, whose lock had no place,
+/// deleted the four conversations it kept as files that did not open.
+pub const OUT_OF_REACH: &str = "the user's key is out of reach for now: ";
+
 /// What keeps the file's key: DPAPI (Windows) or the kernel's keyring (Linux), or in a test something that does not need a user.
 pub trait Wrap {
     fn wrap(&self, key: &[u8]) -> Result<Vec<u8>, String>;
@@ -232,7 +237,7 @@ impl Wrap for KernelKeyring {
         if blob.len() < NONCE + TAG {
             return Err("a wrapped key too short".into());
         }
-        let sealing = Self::sealing()?;
+        let sealing = Self::sealing().map_err(|error| format!("{OUT_OF_REACH}{error}"))?;
         let nonce = Nonce::try_assume_unique_for_key(&blob[..NONCE]).map_err(|_| "a bad nonce".to_string())?;
         let mut sealed = blob[NONCE..].to_vec();
         let opened = sealing.open_in_place(nonce, Aad::from(ENTROPY), &mut sealed)
@@ -497,13 +502,18 @@ impl Store {
     }
 
     /// The newest file this build made under `prefix` that opens, taken for use (it is the newest from now on). A file that does not open, for
-    /// whatever is wrong with it, is deleted, with one line in the log, and the next is tried: the start goes on as without it.
+    /// whatever is wrong with it, is deleted, with one line in the log, and the next is tried: the start goes on as without it. Where the user's
+    /// key is out of reach ([`OUT_OF_REACH`]) no file opens, and each is kept.
     pub fn take_newest(&self, wrap: &dyn Wrap, prefix: &[u8; 32], layout: u32) -> Option<Opened> {
         for entry in self.candidates(prefix) {
             match open(&entry.path, wrap, prefix, layout) {
                 Ok(opened) => {
                     self.touch(&entry.path);
                     return Some(opened);
+                }
+                Err(reason) if reason.starts_with(OUT_OF_REACH) => {
+                    tracing::warn!("Straydog prefix: {} not opened this start ({reason}); it is kept", entry.path.display());
+                    return None;
                 }
                 Err(reason) => {
                     let _ = std::fs::remove_file(&entry.path);
@@ -772,6 +782,19 @@ mod tests {
         assert!(!second.exists() && first.exists(), "the damaged file is gone and the sound one stays");
         // (a use makes it the newest)
         assert_eq!(store.candidates(&prefix)[0].path, first);
+        // a key out of reach for now (the keyring's lock with no place): nothing opens, and the file is kept for a start that reaches it
+        struct OutOfReach;
+        impl Wrap for OutOfReach {
+            fn wrap(&self, key: &[u8]) -> Result<Vec<u8>, String> {
+                Ok(key.to_vec())
+            }
+
+            fn unwrap(&self, _: &[u8]) -> Result<Vec<u8>, String> {
+                Err(format!("{OUT_OF_REACH}the kernel's keyring's lock has no place"))
+            }
+        }
+        assert!(store.take_newest(&OutOfReach, &prefix, 1).is_none());
+        assert!(first.exists(), "a file whose key is out of reach for now is kept");
         // a file the wrong user wrapped: a key that does not unwrap deletes it too, and nothing is left to take
         struct Nobody;
         impl Wrap for Nobody {

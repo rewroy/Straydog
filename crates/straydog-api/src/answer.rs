@@ -15,7 +15,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Map, Value};
-use straydog_engine::reply::{Markup, ReasoningSplitter, StopMatcher, ToolCall, ToolCallSplitter, ToolPiece};
+use straydog_engine::reply::{dsml_calls_at_end, Markup, ReasoningSplitter, StopMatcher, ToolCall, ToolCallSplitter, ToolPiece};
 
 use crate::request::Shape;
 use crate::{ApiError, Generation};
@@ -42,6 +42,7 @@ pub(crate) async fn respond(generation: Generation, shape: Shape, model: &str) -
             if shape.tool_writing { tools.writing() } else { tools }
         },
         calls: Vec::new(),
+        open_thought: (shape.markup == Markup::Dsml && shape.thinking && shape.tools.is_some()).then(String::new),
     };
     let mut completion = Completion { generation, reply, said: tokio::time::Instant::now() };
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
@@ -82,6 +83,9 @@ struct Reply {
     tools: ToolCallSplitter,
     /// The tool calls, once the text has ended.
     calls: Vec<ToolCall>,
+    /// A DSML reply's reasoning while it has not ended, where tools were offered: if the reply ends there on a whole block of tool calls
+    /// (the model wrote its calls in its thinking and no `</think>` before them), those calls are taken as the reply's ([`dsml_calls_at_end`]).
+    open_thought: Option<String>,
 }
 
 impl Reply {
@@ -95,6 +99,9 @@ impl Reply {
         let content = self.tools.feed(&content);
         let mut deltas = Vec::new();
         if !thought.is_empty() {
+            if let Some(open) = self.open_thought.as_mut() {
+                open.push_str(&thought);
+            }
             deltas.push(Delta::Reasoning(thought));
         }
         if !content.is_empty() {
@@ -110,6 +117,7 @@ impl Reply {
     /// The reasoning's end the worker saw: the text the stop strings held, then the reasoning's,
     /// as reasoning.
     fn end_reasoning(&mut self) -> Vec<Delta> {
+        self.open_thought = None;
         let held = self.stop.finish();
         let mut deltas = self.split(&held);
         let thought = self.reasoning.end();
@@ -126,7 +134,23 @@ impl Reply {
         let mut deltas = self.split(&held);
         let thought = self.reasoning.finish();
         if !thought.is_empty() {
+            if let Some(open) = self.open_thought.as_mut() {
+                open.push_str(&thought);
+            }
             deltas.push(Delta::Reasoning(thought));
+        }
+        // (a reply that ended in its thinking on a whole block of calls: the block goes to the calls, as if after `</think>`; its text was
+        // sent as reasoning, and stays so)
+        if let Some(open) = self.open_thought.take().filter(|_| !cut) {
+            if let Some(start) = dsml_calls_at_end(&open) {
+                let block = &open[start..];
+                let block = if block.starts_with("\n\n") { block.to_string() } else { format!("\n\n{block}") };
+                let text = self.tools.feed(&block);
+                if !text.trim().is_empty() {
+                    deltas.push(Delta::Content(text));
+                }
+                eprintln!("WARN Straydog took the tool calls a reply wrote in its unclosed reasoning ({} bytes of markup)", block.len());
+            }
         }
         let (late, calls) = self.tools.finish();
         if self.tools.dropped > 0 {

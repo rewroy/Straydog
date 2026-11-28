@@ -3,7 +3,8 @@
 //! memory bandwidth is the limit; where neither does, the scheduling is.
 //!
 //! STRAYDOG_MODEL=<IQ2_XS directory> cargo run --release --features hip --example qwen_cpu_scaling
-//! under the bench lock.
+//! under the bench lock. STRAYDOG_BENCH_SHARED=1: each call is two rows routed to the same expert (a verification's rows often are), one
+//! route each, which the pair kernels take with one decoding of the expert's rows (STRAYDOG_CPU_PAIR=0 for one route after another).
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -68,7 +69,9 @@ fn main() {
     }
     let per: [usize; 3] = [0, 1, 2].map(|role| banks[0][role].len() / EXPERTS);
     let cores = std::thread::available_parallelism().map_or(4, |count| count.get());
-    println!("kinds {kinds:?}, an expert {} KiB, {} logical CPUs, {} routes a call", (per[0] + per[1] + per[2]) / 1024, cores, ROUTES);
+    let shared = std::env::var("STRAYDOG_BENCH_SHARED").as_deref() == Ok("1");
+    println!("kinds {kinds:?}, an expert {} KiB, {} logical CPUs, {} routes a call{}", (per[0] + per[1] + per[2]) / 1024, cores, ROUTES,
+             if shared { ", two rows to one expert" } else { "" });
     println!("{:>7} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8}", "threads", "mode", "us/route", "gate+up", "product", "down", "GB/s");
     let mut random = Random(0x5eed);
     let mut sizes: Vec<u32> = [1u32, 2, 3, 4, 6, 8, 12, 16].into_iter().filter(|threads| *threads as usize <= cores).collect();
@@ -80,6 +83,8 @@ fn main() {
         for hot in [false, true] {
             let x: Vec<f32> = (0..HIDDEN).map(|_| ((random.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0).collect();
             let mut out = vec![0f32; HIDDEN];
+            let x_second: Vec<f32> = (0..HIDDEN).map(|_| ((random.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0).collect();
+            let mut out_second = vec![0f32; HIDDEN];
             let weights = [0.5f32; ROUTES];
             let (mut before, mut after) = ([0u64; 7], [0u64; 7]);
             let mut wall = std::time::Duration::ZERO;
@@ -94,10 +99,19 @@ fn main() {
                 };
                 let (gate, up, down) = (slices(0), slices(1), slices(2));
                 let started = std::time::Instant::now();
-                // SAFETY: ROUTES expert slices of the declared shapes.
+                // SAFETY: ROUTES expert slices of the declared shapes; in the shared mode two rows of x, each routed to the first expert.
                 let status = unsafe {
-                    ffi::sd_cpu_experts_run(engine, kinds.as_ptr(), gate.as_ptr(), up.as_ptr(), down.as_ptr(), weights.as_ptr(),
-                                            ROUTES as u32, HIDDEN as u64, FFN as u64, x.as_ptr(), out.as_mut_ptr())
+                    if shared {
+                        let (same_gate, same_up, same_down) = ([gate[0]; ROUTES], [up[0]; ROUTES], [down[0]; ROUTES]);
+                        let counts = [1u32; ROUTES];
+                        let xs = [x.as_ptr(), x_second.as_ptr()];
+                        let outs = [out.as_mut_ptr(), out_second.as_mut_ptr()];
+                        ffi::sd_cpu_experts_run_rows(engine, kinds.as_ptr(), ROUTES as u32, counts.as_ptr(), same_gate.as_ptr(), same_up.as_ptr(),
+                                                     same_down.as_ptr(), weights.as_ptr(), HIDDEN as u64, FFN as u64, xs.as_ptr(), outs.as_ptr())
+                    } else {
+                        ffi::sd_cpu_experts_run(engine, kinds.as_ptr(), gate.as_ptr(), up.as_ptr(), down.as_ptr(), weights.as_ptr(),
+                                                ROUTES as u32, HIDDEN as u64, FFN as u64, x.as_ptr(), out.as_mut_ptr())
+                    }
                 };
                 assert_eq!(status, 0);
                 if call >= 8 {

@@ -219,7 +219,9 @@ fn hung(pid_file: Option<&Path>) {
 #[allow(clippy::zombie_processes)] // the process outlives this one on purpose (its new parent reaps it)
 fn lingering(marker: &Path) {
     use std::os::unix::process::CommandExt;
-    let child = std::process::Command::new(std::env::current_exe().unwrap()).arg("grandchild").process_group(0)
+    // (its parent's id given, not read by the grandchild at its start: a slow start, as a debug build's, found the parent gone already,
+    // took init for it, and waited for a change of parent that never came)
+    let child = std::process::Command::new(std::env::current_exe().unwrap()).arg("grandchild").arg(std::process::id().to_string()).process_group(0)
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).spawn().unwrap();
     std::fs::write(marker, child.id().to_string()).unwrap();
     ready();
@@ -232,8 +234,7 @@ fn lingering(marker: &Path) {
 }
 
 #[cfg(unix)]
-fn grandchild() {
-    let parent = std::os::unix::process::parent_id();
+fn grandchild(parent: u32) {
     while std::os::unix::process::parent_id() == parent {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -276,7 +277,7 @@ fn main() {
         #[cfg(unix)]
         Some("lingers") => return lingering(Path::new(&args[2])),
         #[cfg(unix)]
-        Some("grandchild") => return grandchild(),
+        Some("grandchild") => return grandchild(args[2].parse().unwrap()),
         _ => {}
     }
     let scratch = std::env::temp_dir().join(format!("straydog-runtime-controls-{}", std::process::id()));

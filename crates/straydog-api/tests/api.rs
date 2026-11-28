@@ -1061,6 +1061,32 @@ async fn a_dsml_model_gets_its_own_levels_card_and_tool_calls() {
                (Some(0), Some(1.0)));
 }
 
+/// A DSML reply that writes its calls in its thinking and ends there, with no `</think>` before them (DeepSeek-V4.1 did so for one of
+/// Dogmind's first requests 2 to 9 times in 20): the whole block of calls at the reasoning's end is the reply's calls; a block the
+/// thinking goes on after, or a reply cut by its token limit, is left as reasoning.
+#[tokio::test]
+async fn a_dsml_reply_that_ends_in_its_thinking_on_its_calls_makes_them() {
+    let block = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read_file\">\n\
+                 <｜DSML｜ parameter name=\"path\" string=\"true\">main.rs</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    let (first, rest) = block.split_at(block.find("<｜DSML｜ invoke").unwrap());
+    let mock = Mock::new(vec![Script::Events(vec![delta(" Let me look at the files."), delta(first), delta(rest), done("stop")]),
+                              Script::Events(vec![delta(" Maybe:"), delta(block), delta("\n\nNo, first the tests."), done("stop")]),
+                              Script::Events(vec![delta(" Let me look."), delta(block), done("length")])]);
+    let app = || router(mock.clone(), ApiConfig { markup: Markup::Dsml, ..config() });
+    let (status, body) = fetch(app(), chat(ask(json!({"tools": read_file()})).to_string())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let call = &body["choices"][0]["message"]["tool_calls"][0]["function"];
+    assert_eq!((call["name"].as_str(), call["arguments"].as_str()), (Some("read_file"), Some(r#"{"path": "main.rs"}"#)), "{body}");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    assert!(body["choices"][0]["message"]["reasoning_content"].as_str().unwrap().starts_with(" Let me look at the files."), "{body}");
+    for (index, reason) in [(1, "stop"), (2, "length")] {
+        let (status, body) = fetch(app(), chat(ask(json!({"tools": read_file()})).to_string())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["choices"][0]["message"]["tool_calls"].is_null(), "reply {index}: {body}");
+        assert_eq!(body["choices"][0]["finish_reason"], reason, "reply {index}");
+    }
+}
+
 /// A streamed body with what the server draws at random (the ids) and the clock (`created`) replaced.
 fn normalized(body: &str) -> String {
     fn after(text: &str, marker: &str, keep: impl Fn(char) -> bool, with: &str) -> String {

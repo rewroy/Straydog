@@ -236,7 +236,9 @@ impl Store {
         if head.key != *key {
             return Err("it is another engine's, build's or settings'".into());
         }
-        let unwrapped = wrap.unwrap(&head.wrapped)?;
+        // (a key out of reach for now is no fault of the file's: it is kept, as for any reason of the moment)
+        let unwrapped = wrap.unwrap(&head.wrapped)
+            .map_err(|error| if error.starts_with(crate::prefix_store::OUT_OF_REACH) { passing(error) } else { error })?;
         Ok(Some(Opened { file, head, bytes, key: unwrapped }))
     }
 
@@ -572,6 +574,22 @@ mod tests {
         assert_eq!(store.tokens_or_delete(&Flip, &key, 2), None);
         assert!(!store.exists(), "another layout's file is deleted");
         write();
+        // a key out of reach for now (the keyring's lock with no place, as under a service) is no fault of the file's: it is kept, at a start and
+        // at a request
+        struct OutOfReach;
+        impl Wrap for OutOfReach {
+            fn wrap(&self, key: &[u8]) -> Result<Vec<u8>, String> {
+                Ok(key.to_vec())
+            }
+
+            fn unwrap(&self, _: &[u8]) -> Result<Vec<u8>, String> {
+                Err(format!("{}the kernel's keyring's lock has no place", crate::prefix_store::OUT_OF_REACH))
+            }
+        }
+        assert_eq!(store.tokens_or_delete(&OutOfReach, &key, 1), None);
+        assert!(store.exists(), "a file whose key is out of reach for now is kept at a start");
+        assert!(store.state_or_delete(&OutOfReach, &key, 1).is_err());
+        assert!(store.exists(), "and at a request");
         assert_eq!(store.tokens_or_delete(&Nobody, &key, 1), None);
         assert!(!store.exists(), "another user's file is deleted");
         // a byte changed in the tokens' part, and in the state's (which only a request reads)
