@@ -945,6 +945,9 @@ impl<E: Engines> Session<E> {
             checkpoint_seconds += saving.elapsed().as_secs_f64();
             fed = start;
         }
+        // (the tokens after a checkpoint saved on the way are a pass of their own, whose experts the pass before had read and
+        // given up again: what that pass costs, apart, is what a checkpoint taken inside one pass would save)
+        let tail = (fed > reused).then(|| (total - fed, Instant::now(), self.engines.counts()));
         let Some(logits) = self.feed(&tokens[fed..], cancelled, &mut |done| progress(done, total))? else {
             return Ok(());
         };
@@ -953,6 +956,13 @@ impl<E: Engines> Session<E> {
         }
         let prefill_seconds = started.elapsed().as_secs_f64();
         let (hits, host, drive) = self.engines.counts();
+        let prefill_tail = match tail {
+            Some((rows, began, (hits1, host1, drive1))) => json!({
+                "tokens": rows, "seconds": began.elapsed().as_secs_f64(),
+                "vram": hits - hits1, "host": host - host1, "drive": drive - drive1,
+            }),
+            None => Value::Null,
+        };
         let prefill_drive_bytes = self.engines.drive_bytes() - drive_bytes0;
         // (what else the prefill's experts cost: write-backs to the host tier, prefetches it did not
         // use, and the seconds the stores waited for reads, for free slots and for pinning)
@@ -1011,6 +1021,7 @@ impl<E: Engines> Session<E> {
             // the drive bytes are what the wait for the first token read)
             "prefill_experts": {"vram": hits - hits0, "host": host - host0, "drive": drive - drive0},
             "prefill_drive_bytes": prefill_drive_bytes,
+            "prefill_tail": prefill_tail,
             "prefill_profile": prefill_profile,
             "prefill_store": prefill_store,
             "ttft_seconds": ttft, "generated_tokens": emitted, "decode_forward_tokens": decoded.fed, "decode_passes": decoded.passes,

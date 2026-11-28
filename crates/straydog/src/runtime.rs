@@ -814,6 +814,12 @@ pub fn request_summary(event: &Value, id: Option<&str>) -> String {
                                                       count(&experts["vram"]), count(&experts["host"]), count(&experts["drive"]),
                                                       timings["prefill_drive_bytes"].as_f64().unwrap_or(0.0) / 1e6),
             _ => String::new(),
+        } + &match &timings["prefill_tail"] {
+            // (the last tokens after a checkpoint taken on the way, a pass of their own: part of the reads above)
+            tail if tail.is_object() => format!(", of them its last {} tokens after the checkpoint, a pass of their own: {:.0} ms, VRAM {}, host {}, drive {}",
+                                                count(&tail["tokens"]), 1e3 * tail["seconds"].as_f64().unwrap_or(0.0),
+                                                count(&tail["vram"]), count(&tail["host"]), count(&tail["drive"])),
+            _ => String::new(),
         },
         // (the experts' other costs in the prefill)
         match &timings["prefill_store"] {
